@@ -330,12 +330,13 @@ class StorageApi
                 $status = $report['status'] ?? '';
                 $createdAt = $report['created_at'] ?? null;
                 
-                // Проверяем что отчёт успешный и создан менее 24 часов назад
+                // Проверяем что отчёт успешный и создан менее 2.5 часов назад
+                // (ссылка на скачивание истекает через 3 часа - X-Amz-Expires=10800)
                 if ($status === 'success' && $createdAt) {
                     $createdTime = strtotime($createdAt);
                     $hoursAgo = (time() - $createdTime) / 3600;
                     
-                    if ($hoursAgo < 24) {
+                    if ($hoursAgo < 2.5) {
                         Log::info('Found existing placement report', [
                             'report_id' => $report['code'] ?? 'unknown',
                             'created_at' => $createdAt,
