@@ -1,0 +1,417 @@
+<?php
+
+namespace App\Domains\Wildberries\Api;
+
+use App\Domains\Marketplace\Contracts\InventoryApiInterface;
+use App\Models\Integration;
+use Illuminate\Support\Facades\Log;
+
+/**
+ * API для работы с остатками Wildberries
+ * 
+ * Актуальные Endpoints (обновлено 2024-12):
+ * 
+ * Marketplace API (marketplace-api.wildberries.ru):
+ * - GET /api/v3/warehouses - список складов продавца
+ * - POST /api/v3/stocks/{warehouseId} - получить остатки (требует chrtIds!)
+ * - PUT /api/v3/stocks/{warehouseId} - обновить остатки
+ * 
+ * Statistics API (statistics-api.wildberries.ru):
+ * - GET /api/v1/supplier/stocks - отчёт по остаткам на складах WB
+ * 
+ * ВАЖНО: 
+ * - Параметр `skus` DEPRECATED (отключается 9 февраля 2025)!
+ * - Используйте `chrtIds` (ID размеров) вместо `skus`
+ * - Для FBS складов с cargoType: 2,3 обновление остатков отключено
+ * 
+ * @see https://dev.wildberries.ru/openapi/work-with-products
+ */
+class InventoryApi implements InventoryApiInterface
+{
+    public function __construct(
+        private WildberriesClient $client,
+        private ?ProductsApi $productsApi = null
+    ) {}
+
+    /**
+     * Получить остатки по всем складам
+     * 
+     * Использует Statistics API для получения всех остатков сразу.
+     * Это более эффективно чем запрашивать по каждому складу отдельно.
+     * 
+     * @param Integration|null $integration
+     * @param array $chrtIds Массив ID размеров (chrtId). Если пустой - получаем все
+     */
+    public function getStocks(?Integration $integration = null, array $chrtIds = []): array
+    {
+        // Используем Statistics API - он возвращает ВСЕ остатки сразу
+        $stocksReport = $this->getStocksReport();
+        
+        if (empty($stocksReport)) {
+            Log::warning('WB InventoryApi: No stocks from Statistics API, trying FBS warehouses');
+            return $this->getStocksFromFbsWarehouses($integration, $chrtIds);
+        }
+        
+        $allStocks = [];
+        
+        foreach ($stocksReport as $item) {
+            $barcode = $item['barcode'] ?? null;
+            $nmId = $item['nmId'] ?? null;
+            $supplierArticle = $item['supplierArticle'] ?? null;
+            
+            // Используем barcode как основной ключ (это SKU в WB)
+            $key = $barcode ?? (string) $nmId;
+            if (!$key) continue;
+            
+            // Фильтруем по chrtIds если переданы (но в Statistics API нет chrtId напрямую)
+            // Пропускаем фильтрацию если chrtIds пустой
+            
+            if (!isset($allStocks[$key])) {
+                $allStocks[$key] = [
+                    'sku' => $barcode,
+                    'nmId' => $nmId,
+                    'supplierArticle' => $supplierArticle,
+                    'barcode' => $barcode,
+                    'warehouses' => [],
+                    'total' => 0,
+                    'inWayToClient' => 0,
+                    'inWayFromClient' => 0,
+                    // Дополнительные данные из Statistics API
+                    'category' => $item['category'] ?? null,
+                    'subject' => $item['subject'] ?? null,
+                    'brand' => $item['brand'] ?? null,
+                    'price' => $item['Price'] ?? 0,
+                    'discount' => $item['Discount'] ?? 0,
+                ];
+            }
+            
+            $quantity = $item['quantity'] ?? 0;
+            $warehouseName = $item['warehouseName'] ?? 'Unknown';
+            
+            // Определяем тип склада: Statistics API возвращает только склады WB (FBO)
+            // Склады продавца (FBS) получаются через getStocksFromFbsWarehouses()
+            $fulfillmentType = 'FBO';
+            
+            $allStocks[$key]['warehouses'][] = [
+                'warehouse_name' => $warehouseName,
+                'quantity' => $quantity,
+                'quantityFull' => $item['quantityFull'] ?? $quantity,
+                'inWayToClient' => $item['inWayToClient'] ?? 0,
+                'inWayFromClient' => $item['inWayFromClient'] ?? 0,
+                'isSupply' => $item['isSupply'] ?? false,
+                'isRealization' => $item['isRealization'] ?? false,
+                'techSize' => $item['techSize'] ?? '',
+                'fulfillment_type' => $fulfillmentType,
+            ];
+            
+            $allStocks[$key]['total'] += $quantity;
+            $allStocks[$key]['inWayToClient'] += $item['inWayToClient'] ?? 0;
+            $allStocks[$key]['inWayFromClient'] += $item['inWayFromClient'] ?? 0;
+        }
+        
+        Log::info('WB InventoryApi: Got FBO stocks from Statistics API', ['count' => count($allStocks)]);
+        
+        // Также получаем остатки с FBS складов продавца
+        $fbsStocks = $this->getStocksFromFbsWarehouses($integration, $chrtIds);
+        
+        // Объединяем FBO и FBS остатки
+        foreach ($fbsStocks as $fbsItem) {
+            $sku = $fbsItem['sku'] ?? null;
+            if (!$sku) continue;
+            
+            if (isset($allStocks[$sku])) {
+                // Добавляем FBS склады к существующему товару
+                $allStocks[$sku]['warehouses'] = array_merge(
+                    $allStocks[$sku]['warehouses'],
+                    $fbsItem['warehouses'] ?? []
+                );
+                $allStocks[$sku]['total'] += $fbsItem['total'] ?? 0;
+            } else {
+                // Новый товар только на FBS
+                $allStocks[$sku] = $fbsItem;
+            }
+        }
+        
+        Log::info('WB InventoryApi: Combined FBO+FBS stocks', [
+            'total_skus' => count($allStocks),
+            'fbs_skus' => count($fbsStocks),
+        ]);
+        
+        return array_values($allStocks);
+    }
+    
+    /**
+     * Получить остатки с FBS складов продавца
+     * 
+     * Склады продавца получаются через Marketplace API /api/v3/warehouses
+     */
+    private function getStocksFromFbsWarehouses(?Integration $integration, array $chrtIds = []): array
+    {
+        $warehouses = $this->getWarehouses($integration);
+        
+        if (empty($warehouses)) {
+            Log::warning('WB InventoryApi: No warehouses found');
+            return [];
+        }
+        
+        // Если chrtIds не переданы, получаем их из карточек товаров
+        if (empty($chrtIds)) {
+            $chrtIds = $this->getAllChrtIds($integration);
+            
+            if (empty($chrtIds)) {
+                Log::warning('WB InventoryApi: No chrtIds found from products');
+                return [];
+            }
+        }
+        
+        $allStocks = [];
+
+        foreach ($warehouses as $warehouse) {
+            $warehouseId = $warehouse['id'] ?? null;
+            if (!$warehouseId) continue;
+            
+            // Пропускаем склады в процессе обработки или удаления
+            if (($warehouse['isDeleting'] ?? false) || ($warehouse['isProcessing'] ?? false)) {
+                Log::info('WB InventoryApi: Skipping warehouse', [
+                    'id' => $warehouseId,
+                    'isDeleting' => $warehouse['isDeleting'] ?? false,
+                    'isProcessing' => $warehouse['isProcessing'] ?? false,
+                ]);
+                continue;
+            }
+            
+            $stocks = $this->getStocksByWarehouse($warehouseId, $integration, $chrtIds);
+            
+            foreach ($stocks as $stock) {
+                $sku = $stock['sku'] ?? null;
+                $chrtId = $stock['chrtId'] ?? null;
+                if (!$sku) continue;
+
+                if (!isset($allStocks[$sku])) {
+                    $allStocks[$sku] = [
+                        'sku' => $sku,
+                        'chrtId' => $chrtId,
+                        'warehouses' => [],
+                        'total' => 0,
+                    ];
+                }
+
+                $quantity = $stock['amount'] ?? 0;
+                $allStocks[$sku]['warehouses'][] = [
+                    'warehouse_id' => $warehouseId,
+                    'warehouse_name' => $warehouse['name'] ?? '',
+                    'cargo_type' => $warehouse['cargoType'] ?? null,
+                    'quantity' => $quantity,
+                    'fulfillment_type' => 'FBS', // Склады продавца — всегда FBS
+                ];
+                $allStocks[$sku]['total'] += $quantity;
+            }
+        }
+
+        return array_values($allStocks);
+    }
+
+    /**
+     * Получить список складов продавца (FBS)
+     * 
+     * GET /api/v3/warehouses
+     * 
+     * Возвращает:
+     * - name: название склада
+     * - officeId: ID связанного офиса
+     * - id: уникальный ID склада
+     * - cargoType: тип груза (1 - мелкогабарит, 2 - КГТ, 3 - КГТ+)
+     * - deliveryType: тип доставки
+     * - isDeleting: склад удаляется
+     * - isProcessing: склад обрабатывается (обновление/удаление остатков недоступно)
+     * 
+     * @see https://dev.wildberries.ru/openapi/work-with-products
+     */
+    public function getWarehouses(?Integration $integration = null): array
+    {
+        $response = $this->client->get('/api/v3/warehouses');
+        return $response ?? [];
+    }
+
+    /**
+     * Получить остатки по конкретному складу
+     * 
+     * POST /api/v3/stocks/{warehouseId}
+     * 
+     * ВАЖНО: 
+     * - Параметр `skus` DEPRECATED (отключается 9 февраля 2025)!
+     * - Используйте `chrtIds` (ID размеров) вместо `skus`
+     * - Лимит: до 1000 chrtIds за запрос
+     * 
+     * Rate limits: 300 req/min, интервал 200ms, burst 20
+     * Ошибка 409 считается как 10 запросов!
+     * 
+     * @param string $warehouseId ID склада
+     * @param Integration|null $integration
+     * @param array $chrtIds Массив ID размеров (обязательно!)
+     * 
+     * @see https://dev.wildberries.ru/openapi/work-with-products
+     */
+    public function getStocksByWarehouse(string $warehouseId, ?Integration $integration = null, array $chrtIds = []): array
+    {
+        // Если chrtIds не переданы, получаем их из карточек
+        if (empty($chrtIds)) {
+            $chrtIds = $this->getAllChrtIds($integration);
+            
+            if (empty($chrtIds)) {
+                Log::warning('WB InventoryApi: Cannot get stocks - no chrtIds available');
+                return [];
+            }
+        }
+        
+        // WB API позволяет запросить до 1000 chrtIds за раз
+        $chunks = array_chunk($chrtIds, 1000);
+        $allStocks = [];
+        
+        foreach ($chunks as $chunk) {
+            $response = $this->client->post("/api/v3/stocks/{$warehouseId}", [
+                'chrtIds' => $chunk,
+            ]);
+            
+            if ($response && isset($response['stocks'])) {
+                $allStocks = array_merge($allStocks, $response['stocks']);
+            }
+        }
+
+        return $allStocks;
+    }
+
+    /**
+     * Обновить остатки на складе
+     * 
+     * PUT /api/v3/stocks/{warehouseId}
+     * 
+     * ВАЖНО:
+     * - Для FBS складов с cargoType: 2,3 обновление мелкогабарита отключено!
+     * - Используйте склады с cargoType: 1 для мелкогабаритных товаров
+     * 
+     * @param Integration $integration
+     * @param string $warehouseId ID склада
+     * @param array $stocks Массив [{sku: string, amount: int}, ...]
+     * 
+     * @see https://dev.wildberries.ru/openapi/work-with-products
+     */
+    public function updateStocks(Integration $integration, string $warehouseId, array $stocks): bool
+    {
+        $response = $this->client->put("/api/v3/stocks/{$warehouseId}", [
+            'stocks' => $stocks,
+        ]);
+
+        return $response !== null;
+    }
+    
+    /**
+     * Получить отчёт по остаткам на складах WB (Statistics API)
+     * 
+     * GET /api/v1/supplier/stocks (statistics-api.wildberries.ru)
+     * 
+     * Данные обновляются каждые 30 минут.
+     * Лимит: 60 000 строк за запрос.
+     * 
+     * Response fields:
+     * - lastChangeDate: дата последнего изменения остатка
+     * - warehouseName: название склада
+     * - supplierArticle: артикул поставщика
+     * - nmId: ID товара WB
+     * - barcode: штрихкод
+     * - quantity: доступное количество
+     * - inWayToClient: в пути к клиенту
+     * - inWayFromClient: в пути от клиента
+     * - quantityFull: полное количество
+     * - category, subject, brand: категория, предмет, бренд
+     * - techSize: размер
+     * - Price: цена
+     * - Discount: скидка
+     * 
+     * @param string $dateFrom Дата в формате RFC3339 (UTC+3)
+     * 
+     * @see https://dev.wildberries.ru/openapi/reports
+     */
+    public function getStocksReport(string $dateFrom = '2019-06-20'): array
+    {
+        Log::info('WB InventoryApi: Requesting stocks from Statistics API', [
+            'endpoint' => '/api/v1/supplier/stocks',
+            'dateFrom' => $dateFrom,
+        ]);
+        
+        $response = $this->client->statisticsGet('/api/v1/supplier/stocks', [
+            'dateFrom' => $dateFrom,
+        ]);
+        
+        if ($response === null) {
+            Log::warning('WB InventoryApi: Statistics API returned null (check API key permissions)');
+            return [];
+        }
+        
+        Log::info('WB InventoryApi: Statistics API response', [
+            'count' => count($response),
+            'sample' => array_slice($response, 0, 2),
+        ]);
+        
+        return $response;
+    }
+    
+    /**
+     * Получить все chrtIds (ID размеров) из карточек товаров
+     * 
+     * chrtId - это уникальный идентификатор размера товара в WB.
+     * Используется вместо deprecated параметра skus.
+     */
+    private function getAllChrtIds(?Integration $integration = null): array
+    {
+        if (!$this->productsApi) {
+            $this->productsApi = new ProductsApi($this->client);
+        }
+        
+        $chrtIds = [];
+        $cursor = null;
+        $maxIterations = 50; // Защита от бесконечного цикла
+        $iteration = 0;
+        
+        do {
+            $result = $this->productsApi->getProducts($integration, [
+                'limit' => 100,
+                'cursor' => $cursor,
+            ]);
+            
+            $cards = $result['cards'] ?? [];
+            $cursor = $result['cursor'] ?? null;
+            
+            foreach ($cards as $card) {
+                // Собираем chrtIds из всех размеров
+                $sizes = $card['sizes'] ?? [];
+                foreach ($sizes as $size) {
+                    $chrtId = $size['chrtID'] ?? null;
+                    if ($chrtId) {
+                        $chrtIds[] = (int) $chrtId;
+                    }
+                }
+            }
+            
+            $iteration++;
+            
+            // Проверяем условие выхода: нет курсора или достигли лимита итераций
+            $hasMore = !empty($cards) && $cursor && isset($cursor['nmID']);
+            
+        } while ($hasMore && $iteration < $maxIterations);
+        
+        Log::info('WB InventoryApi: Collected chrtIds', ['count' => count($chrtIds)]);
+        
+        return array_unique($chrtIds);
+    }
+    
+    /**
+     * @deprecated Используйте getAllChrtIds() вместо этого метода
+     * Параметр skus будет отключён 9 февраля 2025
+     */
+    private function getAllBarcodes(?Integration $integration = null): array
+    {
+        Log::warning('WB InventoryApi: getAllBarcodes() is deprecated, use getAllChrtIds()');
+        return $this->getAllChrtIds($integration);
+    }
+}

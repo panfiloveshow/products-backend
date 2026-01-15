@@ -1,0 +1,122 @@
+<?php
+
+namespace App\Domains\Ozon\Api;
+
+use App\Models\Integration;
+use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
+
+/**
+ * HTTP клиент для Ozon API
+ */
+class OzonClient
+{
+    private const BASE_URL = 'https://api-seller.ozon.ru';
+    
+    private string $clientId;
+    private string $apiKey;
+    private int $timeout = 30;
+
+    public function __construct(?string $clientId = null, ?string $apiKey = null)
+    {
+        $this->clientId = $clientId ?? config('services.ozon.client_id') ?? '';
+        $this->apiKey = $apiKey ?? config('services.ozon.api_key') ?? '';
+    }
+
+    /**
+     * Создать клиент из Integration модели
+     */
+    public static function fromIntegration(Integration $integration): self
+    {
+        return new self($integration->client_id, $integration->api_key);
+    }
+
+    /**
+     * POST запрос к API (основной метод для Ozon)
+     * @param bool $forceObject Если true и $data пустой, отправляет {} вместо []
+     */
+    public function post(string $endpoint, array $data = [], bool $forceObject = false): ?array
+    {
+        try {
+            // Если нужен пустой объект {} вместо пустого массива []
+            $body = (empty($data) && $forceObject) ? (object)[] : $data;
+            
+            $response = Http::withHeaders($this->getHeaders())
+                ->timeout($this->timeout)
+                ->post(self::BASE_URL . $endpoint, $body);
+
+            if ($response->successful()) {
+                return $response->json();
+            }
+
+            Log::warning('Ozon API error', [
+                'endpoint' => $endpoint,
+                'status' => $response->status(),
+                'body' => $response->body(),
+                'client_id' => $this->clientId ? substr($this->clientId, 0, 4) . '***' : 'empty',
+                'has_api_key' => !empty($this->apiKey),
+            ]);
+
+            return null;
+        } catch (\Exception $e) {
+            Log::error('Ozon API exception', [
+                'endpoint' => $endpoint,
+                'error' => $e->getMessage(),
+                'client_id' => $this->clientId ? substr($this->clientId, 0, 4) . '***' : 'empty',
+            ]);
+            return null;
+        }
+    }
+
+    /**
+     * GET запрос к API
+     */
+    public function get(string $endpoint, array $params = []): ?array
+    {
+        try {
+            $response = Http::withHeaders($this->getHeaders())
+                ->timeout($this->timeout)
+                ->get(self::BASE_URL . $endpoint, $params);
+
+            if ($response->successful()) {
+                return $response->json();
+            }
+
+            Log::warning('Ozon API error', [
+                'endpoint' => $endpoint,
+                'status' => $response->status(),
+                'body' => $response->body(),
+            ]);
+
+            return null;
+        } catch (\Exception $e) {
+            Log::error('Ozon API exception', [
+                'endpoint' => $endpoint,
+                'error' => $e->getMessage(),
+            ]);
+            return null;
+        }
+    }
+
+    /**
+     * Заголовки запроса
+     */
+    private function getHeaders(): array
+    {
+        return [
+            'Client-Id' => $this->clientId,
+            'Api-Key' => $this->apiKey,
+            'Content-Type' => 'application/json',
+            'Accept' => 'application/json',
+        ];
+    }
+
+    /**
+     * Установить таймаут
+     */
+    public function setTimeout(int $seconds): self
+    {
+        $this->timeout = $seconds;
+        return $this;
+    }
+}

@@ -1,0 +1,7 @@
+Артикул продавца;Себестоимость;Название товара;Маркетплейс
+3-02/3505;535,68;Кассовая чековая лента 57 мм;ozon
+3-02/3506;3014;Кассовая чековая лента 57 мм 15 метров;ozon
+3-02/3507;488,7;Кассовая чековая лента;ozon
+TEST-001;1234.56;Test product with dot;wildberries
+TEST-002;1 234,56;Test with space separator;wildberries
+INVALID-SKU;;Empty price;ozon

@@ -1,0 +1,298 @@
+<?php
+
+use App\Http\Controllers\Api\AuthController;
+use App\Http\Controllers\Api\IntegrationController;
+use App\Http\Controllers\Api\ProductController;
+use App\Http\Controllers\Api\InventoryController;
+use App\Http\Controllers\Api\ShipmentController;
+use App\Http\Controllers\Api\UnitEconomicsCacheController;
+use App\Http\Controllers\Api\SupplierController;
+use Illuminate\Support\Facades\Route;
+
+/*
+|--------------------------------------------------------------------------
+| Auth & Integrations (Sellico API)
+|--------------------------------------------------------------------------
+*/
+Route::prefix('auth')->group(function () {
+    Route::post('/login', [AuthController::class, 'login'])->middleware('throttle:auth');
+    Route::get('/me', [AuthController::class, 'me'])->middleware('throttle:api');
+    Route::get('/workspaces', [AuthController::class, 'workspaces'])->middleware('throttle:api');
+    Route::get('/workspaces/{workspaceId}/integrations', [AuthController::class, 'integrations'])->middleware('throttle:api');
+});
+
+/*
+|--------------------------------------------------------------------------
+| Integrations Module
+|--------------------------------------------------------------------------
+*/
+Route::prefix('integrations')->middleware('throttle:api')->group(function () {
+    Route::get('/', [IntegrationController::class, 'index']);
+    Route::post('/test-connection', [IntegrationController::class, 'testConnection']);
+    Route::get('/{id}', [IntegrationController::class, 'show']);
+    Route::post('/', [IntegrationController::class, 'store']);
+    Route::put('/{id}', [IntegrationController::class, 'update']);
+    Route::delete('/{id}', [IntegrationController::class, 'destroy']);
+    Route::post('/{id}/sync', [IntegrationController::class, 'sync'])->middleware('throttle:sync');
+    Route::get('/{id}/sync-status', [IntegrationController::class, 'syncStatus']);
+    Route::get('/{id}/premium-status', [IntegrationController::class, 'getPremiumStatus']);
+    Route::post('/{id}/redemption-rate', [IntegrationController::class, 'setManualRedemptionRate']);
+});
+
+/*
+|--------------------------------------------------------------------------
+| Products Module
+|--------------------------------------------------------------------------
+*/
+Route::prefix('products')->middleware('throttle:api')->group(function () {
+    Route::get('/', [ProductController::class, 'index']);
+    Route::get('/sync/status', [ProductController::class, 'syncStatus']);
+    Route::post('/cost-price/upload', [ProductController::class, 'uploadCostPrice'])->middleware('throttle:bulk');
+    Route::post('/cost-price/bulk', [ProductController::class, 'updateCostPriceBulk'])->middleware('throttle:bulk');
+    Route::get('/cost-price/template', [ProductController::class, 'exportCostPriceTemplate'])->middleware('throttle:export');
+    Route::get('/{id}', [ProductController::class, 'show']);
+    
+    // Защищённые роуты (требуют авторизации через Sellico)
+    Route::middleware('sellico.auth')->group(function () {
+        Route::post('/sync/{marketplace}', [ProductController::class, 'sync'])
+            ->whereIn('marketplace', ['wildberries', 'ozon', 'yandex'])
+            ->middleware('throttle:sync');
+        Route::post('/export/{marketplace}', [ProductController::class, 'export'])
+            ->whereIn('marketplace', ['wildberries', 'ozon', 'yandex'])
+            ->middleware('throttle:sync');
+        Route::post('/', [ProductController::class, 'store']);
+        Route::put('/{id}', [ProductController::class, 'update']);
+        Route::delete('/{id}', [ProductController::class, 'destroy']);
+    });
+});
+
+/*
+|--------------------------------------------------------------------------
+| Inventory Module
+|--------------------------------------------------------------------------
+*/
+Route::prefix('inventory')->middleware('throttle:api')->group(function () {
+    Route::get('/', [InventoryController::class, 'index']);
+    Route::get('/sync/status', [InventoryController::class, 'syncStatus']);
+    Route::get('/alerts', [InventoryController::class, 'alerts']);
+    Route::get('/recommendations', [InventoryController::class, 'recommendations']);
+    Route::get('/redistribution', [InventoryController::class, 'redistribution']);
+    Route::get('/stats', [InventoryController::class, 'stats']);
+    Route::get('/{sku}', [InventoryController::class, 'show']);
+    Route::get('/{sku}/history', [InventoryController::class, 'history']);
+    Route::get('/{sku}/forecast', [InventoryController::class, 'forecast']);
+    Route::get('/{sku}/storage-cost', [InventoryController::class, 'storageCost']);
+    Route::get('/{sku}/analytics', [InventoryController::class, 'analytics']);
+    Route::post('/sync-storage-cost', [InventoryController::class, 'syncStorageCost'])->middleware('throttle:sync');
+    
+    // Защищённые роуты (требуют авторизации через Sellico)
+    Route::middleware('sellico.auth')->group(function () {
+        Route::post('/sync/{marketplace}', [InventoryController::class, 'sync'])
+            ->whereIn('marketplace', ['wildberries', 'ozon', 'yandex'])
+            ->middleware('throttle:sync');
+    });
+});
+
+/*
+|--------------------------------------------------------------------------
+| Shipments Module
+|--------------------------------------------------------------------------
+*/
+Route::prefix('shipments')->middleware('throttle:api')->group(function () {
+    Route::get('/', [ShipmentController::class, 'index']);
+    Route::get('/slots', [ShipmentController::class, 'slots']);
+    Route::get('/marketplace-slots', [ShipmentController::class, 'marketplaceSlots']); // P0: реальные слоты из API
+    Route::get('/warehouses', [ShipmentController::class, 'warehouses']); // P0: склады из API
+    Route::get('/recommendations', [ShipmentController::class, 'recommendations']);
+    Route::get('/stats', [ShipmentController::class, 'stats']);
+    Route::post('/from-recommendation/{recommendationId}', [ShipmentController::class, 'createFromRecommendation']);
+    Route::post('/from-inventory-recommendations', [ShipmentController::class, 'createFromInventoryRecommendations']); // P1
+    
+    Route::get('/{id}', [ShipmentController::class, 'show']);
+    Route::post('/', [ShipmentController::class, 'store']);
+    Route::put('/{id}', [ShipmentController::class, 'update']);
+    Route::delete('/{id}', [ShipmentController::class, 'destroy']);
+    
+    // Items management
+    Route::post('/{id}/items', [ShipmentController::class, 'addItem']);
+    Route::put('/{id}/items/{itemId}', [ShipmentController::class, 'updateItem']);
+    Route::delete('/{id}/items/{itemId}', [ShipmentController::class, 'removeItem']);
+    
+    // Workflow
+    Route::post('/{id}/submit', [ShipmentController::class, 'submit']);
+    Route::post('/{id}/approve', [ShipmentController::class, 'approve']);
+    Route::post('/{id}/reject', [ShipmentController::class, 'reject']);
+    Route::post('/{id}/send', [ShipmentController::class, 'send']);
+    Route::post('/{id}/deliver', [ShipmentController::class, 'deliver']);
+    
+    // Slots
+    Route::post('/{id}/book-slot', [ShipmentController::class, 'bookSlot']);
+    
+    // Labels (P2)
+    Route::post('/{id}/labels', [ShipmentController::class, 'generateLabels'])->middleware('throttle:export');
+    
+    // Export
+    Route::get('/{id}/export/pdf', [ShipmentController::class, 'exportPdf'])->middleware('throttle:export');
+    Route::get('/{id}/export/csv', [ShipmentController::class, 'exportCsv'])->middleware('throttle:export');
+});
+
+/*
+|--------------------------------------------------------------------------
+| Unit Economics Module (единый API, бывший v2)
+|--------------------------------------------------------------------------
+*/
+Route::prefix('unit-economics')->middleware('throttle:api')->group(function () {
+    // Статистика и сравнение (должны быть ДО динамических маршрутов)
+    Route::get('/comparison', [UnitEconomicsCacheController::class, 'comparison']);
+    Route::get('/product-comparison', [UnitEconomicsCacheController::class, 'productComparison']);
+    Route::get('/stats', [UnitEconomicsCacheController::class, 'stats']);
+    Route::get('/cache-stats/{integrationId}', [UnitEconomicsCacheController::class, 'cacheStats']);
+    
+    // Настройки пользователя
+    Route::put('/settings/bulk', [UnitEconomicsCacheController::class, 'bulkUpdateSettings'])->middleware('throttle:bulk');
+    Route::put('/settings/{sku}', [UnitEconomicsCacheController::class, 'updateSettings'])
+        ->where('sku', '.*');
+    
+    // Синхронизация
+    Route::post('/sync/{integrationId}', [UnitEconomicsCacheController::class, 'sync'])->middleware('throttle:sync');
+    Route::post('/sync-now/{integrationId}', [UnitEconomicsCacheController::class, 'syncNow'])->middleware('throttle:sync');
+    Route::post('/recalculate/{integrationId}', [UnitEconomicsCacheController::class, 'recalculate'])->middleware('throttle:sync');
+    
+    // Массовое сохранение
+    Route::post('/save', [UnitEconomicsCacheController::class, 'save'])->middleware('throttle:bulk');
+    
+    // Справочники по маркетплейсу
+    Route::get('/commissions/{marketplace}', [UnitEconomicsCacheController::class, 'commissions'])
+        ->whereIn('marketplace', ['wildberries', 'ozon', 'yandex_market', 'yandex']);
+    Route::get('/tariffs/{marketplace}', [UnitEconomicsCacheController::class, 'tariffs'])
+        ->whereIn('marketplace', ['wildberries', 'ozon', 'yandex_market', 'yandex']);
+    Route::get('/stats/{marketplace}', [UnitEconomicsCacheController::class, 'statsByMarketplace'])
+        ->whereIn('marketplace', ['wildberries', 'ozon', 'yandex_market', 'yandex']);
+    
+    // Расчёт
+    Route::post('/calculate/{marketplace}', [UnitEconomicsCacheController::class, 'calculate'])
+        ->whereIn('marketplace', ['wildberries', 'ozon', 'yandex_market', 'yandex']);
+    
+    // Данные по маркетплейсу (динамические маршруты в конце)
+    Route::get('/{marketplace}', [UnitEconomicsCacheController::class, 'index'])
+        ->whereIn('marketplace', ['wildberries', 'ozon', 'yandex_market', 'yandex']);
+    Route::get('/{marketplace}/{sku}', [UnitEconomicsCacheController::class, 'show'])
+        ->whereIn('marketplace', ['wildberries', 'ozon', 'yandex_market', 'yandex']);
+});
+
+// Legacy v1 Unit Economics удалён — используйте единый /api/unit-economics
+
+/*
+|--------------------------------------------------------------------------
+| Suppliers Module
+|--------------------------------------------------------------------------
+*/
+Route::prefix('suppliers')->middleware('throttle:api')->group(function () {
+    Route::get('/', [SupplierController::class, 'index']);
+    Route::get('/{id}', [SupplierController::class, 'show']);
+    Route::post('/', [SupplierController::class, 'store']);
+    Route::put('/{id}', [SupplierController::class, 'update']);
+    Route::delete('/{id}', [SupplierController::class, 'destroy']);
+});
+
+/*
+|--------------------------------------------------------------------------
+| Supply Plans Module
+|--------------------------------------------------------------------------
+*/
+Route::prefix('supply-plans')->middleware('throttle:api')->group(function () {
+    Route::get('/', [App\Http\Controllers\Api\SupplyPlanController::class, 'index']);
+    Route::post('/', [App\Http\Controllers\Api\SupplyPlanController::class, 'store']);
+    Route::get('/{id}', [App\Http\Controllers\Api\SupplyPlanController::class, 'show']);
+    Route::put('/{id}', [App\Http\Controllers\Api\SupplyPlanController::class, 'update']);
+    Route::delete('/{id}', [App\Http\Controllers\Api\SupplyPlanController::class, 'destroy']);
+    Route::get('/{id}/calculate', [App\Http\Controllers\Api\SupplyPlanController::class, 'calculate']);
+    Route::post('/{id}/approve', [App\Http\Controllers\Api\SupplyPlanController::class, 'approve']);
+    Route::post('/{id}/cancel', [App\Http\Controllers\Api\SupplyPlanController::class, 'cancel']);
+});
+
+/*
+|--------------------------------------------------------------------------
+| Supply Recommendations Module
+|--------------------------------------------------------------------------
+*/
+Route::prefix('supply-recommendations')->middleware('throttle:api')->group(function () {
+    Route::get('/', [App\Http\Controllers\Api\SupplyRecommendationController::class, 'index']);
+    Route::get('/stats', [App\Http\Controllers\Api\SupplyRecommendationController::class, 'stats']);
+    Route::get('/by-warehouse', [App\Http\Controllers\Api\SupplyRecommendationController::class, 'byWarehouse']);
+    Route::post('/generate', [App\Http\Controllers\Api\SupplyRecommendationController::class, 'generate'])->middleware('throttle:sync');
+    Route::get('/{id}', [App\Http\Controllers\Api\SupplyRecommendationController::class, 'show']);
+    Route::post('/{id}/apply', [App\Http\Controllers\Api\SupplyRecommendationController::class, 'apply']);
+    Route::post('/{id}/dismiss', [App\Http\Controllers\Api\SupplyRecommendationController::class, 'dismiss']);
+});
+
+/*
+|--------------------------------------------------------------------------
+| Warehouse Slots Module
+|--------------------------------------------------------------------------
+*/
+Route::prefix('warehouse-slots')->middleware('throttle:api')->group(function () {
+    Route::get('/', [App\Http\Controllers\Api\WarehouseSlotController::class, 'index']);
+    Route::get('/warehouses', [App\Http\Controllers\Api\WarehouseSlotController::class, 'warehouses']);
+    Route::post('/sync', [App\Http\Controllers\Api\WarehouseSlotController::class, 'sync'])->middleware('throttle:sync');
+    Route::post('/{id}/book', [App\Http\Controllers\Api\WarehouseSlotController::class, 'book']);
+    Route::post('/{id}/release', [App\Http\Controllers\Api\WarehouseSlotController::class, 'release']);
+});
+
+/*
+|--------------------------------------------------------------------------
+| Ozon Draft/Supply API (Proxy to Ozon Seller API)
+|--------------------------------------------------------------------------
+*/
+Route::prefix('ozon')->middleware('throttle:api')->group(function () {
+    // Draft endpoints (черновики)
+    Route::post('/draft/create', [App\Http\Controllers\Api\OzonDraftController::class, 'createDraft']);
+    Route::post('/draft/info', [App\Http\Controllers\Api\OzonDraftController::class, 'getDraftInfo']);
+    Route::post('/draft/timeslots', [App\Http\Controllers\Api\OzonDraftController::class, 'getTimeslots']);
+    Route::post('/draft/supply/create', [App\Http\Controllers\Api\OzonDraftController::class, 'createSupplyFromDraft']);
+    Route::post('/draft/items/add', [App\Http\Controllers\Api\OzonDraftController::class, 'addItems']);
+    Route::post('/supply/create/status', [App\Http\Controllers\Api\OzonDraftController::class, 'getSupplyCreateStatus']);
+    Route::post('/warehouses', [App\Http\Controllers\Api\OzonDraftController::class, 'getWarehouses']);
+    
+    // Supply Order endpoints (заявки на поставку)
+    Route::post('/supply/orders', [App\Http\Controllers\Api\OzonSupplyController::class, 'getSupplyOrders']);
+    Route::post('/supply/order', [App\Http\Controllers\Api\OzonSupplyController::class, 'getSupplyOrder']);
+    Route::post('/supply/order/status-counter', [App\Http\Controllers\Api\OzonSupplyController::class, 'getSupplyOrderStatusCounter']);
+    
+    // Timeslot endpoints (таймслоты)
+    Route::post('/supply/order/timeslots', [App\Http\Controllers\Api\OzonSupplyController::class, 'getSupplyOrderTimeslots']);
+    Route::post('/supply/order/timeslot/update', [App\Http\Controllers\Api\OzonSupplyController::class, 'updateSupplyOrderTimeslot']);
+    Route::post('/supply/order/timeslot/update/status', [App\Http\Controllers\Api\OzonSupplyController::class, 'getTimeslotUpdateStatus']);
+    
+    // Pass endpoints (пропуска - данные водителя и ТС)
+    Route::post('/supply/order/pass/create', [App\Http\Controllers\Api\OzonSupplyController::class, 'createSupplyOrderPass']);
+    Route::post('/supply/order/pass/status', [App\Http\Controllers\Api\OzonSupplyController::class, 'getPassCreateStatus']);
+    
+    // Cargoes endpoints (грузоместа)
+    Route::post('/supply/cargoes/create', [App\Http\Controllers\Api\OzonSupplyController::class, 'createCargoes']);
+    Route::post('/supply/cargoes/info', [App\Http\Controllers\Api\OzonSupplyController::class, 'getCargoesInfo']);
+    
+    // Labels endpoints (этикетки)
+    Route::post('/supply/cargoes/labels/create', [App\Http\Controllers\Api\OzonSupplyController::class, 'createCargoesLabels']);
+    Route::post('/supply/cargoes/labels/status', [App\Http\Controllers\Api\OzonSupplyController::class, 'getCargoesLabelsStatus']);
+    Route::get('/supply/cargoes/labels/download', [App\Http\Controllers\Api\OzonSupplyController::class, 'downloadCargoesLabels']);
+    
+    // Warehouses endpoints (склады)
+    Route::post('/clusters', [App\Http\Controllers\Api\OzonSupplyController::class, 'getOzonClusters']);
+    Route::post('/warehouses/fbo', [App\Http\Controllers\Api\OzonSupplyController::class, 'getOzonFboWarehouses']);
+    Route::post('/warehouses/availability', [App\Http\Controllers\Api\OzonSupplyController::class, 'checkWarehouseAvailability']);
+});
+
+/*
+|--------------------------------------------------------------------------
+| Ozon Delivery Analytics (Clusters, Recommendations)
+|--------------------------------------------------------------------------
+*/
+Route::prefix('ozon/delivery-analytics')->middleware('throttle:api')->group(function () {
+    Route::get('/', [App\Http\Controllers\Api\OzonDeliveryAnalyticsController::class, 'index']);
+    Route::get('/details', [App\Http\Controllers\Api\OzonDeliveryAnalyticsController::class, 'details']);
+    Route::get('/recommendations', [App\Http\Controllers\Api\OzonDeliveryAnalyticsController::class, 'recommendations']);
+    Route::get('/clusters', [App\Http\Controllers\Api\OzonDeliveryAnalyticsController::class, 'clusters']);
+    Route::get('/by-clusters', [App\Http\Controllers\Api\OzonDeliveryAnalyticsController::class, 'byClusters']);
+    Route::get('/by-products', [App\Http\Controllers\Api\OzonDeliveryAnalyticsController::class, 'byProducts']);
+});
