@@ -18,7 +18,8 @@ return new class extends Migration
         Schema::create('unit_economics_cache', function (Blueprint $table) {
             $table->id();
             $table->foreignId('integration_id')->constrained()->onDelete('cascade');
-            $table->foreignId('product_id')->constrained()->onDelete('cascade');
+            $table->uuid('product_id');
+            $table->foreign('product_id')->references('id')->on('products')->onDelete('cascade');
             $table->string('sku', 255);
             $table->string('product_name', 500)->nullable();
             $table->string('marketplace', 50)->default('ozon');
