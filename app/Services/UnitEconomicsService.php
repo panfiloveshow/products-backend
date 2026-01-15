@@ -13,6 +13,11 @@ use Illuminate\Support\Facades\DB;
 
 class UnitEconomicsService
 {
+    /**
+     * Текущий индекс локализации (для Ozon) - устанавливается в syncFromRealData
+     */
+    private ?array $currentLocalizationIndex = null;
+    
     public function calculate(string $marketplace, array $data): array
     {
         $price = $data['price'];
@@ -1150,13 +1155,16 @@ class UnitEconomicsService
      * Синхронизация юнит-экономики для интеграции из реальных данных
      * Берет данные из Products и InventoryWarehouse
      */
-    public function syncFromRealData(Integration $integration, ?string $periodStart = null, ?string $periodEnd = null): array
+    public function syncFromRealData(Integration $integration, ?string $periodStart = null, ?string $periodEnd = null, ?array $localizationIndex = null): array
     {
         $periodStart = $periodStart ?? now()->subDays(30)->toDateString();
         $periodEnd = $periodEnd ?? now()->toDateString();
         
         $marketplace = $integration->marketplace;
         $integrationId = $integration->id;
+        
+        // Сохраняем индекс локализации для использования в buildCalculationData
+        $this->currentLocalizationIndex = $localizationIndex;
         
         Log::info("UnitEconomics sync started", [
             'integration_id' => $integrationId,
@@ -1397,6 +1405,13 @@ class UnitEconomicsService
                 $data['redemption_rate'] = $inventory?->redemption_rate 
                     ?? $ozonData['redemption'] 
                     ?? null; // null означает "не перезаписывать существующее значение"
+                
+                // Индекс локализации (среднее время доставки) из API или кэша
+                if ($this->currentLocalizationIndex) {
+                    $data['avg_delivery_time_hours'] = $this->currentLocalizationIndex['average_delivery_time'] ?? 29;
+                    $data['localization_index'] = $this->currentLocalizationIndex['tariff_coefficient'] ?? 1.0;
+                    $data['localization_additional_percent'] = $this->currentLocalizationIndex['additional_fee_percent'] ?? 0;
+                }
                 break;
                 
             case 'yandex_market':
