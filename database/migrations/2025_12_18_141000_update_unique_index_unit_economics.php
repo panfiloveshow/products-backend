@@ -14,16 +14,16 @@ return new class extends Migration
      */
     public function up(): void
     {
-        // SQLite не поддерживает DROP INDEX так же как MySQL
-        if (DB::connection()->getDriverName() !== 'sqlite') {
-            Schema::table('unit_economics', function (Blueprint $table) {
-                // Удаляем старый уникальный индекс (только для MySQL/PostgreSQL)
-                try {
+        // Безопасное удаление индексов
+        $driver = DB::connection()->getDriverName();
+        if ($driver === 'pgsql') {
+            DB::statement('DROP INDEX IF EXISTS unit_economics_sku_integration_unique');
+        } elseif ($driver === 'mysql') {
+            try {
+                Schema::table('unit_economics', function (Blueprint $table) {
                     $table->dropUnique('unit_economics_sku_integration_unique');
-                } catch (\Exception $e) {
-                    // Индекс может не существовать
-                }
-            });
+                });
+            } catch (\Exception $e) {}
         }
         
         Schema::table('unit_economics', function (Blueprint $table) {
@@ -46,6 +46,11 @@ return new class extends Migration
                 }
             }
             return false;
+        }
+        
+        if ($driver === 'pgsql') {
+            $indexes = DB::select("SELECT indexname FROM pg_indexes WHERE tablename = ? AND indexname = ?", [$table, $indexName]);
+            return count($indexes) > 0;
         }
         
         // MySQL

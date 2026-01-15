@@ -17,22 +17,17 @@ return new class extends Migration
      */
     public function up(): void
     {
-        // Для SQLite используем raw SQL
-        if (DB::getDriverName() === 'sqlite') {
-            try {
-                DB::statement('DROP INDEX IF EXISTS unit_economics_unique');
-            } catch (\Exception $e) {
-                // Индекс может не существовать
-            }
+        $driver = DB::getDriverName();
+        
+        if ($driver === 'sqlite' || $driver === 'pgsql') {
+            DB::statement('DROP INDEX IF EXISTS unit_economics_unique');
         } else {
-            // Для MySQL/PostgreSQL
-            Schema::table('unit_economics', function (Blueprint $table) {
-                try {
+            // MySQL
+            try {
+                Schema::table('unit_economics', function (Blueprint $table) {
                     $table->dropUnique('unit_economics_unique');
-                } catch (\Exception $e) {
-                    // Индекс может не существовать
-                }
-            });
+                });
+            } catch (\Exception $e) {}
         }
     }
 
