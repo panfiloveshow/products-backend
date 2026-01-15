@@ -19,7 +19,10 @@ return new class extends Migration
     {
         $driver = DB::getDriverName();
         
-        if ($driver === 'sqlite' || $driver === 'pgsql') {
+        if ($driver === 'pgsql') {
+            // PostgreSQL: нужно удалить constraint, а не index
+            DB::statement('ALTER TABLE unit_economics DROP CONSTRAINT IF EXISTS unit_economics_unique');
+        } elseif ($driver === 'sqlite') {
             DB::statement('DROP INDEX IF EXISTS unit_economics_unique');
         } else {
             // MySQL
