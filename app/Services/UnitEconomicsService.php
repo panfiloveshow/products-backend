@@ -1278,6 +1278,10 @@ class UnitEconomicsService
                         'warehouse_coefficient_percent' => $calculated['warehouse_coefficient_percent'] ?? 0,
                         'warehouse_coefficient_amount' => $calculated['warehouse_coefficient_amount'] ?? 0,
                         'total_expenses_percent' => $calculated['total_expenses_percent'] ?? null,
+                        // Индекс локализации (время доставки) для Ozon
+                        'avg_delivery_time_hours' => $calculated['avg_delivery_time_hours'] ?? null,
+                        'logistics_coefficient' => $calculated['logistics_coefficient'] ?? null,
+                        'additional_commission_percent' => $calculated['additional_commission_percent'] ?? null,
                         'is_actual_scheme' => true,
                         'period_start' => $periodStart,
                         'period_end' => $periodEnd,
