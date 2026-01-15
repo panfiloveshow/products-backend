@@ -8,6 +8,11 @@ return new class extends Migration
 {
     public function up(): void
     {
+        // Сначала удаляем FK из inventory_warehouses
+        Schema::table('inventory_warehouses', function (Blueprint $table) {
+            $table->dropForeign(['sku']);
+        });
+        
         Schema::table('products', function (Blueprint $table) {
             // Удаляем старый уникальный индекс на sku
             $table->dropUnique(['sku']);
@@ -18,6 +23,11 @@ return new class extends Migration
             
             // Добавляем индекс на marketplace_id для быстрого поиска
             $table->index(['marketplace', 'marketplace_id'], 'products_marketplace_id_index');
+        });
+        
+        // Восстанавливаем FK без привязки к уникальному индексу
+        Schema::table('inventory_warehouses', function (Blueprint $table) {
+            $table->foreign('sku')->references('sku')->on('products')->onDelete('cascade');
         });
     }
 
