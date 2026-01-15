@@ -31,7 +31,8 @@ return new class extends Migration
                 $table->index('integration_id');
             }
             
-            if (!Schema::hasIndex('shipments', 'shipments_external_supply_id_index')) {
+            // external_supply_id индекс только если колонка существует
+            if (Schema::hasColumn('shipments', 'external_supply_id') && !Schema::hasIndex('shipments', 'shipments_external_supply_id_index')) {
                 $table->index('external_supply_id');
             }
         });
