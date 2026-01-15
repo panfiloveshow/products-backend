@@ -8,6 +8,7 @@ use App\Http\Requests\Integration\UpdateIntegrationRequest;
 use App\Models\Integration;
 use App\Models\SyncLog;
 use App\Services\ProductService;
+use App\Services\SellicoApiService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Log;
@@ -149,32 +150,62 @@ class IntegrationController extends Controller
 
     /**
      * Запустить синхронизацию для интеграции
+     * Получает credentials из Sellico API по integration_id
      */
-    public function sync(Request $request, int $id, ProductService $productService): JsonResponse
+    public function sync(Request $request, int $id, ProductService $productService, SellicoApiService $sellicoApi): JsonResponse
     {
-        $integration = Integration::find($id);
+        $token = $request->bearerToken();
         
-        if (!$integration) {
+        if (!$token) {
             return response()->json([
                 'success' => false,
-                'message' => 'Интеграция не найдена',
+                'message' => 'Токен не предоставлен',
+            ], 401);
+        }
+        
+        // Устанавливаем токен для Sellico API
+        $sellicoApi->setAccessToken($token);
+        
+        // Получаем credentials интеграции из Sellico
+        $result = $sellicoApi->getIntegrationById($id);
+        
+        if (!$result['success']) {
+            return response()->json([
+                'success' => false,
+                'message' => $result['error'] ?? 'Интеграция не найдена в Sellico',
             ], 404);
         }
         
-        if (!$integration->is_active) {
+        $integrationData = $result['integration'];
+        $credentials = $result['credentials'];
+        $marketplace = strtolower($integrationData['type'] ?? '');
+        
+        // Нормализуем тип маркетплейса
+        $marketplace = match ($marketplace) {
+            'yandexmarket', 'yandex_market', 'yandex' => 'yandex_market',
+            default => $marketplace,
+        };
+        
+        if (empty($credentials) || empty($marketplace)) {
             return response()->json([
                 'success' => false,
-                'message' => 'Интеграция неактивна',
+                'message' => 'Не удалось получить credentials интеграции',
             ], 400);
         }
         
         $syncType = $request->input('type', 'products');
         
         try {
+            Log::info('Starting sync from Sellico integration', [
+                'integration_id' => $id,
+                'marketplace' => $marketplace,
+                'sync_type' => $syncType,
+            ]);
+            
             $syncLog = $productService->startSync(
-                $integration->marketplace,
-                $integration->getDecryptedCredentials(),
-                $integration->id,
+                $marketplace,
+                $credentials,
+                $id,
                 $syncType
             );
             
@@ -189,6 +220,7 @@ class IntegrationController extends Controller
         } catch (\Exception $e) {
             Log::error('Integration sync failed', [
                 'integration_id' => $id,
+                'marketplace' => $marketplace,
                 'error' => $e->getMessage(),
             ]);
             
