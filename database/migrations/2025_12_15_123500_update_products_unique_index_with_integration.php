@@ -16,22 +16,22 @@ return new class extends Migration
             }
         });
         
-        // SQLite не поддерживает DROP INDEX в Schema Builder так же как MySQL
-        // Пропускаем удаление индексов для SQLite (тесты)
-        if (DB::connection()->getDriverName() !== 'sqlite') {
-            Schema::table('products', function (Blueprint $table) {
-                // Удаляем старый уникальный индекс (только для MySQL/PostgreSQL)
-                try {
+        // Безопасное удаление индексов (могут не существовать при fresh install)
+        $driver = DB::connection()->getDriverName();
+        if ($driver === 'pgsql') {
+            DB::statement('DROP INDEX IF EXISTS products_marketplace_marketplace_id_unique');
+            DB::statement('DROP INDEX IF EXISTS products_marketplace_id_index');
+        } elseif ($driver === 'mysql') {
+            try {
+                Schema::table('products', function (Blueprint $table) {
                     $table->dropUnique('products_marketplace_marketplace_id_unique');
-                } catch (\Exception $e) {
-                    // Индекс может не существовать
-                }
-                try {
+                });
+            } catch (\Exception $e) {}
+            try {
+                Schema::table('products', function (Blueprint $table) {
                     $table->dropIndex('products_marketplace_id_index');
-                } catch (\Exception $e) {
-                    // Индекс может не существовать
-                }
-            });
+                });
+            } catch (\Exception $e) {}
         }
         
         Schema::table('products', function (Blueprint $table) {
@@ -62,6 +62,11 @@ return new class extends Migration
                 }
             }
             return false;
+        }
+        
+        if ($driver === 'pgsql') {
+            $indexes = DB::select("SELECT indexname FROM pg_indexes WHERE tablename = ? AND indexname = ?", [$table, $indexName]);
+            return count($indexes) > 0;
         }
         
         // MySQL
