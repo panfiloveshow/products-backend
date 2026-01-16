@@ -29,8 +29,20 @@ class ProductService
         $averagePrice = (clone $query)->avg('price') ?? 0;
         $totalValue = (clone $query)->selectRaw('SUM(price * stock) as total')->value('total') ?? 0;
         
-        // Общая сумма платного хранения за период
-        $totalStorageCost = (clone $query)->sum('storage_cost') ?? 0;
+        // Платное хранение: берём из InventoryWarehouse.storage_fee_total (фактические начисления)
+        // Это данные из отчётов о размещении Ozon и еженедельных отчётов WB
+        $storageQuery = \App\Models\InventoryWarehouse::query();
+        
+        if (!empty($filters['marketplace'])) {
+            $storageQuery->where('marketplace', $filters['marketplace']);
+        }
+        
+        if (!empty($filters['integration_id'])) {
+            $storageQuery->where('integration_id', $filters['integration_id']);
+        }
+        
+        // Суммируем фактические начисления за хранение (storage_fee_total)
+        $totalStorageCost = $storageQuery->sum('storage_fee_total') ?? 0;
 
         $byMarketplace = Product::select('marketplace')
             ->selectRaw('COUNT(*) as count')

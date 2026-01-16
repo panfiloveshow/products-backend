@@ -339,6 +339,7 @@ class SyncInventoryJob implements ShouldQueue
     private function syncInventoryItem(array $stockData): string
     {
         $sku = $stockData['sku'] ?? null;
+        $quantity = $stockData['quantity'] ?? 0;
         
         // Проверяем существование товара для этой интеграции
         $productQuery = Product::where('sku', $sku);
@@ -347,6 +348,15 @@ class SyncInventoryJob implements ShouldQueue
         }
         
         if (!$sku || !$productQuery->exists()) {
+            // Логируем пропуск только для записей с остатками > 0
+            if ($quantity > 0) {
+                Log::debug("syncInventoryItem: skipped - product not found", [
+                    'sku' => $sku,
+                    'quantity' => $quantity,
+                    'integration_id' => $this->syncLog->integration_id,
+                    'marketplace' => $this->syncLog->marketplace,
+                ]);
+            }
             return 'skipped';
         }
         
@@ -488,6 +498,17 @@ class SyncInventoryJob implements ShouldQueue
             if ($this->syncLog->integration_id) {
                 $query->where('integration_id', $this->syncLog->integration_id);
             }
+            
+            // Логируем общее количество записей в InventoryWarehouse
+            $totalWarehouseRecords = (clone $query)->count();
+            $recordsWithStock = (clone $query)->where('quantity', '>', 0)->count();
+            
+            Log::info("syncProductStocks: checking InventoryWarehouse records", [
+                'marketplace' => $this->syncLog->marketplace,
+                'integration_id' => $this->syncLog->integration_id,
+                'total_warehouse_records' => $totalWarehouseRecords,
+                'records_with_stock' => $recordsWithStock,
+            ]);
             
             // Получаем остатки и типы складов по SKU
             $warehouseData = $query
