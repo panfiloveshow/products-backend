@@ -68,21 +68,42 @@ class SyncInventoryJob implements ShouldQueue
             // Для Ozon используем отчёт о размещении (getPlacementCostByProducts)
             // Для WB используем getStorageCostBySku
             $storageCostBySku = [];
+            $storageFeeReportFrom = null;
+            $storageFeeReportTo = null;
+            
             if ($this->syncLog->marketplace === 'ozon' && method_exists($marketplace, 'getPlacementCostByProducts')) {
                 try {
-                    // Получаем данные за текущий месяц
+                    // Получаем данные за текущий месяц (фактически начисленная сумма)
                     $dateFrom = now()->startOfMonth()->format('Y-m-d');
                     $dateTo = now()->format('Y-m-d');
+                    $storageFeeReportFrom = $dateFrom;
+                    $storageFeeReportTo = $dateTo;
+                    
+                    // Сбрасываем старые данные о платном хранении для этой интеграции
+                    // чтобы не накапливались суммы за разные периоды
+                    InventoryWarehouse::where('marketplace', 'ozon')
+                        ->where('integration_id', $this->syncLog->integration_id)
+                        ->update([
+                            'storage_fee_total' => null,
+                            'storage_fee_report_from' => null,
+                            'storage_fee_report_to' => null,
+                        ]);
+                    
                     $placementData = $marketplace->getPlacementCostByProducts($dateFrom, $dateTo, 60);
                     
-                    // Конвертируем в формат storageCostBySku
+                    // Конвертируем в формат storageCostBySku с периодом отчёта
                     foreach ($placementData as $sku => $data) {
                         $storageCostBySku[$sku] = [
                             'storage_fee_total' => $data['placement_cost'] ?? 0,
+                            'storage_fee_report_from' => $dateFrom,
+                            'storage_fee_report_to' => $dateTo,
                         ];
                     }
                     
-                    Log::info('Ozon placement cost loaded', ['count' => count($storageCostBySku)]);
+                    Log::info('Ozon placement cost loaded', [
+                        'count' => count($storageCostBySku),
+                        'period' => "$dateFrom - $dateTo",
+                    ]);
                 } catch (\Exception $e) {
                     Log::warning('Failed to load Ozon placement cost', ['error' => $e->getMessage()]);
                 }
