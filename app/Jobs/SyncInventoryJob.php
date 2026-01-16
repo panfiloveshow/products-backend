@@ -79,6 +79,15 @@ class SyncInventoryJob implements ShouldQueue
                     $storageFeeReportFrom = $dateFrom;
                     $storageFeeReportTo = $dateTo;
                     
+                    // Удаляем старые детальные записи по складам для Ozon
+                    // API getInventory() возвращает агрегированные данные (Ozon FBO Fbo, Ozon FBS),
+                    // а не детальные по складам. Старые записи могли остаться от getDetailedInventory()
+                    InventoryWarehouse::where('marketplace', 'ozon')
+                        ->where('integration_id', $this->syncLog->integration_id)
+                        ->where('warehouse_name', 'NOT LIKE', 'Ozon FBO%')
+                        ->where('warehouse_name', 'NOT LIKE', 'Ozon FBS%')
+                        ->delete();
+                    
                     // Сбрасываем старые данные о платном хранении для этой интеграции
                     // чтобы не накапливались суммы за разные периоды
                     InventoryWarehouse::where('marketplace', 'ozon')
