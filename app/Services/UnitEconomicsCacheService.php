@@ -10,6 +10,7 @@ use App\Models\UnitEconomicsCache;
 use App\Models\UnitEconomicsSettings;
 use App\Domains\UnitEconomics\UnitEconomicsOrchestrator;
 use App\Domains\UnitEconomics\DTO\CalculationInput;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 
@@ -27,6 +28,14 @@ class UnitEconomicsCacheService
 {
     private UnitEconomicsOrchestrator $orchestrator;
     private ?UnitEconomicsService $legacyCalculator;
+    /** @var array<int, Integration> */
+    private array $integrationCache = [];
+    /** @var array<string, ?UnitEconomics> */
+    private array $unitEconomicsCache = [];
+    /** @var array<string, float> */
+    private array $warehouseCoefficientCache = [];
+    /** @var array<string, ?UnitEconomicsSettings> */
+    private array $settingsCache = [];
 
     public function __construct(
         UnitEconomicsOrchestrator $orchestrator,
@@ -100,9 +109,7 @@ class UnitEconomicsCacheService
         $sku = $product->sku;
         
         // Получаем настройки пользователя
-        $settings = UnitEconomicsSettings::where('integration_id', $integrationId)
-            ->where('sku', $sku)
-            ->first();
+        $settings = $this->getSettingsCached($integrationId, $sku);
         
         // Собираем данные для расчёта через новый DTO
         $inputData = $this->prepareCalculationInput($product, $settings, $fulfillmentType);
@@ -136,7 +143,7 @@ class UnitEconomicsCacheService
      */
     public function recalculateIntegration(int $integrationId): array
     {
-        $integration = Integration::find($integrationId);
+        $integration = $this->getIntegrationCached($integrationId);
         if (!$integration) {
             return ['error' => 'Integration not found'];
         }
@@ -158,7 +165,7 @@ class UnitEconomicsCacheService
         $schemes = $this->getSchemesForMarketplace($integration->marketplace);
         
         Product::where('integration_id', $integrationId)
-            ->chunk(100, function ($products) use (&$stats, $schemes) {
+            ->chunkById(100, function ($products) use (&$stats, $schemes) {
                 foreach ($products as $product) {
                     $stats['total']++;
                     
@@ -183,6 +190,8 @@ class UnitEconomicsCacheService
             'integration_id' => $integrationId,
             'stats' => $stats,
         ]);
+
+        $this->forgetStatsCache($integrationId, $integration->marketplace, $schemes);
         
         return $stats;
     }
@@ -192,12 +201,14 @@ class UnitEconomicsCacheService
      */
     public function onSettingsChanged(int $integrationId, string $sku): void
     {
+        $this->forgetSettingsCache($integrationId, $sku);
         $product = Product::where('integration_id', $integrationId)
             ->where('sku', $sku)
             ->first();
         
         if ($product) {
             $this->recalculateProduct($product);
+            $this->forgetStatsCache($integrationId, $product->marketplace, $this->getSchemesForProduct($product));
         }
     }
 
@@ -206,6 +217,9 @@ class UnitEconomicsCacheService
      */
     public function onBulkSettingsChanged(int $integrationId, array $skus): void
     {
+        foreach ($skus as $sku) {
+            $this->forgetSettingsCache($integrationId, $sku);
+        }
         Product::where('integration_id', $integrationId)
             ->whereIn('sku', $skus)
             ->chunk(50, function ($products) {
@@ -213,6 +227,11 @@ class UnitEconomicsCacheService
                     $this->recalculateProduct($product);
                 }
             });
+
+        $integration = $this->getIntegrationCached($integrationId);
+        if ($integration) {
+            $this->forgetStatsCache($integrationId, $integration->marketplace, $this->getSchemesForMarketplace($integration->marketplace));
+        }
     }
 
     /**
@@ -231,10 +250,7 @@ class UnitEconomicsCacheService
         $redemption = $marketplaceData['redemption'] ?? [];
         
         // Получаем существующую запись UnitEconomics для конкретной схемы (там актуальные данные из API)
-        $existingUE = UnitEconomics::where('integration_id', $product->integration_id)
-            ->where('sku', $product->sku)
-            ->where('fulfillment_type', strtoupper($fulfillmentType))
-            ->first();
+        $existingUE = $this->getUnitEconomicsCached($product->integration_id, $product->sku, strtoupper($fulfillmentType));
         
         // Определяем комиссию по схеме
         // ПРИОРИТЕТ: ozon_data.commissions (актуальные из API товаров) > UnitEconomics > дефолт
@@ -305,7 +321,7 @@ class UnitEconomicsCacheService
             // КС (коэффициент склада) — средний взвешенный по всем складам товара
             $warehouseCoefficient = $this->getAverageWarehouseCoefficient($product->sku, $marketplace);
             // ИЛ (индекс локализации) — из настроек интеграции (ручной ввод)
-            $integration = Integration::find($product->integration_id);
+            $integration = $this->getIntegrationCached($product->integration_id);
             $localizationIndex = (float) ($integration?->localization_index ?? 1.0);
         }
         
@@ -484,9 +500,7 @@ class UnitEconomicsCacheService
         $redemption = $ozonData['redemption'] ?? [];
         
         // Получаем существующую запись UnitEconomics (там актуальные данные)
-        $existingUE = UnitEconomics::where('integration_id', $product->integration_id)
-            ->where('sku', $product->sku)
-            ->first();
+        $existingUE = $this->getUnitEconomicsCached($product->integration_id, $product->sku, null);
         
         // Определяем комиссию по схеме
         // ПРИОРИТЕТ: ozon_data.commissions (актуальные из API товаров) > UnitEconomics > дефолт
@@ -575,10 +589,7 @@ class UnitEconomicsCacheService
     {
         // Получаем информацию об акциях
         // Приоритет: UnitEconomics (синхронизируется из API) > ozon_data > commissions
-        $existingUE = UnitEconomics::where('sku', $product->sku)
-            ->where('integration_id', $product->integration_id)
-            ->where('fulfillment_type', $fulfillmentType)
-            ->first();
+        $existingUE = $this->getUnitEconomicsCached($product->integration_id, $product->sku, $fulfillmentType);
         
         $ozonData = $product->ozon_data ?? [];
         $commissions = $ozonData['commissions'] ?? [];
@@ -680,20 +691,24 @@ class UnitEconomicsCacheService
      */
     public function getCacheStats(int $integrationId): array
     {
-        $stats = UnitEconomicsCache::where('integration_id', $integrationId)
-            ->selectRaw('fulfillment_type, COUNT(*) as count, MAX(calculated_at) as last_calculated')
-            ->groupBy('fulfillment_type')
-            ->get()
-            ->keyBy('fulfillment_type')
-            ->toArray();
-        
-        $totalProducts = Product::where('integration_id', $integrationId)->count();
-        
-        return [
-            'total_products' => $totalProducts,
-            'schemes' => $stats,
-            'is_complete' => collect($stats)->sum('count') >= $totalProducts * 4,
-        ];
+        $cacheKey = "ue_cache_stats_{$integrationId}";
+
+        return Cache::remember($cacheKey, 60, function () use ($integrationId) {
+            $stats = UnitEconomicsCache::where('integration_id', $integrationId)
+                ->selectRaw('fulfillment_type, COUNT(*) as count, MAX(calculated_at) as last_calculated')
+                ->groupBy('fulfillment_type')
+                ->get()
+                ->keyBy('fulfillment_type')
+                ->toArray();
+            
+            $totalProducts = Product::where('integration_id', $integrationId)->count();
+            
+            return [
+                'total_products' => $totalProducts,
+                'schemes' => $stats,
+                'is_complete' => collect($stats)->sum('count') >= $totalProducts * 4,
+            ];
+        });
     }
 
     /**
@@ -716,11 +731,17 @@ class UnitEconomicsCacheService
      */
     private function getAverageWarehouseCoefficient(string $sku, string $marketplace): float
     {
+        $cacheKey = $marketplace . '|' . $sku;
+        if (array_key_exists($cacheKey, $this->warehouseCoefficientCache)) {
+            return $this->warehouseCoefficientCache[$cacheKey];
+        }
+
         $warehouses = InventoryWarehouse::where('sku', $sku)
             ->where('marketplace', $marketplace)
             ->get(['warehouse_coefficient', 'quantity']);
         
         if ($warehouses->isEmpty()) {
+            $this->warehouseCoefficientCache[$cacheKey] = 1.0;
             return 1.0; // По умолчанию 100%
         }
         
@@ -734,10 +755,71 @@ class UnitEconomicsCacheService
                 $coef = (float) ($wh->warehouse_coefficient ?? 1.0);
                 $weightedSum += $coef * $wh->quantity;
             }
-            return $weightedSum / $totalQuantity;
+            $this->warehouseCoefficientCache[$cacheKey] = $weightedSum / $totalQuantity;
+            return $this->warehouseCoefficientCache[$cacheKey];
         }
-        
-        // Нет остатков — простое среднее по всем складам
-        return $warehouses->avg(fn($w) => (float) ($w->warehouse_coefficient ?? 1.0)) ?? 1.0;
+
+        $this->warehouseCoefficientCache[$cacheKey] = 1.0;
+        return 1.0;
     }
+
+    private function getIntegrationCached(int $integrationId): ?Integration
+    {
+        if (array_key_exists($integrationId, $this->integrationCache)) {
+            return $this->integrationCache[$integrationId];
+        }
+
+        $this->integrationCache[$integrationId] = Integration::find($integrationId);
+        return $this->integrationCache[$integrationId];
+    }
+
+    private function getUnitEconomicsCached(int $integrationId, string $sku, ?string $fulfillmentType): ?UnitEconomics
+    {
+        $key = $integrationId . '|' . $sku . '|' . ($fulfillmentType ? strtoupper($fulfillmentType) : '');
+        if (array_key_exists($key, $this->unitEconomicsCache)) {
+            return $this->unitEconomicsCache[$key];
+        }
+
+        $query = UnitEconomics::where('integration_id', $integrationId)
+            ->where('sku', $sku);
+        if ($fulfillmentType) {
+            $query->where('fulfillment_type', strtoupper($fulfillmentType));
+        }
+
+        $this->unitEconomicsCache[$key] = $query->first();
+        return $this->unitEconomicsCache[$key];
+    }
+
+    private function getSettingsCached(int $integrationId, string $sku): ?UnitEconomicsSettings
+    {
+        $key = $integrationId . '|' . $sku;
+        if (array_key_exists($key, $this->settingsCache)) {
+            return $this->settingsCache[$key];
+        }
+
+        $this->settingsCache[$key] = UnitEconomicsSettings::where('integration_id', $integrationId)
+            ->where('sku', $sku)
+            ->first();
+
+        return $this->settingsCache[$key];
+    }
+
+    private function forgetSettingsCache(int $integrationId, string $sku): void
+    {
+        $key = $integrationId . '|' . $sku;
+        unset($this->settingsCache[$key]);
+    }
+
+    private function forgetStatsCache(int $integrationId, string $marketplace, array $schemes): void
+    {
+        Cache::forget("ue_cache_stats_{$integrationId}");
+        Cache::forget("ue_scheme_counts_{$integrationId}_{$marketplace}");
+        Cache::forget("ue_actual_scheme_{$integrationId}_{$marketplace}");
+
+        foreach ($schemes as $scheme) {
+            Cache::forget("ue_stats_{$integrationId}_{$marketplace}_" . strtoupper($scheme));
+        }
+    }
+
+    // ...
 }

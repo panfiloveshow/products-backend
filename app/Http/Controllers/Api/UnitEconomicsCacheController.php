@@ -88,9 +88,19 @@ class UnitEconomicsCacheController extends Controller
         $page = $validated['page'] ?? 1;
         $paginator = $query->with('product')->paginate($limit, ['*'], 'page', $page);
 
+        $itemsCollection = collect($paginator->items());
+        $settingsMap = collect();
+        if ($itemsCollection->isNotEmpty()) {
+            $settingsMap = UnitEconomicsSettings::where('integration_id', $validated['integration_id'])
+                ->whereIn('sku', $itemsCollection->pluck('sku')->unique())
+                ->get()
+                ->keyBy('sku');
+        }
+
         // Обогащаем данные полями из Product для совместимости с v1
-        $items = collect($paginator->items())->map(function ($cache) use ($validated) {
-            return $this->enrichCacheItem($cache, $validated['fulfillment_type']);
+        $items = $itemsCollection->map(function ($cache) use ($validated, $settingsMap) {
+            $settings = $settingsMap->get($cache->sku);
+            return $this->enrichCacheItem($cache, $validated['fulfillment_type'], $settings);
         })->toArray();
 
         // Статистика по схемам
@@ -381,44 +391,47 @@ class UnitEconomicsCacheController extends Controller
      */
     private function getStats(int $integrationId, string $marketplace, string $fulfillmentType): array
     {
-        $stats = UnitEconomicsCache::where('integration_id', $integrationId)
-            ->where('marketplace', $marketplace)
-            ->where('fulfillment_type', strtoupper($fulfillmentType))
-            ->selectRaw('
-                COUNT(*) as total_count,
-                SUM(CASE WHEN net_profit > 0 THEN 1 ELSE 0 END) as profitable_count,
-                SUM(CASE WHEN net_profit <= 0 THEN 1 ELSE 0 END) as unprofitable_count,
-                AVG(margin_percent) as avg_margin,
-                SUM(revenue) as total_revenue,
-                SUM(net_profit) as total_profit
-            ')
-            ->first();
+        $cacheKey = "ue_stats_{$integrationId}_{$marketplace}_" . strtoupper($fulfillmentType);
 
-        return [
-            'total_count' => (int) ($stats->total_count ?? 0),
-            'profitable_count' => (int) ($stats->profitable_count ?? 0),
-            'unprofitable_count' => (int) ($stats->unprofitable_count ?? 0),
-            'avg_margin' => round((float) ($stats->avg_margin ?? 0), 2),
-            'total_revenue' => round((float) ($stats->total_revenue ?? 0), 2),
-            'total_profit' => round((float) ($stats->total_profit ?? 0), 2),
-        ];
+        return Cache::remember($cacheKey, 60, function () use ($integrationId, $marketplace, $fulfillmentType) {
+            $stats = UnitEconomicsCache::where('integration_id', $integrationId)
+                ->where('marketplace', $marketplace)
+                ->where('fulfillment_type', strtoupper($fulfillmentType))
+                ->selectRaw('
+                    COUNT(*) as total_count,
+                    SUM(CASE WHEN net_profit > 0 THEN 1 ELSE 0 END) as profitable_count,
+                    SUM(CASE WHEN net_profit <= 0 THEN 1 ELSE 0 END) as unprofitable_count,
+                    AVG(margin_percent) as avg_margin,
+                    SUM(revenue) as total_revenue,
+                    SUM(net_profit) as total_profit
+                ')
+                ->first();
+
+            return [
+                'total_count' => (int) ($stats->total_count ?? 0),
+                'profitable_count' => (int) ($stats->profitable_count ?? 0),
+                'unprofitable_count' => (int) ($stats->unprofitable_count ?? 0),
+                'avg_margin' => round((float) ($stats->avg_margin ?? 0), 2),
+                'total_revenue' => round((float) ($stats->total_revenue ?? 0), 2),
+                'total_profit' => round((float) ($stats->total_profit ?? 0), 2),
+            ];
+        });
     }
 
     /**
      * Обогатить данные кэша полями из Product для совместимости с v1 API
      */
-    private function enrichCacheItem(UnitEconomicsCache $cache, string $fulfillmentType): array
+    private function enrichCacheItem(
+        UnitEconomicsCache $cache,
+        string $fulfillmentType,
+        ?UnitEconomicsSettings $settings = null
+    ): array
     {
         $product = $cache->product;
         $ozonData = $product?->ozon_data ?? [];
         $commissions = $ozonData['commissions'] ?? [];
         $redemption = $ozonData['redemption'] ?? [];
         $salesCount = max(1, (int) $cache->sales_count);
-        
-        // Получаем настройки пользователя (там могут быть габариты, СПП и т.д.)
-        $settings = UnitEconomicsSettings::where('integration_id', $cache->integration_id)
-            ->where('sku', $cache->sku)
-            ->first();
         
         // Получаем реальную схему товара из Product (там актуальные данные из Ozon API)
         $realScheme = $product?->fulfillment_type ?? 'FBO';
