@@ -32,8 +32,9 @@ class WildberriesMarketplace implements MarketplaceInterface
     private RealizationReportApi $realizationReport;
     private SuppliesApi $supplies;
     private FbsSuppliesApi $fbsSupplies;
+    private ?Integration $integration = null;
 
-    public function __construct(array $credentials = [])
+    public function __construct(array $credentials = [], ?Integration $integration = null)
     {
         $apiKey = $credentials['api_key'] ?? config('services.wildberries.api_key');
 
@@ -45,6 +46,7 @@ class WildberriesMarketplace implements MarketplaceInterface
         $this->realizationReport = new RealizationReportApi($this->client);
         $this->supplies = new SuppliesApi($this->client);
         $this->fbsSupplies = new FbsSuppliesApi($this->client);
+        $this->integration = $integration;
     }
 
     /**
@@ -52,9 +54,15 @@ class WildberriesMarketplace implements MarketplaceInterface
      */
     public static function fromIntegration(Integration $integration): self
     {
-        return new self([
-            'api_key' => $integration->api_key,
-        ]);
+        return new self($integration->getDecryptedCredentials(), $integration);
+    }
+
+    /**
+     * Получить связанную интеграцию
+     */
+    public function getIntegration(): ?Integration
+    {
+        return $this->integration;
     }
 
     // === MarketplaceInterface ===
@@ -465,10 +473,6 @@ class WildberriesMarketplace implements MarketplaceInterface
         ];
     }
     
-    private function getIntegration(): ?\App\Models\Integration
-    {
-        return null; // Credentials уже в client
-    }
 
     public function getProductPrices(): array
     {

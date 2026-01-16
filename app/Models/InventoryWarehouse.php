@@ -93,9 +93,14 @@ class InventoryWarehouse extends Model
         'last_recommendation_at' => 'datetime',
     ];
 
+    /**
+     * Связанный товар
+     * Связь по составному ключу: sku + integration_id
+     */
     public function product(): BelongsTo
     {
-        return $this->belongsTo(Product::class, 'sku', 'sku');
+        return $this->belongsTo(Product::class, 'sku', 'sku')
+            ->where('integration_id', $this->integration_id);
     }
 
     public function history(): HasMany

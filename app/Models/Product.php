@@ -83,21 +83,39 @@ class Product extends Model
         'volume_weight' => 'decimal:4',
     ];
 
+    /**
+     * Остатки на складах маркетплейса
+     * Связь по составному ключу: sku + integration_id
+     */
     public function inventoryWarehouses(): HasMany
     {
-        return $this->hasMany(InventoryWarehouse::class, 'sku', 'sku');
+        return $this->hasMany(InventoryWarehouse::class, 'sku', 'sku')
+            ->where('integration_id', $this->integration_id);
     }
 
+    /**
+     * История остатков для графиков динамики
+     * Связь по sku (integration_id нет в InventoryHistory)
+     */
     public function inventoryHistory(): HasMany
     {
         return $this->hasMany(InventoryHistory::class, 'sku', 'sku');
     }
 
+    /**
+     * Юнит-экономика товара
+     * Связь по составному ключу: sku + integration_id
+     */
     public function unitEconomics(): HasMany
     {
-        return $this->hasMany(UnitEconomics::class, 'sku', 'sku');
+        return $this->hasMany(UnitEconomics::class, 'sku', 'sku')
+            ->where('integration_id', $this->integration_id);
     }
 
+    /**
+     * Алерты по остаткам
+     * Связь по sku (integration_id нет в InventoryAlert)
+     */
     public function alerts(): HasMany
     {
         return $this->hasMany(InventoryAlert::class, 'sku', 'sku');

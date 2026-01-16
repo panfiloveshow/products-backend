@@ -28,7 +28,11 @@ class OzonClient
      */
     public static function fromIntegration(Integration $integration): self
     {
-        return new self($integration->client_id, $integration->api_key);
+        $credentials = $integration->getDecryptedCredentials();
+        return new self(
+            $credentials['client_id'] ?? null,
+            $credentials['api_key'] ?? null
+        );
     }
 
     /**

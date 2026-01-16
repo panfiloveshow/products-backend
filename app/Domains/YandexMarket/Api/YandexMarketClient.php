@@ -30,10 +30,11 @@ class YandexMarketClient
      */
     public static function fromIntegration(Integration $integration): self
     {
+        $credentials = $integration->getDecryptedCredentials();
         return new self(
-            $integration->api_key,
-            $integration->campaign_id ?? $integration->client_id ?? '',
-            $integration->business_id ?? null
+            $credentials['api_key'] ?? $credentials['token'] ?? null,
+            $credentials['campaign_id'] ?? $credentials['client_id'] ?? '',
+            $credentials['business_id'] ?? null
         );
     }
 

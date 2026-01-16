@@ -340,6 +340,10 @@ class SyncInventoryJob implements ShouldQueue
             
             // Пересчитываем юнит-экономику для всех товаров интеграции
             $this->recalculateUnitEconomics();
+            
+            // Запускаем отдельный джоб для синхронизации storage fees WB
+            // Выделен в отдельный джоб для изоляции памяти (отчёт реализации WB может быть 80+ MB)
+            $this->dispatchStorageFeesSync();
 
             Log::info("Inventory sync completed", [
                 'marketplace' => $this->syncLog->marketplace,
@@ -850,6 +854,51 @@ class SyncInventoryJob implements ShouldQueue
         } catch (\Exception $e) {
             Log::warning("Failed to update Ozon commissions", [
                 'marketplace' => $this->syncLog->marketplace,
+                'error' => $e->getMessage(),
+            ]);
+        }
+    }
+    
+    /**
+     * Запуск отдельного джоба для синхронизации storage fees WB
+     * 
+     * Выделен в отдельный джоб для:
+     * - Изоляции памяти (отчёт реализации WB может быть 80+ MB)
+     * - Возможности запуска отдельно от основной синхронизации
+     * - Chunk-обработки для экономии памяти
+     */
+    private function dispatchStorageFeesSync(): void
+    {
+        // Только для Wildberries
+        if ($this->syncLog->marketplace !== 'wildberries') {
+            return;
+        }
+        
+        // Нужен integration_id и credentials
+        if (!$this->syncLog->integration_id) {
+            Log::debug('dispatchStorageFeesSync: skipped - no integration_id');
+            return;
+        }
+        
+        $credentials = $this->syncLog->credentials;
+        if (empty($credentials)) {
+            Log::debug('dispatchStorageFeesSync: skipped - no credentials');
+            return;
+        }
+        
+        try {
+            SyncStorageFeesJob::dispatch(
+                $this->syncLog->integration_id,
+                $credentials,
+                4 // weeks
+            )->onQueue('inventory');
+            
+            Log::info('SyncStorageFeesJob dispatched', [
+                'integration_id' => $this->syncLog->integration_id,
+            ]);
+        } catch (\Exception $e) {
+            Log::warning('Failed to dispatch SyncStorageFeesJob', [
+                'integration_id' => $this->syncLog->integration_id,
                 'error' => $e->getMessage(),
             ]);
         }

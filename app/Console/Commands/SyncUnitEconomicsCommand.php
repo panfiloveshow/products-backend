@@ -1082,7 +1082,7 @@ class SyncUnitEconomicsCommand extends Command
                 
                 // Хранение
                 'storage_cost' => $calculated['storage_cost'] ?? $data['storage_cost'] ?? null,
-                'turnover_days' => $calculated['turnover_days'] ?? $data['turnover_days'] ?? null,
+                'turnover_days' => (int) ($calculated['turnover_days'] ?? $data['turnover_days'] ?? 0),
                 'litrobonus' => $calculated['litrobonus'] ?? $data['litrobonus'] ?? null,
                 
                 // Возвраты
@@ -1183,9 +1183,9 @@ class SyncUnitEconomicsCommand extends Command
                 // === ХРАНЕНИЕ (FBO) ===
                 'storage_tariff' => $calculated['storage_tariff'] ?? $data['storage_tariff'] ?? 0.08,
                 'storage_coefficient' => $calculated['storage_coefficient'] ?? 1.0,
-                'storage_days' => $calculated['storage_days'] ?? $data['storage_days'] ?? 30,
+                'storage_days' => (int) ($calculated['storage_days'] ?? $data['storage_days'] ?? 30),
                 'storage_cost' => $calculated['storage_cost'] ?? null,
-                'turnover_days' => $data['turnover_days'] ?? $data['storage_days'] ?? 30,
+                'turnover_days' => (int) ($data['turnover_days'] ?? $data['storage_days'] ?? 30),
                 
                 // === ЭКВАЙРИНГ (WB: 0%) ===
                 'acquiring_percent' => $calculated['acquiring_percent'] ?? $data['acquiring_percent'] ?? 0,
@@ -1249,7 +1249,7 @@ class SyncUnitEconomicsCommand extends Command
                 
                 // === ХРАНЕНИЕ ===
                 'storage_cost' => $calculated['storage_cost'] ?? null,
-                'turnover_days' => $data['turnover_days'] ?? 30,
+                'turnover_days' => (int) ($data['turnover_days'] ?? 30),
                 
                 // === ВОЗВРАТЫ ===
                 'return_logistics_cost' => $calculated['return_logistics_cost'] ?? null,

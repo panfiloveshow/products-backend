@@ -61,10 +61,7 @@ class OzonMarketplace implements MarketplaceInterface
      */
     public static function fromIntegration(Integration $integration): self
     {
-        return new self([
-            'client_id' => $integration->client_id,
-            'api_key' => $integration->api_key,
-        ], $integration);
+        return new self($integration->getDecryptedCredentials(), $integration);
     }
 
     // === MarketplaceInterface ===
