@@ -88,31 +88,37 @@ class SyncInventoryJob implements ShouldQueue
                         ->where('warehouse_name', 'NOT LIKE', 'Ozon FBS%')
                         ->delete();
                     
-                    // Сбрасываем старые данные о платном хранении для этой интеграции
-                    // чтобы не накапливались суммы за разные периоды
-                    InventoryWarehouse::where('marketplace', 'ozon')
-                        ->where('integration_id', $this->syncLog->integration_id)
-                        ->update([
-                            'storage_fee_total' => null,
-                            'storage_fee_report_from' => null,
-                            'storage_fee_report_to' => null,
-                        ]);
-                    
                     $placementData = $marketplace->getPlacementCostByProducts($dateFrom, $dateTo, 60);
                     
-                    // Конвертируем в формат storageCostBySku с периодом отчёта
-                    foreach ($placementData as $sku => $data) {
-                        $storageCostBySku[$sku] = [
-                            'storage_fee_total' => $data['placement_cost'] ?? 0,
-                            'storage_fee_report_from' => $dateFrom,
-                            'storage_fee_report_to' => $dateTo,
-                        ];
+                    if (!empty($placementData)) {
+                        // Сбрасываем старые данные о платном хранении для этой интеграции
+                        // чтобы не накапливались суммы за разные периоды
+                        InventoryWarehouse::where('marketplace', 'ozon')
+                            ->where('integration_id', $this->syncLog->integration_id)
+                            ->update([
+                                'storage_fee_total' => null,
+                                'storage_fee_report_from' => null,
+                                'storage_fee_report_to' => null,
+                            ]);
+                        
+                        // Конвертируем в формат storageCostBySku с периодом отчёта
+                        foreach ($placementData as $sku => $data) {
+                            $storageCostBySku[$sku] = [
+                                'storage_fee_total' => $data['placement_cost'] ?? 0,
+                                'storage_fee_report_from' => $dateFrom,
+                                'storage_fee_report_to' => $dateTo,
+                            ];
+                        }
+                        
+                        Log::info('Ozon placement cost loaded', [
+                            'count' => count($storageCostBySku),
+                            'period' => "$dateFrom - $dateTo",
+                        ]);
+                    } else {
+                        Log::warning('Ozon placement cost not loaded, keeping previous values', [
+                            'period' => "$dateFrom - $dateTo",
+                        ]);
                     }
-                    
-                    Log::info('Ozon placement cost loaded', [
-                        'count' => count($storageCostBySku),
-                        'period' => "$dateFrom - $dateTo",
-                    ]);
                 } catch (\Exception $e) {
                     Log::warning('Failed to load Ozon placement cost', ['error' => $e->getMessage()]);
                 }
@@ -404,8 +410,16 @@ class SyncInventoryJob implements ShouldQueue
             ->first();
 
         // Рассчитываем оборачиваемость
-        $sales30 = $stockData['sales_30_days'] ?? 0;
-        $avgDailySales = $stockData['avg_daily_sales'] ?? ($sales30 > 0 ? $sales30 / 30 : 0);
+        $hasSalesData = array_key_exists('sales_30_days', $stockData)
+            || array_key_exists('avg_daily_sales', $stockData)
+            || array_key_exists('sales_7_days', $stockData)
+            || array_key_exists('sales_14_days', $stockData);
+        $existingSales30 = $existing?->sales_30_days ?? 0;
+        $existingAvgDaily = $existing?->average_daily_sales ?? 0;
+        $sales30 = $hasSalesData ? ($stockData['sales_30_days'] ?? 0) : $existingSales30;
+        $avgDailySales = $hasSalesData
+            ? ($stockData['avg_daily_sales'] ?? ($sales30 > 0 ? $sales30 / 30 : 0))
+            : $existingAvgDaily;
         $quantity = $stockData['quantity'] ?? 0;
         
         // Если есть продажи — рассчитываем дни запаса
@@ -447,6 +461,19 @@ class SyncInventoryJob implements ShouldQueue
             }
         }
 
+        $storageFeeTotal = array_key_exists('storage_fee_total', $stockData)
+            ? $stockData['storage_fee_total']
+            : ($existing?->storage_fee_total ?? null);
+        $storageFeeLastWeek = array_key_exists('storage_fee_last_week', $stockData)
+            ? $stockData['storage_fee_last_week']
+            : ($existing?->storage_fee_last_week ?? null);
+        $storageFeeReportFrom = array_key_exists('storage_fee_report_from', $stockData)
+            ? $stockData['storage_fee_report_from']
+            : ($existing?->storage_fee_report_from ?? null);
+        $storageFeeReportTo = array_key_exists('storage_fee_report_to', $stockData)
+            ? $stockData['storage_fee_report_to']
+            : ($existing?->storage_fee_report_to ?? null);
+
         $newData = [
             'warehouse_name' => $stockData['warehouse_name'] ?? $warehouseId,
             'warehouse_coefficient' => $stockData['warehouse_coefficient'] ?? null,
@@ -457,8 +484,8 @@ class SyncInventoryJob implements ShouldQueue
             'in_transit' => $stockData['in_transit'] ?? 0,
             'in_way_to_client' => $stockData['in_way_to_client'] ?? 0,
             'in_way_from_client' => $stockData['in_way_from_client'] ?? 0,
-            'sales_7_days' => $stockData['sales_7_days'] ?? 0,
-            'sales_14_days' => $stockData['sales_14_days'] ?? 0,
+            'sales_7_days' => $hasSalesData ? ($stockData['sales_7_days'] ?? 0) : ($existing?->sales_7_days ?? 0),
+            'sales_14_days' => $hasSalesData ? ($stockData['sales_14_days'] ?? 0) : ($existing?->sales_14_days ?? 0),
             'sales_30_days' => $sales30,
             'average_daily_sales' => round($avgDailySales, 2),
             'days_of_stock' => $daysOfStock,
@@ -466,10 +493,10 @@ class SyncInventoryJob implements ShouldQueue
             'storage_cost_per_day' => $storageCostPerDay,
             'storage_cost_per_month' => $storageCostPerMonth,
             // Фактические начисления за хранение из еженедельных отчётов WB
-            'storage_fee_total' => $stockData['storage_fee_total'] ?? null,
-            'storage_fee_last_week' => $stockData['storage_fee_last_week'] ?? null,
-            'storage_fee_report_from' => $stockData['storage_fee_report_from'] ?? null,
-            'storage_fee_report_to' => $stockData['storage_fee_report_to'] ?? null,
+            'storage_fee_total' => $storageFeeTotal,
+            'storage_fee_last_week' => $storageFeeLastWeek,
+            'storage_fee_report_from' => $storageFeeReportFrom,
+            'storage_fee_report_to' => $storageFeeReportTo,
             'last_updated' => now(),
         ];
 
