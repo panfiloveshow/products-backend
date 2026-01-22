@@ -203,6 +203,10 @@ class SyncInventoryJob implements ShouldQueue
             $failed = 0;
             $updated = 0;
             $created = 0;
+            
+            // Для Ozon: отслеживаем SKU, которым уже записали storage_fee_total
+            // чтобы не дублировать на все записи складов одного SKU
+            $skusWithStorageFeeWritten = [];
 
             // Отключаем foreign key checks для SQLite (товары могут быть из разных интеграций)
             if (DB::getDriverName() === 'sqlite') {
@@ -220,8 +224,18 @@ class SyncInventoryJob implements ShouldQueue
                     }
                     
                     // Добавляем стоимость хранения если есть (расчётная)
+                    // Для Ozon: записываем storage_fee_total только в первую запись склада для SKU
                     if ($sku && isset($storageCostBySku[$sku])) {
-                        $stockData = array_merge($stockData, $storageCostBySku[$sku]);
+                        if ($this->syncLog->marketplace === 'ozon') {
+                            // Для Ozon: записываем storage_fee только если ещё не записали для этого SKU
+                            if (!isset($skusWithStorageFeeWritten[$sku])) {
+                                $stockData = array_merge($stockData, $storageCostBySku[$sku]);
+                                $skusWithStorageFeeWritten[$sku] = true;
+                            }
+                            // Иначе не добавляем storage_fee_total (останется null)
+                        } else {
+                            $stockData = array_merge($stockData, $storageCostBySku[$sku]);
+                        }
                     }
                     
                     // Добавляем ФАКТИЧЕСКИЕ начисления за хранение из отчётов реализации WB
@@ -303,7 +317,14 @@ class SyncInventoryJob implements ShouldQueue
                             }
                         }
                     } else {
-                        // Fallback: если warehouses нет, создаём одну запись
+                        // Fallback: если warehouses нет, создаём одну запись (Ozon getDetailedInventory)
+                        // Для Ozon: storage_fee_total применяется только к FBO складам
+                        $fulfillmentType = $stockData['fulfillment_type'] ?? null;
+                        if ($this->syncLog->marketplace === 'ozon' && !in_array($fulfillmentType, ['FBO', 'FBY'], true)) {
+                            $stockData['storage_fee_total'] = null;
+                            $stockData['storage_fee_last_week'] = null;
+                        }
+                        
                         $result = $this->syncInventoryItem($stockData);
                         $synced++;
                         
