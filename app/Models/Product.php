@@ -86,12 +86,21 @@ class Product extends Model
     /**
      * Остатки на складах маркетплейса
      * Связь по составному ключу: sku + integration_id
-     * Используем whereColumn для корректной работы с eager loading
+     * Для eager loading используется with(['inventoryWarehouses' => fn($q) => $q->where('integration_id', $integrationId)])
+     * Или загрузка через отдельный запрос в сервисе
      */
     public function inventoryWarehouses(): HasMany
     {
-        return $this->hasMany(InventoryWarehouse::class, 'sku', 'sku')
-            ->whereColumn('inventory_warehouses.integration_id', 'products.integration_id');
+        return $this->hasMany(InventoryWarehouse::class, 'sku', 'sku');
+    }
+    
+    /**
+     * Остатки на складах с фильтром по integration_id
+     * Используется для lazy loading когда модель уже загружена
+     */
+    public function getInventoryWarehousesFilteredAttribute()
+    {
+        return $this->inventoryWarehouses->where('integration_id', $this->integration_id);
     }
 
     /**

@@ -21,9 +21,15 @@ class InventoryController extends Controller
     public function index(IndexInventoryRequest $request): JsonResponse
     {
         $validated = $request->validated();
+        $integrationId = $validated['integration_id'] ?? null;
 
         // Показываем ВСЕ товары, не только с остатками
-        $query = Product::with(['inventoryWarehouses']);
+        // Фильтруем inventoryWarehouses по integration_id для корректного отображения
+        $query = Product::with(['inventoryWarehouses' => function ($q) use ($integrationId) {
+            if ($integrationId) {
+                $q->where('integration_id', $integrationId);
+            }
+        }]);
 
         if (!empty($validated['search'])) {
             $query->search($validated['search']);
@@ -33,8 +39,8 @@ class InventoryController extends Controller
             $query->where('marketplace', $validated['marketplace']);
         }
 
-        if (!empty($validated['integration_id'])) {
-            $query->where('integration_id', $validated['integration_id']);
+        if ($integrationId) {
+            $query->where('integration_id', $integrationId);
         }
 
         if (!empty($validated['category'])) {
