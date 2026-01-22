@@ -310,17 +310,22 @@ class SupplyRecommendationService
      */
     protected function getSalesData(int $integrationId): array
     {
-        // Агрегируем продажи за 7/14/28 дней
+        // Агрегируем продажи за 7/14/28 дней (PostgreSQL синтаксис)
+        $date7 = now()->subDays(7)->toDateString();
+        $date14 = now()->subDays(14)->toDateString();
+        $date28 = now()->subDays(28)->toDateString();
+        $date30 = now()->subDays(30)->toDateString();
+
         $sales = DB::table('sales_daily')
             ->select([
                 'sku',
-                DB::raw('SUM(CASE WHEN date >= DATE_SUB(CURDATE(), INTERVAL 7 DAY) THEN quantity ELSE 0 END) as qty_7d'),
-                DB::raw('SUM(CASE WHEN date >= DATE_SUB(CURDATE(), INTERVAL 14 DAY) THEN quantity ELSE 0 END) as qty_14d'),
-                DB::raw('SUM(CASE WHEN date >= DATE_SUB(CURDATE(), INTERVAL 28 DAY) THEN quantity ELSE 0 END) as qty_28d'),
-                DB::raw('SUM(CASE WHEN date >= DATE_SUB(CURDATE(), INTERVAL 30 DAY) THEN revenue ELSE 0 END) as revenue_30d'),
+                DB::raw("SUM(CASE WHEN date >= '{$date7}' THEN quantity ELSE 0 END) as qty_7d"),
+                DB::raw("SUM(CASE WHEN date >= '{$date14}' THEN quantity ELSE 0 END) as qty_14d"),
+                DB::raw("SUM(CASE WHEN date >= '{$date28}' THEN quantity ELSE 0 END) as qty_28d"),
+                DB::raw("SUM(CASE WHEN date >= '{$date30}' THEN revenue ELSE 0 END) as revenue_30d"),
             ])
             ->where('integration_id', $integrationId)
-            ->where('date', '>=', now()->subDays(28)->toDateString())
+            ->where('date', '>=', $date30)
             ->groupBy('sku')
             ->get();
 
