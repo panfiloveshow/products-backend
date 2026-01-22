@@ -93,9 +93,9 @@ return new class extends Migration
                 $table->integer('accepted_quantity')->nullable();
                 $table->integer('rejected_quantity')->nullable();
                 $table->json('acceptance_discrepancies')->nullable();
-                $table->foreignId('created_by')->nullable()->constrained('users')->nullOnDelete();
-                $table->foreignId('responsible_id')->nullable()->constrained('users')->nullOnDelete();
-                $table->foreignId('supply_plan_id')->nullable()->constrained('supply_plans')->nullOnDelete();
+                $table->unsignedBigInteger('created_by')->nullable();
+                $table->unsignedBigInteger('responsible_id')->nullable();
+                $table->uuid('supply_plan_id')->nullable(); // UUID без foreign key
                 $table->text('comment')->nullable();
                 $table->json('meta')->nullable();
                 $table->json('ozon_response')->nullable();
