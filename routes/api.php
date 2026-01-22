@@ -298,6 +298,41 @@ Route::prefix('ozon')->middleware('throttle:api')->group(function () {
 
 /*
 |--------------------------------------------------------------------------
+| Supplies Module (Модуль поставок Ozon FBO)
+|--------------------------------------------------------------------------
+*/
+Route::prefix('supplies')->middleware('throttle:api')->group(function () {
+    // Рекомендации
+    Route::get('/recommendations', [App\Http\Controllers\Api\SupplyController::class, 'getRecommendations']);
+    Route::post('/recommendations/calculate', [App\Http\Controllers\Api\SupplyController::class, 'calculateRecommendations']);
+    Route::post('/recommendations/{id}/accept', [App\Http\Controllers\Api\SupplyController::class, 'acceptRecommendation']);
+    Route::post('/recommendations/{id}/reject', [App\Http\Controllers\Api\SupplyController::class, 'rejectRecommendation']);
+    Route::post('/recommendations/{id}/postpone', [App\Http\Controllers\Api\SupplyController::class, 'postponeRecommendation']);
+    
+    // Поставки CRUD
+    Route::get('/', [App\Http\Controllers\Api\SupplyController::class, 'index']);
+    Route::post('/', [App\Http\Controllers\Api\SupplyController::class, 'store']);
+    Route::get('/stats', [App\Http\Controllers\Api\SupplyController::class, 'getStats']);
+    Route::get('/{id}', [App\Http\Controllers\Api\SupplyController::class, 'show']);
+    Route::get('/{id}/events', [App\Http\Controllers\Api\SupplyController::class, 'getEvents']);
+    
+    // Действия с поставкой
+    Route::post('/{id}/create-draft', [App\Http\Controllers\Api\SupplyController::class, 'createDraft']);
+    Route::get('/{id}/timeslots', [App\Http\Controllers\Api\SupplyController::class, 'getTimeslots']);
+    Route::post('/{id}/book-slot', [App\Http\Controllers\Api\SupplyController::class, 'bookSlot']);
+    Route::post('/{id}/start-preparing', [App\Http\Controllers\Api\SupplyController::class, 'startPreparing']);
+    Route::post('/{id}/ready-to-ship', [App\Http\Controllers\Api\SupplyController::class, 'markReadyToShip']);
+    Route::post('/{id}/ship', [App\Http\Controllers\Api\SupplyController::class, 'markShipped']);
+    Route::post('/{id}/cancel', [App\Http\Controllers\Api\SupplyController::class, 'cancel']);
+    Route::post('/{id}/sync-status', [App\Http\Controllers\Api\SupplyController::class, 'syncStatus']);
+    
+    // Настройки
+    Route::get('/settings', [App\Http\Controllers\Api\SupplyController::class, 'getSettings']);
+    Route::put('/settings', [App\Http\Controllers\Api\SupplyController::class, 'updateSettings']);
+});
+
+/*
+|--------------------------------------------------------------------------
 | Ozon Delivery Analytics (Clusters, Recommendations)
 |--------------------------------------------------------------------------
 */
