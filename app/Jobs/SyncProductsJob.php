@@ -156,6 +156,9 @@ class SyncProductsJob implements ShouldQueue
             ]);
             
             $this->syncLog->complete($synced, $failed);
+            
+            // Инвалидируем кэш статистики
+            \App\Services\ProductService::invalidateStatsCache($this->syncLog->integration_id, $this->syncLog->marketplace);
 
             Log::info("Products sync completed successfully", [
                 'sync_log_id' => $this->syncLog->id,

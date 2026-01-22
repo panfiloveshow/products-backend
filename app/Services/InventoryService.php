@@ -9,6 +9,7 @@ use App\Models\Product;
 use App\Models\SyncLog;
 use App\Jobs\SyncInventoryJob;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Cache;
 
 class InventoryService
 {
@@ -305,7 +306,51 @@ class InventoryService
         ];
     }
 
+    /**
+     * Получить статистику остатков с кэшированием
+     * Кэш инвалидируется при синхронизации
+     */
     public function getInventoryStats(array $filters = []): array
+    {
+        $cacheKey = 'inventory_stats_' . md5(json_encode($filters));
+        $cacheTtl = 300; // 5 минут
+        
+        return Cache::remember($cacheKey, $cacheTtl, function () use ($filters) {
+            return $this->calculateInventoryStats($filters);
+        });
+    }
+    
+    /**
+     * Инвалидировать кэш статистики остатков
+     */
+    public static function invalidateStatsCache(?int $integrationId = null, ?string $marketplace = null): void
+    {
+        $patterns = [
+            'inventory_stats_' . md5(json_encode([])),
+        ];
+        
+        if ($integrationId) {
+            $patterns[] = 'inventory_stats_' . md5(json_encode(['integration_id' => $integrationId]));
+        }
+        
+        if ($marketplace) {
+            $patterns[] = 'inventory_stats_' . md5(json_encode(['marketplace' => $marketplace]));
+        }
+        
+        if ($integrationId && $marketplace) {
+            $patterns[] = 'inventory_stats_' . md5(json_encode(['integration_id' => $integrationId, 'marketplace' => $marketplace]));
+            $patterns[] = 'inventory_stats_' . md5(json_encode(['marketplace' => $marketplace, 'integration_id' => $integrationId]));
+        }
+        
+        foreach ($patterns as $key) {
+            Cache::forget($key);
+        }
+    }
+    
+    /**
+     * Расчёт статистики остатков (без кэша)
+     */
+    private function calculateInventoryStats(array $filters): array
     {
         $marketplace = $filters['marketplace'] ?? null;
         $integrationId = $filters['integration_id'] ?? null;

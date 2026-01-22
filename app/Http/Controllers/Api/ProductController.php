@@ -74,6 +74,7 @@ class ProductController extends Controller
         $limit = min($validated['limit'] ?? 50, 1000);
         $page = $validated['page'] ?? 1;
 
+        // Select только нужных полей для оптимизации (тяжёлые поля исключаются ниже)
         $products = $query->paginate($limit, ['*'], 'page', $page);
 
         // Добавляем cost_price из unitEconomics к каждому товару

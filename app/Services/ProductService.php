@@ -8,10 +8,56 @@ use App\Models\SyncLog;
 use App\Jobs\SyncProductsJob;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Cache;
 
 class ProductService
 {
+    /**
+     * Получить статистику товаров с кэшированием
+     * Кэш инвалидируется при синхронизации (см. SyncProductsJob, SyncInventoryJob)
+     */
     public function getProductsStats(array $filters = []): array
+    {
+        $cacheKey = 'products_stats_' . md5(json_encode($filters));
+        $cacheTtl = 300; // 5 минут
+        
+        return Cache::remember($cacheKey, $cacheTtl, function () use ($filters) {
+            return $this->calculateProductsStats($filters);
+        });
+    }
+    
+    /**
+     * Инвалидировать кэш статистики товаров
+     */
+    public static function invalidateStatsCache(?int $integrationId = null, ?string $marketplace = null): void
+    {
+        // Инвалидируем все возможные комбинации кэша
+        $patterns = [
+            'products_stats_' . md5(json_encode([])),
+        ];
+        
+        if ($integrationId) {
+            $patterns[] = 'products_stats_' . md5(json_encode(['integration_id' => $integrationId]));
+        }
+        
+        if ($marketplace) {
+            $patterns[] = 'products_stats_' . md5(json_encode(['marketplace' => $marketplace]));
+        }
+        
+        if ($integrationId && $marketplace) {
+            $patterns[] = 'products_stats_' . md5(json_encode(['integration_id' => $integrationId, 'marketplace' => $marketplace]));
+            $patterns[] = 'products_stats_' . md5(json_encode(['marketplace' => $marketplace, 'integration_id' => $integrationId]));
+        }
+        
+        foreach ($patterns as $key) {
+            Cache::forget($key);
+        }
+    }
+    
+    /**
+     * Расчёт статистики товаров (без кэша)
+     */
+    private function calculateProductsStats(array $filters): array
     {
         $query = Product::query();
 

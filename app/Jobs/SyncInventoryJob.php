@@ -363,6 +363,10 @@ class SyncInventoryJob implements ShouldQueue
             
             $this->syncLog->complete($synced, $failed);
             
+            // Инвалидируем кэш статистики
+            \App\Services\ProductService::invalidateStatsCache($this->syncLog->integration_id, $this->syncLog->marketplace);
+            \App\Services\InventoryService::invalidateStatsCache($this->syncLog->integration_id, $this->syncLog->marketplace);
+            
             // Синхронизируем Product.stock с суммой остатков на складах
             $this->syncProductStocks();
             
