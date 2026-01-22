@@ -86,11 +86,12 @@ class Product extends Model
     /**
      * Остатки на складах маркетплейса
      * Связь по составному ключу: sku + integration_id
+     * Используем whereColumn для корректной работы с eager loading
      */
     public function inventoryWarehouses(): HasMany
     {
         return $this->hasMany(InventoryWarehouse::class, 'sku', 'sku')
-            ->where('integration_id', $this->integration_id);
+            ->whereColumn('inventory_warehouses.integration_id', 'products.integration_id');
     }
 
     /**
