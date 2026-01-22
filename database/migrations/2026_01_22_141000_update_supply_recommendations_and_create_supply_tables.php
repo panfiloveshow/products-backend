@@ -16,7 +16,8 @@ return new class extends Migration
             Schema::table('supply_recommendations', function (Blueprint $table) {
                 // Добавляем новые поля если их нет
                 if (!Schema::hasColumn('supply_recommendations', 'product_id')) {
-                    $table->foreignId('product_id')->nullable()->after('integration_id')->constrained()->onDelete('cascade');
+                    // product_id как uuid (без foreign key из-за разных типов)
+                    $table->uuid('product_id')->nullable()->after('integration_id');
                 }
                 if (!Schema::hasColumn('supply_recommendations', 'ozon_product_id')) {
                     $table->string('ozon_product_id', 50)->nullable()->after('sku');
@@ -110,7 +111,7 @@ return new class extends Migration
             Schema::create('supply_items', function (Blueprint $table) {
                 $table->id();
                 $table->foreignId('supply_id')->constrained('supplies')->onDelete('cascade');
-                $table->foreignId('product_id')->nullable()->constrained()->onDelete('set null');
+                $table->uuid('product_id')->nullable(); // UUID без foreign key
                 $table->string('sku', 100)->index();
                 $table->string('ozon_product_id', 50)->nullable();
                 $table->string('barcode', 100)->nullable();
