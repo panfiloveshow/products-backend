@@ -46,9 +46,14 @@ class SyncInventoryJob implements ShouldQueue
             // Создаём сервис маркетплейса с credentials и integration
             $marketplace = MarketplaceFactory::create($this->syncLog->marketplace, $credentials, $integration);
             
-            // Для Ozon используем getInventory(), который загружает остатки для ВСЕХ схем (FBO и FBS)
-            // getDetailedInventory() устарел и возвращает неполные данные
-            $inventory = $marketplace->getInventory();
+            // Для Ozon используем getDetailedInventory() для получения детальных данных по каждому складу
+            // getInventory() возвращает только агрегированные данные (Ozon FBO Fbo), что не подходит для отображения по складам
+            if ($this->syncLog->marketplace === 'ozon' && method_exists($marketplace, 'getDetailedInventory')) {
+                $inventory = $marketplace->getDetailedInventory();
+                Log::info('Ozon: using getDetailedInventory for warehouse-level data', ['count' => count($inventory)]);
+            } else {
+                $inventory = $marketplace->getInventory();
+            }
 
             if (empty($inventory)) {
                 Log::warning("No inventory returned from marketplace API", [
@@ -79,16 +84,18 @@ class SyncInventoryJob implements ShouldQueue
                     $storageFeeReportFrom = $dateFrom;
                     $storageFeeReportTo = $dateTo;
                     
-                    // Удаляем старые детальные записи по складам для Ozon
-                    // API getInventory() возвращает агрегированные данные (Ozon FBO Fbo, Ozon FBS),
-                    // а не детальные по складам. Старые записи могли остаться от getDetailedInventory()
+                    // Удаляем старые агрегированные записи (Ozon FBO Fbo, Ozon FBS) - они больше не нужны
+                    // Теперь используем детальные данные по каждому складу из getDetailedInventory()
                     InventoryWarehouse::where('marketplace', 'ozon')
                         ->where('integration_id', $this->syncLog->integration_id)
-                        ->where('warehouse_name', 'NOT LIKE', 'Ozon FBO%')
-                        ->where('warehouse_name', 'NOT LIKE', 'Ozon FBS%')
+                        ->where(function($q) {
+                            $q->where('warehouse_name', 'LIKE', 'Ozon FBO%')
+                              ->orWhere('warehouse_name', 'LIKE', 'Ozon FBS%')
+                              ->orWhere('warehouse_name', 'FBS');
+                        })
                         ->delete();
                     
-                    $placementData = $marketplace->getPlacementCostByProducts($dateFrom, $dateTo, 60);
+                    $placementData = $marketplace->getPlacementCostByProducts($dateFrom, $dateTo, 120);
                     
                     if (!empty($placementData)) {
                         // Сбрасываем старые данные о платном хранении для этой интеграции
