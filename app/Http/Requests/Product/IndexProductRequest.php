@@ -23,7 +23,7 @@ class IndexProductRequest extends FormRequest
             'price_to' => 'nullable|numeric|min:0',
             'in_stock' => 'nullable|boolean',
             'page' => 'nullable|integer|min:1',
-            'limit' => 'nullable|integer|min:1|max:200',
+            'limit' => 'nullable|integer|min:1|max:1000',
             'sort' => 'nullable|in:name,price,stock,rating,created_at',
             'sort_order' => 'nullable|in:asc,desc',
         ];

@@ -71,7 +71,7 @@ class ProductController extends Controller
         $sortOrder = $validated['sort_order'] ?? 'desc';
         $query->orderBy($sortField, $sortOrder);
 
-        $limit = min($validated['limit'] ?? 50, 200);
+        $limit = min($validated['limit'] ?? 50, 1000);
         $page = $validated['page'] ?? 1;
 
         $products = $query->paginate($limit, ['*'], 'page', $page);
