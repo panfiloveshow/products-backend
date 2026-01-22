@@ -12,12 +12,26 @@ use Illuminate\Support\Facades\Log;
 /**
  * Контроллер для работы с черновиками поставок Ozon
  * 
- * Проксирует запросы к Ozon Seller API:
- * - POST /api/ozon/draft/create - создание черновика
+ * Legacy endpoints (до 16.02.2026):
+ * - POST /api/ozon/draft/create - создание черновика (warehouse_id)
  * - POST /api/ozon/draft/info - информация о черновике
  * - POST /api/ozon/draft/timeslots - получение таймслотов
  * - POST /api/ozon/draft/supply/create - создание поставки из черновика
  * - POST /api/ozon/supply/create/status - статус создания поставки
+ * 
+ * New endpoints (с 16.02.2026 - кластерная модель):
+ * - POST /api/ozon/clusters - список макролокальных кластеров
+ * - POST /api/ozon/draft/direct/create - прямая поставка
+ * - POST /api/ozon/draft/crossdock/create - кросс-док поставка
+ * - POST /api/ozon/draft/multi-cluster/create - мультикластерная поставка
+ * - POST /api/ozon/draft/v2/info - статус и расчёты черновика
+ * - POST /api/ozon/draft/v2/timeslots - таймслоты для черновика
+ * - POST /api/ozon/draft/v2/supply/create - создание поставки (новый API)
+ * - POST /api/ozon/warehouses/fbo - список складов FBO
+ * - POST /api/ozon/warehouses/seller - список складов продавца
+ * - POST /api/ozon/cargoes - грузоместа в поставке
+ * 
+ * @see https://dev.ozon.ru/news/647-Izmeneniia-v-metodakh-Seller-API-pri-rabote-s-postavkami-FBO/
  */
 class OzonDraftController extends Controller
 {
@@ -397,6 +411,562 @@ class OzonDraftController extends Controller
 
         } catch (\Exception $e) {
             Log::error('Failed to add items to Ozon supply', [
+                'error' => $e->getMessage(),
+                'supply_order_id' => $validated['supply_order_id'] ?? null,
+            ]);
+
+            return response()->json([
+                'success' => false,
+                'message' => $e->getMessage(),
+            ], 422);
+        }
+    }
+
+    // ========================================================================
+    // НОВЫЕ МЕТОДЫ ДЛЯ КЛАСТЕРНОЙ МОДЕЛИ (с 16.02.2026)
+    // ========================================================================
+
+    /**
+     * Получить список макролокальных кластеров
+     * 
+     * POST /api/ozon/clusters
+     * 
+     * Request body:
+     * {
+     *   "integration_id": 1
+     * }
+     */
+    public function getClusters(Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'integration_id' => 'required|exists:integrations,id',
+        ]);
+
+        try {
+            $integration = Integration::findOrFail($validated['integration_id']);
+            $ozon = OzonMarketplace::fromIntegration($integration);
+            
+            $clusters = $ozon->supplies()->getClusters();
+
+            return response()->json([
+                'success' => true,
+                'data' => [
+                    'clusters' => $clusters,
+                ],
+            ]);
+
+        } catch (\Exception $e) {
+            Log::error('Failed to get Ozon clusters', [
+                'error' => $e->getMessage(),
+                'integration_id' => $validated['integration_id'] ?? null,
+            ]);
+
+            return response()->json([
+                'success' => false,
+                'message' => $e->getMessage(),
+            ], 422);
+        }
+    }
+
+    /**
+     * Создать черновик прямой поставки
+     * 
+     * POST /api/ozon/draft/direct/create
+     * 
+     * Request body:
+     * {
+     *   "integration_id": 1,
+     *   "macrolocal_cluster_id": "cluster_123",
+     *   "items": [
+     *     {"sku": "SKU-001", "quantity": 10}
+     *   ]
+     * }
+     */
+    public function createDirectDraft(Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'integration_id' => 'required|exists:integrations,id',
+            'macrolocal_cluster_id' => 'required|string',
+            'items' => 'nullable|array',
+            'items.*.sku' => 'required_with:items|string',
+            'items.*.quantity' => 'required_with:items|integer|min:1',
+        ]);
+
+        try {
+            $integration = Integration::findOrFail($validated['integration_id']);
+            $ozon = OzonMarketplace::fromIntegration($integration);
+            
+            $result = $ozon->supplies()->createDirectDraft([
+                'macrolocal_cluster_id' => $validated['macrolocal_cluster_id'],
+                'items' => $validated['items'] ?? [],
+            ]);
+
+            Log::info('Ozon direct draft created', [
+                'integration_id' => $validated['integration_id'],
+                'draft_id' => $result['draft_id'] ?? null,
+                'cluster_id' => $validated['macrolocal_cluster_id'],
+            ]);
+
+            return response()->json([
+                'success' => true,
+                'data' => $result,
+            ], 201);
+
+        } catch (\Exception $e) {
+            Log::error('Failed to create Ozon direct draft', [
+                'error' => $e->getMessage(),
+                'integration_id' => $validated['integration_id'] ?? null,
+            ]);
+
+            return response()->json([
+                'success' => false,
+                'message' => $e->getMessage(),
+            ], 422);
+        }
+    }
+
+    /**
+     * Создать черновик кросс-док поставки
+     * 
+     * POST /api/ozon/draft/crossdock/create
+     * 
+     * Request body:
+     * {
+     *   "integration_id": 1,
+     *   "macrolocal_cluster_id": "cluster_123",
+     *   "delivery_scheme": "drop_off",
+     *   "point_id": "point_456",
+     *   "point_type": "PVZ",
+     *   "items": [...]
+     * }
+     * 
+     * или для Pick Up:
+     * {
+     *   "integration_id": 1,
+     *   "macrolocal_cluster_id": "cluster_123",
+     *   "delivery_scheme": "pick_up",
+     *   "seller_warehouse_id": "seller_wh_789",
+     *   "items": [...]
+     * }
+     */
+    public function createCrossdockDraft(Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'integration_id' => 'required|exists:integrations,id',
+            'macrolocal_cluster_id' => 'required|string',
+            'delivery_scheme' => 'required|in:drop_off,pick_up',
+            'point_id' => 'required_if:delivery_scheme,drop_off|string|nullable',
+            'point_type' => 'required_if:delivery_scheme,drop_off|string|nullable',
+            'seller_warehouse_id' => 'required_if:delivery_scheme,pick_up|string|nullable',
+            'items' => 'nullable|array',
+            'items.*.sku' => 'required_with:items|string',
+            'items.*.quantity' => 'required_with:items|integer|min:1',
+        ]);
+
+        try {
+            $integration = Integration::findOrFail($validated['integration_id']);
+            $ozon = OzonMarketplace::fromIntegration($integration);
+            
+            $result = $ozon->supplies()->createCrossdockDraft($validated);
+
+            Log::info('Ozon crossdock draft created', [
+                'integration_id' => $validated['integration_id'],
+                'draft_id' => $result['draft_id'] ?? null,
+                'cluster_id' => $validated['macrolocal_cluster_id'],
+                'delivery_scheme' => $validated['delivery_scheme'],
+            ]);
+
+            return response()->json([
+                'success' => true,
+                'data' => $result,
+            ], 201);
+
+        } catch (\Exception $e) {
+            Log::error('Failed to create Ozon crossdock draft', [
+                'error' => $e->getMessage(),
+                'integration_id' => $validated['integration_id'] ?? null,
+            ]);
+
+            return response()->json([
+                'success' => false,
+                'message' => $e->getMessage(),
+            ], 422);
+        }
+    }
+
+    /**
+     * Создать черновик мультикластерной поставки
+     * 
+     * POST /api/ozon/draft/multi-cluster/create
+     * 
+     * Request body:
+     * {
+     *   "integration_id": 1,
+     *   "cluster_ids": ["cluster_1", "cluster_2"],
+     *   "delivery_scheme": "drop_off",
+     *   "point_id": "point_456",
+     *   "point_type": "PVZ",
+     *   "items": [...]
+     * }
+     */
+    public function createMultiClusterDraft(Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'integration_id' => 'required|exists:integrations,id',
+            'cluster_ids' => 'required|array|min:1',
+            'cluster_ids.*' => 'string',
+            'delivery_scheme' => 'required|in:drop_off,pick_up',
+            'point_id' => 'required_if:delivery_scheme,drop_off|string|nullable',
+            'point_type' => 'required_if:delivery_scheme,drop_off|string|nullable',
+            'seller_warehouse_id' => 'required_if:delivery_scheme,pick_up|string|nullable',
+            'items' => 'nullable|array',
+            'items.*.sku' => 'required_with:items|string',
+            'items.*.quantity' => 'required_with:items|integer|min:1',
+        ]);
+
+        try {
+            $integration = Integration::findOrFail($validated['integration_id']);
+            $ozon = OzonMarketplace::fromIntegration($integration);
+            
+            $result = $ozon->supplies()->createMultiClusterDraft($validated);
+
+            Log::info('Ozon multi-cluster draft created', [
+                'integration_id' => $validated['integration_id'],
+                'draft_id' => $result['draft_id'] ?? null,
+                'cluster_ids' => $validated['cluster_ids'],
+                'delivery_scheme' => $validated['delivery_scheme'],
+            ]);
+
+            return response()->json([
+                'success' => true,
+                'data' => $result,
+            ], 201);
+
+        } catch (\Exception $e) {
+            Log::error('Failed to create Ozon multi-cluster draft', [
+                'error' => $e->getMessage(),
+                'integration_id' => $validated['integration_id'] ?? null,
+            ]);
+
+            return response()->json([
+                'success' => false,
+                'message' => $e->getMessage(),
+            ], 422);
+        }
+    }
+
+    /**
+     * Получить статус и расчёты черновика (новый API v2)
+     * 
+     * POST /api/ozon/draft/v2/info
+     * 
+     * Request body:
+     * {
+     *   "integration_id": 1,
+     *   "draft_id": "draft_123"
+     * }
+     */
+    public function getDraftInfoV2(Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'integration_id' => 'required|exists:integrations,id',
+            'draft_id' => 'required|string',
+        ]);
+
+        try {
+            $integration = Integration::findOrFail($validated['integration_id']);
+            $ozon = OzonMarketplace::fromIntegration($integration);
+            
+            $info = $ozon->supplies()->getDraftInfo($validated['draft_id']);
+
+            return response()->json([
+                'success' => true,
+                'data' => $info,
+            ]);
+
+        } catch (\Exception $e) {
+            Log::error('Failed to get Ozon draft info v2', [
+                'error' => $e->getMessage(),
+                'draft_id' => $validated['draft_id'] ?? null,
+            ]);
+
+            return response()->json([
+                'success' => false,
+                'message' => $e->getMessage(),
+            ], 422);
+        }
+    }
+
+    /**
+     * Получить таймслоты для черновика (новый API v2)
+     * 
+     * POST /api/ozon/draft/v2/timeslots
+     * 
+     * Request body:
+     * {
+     *   "integration_id": 1,
+     *   "draft_id": "draft_123",
+     *   "warehouse_id": 22655170176000
+     * }
+     */
+    public function getDraftTimeslotsV2(Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'integration_id' => 'required|exists:integrations,id',
+            'draft_id' => 'required|string',
+            'warehouse_id' => 'required|string',
+        ]);
+
+        try {
+            $integration = Integration::findOrFail($validated['integration_id']);
+            $ozon = OzonMarketplace::fromIntegration($integration);
+            
+            $slots = $ozon->supplies()->getDraftTimeslots(
+                $validated['draft_id'],
+                $validated['warehouse_id']
+            );
+
+            return response()->json([
+                'success' => true,
+                'data' => [
+                    'timeslots' => $slots,
+                    'draft_id' => $validated['draft_id'],
+                    'warehouse_id' => $validated['warehouse_id'],
+                ],
+            ]);
+
+        } catch (\Exception $e) {
+            Log::error('Failed to get Ozon draft timeslots v2', [
+                'error' => $e->getMessage(),
+                'draft_id' => $validated['draft_id'] ?? null,
+            ]);
+
+            return response()->json([
+                'success' => false,
+                'message' => $e->getMessage(),
+            ], 422);
+        }
+    }
+
+    /**
+     * Создать поставку из черновика (новый API v2)
+     * 
+     * POST /api/ozon/draft/v2/supply/create
+     * 
+     * Request body:
+     * {
+     *   "integration_id": 1,
+     *   "draft_id": "draft_123",
+     *   "warehouse_id": "22655170176000",
+     *   "timeslot_id": "987654321"
+     * }
+     */
+    public function createSupplyFromDraftV2(Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'integration_id' => 'required|exists:integrations,id',
+            'draft_id' => 'required|string',
+            'warehouse_id' => 'required|string',
+            'timeslot_id' => 'required|string',
+        ]);
+
+        try {
+            $integration = Integration::findOrFail($validated['integration_id']);
+            $ozon = OzonMarketplace::fromIntegration($integration);
+            
+            $result = $ozon->supplies()->createSupplyFromDraft(
+                $validated['draft_id'],
+                $validated['warehouse_id'],
+                $validated['timeslot_id']
+            );
+
+            Log::info('Ozon supply created from draft v2', [
+                'integration_id' => $validated['integration_id'],
+                'draft_id' => $validated['draft_id'],
+                'warehouse_id' => $validated['warehouse_id'],
+                'timeslot_id' => $validated['timeslot_id'],
+                'supply_order_id' => $result['supply_order_id'] ?? null,
+            ]);
+
+            return response()->json([
+                'success' => true,
+                'data' => $result,
+                'message' => 'Поставка создана',
+            ], 201);
+
+        } catch (\Exception $e) {
+            Log::error('Failed to create Ozon supply from draft v2', [
+                'error' => $e->getMessage(),
+                'draft_id' => $validated['draft_id'] ?? null,
+            ]);
+
+            return response()->json([
+                'success' => false,
+                'message' => $e->getMessage(),
+            ], 422);
+        }
+    }
+
+    /**
+     * Получить статус создания поставки (новый API v2)
+     * 
+     * POST /api/ozon/draft/v2/supply/status
+     * 
+     * Request body:
+     * {
+     *   "integration_id": 1,
+     *   "draft_id": "draft_123"
+     * }
+     */
+    public function getSupplyCreateStatusV2(Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'integration_id' => 'required|exists:integrations,id',
+            'draft_id' => 'required|string',
+        ]);
+
+        try {
+            $integration = Integration::findOrFail($validated['integration_id']);
+            $ozon = OzonMarketplace::fromIntegration($integration);
+            
+            $status = $ozon->supplies()->getSupplyCreateStatus($validated['draft_id']);
+
+            return response()->json([
+                'success' => true,
+                'data' => $status,
+            ]);
+
+        } catch (\Exception $e) {
+            Log::error('Failed to get Ozon supply create status v2', [
+                'error' => $e->getMessage(),
+                'draft_id' => $validated['draft_id'] ?? null,
+            ]);
+
+            return response()->json([
+                'success' => false,
+                'message' => $e->getMessage(),
+            ], 422);
+        }
+    }
+
+    /**
+     * Получить список складов FBO
+     * 
+     * POST /api/ozon/warehouses/fbo
+     * 
+     * Request body:
+     * {
+     *   "integration_id": 1
+     * }
+     */
+    public function getFboWarehouses(Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'integration_id' => 'required|exists:integrations,id',
+        ]);
+
+        try {
+            $integration = Integration::findOrFail($validated['integration_id']);
+            $ozon = OzonMarketplace::fromIntegration($integration);
+            
+            $warehouses = $ozon->supplies()->getFboWarehouses();
+
+            return response()->json([
+                'success' => true,
+                'data' => [
+                    'warehouses' => $warehouses,
+                ],
+            ]);
+
+        } catch (\Exception $e) {
+            Log::error('Failed to get Ozon FBO warehouses', [
+                'error' => $e->getMessage(),
+                'integration_id' => $validated['integration_id'] ?? null,
+            ]);
+
+            return response()->json([
+                'success' => false,
+                'message' => $e->getMessage(),
+            ], 422);
+        }
+    }
+
+    /**
+     * Получить список складов продавца (для Pick Up)
+     * 
+     * POST /api/ozon/warehouses/seller
+     * 
+     * Request body:
+     * {
+     *   "integration_id": 1
+     * }
+     */
+    public function getSellerWarehouses(Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'integration_id' => 'required|exists:integrations,id',
+        ]);
+
+        try {
+            $integration = Integration::findOrFail($validated['integration_id']);
+            $ozon = OzonMarketplace::fromIntegration($integration);
+            
+            $warehouses = $ozon->supplies()->getSellerWarehouses();
+
+            return response()->json([
+                'success' => true,
+                'data' => [
+                    'warehouses' => $warehouses,
+                ],
+            ]);
+
+        } catch (\Exception $e) {
+            Log::error('Failed to get Ozon seller warehouses', [
+                'error' => $e->getMessage(),
+                'integration_id' => $validated['integration_id'] ?? null,
+            ]);
+
+            return response()->json([
+                'success' => false,
+                'message' => $e->getMessage(),
+            ], 422);
+        }
+    }
+
+    /**
+     * Получить грузоместа в поставке (бета)
+     * 
+     * POST /api/ozon/cargoes
+     * 
+     * Request body:
+     * {
+     *   "integration_id": 1,
+     *   "supply_order_id": 123456789
+     * }
+     */
+    public function getCargoes(Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'integration_id' => 'required|exists:integrations,id',
+            'supply_order_id' => 'required|integer',
+        ]);
+
+        try {
+            $integration = Integration::findOrFail($validated['integration_id']);
+            $ozon = OzonMarketplace::fromIntegration($integration);
+            
+            $cargoes = $ozon->supplies()->getCargoes((string) $validated['supply_order_id']);
+
+            return response()->json([
+                'success' => true,
+                'data' => [
+                    'cargoes' => $cargoes,
+                    'supply_order_id' => $validated['supply_order_id'],
+                ],
+            ]);
+
+        } catch (\Exception $e) {
+            Log::error('Failed to get Ozon cargoes', [
                 'error' => $e->getMessage(),
                 'supply_order_id' => $validated['supply_order_id'] ?? null,
             ]);

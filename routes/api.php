@@ -245,7 +245,7 @@ Route::prefix('warehouse-slots')->middleware('throttle:api')->group(function () 
 |--------------------------------------------------------------------------
 */
 Route::prefix('ozon')->middleware('throttle:api')->group(function () {
-    // Draft endpoints (черновики)
+    // Legacy Draft endpoints (черновики - до 16.02.2026)
     Route::post('/draft/create', [App\Http\Controllers\Api\OzonDraftController::class, 'createDraft']);
     Route::post('/draft/info', [App\Http\Controllers\Api\OzonDraftController::class, 'getDraftInfo']);
     Route::post('/draft/timeslots', [App\Http\Controllers\Api\OzonDraftController::class, 'getTimeslots']);
@@ -253,6 +253,19 @@ Route::prefix('ozon')->middleware('throttle:api')->group(function () {
     Route::post('/draft/items/add', [App\Http\Controllers\Api\OzonDraftController::class, 'addItems']);
     Route::post('/supply/create/status', [App\Http\Controllers\Api\OzonDraftController::class, 'getSupplyCreateStatus']);
     Route::post('/warehouses', [App\Http\Controllers\Api\OzonDraftController::class, 'getWarehouses']);
+    
+    // New Cluster-based Draft endpoints (с 16.02.2026 - кластерная модель)
+    Route::post('/clusters/list', [App\Http\Controllers\Api\OzonDraftController::class, 'getClusters']);
+    Route::post('/draft/direct/create', [App\Http\Controllers\Api\OzonDraftController::class, 'createDirectDraft']);
+    Route::post('/draft/crossdock/create', [App\Http\Controllers\Api\OzonDraftController::class, 'createCrossdockDraft']);
+    Route::post('/draft/multi-cluster/create', [App\Http\Controllers\Api\OzonDraftController::class, 'createMultiClusterDraft']);
+    Route::post('/draft/v2/info', [App\Http\Controllers\Api\OzonDraftController::class, 'getDraftInfoV2']);
+    Route::post('/draft/v2/timeslots', [App\Http\Controllers\Api\OzonDraftController::class, 'getDraftTimeslotsV2']);
+    Route::post('/draft/v2/supply/create', [App\Http\Controllers\Api\OzonDraftController::class, 'createSupplyFromDraftV2']);
+    Route::post('/draft/v2/supply/status', [App\Http\Controllers\Api\OzonDraftController::class, 'getSupplyCreateStatusV2']);
+    Route::post('/warehouses/fbo/list', [App\Http\Controllers\Api\OzonDraftController::class, 'getFboWarehouses']);
+    Route::post('/warehouses/seller/list', [App\Http\Controllers\Api\OzonDraftController::class, 'getSellerWarehouses']);
+    Route::post('/cargoes/get', [App\Http\Controllers\Api\OzonDraftController::class, 'getCargoes']);
     
     // Supply Order endpoints (заявки на поставку)
     Route::post('/supply/orders', [App\Http\Controllers\Api\OzonSupplyController::class, 'getSupplyOrders']);

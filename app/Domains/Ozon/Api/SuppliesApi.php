@@ -7,7 +7,7 @@ use App\Domains\Marketplace\Contracts\SuppliesApiInterface;
 /**
  * API для работы с поставками Ozon (FBO Supplies)
  * 
- * Endpoints:
+ * Endpoints (Legacy - до 16.02.2026):
  * - POST /v1/supply/order/list — список заказов на поставку
  * - POST /v1/supply/order/get — детали заказа на поставку
  * - POST /v1/supply/draft/create — создать черновик поставки
@@ -17,7 +17,20 @@ use App\Domains\Marketplace\Contracts\SuppliesApiInterface;
  * - POST /v1/supply/driver/set — назначить водителя
  * - POST /v1/warehouse/list — список складов
  * 
+ * Endpoints (New - с 16.02.2026):
+ * - POST /v1/cluster/list — список макролокальных кластеров
+ * - POST /v1/draft/direct/create — черновик прямой поставки
+ * - POST /v1/draft/crossdock/create — черновик кросс-док поставки
+ * - POST /v1/draft/multi-cluster/create — черновик мультикластерной поставки
+ * - POST /v2/draft/create/info — статус и расчёты черновика
+ * - POST /v2/draft/timeslot/info — таймслоты для черновика
+ * - POST /v2/draft/supply/create/status — статус создания поставки
+ * - POST /v1/cargoes/get — грузоместа в поставках FBO (бета)
+ * - POST /v1/warehouse/fbo/list — список складов FBO
+ * - POST /v1/warehouse/fbo/seller/list — список складов продавца
+ * 
  * @see https://docs.ozon.ru/api/seller
+ * @see https://dev.ozon.ru/news/647-Izmeneniia-v-metodakh-Seller-API-pri-rabote-s-postavkami-FBO/
  */
 class SuppliesApi implements SuppliesApiInterface
 {
@@ -411,13 +424,444 @@ class SuppliesApi implements SuppliesApiInterface
             'marketplace' => 'ozon',
             'warehouse_id' => (string) ($order['warehouse_id'] ?? null),
             'warehouse_name' => $order['warehouse_name'] ?? null,
+            'macrolocal_cluster_id' => $order['macrolocal_cluster_id'] ?? null,
+            'cluster_name' => $order['cluster_name'] ?? null,
             'created_at' => $order['created_at'] ?? null,
             'timeslot_from' => $order['timeslot']['from'] ?? null,
             'timeslot_to' => $order['timeslot']['to'] ?? null,
             'items_count' => $order['items_count'] ?? 0,
             'total_quantity' => $order['total_quantity'] ?? 0,
             'supply_type' => $order['supply_type'] ?? 'FBO',
+            'supply_method' => $order['supply_method'] ?? null,
+            'delivery_scheme' => $order['delivery_scheme'] ?? null,
             'raw_data' => $order,
         ];
+    }
+
+    // ========================================================================
+    // НОВЫЕ МЕТОДЫ ДЛЯ КЛАСТЕРНОЙ МОДЕЛИ (с 16.02.2026)
+    // ========================================================================
+
+    /**
+     * Получить список макролокальных кластеров
+     * 
+     * POST /v1/cluster/list
+     * 
+     * @return array Список кластеров с id и названием
+     */
+    public function getClusters(): array
+    {
+        $response = $this->client->post('/v1/cluster/list', []);
+
+        if (!$response) {
+            return [];
+        }
+
+        $clusters = $response['result']['clusters'] ?? $response['clusters'] ?? [];
+        
+        return array_map(fn($cluster) => [
+            'id' => (string) ($cluster['macrolocal_cluster_id'] ?? $cluster['id'] ?? null),
+            'name' => $cluster['name'] ?? null,
+            'region' => $cluster['region'] ?? null,
+            'warehouses_count' => $cluster['warehouses_count'] ?? 0,
+            'is_active' => $cluster['is_active'] ?? true,
+        ], $clusters);
+    }
+
+    /**
+     * Создать черновик прямой поставки (на конкретный склад)
+     * 
+     * POST /v1/draft/direct/create
+     * 
+     * @param array $data [
+     *   'macrolocal_cluster_id' => string,
+     *   'items' => [['sku' => string, 'quantity' => int], ...],
+     * ]
+     */
+    public function createDirectDraft(array $data): array
+    {
+        $body = [
+            'macrolocal_cluster_id' => $data['macrolocal_cluster_id'] ?? '',
+        ];
+
+        if (!empty($data['items'])) {
+            $body['items'] = array_map(fn($item) => [
+                'sku' => $item['sku'] ?? $item['offer_id'] ?? '',
+                'quantity' => $item['quantity'] ?? 0,
+            ], $data['items']);
+        }
+
+        $response = $this->client->post('/v1/draft/direct/create', $body);
+
+        if (!$response || empty($response['result'])) {
+            throw new \RuntimeException(
+                'Не удалось создать черновик прямой поставки: ' . 
+                ($response['error']['message'] ?? 'Unknown error')
+            );
+        }
+
+        return [
+            'draft_id' => (string) ($response['result']['draft_id'] ?? null),
+            'status' => 'draft',
+            'supply_method' => 'direct',
+            'macrolocal_cluster_id' => $data['macrolocal_cluster_id'] ?? null,
+            'created_at' => now()->toIso8601String(),
+        ];
+    }
+
+    /**
+     * Создать черновик кросс-док поставки (Drop Off или Pick Up)
+     * 
+     * POST /v1/draft/crossdock/create
+     * 
+     * @param array $data [
+     *   'macrolocal_cluster_id' => string,
+     *   'delivery_scheme' => 'drop_off' | 'pick_up',
+     *   'point_id' => string (для drop_off — ID точки из /v1/warehouse/fbo/list),
+     *   'point_type' => string (для drop_off — тип точки),
+     *   'seller_warehouse_id' => string (для pick_up — ID склада продавца),
+     *   'items' => [['sku' => string, 'quantity' => int], ...],
+     * ]
+     */
+    public function createCrossdockDraft(array $data): array
+    {
+        $body = [
+            'macrolocal_cluster_id' => $data['macrolocal_cluster_id'] ?? '',
+            'delivery_scheme' => strtoupper($data['delivery_scheme'] ?? 'DROP_OFF'),
+        ];
+
+        if (($data['delivery_scheme'] ?? '') === 'drop_off') {
+            $body['drop_off_point'] = [
+                'id' => $data['point_id'] ?? '',
+                'type' => $data['point_type'] ?? '',
+            ];
+        } else {
+            $body['seller_warehouse_id'] = $data['seller_warehouse_id'] ?? '';
+        }
+
+        if (!empty($data['items'])) {
+            $body['items'] = array_map(fn($item) => [
+                'sku' => $item['sku'] ?? $item['offer_id'] ?? '',
+                'quantity' => $item['quantity'] ?? 0,
+            ], $data['items']);
+        }
+
+        $response = $this->client->post('/v1/draft/crossdock/create', $body);
+
+        if (!$response || empty($response['result'])) {
+            throw new \RuntimeException(
+                'Не удалось создать черновик кросс-док поставки: ' . 
+                ($response['error']['message'] ?? 'Unknown error')
+            );
+        }
+
+        return [
+            'draft_id' => (string) ($response['result']['draft_id'] ?? null),
+            'status' => 'draft',
+            'supply_method' => 'crossdock',
+            'delivery_scheme' => $data['delivery_scheme'] ?? 'drop_off',
+            'macrolocal_cluster_id' => $data['macrolocal_cluster_id'] ?? null,
+            'created_at' => now()->toIso8601String(),
+        ];
+    }
+
+    /**
+     * Создать черновик мультикластерной поставки
+     * 
+     * POST /v1/draft/multi-cluster/create
+     * 
+     * @param array $data [
+     *   'cluster_ids' => string[] (массив ID кластеров),
+     *   'delivery_scheme' => 'drop_off' | 'pick_up',
+     *   'point_id' => string (для drop_off),
+     *   'point_type' => string (для drop_off),
+     *   'seller_warehouse_id' => string (для pick_up),
+     *   'items' => [['sku' => string, 'quantity' => int], ...],
+     * ]
+     */
+    public function createMultiClusterDraft(array $data): array
+    {
+        $body = [
+            'macrolocal_cluster_ids' => $data['cluster_ids'] ?? [],
+            'delivery_scheme' => strtoupper($data['delivery_scheme'] ?? 'DROP_OFF'),
+        ];
+
+        if (($data['delivery_scheme'] ?? '') === 'drop_off') {
+            $body['drop_off_point'] = [
+                'id' => $data['point_id'] ?? '',
+                'type' => $data['point_type'] ?? '',
+            ];
+        } else {
+            $body['seller_warehouse_id'] = $data['seller_warehouse_id'] ?? '';
+        }
+
+        if (!empty($data['items'])) {
+            $body['items'] = array_map(fn($item) => [
+                'sku' => $item['sku'] ?? $item['offer_id'] ?? '',
+                'quantity' => $item['quantity'] ?? 0,
+            ], $data['items']);
+        }
+
+        $response = $this->client->post('/v1/draft/multi-cluster/create', $body);
+
+        if (!$response || empty($response['result'])) {
+            throw new \RuntimeException(
+                'Не удалось создать черновик мультикластерной поставки: ' . 
+                ($response['error']['message'] ?? 'Unknown error')
+            );
+        }
+
+        return [
+            'draft_id' => (string) ($response['result']['draft_id'] ?? null),
+            'status' => 'draft',
+            'supply_method' => 'multi_cluster',
+            'delivery_scheme' => $data['delivery_scheme'] ?? 'drop_off',
+            'cluster_ids' => $data['cluster_ids'] ?? [],
+            'created_at' => now()->toIso8601String(),
+        ];
+    }
+
+    /**
+     * Получить статус и расчёты черновика
+     * 
+     * POST /v2/draft/create/info
+     * 
+     * @param string $draftId ID черновика
+     * @return array Статус, ошибки и расчёты по складам
+     */
+    public function getDraftInfo(string $draftId): array
+    {
+        $response = $this->client->post('/v2/draft/create/info', [
+            'draft_id' => $draftId,
+        ]);
+
+        if (!$response) {
+            return [];
+        }
+
+        $result = $response['result'] ?? [];
+        
+        return [
+            'draft_id' => $draftId,
+            'status' => $result['status'] ?? 'unknown',
+            'errors' => $result['errors'] ?? [],
+            'warehouses' => array_map(fn($wh) => [
+                'warehouse_id' => (string) ($wh['warehouse_id'] ?? null),
+                'warehouse_name' => $wh['warehouse_name'] ?? null,
+                'cluster_id' => $wh['macrolocal_cluster_id'] ?? null,
+                'items_count' => $wh['items_count'] ?? 0,
+                'total_quantity' => $wh['total_quantity'] ?? 0,
+                'estimated_cost' => $wh['estimated_cost'] ?? null,
+                'is_available' => $wh['is_available'] ?? true,
+            ], $result['warehouses'] ?? []),
+        ];
+    }
+
+    /**
+     * Получить таймслоты для черновика (новый API)
+     * 
+     * POST /v2/draft/timeslot/info
+     * 
+     * @param string $draftId ID черновика
+     * @param string $warehouseId ID склада в кластере
+     */
+    public function getDraftTimeslots(string $draftId, string $warehouseId): array
+    {
+        $response = $this->client->post('/v2/draft/timeslot/info', [
+            'draft_id' => $draftId,
+            'warehouse_id' => (int) $warehouseId,
+        ]);
+
+        if (!$response) {
+            return [];
+        }
+
+        $slots = $response['result']['timeslots'] ?? $response['timeslots'] ?? [];
+        
+        return array_map(fn($slot) => [
+            'id' => $slot['timeslot_id'] ?? null,
+            'warehouse_id' => $warehouseId,
+            'date' => substr($slot['from'] ?? '', 0, 10),
+            'time_from' => substr($slot['from'] ?? '', 11, 5),
+            'time_to' => substr($slot['to'] ?? '', 11, 5),
+            'from_datetime' => $slot['from'] ?? null,
+            'to_datetime' => $slot['to'] ?? null,
+            'is_available' => $slot['is_available'] ?? true,
+            'capacity' => $slot['capacity'] ?? null,
+        ], $slots);
+    }
+
+    /**
+     * Создать поставку из черновика (новый API)
+     * 
+     * POST /v2/draft/timeslot/info (с параметрами для создания)
+     * 
+     * @param string $draftId ID черновика
+     * @param string $warehouseId ID склада
+     * @param string $timeslotId ID таймслота
+     */
+    public function createSupplyFromDraft(string $draftId, string $warehouseId, string $timeslotId): array
+    {
+        $response = $this->client->post('/v2/draft/timeslot/info', [
+            'draft_id' => $draftId,
+            'warehouse_id' => (int) $warehouseId,
+            'timeslot_id' => (int) $timeslotId,
+            'create_supply' => true,
+        ]);
+
+        if (!$response || !empty($response['error'])) {
+            throw new \RuntimeException(
+                'Не удалось создать поставку из черновика: ' . 
+                ($response['error']['message'] ?? 'Unknown error')
+            );
+        }
+
+        return [
+            'success' => true,
+            'draft_id' => $draftId,
+            'warehouse_id' => $warehouseId,
+            'timeslot_id' => $timeslotId,
+            'supply_order_id' => $response['result']['supply_order_id'] ?? null,
+            'created_at' => now()->toIso8601String(),
+        ];
+    }
+
+    /**
+     * Получить статус создания поставки
+     * 
+     * POST /v2/draft/supply/create/status
+     */
+    public function getSupplyCreateStatus(string $draftId): array
+    {
+        $response = $this->client->post('/v2/draft/supply/create/status', [
+            'draft_id' => $draftId,
+        ]);
+
+        if (!$response) {
+            return [];
+        }
+
+        $result = $response['result'] ?? [];
+        
+        return [
+            'draft_id' => $draftId,
+            'status' => $result['status'] ?? 'unknown',
+            'supply_order_id' => $result['supply_order_id'] ?? null,
+            'errors' => $result['errors'] ?? [],
+            'created_at' => $result['created_at'] ?? null,
+        ];
+    }
+
+    /**
+     * Получить список складов FBO
+     * 
+     * POST /v1/warehouse/fbo/list
+     */
+    public function getFboWarehouses(): array
+    {
+        $response = $this->client->post('/v1/warehouse/fbo/list', []);
+
+        if (!$response) {
+            return [];
+        }
+
+        $warehouses = $response['result']['warehouses'] ?? $response['result'] ?? [];
+        
+        return array_map(fn($wh) => [
+            'id' => (string) ($wh['warehouse_id'] ?? $wh['id'] ?? null),
+            'name' => $wh['name'] ?? null,
+            'type' => $wh['type'] ?? null,
+            'address' => $wh['address'] ?? null,
+            'city' => $wh['city'] ?? null,
+            'region' => $wh['region'] ?? null,
+            'cluster_id' => $wh['macrolocal_cluster_id'] ?? null,
+            'cluster_name' => $wh['cluster_name'] ?? null,
+            'is_active' => $wh['is_active'] ?? true,
+        ], $warehouses);
+    }
+
+    /**
+     * Получить список складов продавца (для Pick Up)
+     * 
+     * POST /v1/warehouse/fbo/seller/list
+     */
+    public function getSellerWarehouses(): array
+    {
+        $response = $this->client->post('/v1/warehouse/fbo/seller/list', []);
+
+        if (!$response) {
+            return [];
+        }
+
+        $warehouses = $response['result']['warehouses'] ?? $response['result'] ?? [];
+        
+        return array_map(fn($wh) => [
+            'id' => (string) ($wh['warehouse_id'] ?? $wh['id'] ?? null),
+            'name' => $wh['name'] ?? null,
+            'address' => $wh['address'] ?? null,
+            'city' => $wh['city'] ?? null,
+            'is_active' => $wh['is_active'] ?? true,
+        ], $warehouses);
+    }
+
+    /**
+     * Получить грузоместа в поставках FBO (бета)
+     * 
+     * POST /v1/cargoes/get
+     */
+    public function getCargoes(string $supplyOrderId): array
+    {
+        $response = $this->client->post('/v1/cargoes/get', [
+            'supply_order_id' => (int) $supplyOrderId,
+        ]);
+
+        if (!$response) {
+            return [];
+        }
+
+        $cargoes = $response['result']['cargoes'] ?? $response['cargoes'] ?? [];
+        
+        return array_map(fn($cargo) => [
+            'id' => $cargo['cargo_id'] ?? null,
+            'barcode' => $cargo['barcode'] ?? null,
+            'type' => $cargo['container_type'] ?? null,
+            'weight' => $cargo['weight'] ?? 0,
+            'dimensions' => [
+                'length' => $cargo['length'] ?? 0,
+                'width' => $cargo['width'] ?? 0,
+                'height' => $cargo['height'] ?? 0,
+            ],
+            'items_count' => $cargo['items_count'] ?? 0,
+        ], $cargoes);
+    }
+
+    /**
+     * Универсальный метод создания черновика (автовыбор типа)
+     * 
+     * @param array $data [
+     *   'supply_method' => 'direct' | 'crossdock' | 'multi_cluster',
+     *   'macrolocal_cluster_id' => string (для direct/crossdock),
+     *   'cluster_ids' => string[] (для multi_cluster),
+     *   'warehouse_id' => string (legacy, для обратной совместимости),
+     *   'delivery_scheme' => 'drop_off' | 'pick_up' (для crossdock/multi_cluster),
+     *   'items' => [['sku' => string, 'quantity' => int], ...],
+     *   ...
+     * ]
+     */
+    public function createDraft(array $data): array
+    {
+        $supplyMethod = $data['supply_method'] ?? null;
+        
+        // Обратная совместимость: если передан warehouse_id без supply_method
+        if (!$supplyMethod && !empty($data['warehouse_id'])) {
+            return $this->createSupplyDraft($data);
+        }
+
+        return match ($supplyMethod) {
+            'direct' => $this->createDirectDraft($data),
+            'crossdock' => $this->createCrossdockDraft($data),
+            'multi_cluster' => $this->createMultiClusterDraft($data),
+            default => $this->createSupplyDraft($data), // Legacy fallback
+        };
     }
 }
