@@ -5,6 +5,7 @@ namespace App\Http\Controllers\Api;
 use App\Http\Controllers\Controller;
 use App\Models\Integration;
 use App\Models\Supply;
+use App\Models\SupplyAnalytics;
 use App\Models\SupplyRecommendation;
 use App\Models\SupplySettings;
 use App\Services\Supply\SupplyRecommendationService;
@@ -670,5 +671,87 @@ class SupplyController extends Controller
             'data' => $settings->fresh(),
             'message' => 'Настройки сохранены',
         ]);
+    }
+
+    // ========================================================================
+    // АНАЛИТИКА
+    // ========================================================================
+
+    /**
+     * Получить аналитику поставок
+     * 
+     * GET /api/supplies/analytics
+     */
+    public function getAnalytics(Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'integration_id' => 'required|exists:integrations,id',
+            'period' => 'nullable|in:7d,14d,30d,90d',
+        ]);
+
+        $periodDays = match ($validated['period'] ?? '30d') {
+            '7d' => 7,
+            '14d' => 14,
+            '30d' => 30,
+            '90d' => 90,
+        };
+
+        $startDate = now()->subDays($periodDays)->startOfDay();
+        $endDate = now()->endOfDay();
+
+        // Получаем последнюю аналитику
+        $analytics = SupplyAnalytics::where('integration_id', $validated['integration_id'])
+            ->where('period_start', '>=', $startDate->subDays(1))
+            ->orderByDesc('calculated_at')
+            ->first();
+
+        // Если нет данных или устарели — возвращаем базовую статистику
+        if (!$analytics) {
+            $analytics = $this->calculateBasicAnalytics($validated['integration_id'], $startDate, $endDate);
+        }
+
+        return response()->json([
+            'success' => true,
+            'data' => $analytics,
+        ]);
+    }
+
+    /**
+     * Рассчитать базовую аналитику на лету
+     */
+    private function calculateBasicAnalytics(int $integrationId, $startDate, $endDate): array
+    {
+        $supplies = Supply::where('integration_id', $integrationId)
+            ->whereBetween('created_at', [$startDate, $endDate])
+            ->get();
+
+        $completed = $supplies->whereIn('status', ['accepted_full', 'accepted_partial', 'closed'])->count();
+        $cancelled = $supplies->where('status', 'cancelled')->count();
+        $errors = $supplies->where('status', 'error')->count();
+
+        $recommendations = SupplyRecommendation::where('integration_id', $integrationId)
+            ->whereBetween('created_at', [$startDate, $endDate])
+            ->get();
+
+        $oosRiskCount = $recommendations->where('oos_risk', true)->count();
+
+        return [
+            'period_start' => $startDate->toDateString(),
+            'period_end' => $endDate->toDateString(),
+            'oos_rate' => $recommendations->count() > 0 
+                ? round(($oosRiskCount / $recommendations->count()) * 100, 2) 
+                : 0,
+            'forecast_accuracy' => null,
+            'avg_lead_time_hours' => null,
+            'total_supplies' => $supplies->count(),
+            'completed_supplies' => $completed,
+            'cancelled_supplies' => $cancelled,
+            'error_supplies' => $errors,
+            'total_items' => $supplies->sum('items_count'),
+            'total_quantity' => $supplies->sum('total_quantity'),
+            'acceptance_rate' => $completed > 0 ? 100 : null,
+            'calculated_at' => now()->toIso8601String(),
+            'is_realtime' => true,
+        ];
     }
 }

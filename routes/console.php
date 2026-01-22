@@ -1,6 +1,7 @@
 <?php
 
 use App\Jobs\CalculateForecastsJob;
+use App\Jobs\CalculateSupplyRecommendationsJob;
 use App\Jobs\CalculateUnitEconomicsJob;
 use App\Jobs\GenerateAlertsJob;
 use App\Jobs\GenerateShipmentRecommendationsJob;
@@ -8,6 +9,7 @@ use App\Jobs\GenerateSupplyRecommendationsJob;
 use App\Jobs\SyncInventoryJob;
 use App\Jobs\SyncProductsJob;
 use App\Jobs\SyncShipmentStatusJob;
+use App\Jobs\SyncSupplyStatusesJob;
 use App\Models\SyncLog;
 use Illuminate\Foundation\Inspiring;
 use Illuminate\Support\Facades\Artisan;
@@ -119,3 +121,24 @@ Schedule::job(new SyncShipmentStatusJob())
 Schedule::job(new \App\Jobs\SyncWarehouseSlotsJob())
     ->everySixHours()
     ->name('sync_warehouse_slots');
+
+/*
+|--------------------------------------------------------------------------
+| Ozon FBO Supplies Module Jobs
+|--------------------------------------------------------------------------
+*/
+
+// Calculate supply recommendations every 4 hours (after inventory sync)
+Schedule::job(new CalculateSupplyRecommendationsJob())
+    ->cron('0 */4 * * *')  // Every 4 hours at :00
+    ->name('calculate_supply_recommendations');
+
+// Sync supply statuses every 30 minutes for active supplies
+Schedule::job(new SyncSupplyStatusesJob())
+    ->everyThirtyMinutes()
+    ->name('sync_supply_statuses');
+
+// Calculate supply analytics daily at 07:00
+Schedule::command('supplies:analytics')
+    ->dailyAt('07:00')
+    ->name('calculate_supply_analytics');

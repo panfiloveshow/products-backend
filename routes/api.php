@@ -329,6 +329,9 @@ Route::prefix('supplies')->middleware('throttle:api')->group(function () {
     // Настройки
     Route::get('/settings', [App\Http\Controllers\Api\SupplyController::class, 'getSettings']);
     Route::put('/settings', [App\Http\Controllers\Api\SupplyController::class, 'updateSettings']);
+    
+    // Аналитика
+    Route::get('/analytics', [App\Http\Controllers\Api\SupplyController::class, 'getAnalytics']);
 });
 
 /*
