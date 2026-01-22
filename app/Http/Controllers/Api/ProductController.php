@@ -77,10 +77,19 @@ class ProductController extends Controller
         $products = $query->paginate($limit, ['*'], 'page', $page);
 
         // Добавляем cost_price из unitEconomics к каждому товару
-        $productsWithCostPrice = collect($products->items())->map(function ($product) {
+        // Исключаем тяжёлые поля для оптимизации размера ответа (ozon_data, characteristics и т.д. могут занимать ~100KB на товар)
+        $heavyFields = ['ozon_data', 'wb_data', 'yandex_data', 'characteristics', 'characteristics_list', 'description'];
+        
+        $productsWithCostPrice = collect($products->items())->map(function ($product) use ($heavyFields) {
             $productArray = $product->toArray();
             $productArray['cost_price'] = $product->unitEconomics->first()?->cost_price ?? null;
             unset($productArray['unit_economics']); // Убираем лишние данные
+            
+            // Убираем тяжёлые поля из списка товаров (они доступны через show endpoint)
+            foreach ($heavyFields as $field) {
+                unset($productArray[$field]);
+            }
+            
             return $productArray;
         });
 
