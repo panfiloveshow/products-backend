@@ -134,6 +134,7 @@ class SupplyRecommendationService
 
         return [
             'integration_id' => $integration->id,
+            'marketplace' => $integration->marketplace,
             'sku' => $sku,
             'ozon_product_id' => $stockInfo['ozon_product_id'] ?? null,
             'product_name' => $stockInfo['product_name'] ?? null,
@@ -167,6 +168,9 @@ class SupplyRecommendationService
             'recommended_create_date' => $recommendedCreateDate,
             'recommended_delivery_date' => $recommendedDeliveryDate,
             'lead_time_days' => $leadTimeDays,
+            'title' => $stockInfo['product_name']
+                ? "Рекомендация поставки: {$stockInfo['product_name']}"
+                : "Рекомендация поставки: {$sku}",
             'state' => SupplyRecommendation::STATE_NEW,
         ];
     }

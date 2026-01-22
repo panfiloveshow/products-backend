@@ -31,6 +31,7 @@ class SupplyRecommendation extends Model
 
     protected $fillable = [
         'integration_id',
+        'marketplace',
         'product_id',
         'sku',
         'ozon_product_id',
