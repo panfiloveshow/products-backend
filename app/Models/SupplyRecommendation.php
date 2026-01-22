@@ -40,6 +40,7 @@ class SupplyRecommendation extends Model
         'cluster_name',
         'warehouse_id',
         'warehouse_name',
+        'title',
         'avg_sales_7d',
         'avg_sales_14d',
         'avg_sales_28d',
