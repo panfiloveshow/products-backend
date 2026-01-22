@@ -128,15 +128,27 @@ Schedule::job(new \App\Jobs\SyncWarehouseSlotsJob())
 |--------------------------------------------------------------------------
 */
 
-// Calculate supply recommendations every 4 hours (after inventory sync)
-Schedule::job(new CalculateSupplyRecommendationsJob())
-    ->cron('0 */4 * * *')  // Every 4 hours at :00
-    ->name('calculate_supply_recommendations');
+// Calculate supply recommendations every 4 hours for all Ozon integrations
+Schedule::call(function () {
+    $integrations = \App\Models\Integration::where('marketplace', 'ozon')
+        ->where('is_active', true)
+        ->pluck('id');
+    
+    foreach ($integrations as $integrationId) {
+        CalculateSupplyRecommendationsJob::dispatch($integrationId);
+    }
+})->cron('0 */4 * * *')->name('calculate_supply_recommendations');
 
 // Sync supply statuses every 30 minutes for active supplies
-Schedule::job(new SyncSupplyStatusesJob())
-    ->everyThirtyMinutes()
-    ->name('sync_supply_statuses');
+Schedule::call(function () {
+    $integrations = \App\Models\Integration::where('marketplace', 'ozon')
+        ->where('is_active', true)
+        ->pluck('id');
+    
+    foreach ($integrations as $integrationId) {
+        SyncSupplyStatusesJob::dispatch($integrationId);
+    }
+})->everyThirtyMinutes()->name('sync_supply_statuses');
 
 // Calculate supply analytics daily at 07:00
 Schedule::command('supplies:analytics')
