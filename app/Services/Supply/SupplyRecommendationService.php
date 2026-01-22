@@ -306,36 +306,31 @@ class SupplyRecommendationService
     }
 
     /**
-     * Получить данные о продажах
+     * Получить данные о продажах из inventory_warehouses
      */
     protected function getSalesData(int $integrationId): array
     {
-        // Агрегируем продажи за 7/14/28 дней (PostgreSQL синтаксис)
-        $date7 = now()->subDays(7)->toDateString();
-        $date14 = now()->subDays(14)->toDateString();
-        $date28 = now()->subDays(28)->toDateString();
-        $date30 = now()->subDays(30)->toDateString();
-
-        $sales = DB::table('sales_daily')
+        // Используем данные о продажах из inventory_warehouses (агрегированные по SKU)
+        $sales = DB::table('inventory_warehouses')
             ->select([
                 'sku',
-                DB::raw("SUM(CASE WHEN date >= '{$date7}' THEN quantity ELSE 0 END) as qty_7d"),
-                DB::raw("SUM(CASE WHEN date >= '{$date14}' THEN quantity ELSE 0 END) as qty_14d"),
-                DB::raw("SUM(CASE WHEN date >= '{$date28}' THEN quantity ELSE 0 END) as qty_28d"),
-                DB::raw("SUM(CASE WHEN date >= '{$date30}' THEN revenue ELSE 0 END) as revenue_30d"),
+                DB::raw('SUM(COALESCE(sales_7_days, 0)) as qty_7d'),
+                DB::raw('SUM(COALESCE(sales_14_days, 0)) as qty_14d'),
+                DB::raw('SUM(COALESCE(sales_28_days, 0)) as qty_28d'),
+                DB::raw('SUM(COALESCE(sales_30_days, 0)) as qty_30d'),
             ])
             ->where('integration_id', $integrationId)
-            ->where('date', '>=', $date30)
+            ->whereNotNull('sku')
             ->groupBy('sku')
             ->get();
 
         $result = [];
         foreach ($sales as $row) {
             $result[$row->sku] = [
-                'avg_7d' => $row->qty_7d / 7,
-                'avg_14d' => $row->qty_14d / 14,
-                'avg_28d' => $row->qty_28d / 28,
-                'revenue_30d' => $row->revenue_30d ?? 0,
+                'avg_7d' => $row->qty_7d > 0 ? $row->qty_7d / 7 : 0,
+                'avg_14d' => $row->qty_14d > 0 ? $row->qty_14d / 14 : 0,
+                'avg_28d' => $row->qty_28d > 0 ? $row->qty_28d / 28 : 0,
+                'revenue_30d' => 0, // Выручка рассчитывается отдельно через unit_economics
             ];
         }
 
