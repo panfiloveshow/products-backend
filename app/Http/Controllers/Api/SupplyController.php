@@ -322,6 +322,61 @@ class SupplyController extends Controller
     }
 
     /**
+     * Создать поставку вручную (без рекомендаций)
+     * 
+     * POST /api/supplies/manual
+     */
+    public function storeManual(Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'integration_id' => 'required|exists:integrations,id',
+            'warehouse_id' => 'required|string',
+            'warehouse_name' => 'nullable|string',
+            'items' => 'required|array|min:1',
+            'items.*.sku' => 'required|string',
+            'items.*.quantity' => 'required|integer|min:1',
+            'items.*.product_name' => 'nullable|string',
+            'supply_method' => 'nullable|in:direct,crossdock,multi_cluster',
+            'delivery_scheme' => 'nullable|in:drop_off,pick_up',
+            'comment' => 'nullable|string|max:1000',
+        ]);
+
+        try {
+            $integration = Integration::findOrFail($validated['integration_id']);
+
+            $supply = $this->supplyService->createManual(
+                $integration,
+                $validated['items'],
+                [
+                    'warehouse_id' => $validated['warehouse_id'],
+                    'warehouse_name' => $validated['warehouse_name'] ?? null,
+                    'supply_method' => $validated['supply_method'] ?? Supply::METHOD_DIRECT,
+                    'delivery_scheme' => $validated['delivery_scheme'] ?? null,
+                    'comment' => $validated['comment'] ?? null,
+                    'user_id' => $request->user()?->id,
+                ]
+            );
+
+            return response()->json([
+                'success' => true,
+                'data' => $supply->load('items'),
+                'message' => 'Поставка создана',
+            ], 201);
+
+        } catch (\Exception $e) {
+            Log::error('Failed to create manual supply', [
+                'error' => $e->getMessage(),
+                'integration_id' => $validated['integration_id'],
+            ]);
+
+            return response()->json([
+                'success' => false,
+                'message' => $e->getMessage(),
+            ], 422);
+        }
+    }
+
+    /**
      * Создать черновик в Ozon
      * 
      * POST /api/supplies/{id}/create-draft

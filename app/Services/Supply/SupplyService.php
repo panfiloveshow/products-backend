@@ -103,6 +103,64 @@ class SupplyService
     }
 
     /**
+     * Создать поставку вручную (без рекомендаций)
+     */
+    public function createManual(
+        Integration $integration,
+        array $items,
+        array $options = []
+    ): Supply {
+        return DB::transaction(function () use ($integration, $items, $options) {
+            // Создаём поставку
+            $supply = Supply::create([
+                'integration_id' => $integration->id,
+                'supply_type' => Supply::TYPE_FBO,
+                'supply_method' => $options['supply_method'] ?? Supply::METHOD_DIRECT,
+                'delivery_scheme' => $options['delivery_scheme'] ?? null,
+                'warehouse_id' => $options['warehouse_id'] ?? null,
+                'warehouse_name' => $options['warehouse_name'] ?? null,
+                'status' => Supply::STATUS_DRAFT,
+                'created_by' => $options['user_id'] ?? null,
+                'responsible_id' => $options['responsible_id'] ?? $options['user_id'] ?? null,
+                'comment' => $options['comment'] ?? null,
+            ]);
+
+            // Добавляем позиции
+            foreach ($items as $item) {
+                // Пытаемся найти продукт в БД для дополнительных данных
+                $product = \App\Models\Product::where('integration_id', $integration->id)
+                    ->where('sku', $item['sku'])
+                    ->first();
+
+                SupplyItem::create([
+                    'supply_id' => $supply->id,
+                    'product_id' => $product?->id,
+                    'sku' => $item['sku'],
+                    'ozon_product_id' => $product?->ozon_product_id ?? $item['ozon_product_id'] ?? null,
+                    'product_name' => $item['product_name'] ?? $product?->name ?? null,
+                    'barcode' => $product?->barcode ?? $item['barcode'] ?? null,
+                    'planned_qty' => $item['quantity'],
+                    'pack_multiple' => $product?->pack_multiple ?? $item['pack_multiple'] ?? 1,
+                    'status' => SupplyItem::STATUS_PENDING,
+                ]);
+            }
+
+            // Пересчитываем итоги
+            $supply->recalculateTotals();
+
+            // Логируем событие
+            $supply->logEvent(SupplyEvent::TYPE_CREATED, [
+                'title' => 'Поставка создана вручную',
+                'description' => "Создана с " . count($items) . " позициями",
+                'initiated_by' => $options['user_id'] ? 'user' : 'system',
+                'user_id' => $options['user_id'] ?? null,
+            ]);
+
+            return $supply;
+        });
+    }
+
+    /**
      * Создать черновик в Ozon
      */
     public function createOzonDraft(Supply $supply): array

@@ -312,6 +312,7 @@ Route::prefix('supplies')->middleware('throttle:api')->group(function () {
     // Поставки CRUD
     Route::get('/', [App\Http\Controllers\Api\SupplyController::class, 'index']);
     Route::post('/', [App\Http\Controllers\Api\SupplyController::class, 'store']);
+    Route::post('/manual', [App\Http\Controllers\Api\SupplyController::class, 'storeManual']);
     Route::get('/stats', [App\Http\Controllers\Api\SupplyController::class, 'getStats']);
     Route::get('/{id}', [App\Http\Controllers\Api\SupplyController::class, 'show']);
     Route::get('/{id}/events', [App\Http\Controllers\Api\SupplyController::class, 'getEvents']);
