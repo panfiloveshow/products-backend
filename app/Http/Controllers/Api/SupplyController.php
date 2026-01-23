@@ -980,42 +980,31 @@ class SupplyController extends Controller
     {
         $result = [];
         
-        // Получаем рекомендации к поставке один раз для всех кластеров
-        $recommendations = [];
-        try {
-            $recommendations = $ozon->supplies()->getSupplyRecommendations(500, 0);
-        } catch (\Exception $e) {
-            Log::warning('Failed to get supply recommendations', [
-                'integration_id' => $integration->id,
-                'error' => $e->getMessage(),
-            ]);
-        }
-        
-        // Считаем общую статистику рекомендаций
-        // Фильтруем только товары с рекомендацией к поставке (recommended_qty > 0 или критичный/красный уровень)
-        $recommendedProducts = array_filter($recommendations, function($item) {
-            return ($item['recommended_qty'] ?? 0) > 0 
-                || in_array($item['priority'] ?? '', ['critical', 'high']);
-        });
-        
-        $totalSkuCount = count($recommendedProducts);
-        $totalUnitsCount = array_sum(array_column($recommendedProducts, 'recommended_qty'));
-        
         foreach ($apiClusters as $cluster) {
             $clusterId = $cluster['id'];
             $warehouseIds = $cluster['warehouse_ids'] ?? [];
             $warehousesCount = $cluster['warehouses_count'] ?? count($warehouseIds);
             
-            // Для каждого кластера показываем общую статистику рекомендаций
-            // (Ozon API не разделяет рекомендации по кластерам, это общие данные по продавцу)
+            // Получаем аналитику по конкретному кластеру
+            $clusterStats = ['sku_count' => 0, 'units_count' => 0];
+            try {
+                $clusterStats = $ozon->supplies()->getClusterStockAnalytics($clusterId);
+            } catch (\Exception $e) {
+                Log::warning('Failed to get cluster stock analytics', [
+                    'integration_id' => $integration->id,
+                    'cluster_id' => $clusterId,
+                    'error' => $e->getMessage(),
+                ]);
+            }
+            
             $result[] = [
                 'id' => $clusterId,
                 'name' => $cluster['name'],
                 'type' => $cluster['type'] ?? null,
                 'warehouses_count' => $warehousesCount,
                 'warehouse_ids' => $warehouseIds,
-                'sku_count' => $totalSkuCount,
-                'units_count' => $totalUnitsCount,
+                'sku_count' => $clusterStats['sku_count'] ?? 0,
+                'units_count' => $clusterStats['units_count'] ?? 0,
                 'days_of_stock' => $periodDays,
             ];
         }

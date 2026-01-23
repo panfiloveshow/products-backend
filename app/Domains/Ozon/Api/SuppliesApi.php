@@ -962,8 +962,79 @@ class SuppliesApi implements SuppliesApiInterface
     }
     
     /**
-     * Получить рекомендации товаров для кластера (legacy метод)
-     * Использует getSupplyRecommendations и фильтрует по наличию на складах кластера
+     * Получить аналитику остатков по кластеру
+     * 
+     * POST /v1/analytics/stocks с фильтром по cluster_ids
+     * Возвращает товары с данными по конкретному кластеру
+     * 
+     * @param string $clusterId ID кластера
+     * @return array ['sku_count' => int, 'units_count' => int, 'items' => array]
+     */
+    public function getClusterStockAnalytics(string $clusterId): array
+    {
+        $response = $this->client->post('/v1/analytics/stocks', [
+            'cluster_ids' => [$clusterId],
+            'limit' => 1000,
+            'offset' => 0,
+        ]);
+
+        if (!$response) {
+            return ['sku_count' => 0, 'units_count' => 0, 'items' => []];
+        }
+
+        $items = $response['items'] ?? [];
+        
+        // Группируем по SKU и считаем рекомендации
+        $skuData = [];
+        foreach ($items as $item) {
+            $sku = (string) ($item['sku'] ?? '');
+            if (empty($sku)) continue;
+            
+            $avgDailySales = $item['ads_cluster'] ?? $item['ads'] ?? 0;
+            $currentStock = $item['valid_stock_count'] ?? $item['available_stock_count'] ?? 0;
+            $daysOfStock = $item['idc_cluster'] ?? $item['idc'] ?? 0;
+            
+            // Рекомендуемое количество: на 28 дней минус текущий запас
+            $recommendedQty = max(0, ceil($avgDailySales * 28) - $currentStock);
+            
+            if (!isset($skuData[$sku])) {
+                $skuData[$sku] = [
+                    'sku' => $sku,
+                    'name' => $item['name'] ?? null,
+                    'offer_id' => $item['offer_id'] ?? null,
+                    'current_stock' => $currentStock,
+                    'avg_daily_sales' => $avgDailySales,
+                    'days_of_stock' => $daysOfStock,
+                    'recommended_qty' => $recommendedQty,
+                    'turnover_grade' => $item['turnover_grade_cluster'] ?? $item['turnover_grade'] ?? null,
+                ];
+            } else {
+                // Суммируем остатки по складам
+                $skuData[$sku]['current_stock'] += $currentStock;
+                // Пересчитываем рекомендацию
+                $totalStock = $skuData[$sku]['current_stock'];
+                $skuData[$sku]['recommended_qty'] = max(0, ceil($avgDailySales * 28) - $totalStock);
+            }
+        }
+        
+        // Фильтруем только товары с рекомендацией к поставке
+        $recommendedItems = array_filter($skuData, function($item) {
+            return ($item['recommended_qty'] ?? 0) > 0 
+                || in_array($item['turnover_grade'] ?? '', ['DEFICIT', 'WAS_DEFICIT']);
+        });
+        
+        $skuCount = count($recommendedItems);
+        $unitsCount = array_sum(array_column($recommendedItems, 'recommended_qty'));
+        
+        return [
+            'sku_count' => $skuCount,
+            'units_count' => $unitsCount,
+            'items' => array_values($recommendedItems),
+        ];
+    }
+    
+    /**
+     * Получить рекомендации товаров для кластера
      * 
      * @param string $clusterId ID кластера
      * @param int $days Период рекомендаций (не используется, для совместимости)
@@ -971,8 +1042,8 @@ class SuppliesApi implements SuppliesApiInterface
      */
     public function getClusterRecommendations(string $clusterId, int $days = 28): array
     {
-        // Получаем все рекомендации
-        return $this->getSupplyRecommendations(100, 0);
+        $analytics = $this->getClusterStockAnalytics($clusterId);
+        return $analytics['items'] ?? [];
     }
 
     /**
