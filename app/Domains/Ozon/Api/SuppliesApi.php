@@ -470,16 +470,26 @@ class SuppliesApi implements SuppliesApiInterface
         $clusters = $response['result']['clusters'] ?? $response['clusters'] ?? [];
         
         return array_map(function ($cluster) {
-            // Считаем количество складов из logistic_clusters
-            $warehousesCount = 0;
-            $warehouseIds = [];
+            // Считаем только склады приёмки (FULL_FILLMENT) — как на Ozon
+            // Типы: FULL_FILLMENT (РФЦ), CROSS_DOCK (кроссдокинг), SORTING_CENTER (сортировка), ORDERS_RECEIVING_POINT (ПВЗ)
+            $acceptingWarehousesCount = 0;
+            $allWarehouseIds = [];
+            $acceptingWarehouseIds = [];
             
             $logisticClusters = $cluster['logistic_clusters'] ?? [];
             foreach ($logisticClusters as $lc) {
                 $warehouses = $lc['warehouses'] ?? [];
-                $warehousesCount += count($warehouses);
                 foreach ($warehouses as $wh) {
-                    $warehouseIds[] = (string) ($wh['warehouse_id'] ?? $wh['id'] ?? null);
+                    $whId = (string) ($wh['warehouse_id'] ?? $wh['id'] ?? null);
+                    $whType = $wh['type'] ?? '';
+                    
+                    $allWarehouseIds[] = $whId;
+                    
+                    // Считаем только склады, принимающие поставки (FULL_FILLMENT и CROSS_DOCK)
+                    if (in_array($whType, ['FULL_FILLMENT', 'CROSS_DOCK'])) {
+                        $acceptingWarehousesCount++;
+                        $acceptingWarehouseIds[] = $whId;
+                    }
                 }
             }
             
@@ -487,8 +497,9 @@ class SuppliesApi implements SuppliesApiInterface
                 'id' => (string) ($cluster['id'] ?? null),
                 'name' => $cluster['name'] ?? null,
                 'type' => $cluster['type'] ?? 'CLUSTER_TYPE_OZON',
-                'warehouses_count' => $warehousesCount,
-                'warehouse_ids' => $warehouseIds,
+                'warehouses_count' => $acceptingWarehousesCount,
+                'warehouse_ids' => $acceptingWarehouseIds,
+                'all_warehouse_ids' => $allWarehouseIds,
                 'is_active' => true,
             ];
         }, $clusters);
