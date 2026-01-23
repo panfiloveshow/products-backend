@@ -997,25 +997,44 @@ class SupplyController extends Controller
         }
         
         // Получаем остатки по складам из нашей БД
+        // В нашей БД warehouse_id — это название склада (ПЕТРОВСКОЕ_РФЦ)
         $warehouseStocks = \App\Models\InventoryWarehouse::where('integration_id', $integration->id)
             ->where('marketplace', 'ozon')
             ->where('quantity', '>', 0)
             ->select('warehouse_id', 'warehouse_name', 'sku', 'quantity', 'average_daily_sales', 'days_of_stock')
             ->get()
-            ->groupBy('warehouse_id');
+            ->groupBy('warehouse_name'); // Группируем по названию склада
         
-        // Создаём маппинг warehouse_id -> cluster_id
-        $warehouseToCluster = [];
+        // Создаём маппинг warehouse_name -> cluster_id
+        // Ozon API возвращает warehouse_ids как числовые ID, но также есть названия в logistic_clusters
+        $warehouseNameToCluster = [];
         foreach ($apiClusters as $cluster) {
-            foreach ($cluster['warehouse_ids'] ?? [] as $whId) {
-                $warehouseToCluster[$whId] = $cluster['id'];
+            $clusterId = $cluster['id'];
+            $clusterName = $cluster['name'] ?? '';
+            
+            // Определяем кластер по ключевым словам в названии склада
+            // Москва: ДОМОДЕДОВО, ХОРУГВИНО, ПЕТРОВСКОЕ, СОФЬИНО, ТВЕРЬ
+            // СПб: СПБ_, ШУШАРЫ, БУГРЫ, КОЛПИНО, ПОРОШКИНО
+            // Екатеринбург: ЕКБ_, ЕКАТЕРИНБУРГ
+            // и т.д.
+            $clusterKeywords = $this->getClusterKeywords($clusterName);
+            foreach ($clusterKeywords as $keyword) {
+                $warehouseNameToCluster[strtoupper($keyword)] = $clusterId;
             }
         }
         
         // Группируем остатки по кластерам
         $clusterStocks = [];
-        foreach ($warehouseStocks as $warehouseId => $stocks) {
-            $clusterId = $warehouseToCluster[$warehouseId] ?? null;
+        foreach ($warehouseStocks as $warehouseName => $stocks) {
+            // Ищем кластер по названию склада
+            $clusterId = null;
+            $upperName = strtoupper($warehouseName);
+            foreach ($warehouseNameToCluster as $keyword => $cId) {
+                if (strpos($upperName, $keyword) !== false) {
+                    $clusterId = $cId;
+                    break;
+                }
+            }
             if (!$clusterId) continue;
             
             if (!isset($clusterStocks[$clusterId])) {
@@ -1084,6 +1103,54 @@ class SupplyController extends Controller
         }
         
         return $result;
+    }
+
+    /**
+     * Получить ключевые слова для определения кластера по названию склада
+     */
+    private function getClusterKeywords(string $clusterName): array
+    {
+        $keywords = [
+            'Москва' => ['ДОМОДЕДОВО', 'ХОРУГВИНО', 'ПЕТРОВСКОЕ', 'СОФЬИНО', 'ПОДОЛЬСК', 'КОЛЕДИНО', 'ЭЛЕКТРОСТАЛЬ', 'ПУШКИНО'],
+            'Санкт-Петербург' => ['СПБ_', 'ШУШАРЫ', 'БУГРЫ', 'КОЛПИНО', 'ПОРОШКИНО', 'ВОЛХОНКА', 'САНКТ_ПЕТЕРБУРГ', 'САНКТ-ПЕТЕРБУРГ'],
+            'Екатеринбург' => ['ЕКБ_', 'ЕКАТЕРИНБУРГ', 'ЕКАТ'],
+            'Новосибирск' => ['НСК_', 'НОВОСИБИРСК'],
+            'Казань' => ['КАЗАНЬ', 'КЗН_'],
+            'Краснодар' => ['КРАСНОДАР', 'КРД_'],
+            'Ростов' => ['РОСТОВ', 'РНД_', 'АКСАЙ'],
+            'Самара' => ['САМАРА', 'СМР_'],
+            'Воронеж' => ['ВОРОНЕЖ', 'ВРН_'],
+            'Нижний Новгород' => ['НИЖНИЙ_НОВГОРОД', 'НН_', 'ДЗЕРЖИНСК'],
+            'Красноярск' => ['КРАСНОЯРСК', 'КРС_'],
+            'Пермь' => ['ПЕРМЬ', 'ПРМ_'],
+            'Уфа' => ['УФА', 'УФ_'],
+            'Челябинск' => ['ЧЕЛЯБИНСК', 'ЧЛБ_'],
+            'Омск' => ['ОМСК', 'ОМС_'],
+            'Волгоград' => ['ВОЛГОГРАД', 'ВЛГ_'],
+            'Тюмень' => ['ТЮМЕНЬ', 'ТМН_'],
+            'Оренбург' => ['ОРЕНБУРГ', 'ОРБ_'],
+            'Тверь' => ['ТВЕРЬ', 'ТВР_'],
+            'Ярославль' => ['ЯРОСЛАВЛЬ', 'ЯРС_'],
+            'Хабаровск' => ['ХАБАРОВСК', 'ХБР_'],
+            'Владивосток' => ['ВЛАДИВОСТОК', 'ВЛД_', 'АРТЕМ'],
+            'Иркутск' => ['ИРКУТСК', 'ИРК_'],
+            'Барнаул' => ['БАРНАУЛ', 'БРН_'],
+            'Невинномысск' => ['НЕВИННОМЫССК', 'НВМ_'],
+            'Дальний Восток' => ['ДАЛЬНИЙ', 'ДВ_'],
+            'Астана' => ['АСТАНА', 'АСТ_'],
+            'Алматы' => ['АЛМАТЫ', 'АЛМ_'],
+        ];
+        
+        foreach ($keywords as $key => $values) {
+            if (stripos($clusterName, $key) !== false) {
+                return $values;
+            }
+        }
+        
+        // Если не нашли — возвращаем первое слово названия кластера
+        $firstWord = explode(' ', $clusterName)[0] ?? '';
+        $firstWord = explode(',', $firstWord)[0] ?? '';
+        return $firstWord ? [strtoupper($firstWord)] : [];
     }
 
     /**
