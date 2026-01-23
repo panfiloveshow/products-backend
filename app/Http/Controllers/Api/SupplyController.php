@@ -974,59 +974,50 @@ class SupplyController extends Controller
     }
 
     /**
-     * Обогатить кластеры реальными данными из Ozon API
+     * Обогатить кластеры реальными данными из внутренней БД
      * 
      * Логика расчёта рекомендаций по кластерам:
-     * 1. Получаем общие рекомендации из Ozon API (товары с низким запасом)
-     * 2. Для каждого кластера считаем, какие товары нужно поставить на его склады
-     *    на основе текущих остатков и средних продаж
+     * 1. Берём данные из InventoryWarehouse (продажи, оборачиваемость, остатки)
+     * 2. Маппим склады к кластерам по ключевым словам в названиях
+     * 3. Для каждого кластера считаем товары с низким запасом (< periodDays)
+     * 4. Рекомендуемое количество = (avg_daily_sales * periodDays) - current_stock
      */
     private function enrichClustersWithRealData(Integration $integration, $ozon, array $apiClusters, int $periodDays): array
     {
         $result = [];
         
-        // Получаем общие рекомендации один раз
-        $allRecommendations = [];
-        try {
-            $allRecommendations = $ozon->supplies()->getSupplyRecommendations(1000, 0);
-        } catch (\Exception $e) {
-            Log::warning('Failed to get supply recommendations', [
-                'integration_id' => $integration->id,
-                'error' => $e->getMessage(),
-            ]);
-        }
-        
-        // Получаем остатки по складам из нашей БД
-        // В нашей БД warehouse_id — это название склада (ПЕТРОВСКОЕ_РФЦ)
-        $warehouseStocks = \App\Models\InventoryWarehouse::where('integration_id', $integration->id)
+        // Получаем ВСЕ данные по складам из нашей БД (включая товары с 0 остатком но с продажами)
+        $warehouseData = \App\Models\InventoryWarehouse::where('integration_id', $integration->id)
             ->where('marketplace', 'ozon')
-            ->where('quantity', '>', 0)
-            ->select('warehouse_id', 'warehouse_name', 'sku', 'quantity', 'average_daily_sales', 'days_of_stock')
+            ->select(
+                'sku', 
+                'warehouse_name', 
+                'quantity', 
+                'reserved',
+                'sales_7_days',
+                'sales_14_days', 
+                'sales_30_days',
+                'average_daily_sales', 
+                'days_of_stock',
+                'turnover_days'
+            )
             ->get()
-            ->groupBy('warehouse_name'); // Группируем по названию склада
+            ->groupBy('warehouse_name');
         
         // Создаём маппинг warehouse_name -> cluster_id
-        // Ozon API возвращает warehouse_ids как числовые ID, но также есть названия в logistic_clusters
         $warehouseNameToCluster = [];
         foreach ($apiClusters as $cluster) {
             $clusterId = $cluster['id'];
             $clusterName = $cluster['name'] ?? '';
-            
-            // Определяем кластер по ключевым словам в названии склада
-            // Москва: ДОМОДЕДОВО, ХОРУГВИНО, ПЕТРОВСКОЕ, СОФЬИНО, ТВЕРЬ
-            // СПб: СПБ_, ШУШАРЫ, БУГРЫ, КОЛПИНО, ПОРОШКИНО
-            // Екатеринбург: ЕКБ_, ЕКАТЕРИНБУРГ
-            // и т.д.
             $clusterKeywords = $this->getClusterKeywords($clusterName);
             foreach ($clusterKeywords as $keyword) {
                 $warehouseNameToCluster[strtoupper($keyword)] = $clusterId;
             }
         }
         
-        // Группируем остатки по кластерам
-        $clusterStocks = [];
-        foreach ($warehouseStocks as $warehouseName => $stocks) {
-            // Ищем кластер по названию склада
+        // Группируем данные по кластерам
+        $clusterData = [];
+        foreach ($warehouseData as $warehouseName => $stocks) {
             $clusterId = null;
             $upperName = strtoupper($warehouseName);
             foreach ($warehouseNameToCluster as $keyword => $cId) {
@@ -1037,20 +1028,35 @@ class SupplyController extends Controller
             }
             if (!$clusterId) continue;
             
-            if (!isset($clusterStocks[$clusterId])) {
-                $clusterStocks[$clusterId] = [];
+            if (!isset($clusterData[$clusterId])) {
+                $clusterData[$clusterId] = [];
             }
             
             foreach ($stocks as $stock) {
                 $sku = $stock->sku;
-                if (!isset($clusterStocks[$clusterId][$sku])) {
-                    $clusterStocks[$clusterId][$sku] = [
+                $avgSales = (float) ($stock->average_daily_sales ?? 0);
+                $quantity = (int) ($stock->quantity ?? 0);
+                $daysOfStock = (int) ($stock->days_of_stock ?? 0);
+                $sales30 = (int) ($stock->sales_30_days ?? 0);
+                
+                if (!isset($clusterData[$clusterId][$sku])) {
+                    $clusterData[$clusterId][$sku] = [
                         'quantity' => 0,
-                        'avg_sales' => $stock->average_daily_sales ?? 0,
-                        'days_of_stock' => $stock->days_of_stock ?? 0,
+                        'avg_daily_sales' => $avgSales,
+                        'days_of_stock' => $daysOfStock,
+                        'sales_30_days' => $sales30,
                     ];
                 }
-                $clusterStocks[$clusterId][$sku]['quantity'] += $stock->quantity;
+                
+                // Суммируем остатки по всем складам кластера
+                $clusterData[$clusterId][$sku]['quantity'] += $quantity;
+                // Берём максимальные продажи (товар мог продаваться на разных складах)
+                if ($avgSales > $clusterData[$clusterId][$sku]['avg_daily_sales']) {
+                    $clusterData[$clusterId][$sku]['avg_daily_sales'] = $avgSales;
+                }
+                if ($sales30 > $clusterData[$clusterId][$sku]['sales_30_days']) {
+                    $clusterData[$clusterId][$sku]['sales_30_days'] = $sales30;
+                }
             }
         }
         
@@ -1059,8 +1065,7 @@ class SupplyController extends Controller
             $warehouseIds = $cluster['warehouse_ids'] ?? [];
             $warehousesCount = $cluster['warehouses_count'] ?? count($warehouseIds);
             
-            // Считаем рекомендации для этого кластера
-            $clusterSkuData = $clusterStocks[$clusterId] ?? [];
+            $clusterSkuData = $clusterData[$clusterId] ?? [];
             
             // Если нет данных по кластеру — показываем 0
             if (empty($clusterSkuData)) {
@@ -1077,21 +1082,31 @@ class SupplyController extends Controller
                 continue;
             }
             
-            // Фильтруем товары, которым нужна поставка в этот кластер
-            // Только товары, которые УЖЕ есть на складах этого кластера
+            // Считаем рекомендации: товары с запасом < periodDays
             $recommendedSkus = [];
             $totalUnits = 0;
             
-            foreach ($clusterSkuData as $sku => $stockData) {
-                $currentStock = $stockData['quantity'] ?? 0;
-                $avgSales = $stockData['avg_sales'] ?? 0;
-                $daysOfStock = $stockData['days_of_stock'] ?? 0;
+            foreach ($clusterSkuData as $sku => $data) {
+                $currentStock = $data['quantity'];
+                $avgSales = $data['avg_daily_sales'];
+                $daysOfStock = $data['days_of_stock'];
+                $sales30 = $data['sales_30_days'];
                 
-                // Рекомендуемое количество: на 28 дней минус текущий запас
-                $neededQty = max(0, ceil($avgSales * $periodDays) - $currentStock);
+                // Если нет средних продаж — рассчитываем из sales_30_days
+                if ($avgSales <= 0 && $sales30 > 0) {
+                    $avgSales = $sales30 / 30;
+                }
                 
-                // Добавляем в рекомендации если нужна поставка (запас < 28 дней)
-                if ($neededQty > 0 || $daysOfStock < $periodDays) {
+                // Рекомендуемое количество: на periodDays дней минус текущий запас
+                $neededForPeriod = ceil($avgSales * $periodDays);
+                $neededQty = max(0, $neededForPeriod - $currentStock);
+                
+                // Добавляем в рекомендации если:
+                // 1. Нужна поставка (neededQty > 0)
+                // 2. ИЛИ запас меньше периода И есть продажи
+                $needsSupply = $neededQty > 0 || ($daysOfStock < $periodDays && $avgSales > 0);
+                
+                if ($needsSupply) {
                     $recommendedSkus[] = $sku;
                     $totalUnits += $neededQty;
                 }
@@ -1104,7 +1119,7 @@ class SupplyController extends Controller
                 'warehouses_count' => $warehousesCount,
                 'warehouse_ids' => $warehouseIds,
                 'sku_count' => count(array_unique($recommendedSkus)),
-                'units_count' => $totalUnits,
+                'units_count' => (int) $totalUnits,
                 'days_of_stock' => $periodDays,
             ];
         }
