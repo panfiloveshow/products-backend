@@ -888,41 +888,91 @@ class SuppliesApi implements SuppliesApiInterface
     }
 
     /**
-     * Получить рекомендации товаров для кластера
+     * Получить рекомендации товаров для поставки
      * 
-     * POST /v1/supply/recommendations
+     * Использует /v1/analytics/turnover/stocks для получения товаров с низким запасом
+     * Сортирует по уровню запаса (критичные первыми)
      * 
-     * @param string $clusterId ID кластера
-     * @param int $days Период рекомендаций (по умолчанию 28 дней)
-     * @return array Список рекомендованных товаров
+     * @param int $limit Количество товаров (по умолчанию 100)
+     * @param int $offset Смещение для пагинации
+     * @return array Список товаров с рекомендациями к поставке
      */
-    public function getClusterRecommendations(string $clusterId, int $days = 28): array
+    public function getSupplyRecommendations(int $limit = 100, int $offset = 0): array
     {
-        $response = $this->client->post('/v1/supply/recommendations', [
-            'macrolocal_cluster_id' => $clusterId,
-            'period_days' => $days,
+        $response = $this->client->post('/v1/analytics/turnover/stocks', [
+            'limit' => min($limit, 1000),
+            'offset' => $offset,
         ]);
 
         if (!$response) {
             return [];
         }
 
-        $items = $response['result']['items'] ?? $response['items'] ?? [];
+        $items = $response['items'] ?? [];
         
-        return array_map(fn($item) => [
-            'sku' => $item['offer_id'] ?? $item['sku'] ?? null,
-            'product_id' => $item['product_id'] ?? null,
-            'name' => $item['name'] ?? null,
-            'barcode' => $item['barcode'] ?? null,
-            'recommended_qty' => $item['recommended_quantity'] ?? $item['quantity'] ?? 0,
-            'volume' => $item['volume'] ?? 0,
-            'current_stock' => $item['stock'] ?? $item['current_stock'] ?? 0,
-            'in_transit' => $item['in_transit'] ?? 0,
-            'avg_sales_28d' => $item['avg_daily_sales'] ?? $item['average_sales'] ?? 0,
-            'days_of_stock' => $item['days_of_stock'] ?? 0,
-            'priority' => $item['priority'] ?? 'normal',
-            'is_sortable' => $item['is_sortable'] ?? true,
-        ], $items);
+        // Приоритет по уровню запаса
+        $gradePriority = [
+            'GRADES_CRITICAL' => 1,
+            'GRADES_RED' => 2,
+            'GRADES_YELLOW' => 3,
+            'GRADES_GREEN' => 4,
+            'GRADES_NOSALES' => 5,
+            'GRADES_NONE' => 6,
+        ];
+        
+        // Сортируем по критичности запаса
+        usort($items, function($a, $b) use ($gradePriority) {
+            $priorityA = $gradePriority[$a['idc_grade'] ?? 'GRADES_NONE'] ?? 6;
+            $priorityB = $gradePriority[$b['idc_grade'] ?? 'GRADES_NONE'] ?? 6;
+            return $priorityA - $priorityB;
+        });
+        
+        return array_map(function($item) {
+            $avgDailySales = $item['ads'] ?? 0;
+            $currentStock = $item['current_stock'] ?? 0;
+            $daysOfStock = $item['idc'] ?? 0;
+            
+            // Рекомендуемое количество: на 28 дней минус текущий запас
+            $recommendedQty = max(0, ceil($avgDailySales * 28) - $currentStock);
+            
+            // Определяем приоритет на основе уровня запаса
+            $grade = $item['idc_grade'] ?? 'GRADES_NONE';
+            $priority = match($grade) {
+                'GRADES_CRITICAL' => 'critical',
+                'GRADES_RED' => 'high',
+                'GRADES_YELLOW' => 'medium',
+                'GRADES_GREEN' => 'low',
+                default => 'none',
+            };
+            
+            return [
+                'sku' => (string) ($item['sku'] ?? ''),
+                'offer_id' => $item['offer_id'] ?? null,
+                'name' => $item['name'] ?? null,
+                'current_stock' => $currentStock,
+                'avg_daily_sales' => round($avgDailySales, 2),
+                'days_of_stock' => round($daysOfStock, 1),
+                'turnover_days' => round($item['turnover'] ?? 0, 1),
+                'recommended_qty' => $recommendedQty,
+                'stock_grade' => $grade,
+                'turnover_grade' => $item['turnover_grade'] ?? 'GRADES_NONE',
+                'priority' => $priority,
+            ];
+        }, $items);
+    }
+    
+    /**
+     * Получить рекомендации товаров для кластера (legacy метод)
+     * Использует getSupplyRecommendations и фильтрует по наличию на складах кластера
+     * 
+     * @param string $clusterId ID кластера
+     * @param int $days Период рекомендаций (не используется, для совместимости)
+     * @return array Список рекомендованных товаров
+     */
+    public function getClusterRecommendations(string $clusterId, int $days = 28): array
+    {
+        // Получаем все рекомендации
+        return $this->getSupplyRecommendations(100, 0);
     }
 
     /**
