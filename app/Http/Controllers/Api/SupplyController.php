@@ -1062,27 +1062,40 @@ class SupplyController extends Controller
             // Считаем рекомендации для этого кластера
             $clusterSkuData = $clusterStocks[$clusterId] ?? [];
             
+            // Если нет данных по кластеру — показываем 0
+            if (empty($clusterSkuData)) {
+                $result[] = [
+                    'id' => $clusterId,
+                    'name' => $cluster['name'],
+                    'type' => $cluster['type'] ?? null,
+                    'warehouses_count' => $warehousesCount,
+                    'warehouse_ids' => $warehouseIds,
+                    'sku_count' => 0,
+                    'units_count' => 0,
+                    'days_of_stock' => $periodDays,
+                ];
+                continue;
+            }
+            
             // Фильтруем товары, которым нужна поставка в этот кластер
-            // (запас < 28 дней или нет остатков)
+            // Только товары, которые УЖЕ есть на складах этого кластера
             $recommendedSkus = [];
             $totalUnits = 0;
             
-            foreach ($allRecommendations as $rec) {
-                $sku = $rec['sku'] ?? '';
-                $avgSales = $rec['avg_daily_sales'] ?? 0;
-                $currentStock = $clusterSkuData[$sku]['quantity'] ?? 0;
+            foreach ($clusterSkuData as $sku => $stockData) {
+                $currentStock = $stockData['quantity'] ?? 0;
+                $avgSales = $stockData['avg_sales'] ?? 0;
+                $daysOfStock = $stockData['days_of_stock'] ?? 0;
                 
-                // Рекомендуемое количество для этого кластера
+                // Рекомендуемое количество: на 28 дней минус текущий запас
                 $neededQty = max(0, ceil($avgSales * $periodDays) - $currentStock);
                 
-                if ($neededQty > 0 || ($rec['priority'] ?? '') === 'critical') {
+                // Добавляем в рекомендации если нужна поставка (запас < 28 дней)
+                if ($neededQty > 0 || $daysOfStock < $periodDays) {
                     $recommendedSkus[] = $sku;
                     $totalUnits += $neededQty;
                 }
             }
-            
-            // Если нет данных по кластеру — НЕ показываем общие рекомендации
-            // Каждый кластер должен показывать только свои данные
             
             $result[] = [
                 'id' => $clusterId,
