@@ -310,6 +310,12 @@ Route::prefix('supplies')->middleware('throttle:api')->group(function () {
     Route::post('/recommendations/{id}/reject', [App\Http\Controllers\Api\SupplyController::class, 'rejectRecommendation']);
     Route::post('/recommendations/{id}/postpone', [App\Http\Controllers\Api\SupplyController::class, 'postponeRecommendation']);
     
+    // Слоты приёмки (новый flow фронтенда)
+    Route::get('/slots', [App\Http\Controllers\Api\SupplyController::class, 'getSlots']);
+    Route::post('/sync-slots', [App\Http\Controllers\Api\SupplyController::class, 'syncSlots']);
+    Route::get('/products-for-supply', [App\Http\Controllers\Api\SupplyController::class, 'getProductsForSupply']);
+    Route::post('/create-with-slot', [App\Http\Controllers\Api\SupplyController::class, 'createWithSlot']);
+    
     // Поставки CRUD
     Route::get('/', [App\Http\Controllers\Api\SupplyController::class, 'index']);
     Route::post('/', [App\Http\Controllers\Api\SupplyController::class, 'store']);

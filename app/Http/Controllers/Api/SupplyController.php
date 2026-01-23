@@ -771,6 +771,483 @@ class SupplyController extends Controller
         ]);
     }
 
+    // ========================================================================
+    // СЛОТЫ И СОЗДАНИЕ ПОСТАВКИ СО СЛОТОМ (новый flow фронтенда)
+    // ========================================================================
+
+    /**
+     * Получить доступные слоты приёмки
+     * 
+     * GET /api/supplies/slots
+     */
+    public function getSlots(Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'integration_id' => 'required|exists:integrations,id',
+            'date_from' => 'nullable|date',
+            'date_to' => 'nullable|date',
+            'warehouse_id' => 'nullable|string',
+        ]);
+
+        $integration = Integration::findOrFail($validated['integration_id']);
+
+        // Проверяем что это Ozon
+        if ($integration->marketplace !== 'ozon') {
+            return response()->json([
+                'success' => false,
+                'message' => 'Слоты доступны только для Ozon',
+            ], 422);
+        }
+
+        $dateFrom = $validated['date_from'] ?? now()->toDateString();
+        $dateTo = $validated['date_to'] ?? now()->addDays(14)->toDateString();
+
+        // Получаем слоты из БД
+        $query = \App\Models\WarehouseSlot::query()
+            ->where('marketplace', 'ozon')
+            ->where('date', '>=', $dateFrom)
+            ->where('date', '<=', $dateTo)
+            ->orderBy('date')
+            ->orderBy('time_from');
+
+        if (!empty($validated['warehouse_id'])) {
+            $query->where('warehouse_id', $validated['warehouse_id']);
+        }
+
+        $slots = $query->get();
+
+        // Если слотов нет — пробуем синхронизировать или возвращаем fallback
+        if ($slots->isEmpty()) {
+            // Запускаем синхронизацию в фоне
+            \App\Jobs\SyncWarehouseSlotsJob::dispatch($integration->id);
+
+            // Возвращаем fallback-слоты для демонстрации
+            $fallbackSlots = $this->generateFallbackSlots($dateFrom, $dateTo);
+            
+            return response()->json([
+                'success' => true,
+                'data' => $fallbackSlots,
+                'meta' => [
+                    'synced_at' => null,
+                    'total' => count($fallbackSlots),
+                    'source' => 'fallback',
+                    'message' => 'Синхронизация слотов запущена. Обновите страницу через минуту.',
+                ],
+            ]);
+        }
+
+        $data = $slots->map(fn($slot) => [
+            'id' => $slot->external_slot_id ?? $slot->id,
+            'date' => $slot->date->toDateString(),
+            'time_from' => substr($slot->time_from, 0, 5),
+            'time_to' => substr($slot->time_to, 0, 5),
+            'warehouse_id' => $slot->warehouse_id,
+            'warehouse_name' => $slot->warehouse_name,
+            'is_available' => $slot->is_available && !$slot->booked_by_supply_id,
+            'capacity' => $slot->capacity,
+            'capacity_used' => $slot->capacity_used ?? 0,
+            'coefficient' => (float) ($slot->coefficient ?? 1.0),
+        ]);
+
+        return response()->json([
+            'success' => true,
+            'data' => $data,
+            'meta' => [
+                'synced_at' => $slots->first()?->synced_at?->toIso8601String(),
+                'total' => $data->count(),
+            ],
+        ]);
+    }
+
+    /**
+     * Получить товары для создания поставки
+     * 
+     * GET /api/supplies/products-for-supply
+     */
+    public function getProductsForSupply(Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'integration_id' => 'required|exists:integrations,id',
+            'warehouse_id' => 'nullable|string',
+        ]);
+
+        $integration = Integration::findOrFail($validated['integration_id']);
+
+        // Получаем товары с остатками и продажами
+        $products = \App\Models\Product::where('integration_id', $integration->id)
+            ->where('is_active', true)
+            ->with(['inventoryWarehouses' => function ($q) use ($validated) {
+                $q->where('marketplace', 'ozon');
+                if (!empty($validated['warehouse_id'])) {
+                    $q->where('warehouse_id', $validated['warehouse_id']);
+                }
+            }])
+            ->get();
+
+        $data = $products->map(function ($product) {
+            // Суммируем остатки по всем складам
+            $inventory = $product->inventoryWarehouses;
+            $currentStock = $inventory->sum('quantity');
+            $inTransit = $inventory->sum('in_transit') + $inventory->sum('in_way_to_client');
+            
+            // Продажи
+            $avgSales7d = $inventory->avg('sales_7_days') ?? 0;
+            $avgSales14d = $inventory->avg('sales_14_days') ?? 0;
+            $avgSales28d = $inventory->avg('sales_30_days') ?? 0;
+            
+            // Дней запаса
+            $daysOfStock = $avgSales7d > 0 
+                ? (int) round($currentStock / $avgSales7d) 
+                : ($currentStock > 0 ? 999 : 0);
+
+            // Рекомендуемое количество (на 14 дней продаж минус текущий запас)
+            $targetDays = 14;
+            $recommendedQty = max(0, (int) ceil($avgSales7d * $targetDays - $currentStock - $inTransit));
+
+            // Приоритет
+            $priority = match (true) {
+                $daysOfStock <= 3 => 'A',
+                $daysOfStock <= 7 => 'B',
+                default => 'C',
+            };
+
+            return [
+                'id' => $product->id,
+                'sku' => $product->sku,
+                'ozon_product_id' => $product->ozon_product_id ?? $product->marketplace_id,
+                'name' => $product->name,
+                'current_stock' => $currentStock,
+                'in_transit' => $inTransit,
+                'avg_sales_7d' => round($avgSales7d, 1),
+                'avg_sales_14d' => round($avgSales14d, 1),
+                'avg_sales_28d' => round($avgSales28d, 1),
+                'days_of_stock' => min($daysOfStock, 999),
+                'recommended_qty' => $recommendedQty,
+                'min_order_qty' => $product->min_order_qty ?? 1,
+                'pack_multiple' => $product->pack_multiple ?? 1,
+                'priority' => $priority,
+                'oos_risk' => $daysOfStock <= 3,
+            ];
+        })
+        ->filter(fn($p) => $p['current_stock'] > 0 || $p['recommended_qty'] > 0 || $p['oos_risk'])
+        ->sortBy('days_of_stock')
+        ->values();
+
+        return response()->json([
+            'success' => true,
+            'data' => $data,
+        ]);
+    }
+
+    /**
+     * Создать поставку с привязкой к слоту
+     * 
+     * POST /api/supplies/create-with-slot
+     */
+    public function createWithSlot(Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'integration_id' => 'required|exists:integrations,id',
+            'slot_id' => 'required|string',
+            'items' => 'required|array|min:1',
+            'items.*.sku' => 'required|string',
+            'items.*.qty' => 'required|integer|min:1',
+            'name' => 'nullable|string|max:255',
+            'comment' => 'nullable|string|max:1000',
+        ]);
+
+        $integration = Integration::findOrFail($validated['integration_id']);
+
+        // 1. Найти и проверить слот
+        $slot = \App\Models\WarehouseSlot::where(function ($q) use ($validated) {
+                $q->where('external_slot_id', $validated['slot_id'])
+                  ->orWhere('id', $validated['slot_id']);
+            })
+            ->where('marketplace', 'ozon')
+            ->first();
+
+        if (!$slot) {
+            return response()->json([
+                'success' => false,
+                'error' => [
+                    'code' => 'SLOT_NOT_FOUND',
+                    'message' => 'Слот не найден',
+                ],
+            ], 404);
+        }
+
+        if (!$slot->is_available || $slot->booked_by_supply_id) {
+            return response()->json([
+                'success' => false,
+                'error' => [
+                    'code' => 'SLOT_NOT_AVAILABLE',
+                    'message' => 'Выбранный слот уже занят или недоступен',
+                ],
+            ], 422);
+        }
+
+        if ($slot->date->isPast()) {
+            return response()->json([
+                'success' => false,
+                'error' => [
+                    'code' => 'SLOT_EXPIRED',
+                    'message' => 'Слот в прошлом',
+                ],
+            ], 422);
+        }
+
+        // 2. Валидация товаров
+        $invalidItems = [];
+        $validItems = [];
+
+        foreach ($validated['items'] as $item) {
+            $product = \App\Models\Product::where('integration_id', $integration->id)
+                ->where('sku', $item['sku'])
+                ->first();
+
+            if (!$product) {
+                $invalidItems[] = [
+                    'sku' => $item['sku'],
+                    'reason' => 'Товар не найден',
+                ];
+                continue;
+            }
+
+            // Проверка кратности
+            $packMultiple = $product->pack_multiple ?? 1;
+            if ($packMultiple > 1 && $item['qty'] % $packMultiple !== 0) {
+                $invalidItems[] = [
+                    'sku' => $item['sku'],
+                    'reason' => "Количество должно быть кратно {$packMultiple}",
+                ];
+                continue;
+            }
+
+            $validItems[] = [
+                'product' => $product,
+                'sku' => $item['sku'],
+                'quantity' => $item['qty'],
+            ];
+        }
+
+        if (!empty($invalidItems)) {
+            return response()->json([
+                'success' => false,
+                'error' => [
+                    'code' => 'INVALID_ITEMS',
+                    'message' => 'Некоторые товары недоступны для поставки',
+                    'details' => $invalidItems,
+                ],
+            ], 422);
+        }
+
+        // 3. Создать поставку
+        try {
+            $supplyName = $validated['name'] 
+                ?? "Поставка {$slot->date->format('d M')} {$slot->time_from}";
+
+            $supply = \DB::transaction(function () use ($integration, $slot, $validItems, $supplyName, $validated) {
+                // Создаём поставку
+                $supply = Supply::create([
+                    'integration_id' => $integration->id,
+                    'supply_type' => Supply::TYPE_FBO,
+                    'supply_method' => Supply::METHOD_DIRECT,
+                    'warehouse_id' => $slot->warehouse_id,
+                    'warehouse_name' => $slot->warehouse_name,
+                    'timeslot_id' => $slot->external_slot_id ?? $slot->id,
+                    'timeslot_from' => $slot->from_datetime ?? $slot->date->setTimeFromTimeString($slot->time_from),
+                    'timeslot_to' => $slot->to_datetime ?? $slot->date->setTimeFromTimeString($slot->time_to),
+                    'planned_delivery_date' => $slot->date,
+                    'status' => Supply::STATUS_DRAFT,
+                    'comment' => $validated['comment'] ?? null,
+                    'created_by' => auth()->id(),
+                ]);
+
+                // Добавляем позиции
+                foreach ($validItems as $item) {
+                    \App\Models\SupplyItem::create([
+                        'supply_id' => $supply->id,
+                        'product_id' => $item['product']->id,
+                        'sku' => $item['sku'],
+                        'ozon_product_id' => $item['product']->ozon_product_id ?? $item['product']->marketplace_id,
+                        'product_name' => $item['product']->name,
+                        'barcode' => $item['product']->barcode,
+                        'planned_qty' => $item['quantity'],
+                        'pack_multiple' => $item['product']->pack_multiple ?? 1,
+                        'status' => \App\Models\SupplyItem::STATUS_PENDING,
+                    ]);
+                }
+
+                // Пересчитываем итоги
+                $supply->recalculateTotals();
+
+                // Бронируем слот
+                $slot->update([
+                    'booked_by_supply_id' => $supply->id,
+                    'booked_at' => now(),
+                    'is_available' => false,
+                ]);
+
+                // Логируем событие
+                $supply->logEvent(\App\Models\SupplyEvent::TYPE_CREATED, [
+                    'title' => 'Поставка создана со слотом',
+                    'description' => "Слот: {$slot->date->format('d.m.Y')} {$slot->time_from}-{$slot->time_to}",
+                ]);
+
+                return $supply;
+            });
+
+            return response()->json([
+                'success' => true,
+                'data' => [
+                    'id' => $supply->id,
+                    'name' => $supplyName,
+                    'status' => $supply->status,
+                    'ozon_supply_id' => $supply->ozon_supply_id,
+                    'slot' => [
+                        'id' => $slot->external_slot_id ?? $slot->id,
+                        'date' => $slot->date->toDateString(),
+                        'time_from' => substr($slot->time_from, 0, 5),
+                        'time_to' => substr($slot->time_to, 0, 5),
+                        'warehouse_name' => $slot->warehouse_name,
+                        'is_booked' => true,
+                    ],
+                    'items_count' => count($validItems),
+                    'total_qty' => collect($validItems)->sum('quantity'),
+                    'created_at' => $supply->created_at->toIso8601String(),
+                ],
+                'message' => 'Поставка создана. Слот забронирован.',
+            ], 201);
+
+        } catch (\Exception $e) {
+            Log::error('Failed to create supply with slot', [
+                'error' => $e->getMessage(),
+                'integration_id' => $integration->id,
+                'slot_id' => $validated['slot_id'],
+            ]);
+
+            return response()->json([
+                'success' => false,
+                'error' => [
+                    'code' => 'CREATE_FAILED',
+                    'message' => 'Не удалось создать поставку: ' . $e->getMessage(),
+                ],
+            ], 500);
+        }
+    }
+
+    /**
+     * Синхронизировать слоты с Ozon
+     * 
+     * POST /api/supplies/sync-slots
+     */
+    public function syncSlots(Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'integration_id' => 'required|exists:integrations,id',
+            'async' => 'nullable|boolean',
+        ]);
+
+        $integration = Integration::findOrFail($validated['integration_id']);
+
+        if ($integration->marketplace !== 'ozon') {
+            return response()->json([
+                'success' => false,
+                'message' => 'Синхронизация слотов доступна только для Ozon',
+            ], 422);
+        }
+
+        if ($request->boolean('async', true)) {
+            \App\Jobs\SyncWarehouseSlotsJob::dispatch($integration->id);
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Синхронизация запущена',
+                'job_id' => 'job_' . uniqid(),
+            ]);
+        }
+
+        // Синхронная синхронизация
+        try {
+            $job = new \App\Jobs\SyncWarehouseSlotsJob($integration->id);
+            $job->handle();
+
+            $slotsCount = \App\Models\WarehouseSlot::where('marketplace', 'ozon')
+                ->where('synced_at', '>=', now()->subMinutes(5))
+                ->count();
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Синхронизация завершена',
+                'data' => [
+                    'slots_synced' => $slotsCount,
+                ],
+            ]);
+
+        } catch (\Exception $e) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Ошибка синхронизации: ' . $e->getMessage(),
+            ], 500);
+        }
+    }
+
+    /**
+     * Генерация fallback слотов для демонстрации
+     */
+    private function generateFallbackSlots(string $dateFrom, string $dateTo): array
+    {
+        $slots = [];
+        $startDate = \Carbon\Carbon::parse($dateFrom);
+        $endDate = \Carbon\Carbon::parse($dateTo);
+        
+        $warehouses = [
+            ['id' => '22655170176000', 'name' => 'Хоругвино'],
+            ['id' => '22655170177000', 'name' => 'Коледино'],
+        ];
+
+        while ($startDate <= $endDate) {
+            // Пропускаем выходные
+            if (!$startDate->isWeekend()) {
+                foreach ($warehouses as $warehouse) {
+                    // Утренний слот
+                    $slots[] = [
+                        'id' => 'demo_' . $startDate->format('Ymd') . '_' . $warehouse['id'] . '_am',
+                        'date' => $startDate->toDateString(),
+                        'time_from' => '09:00',
+                        'time_to' => '12:00',
+                        'warehouse_id' => $warehouse['id'],
+                        'warehouse_name' => $warehouse['name'],
+                        'is_available' => true,
+                        'capacity' => 100,
+                        'capacity_used' => rand(20, 60),
+                        'coefficient' => rand(0, 1) ? 1.0 : 1.5,
+                        'is_demo' => true,
+                    ];
+
+                    // Дневной слот
+                    $slots[] = [
+                        'id' => 'demo_' . $startDate->format('Ymd') . '_' . $warehouse['id'] . '_pm',
+                        'date' => $startDate->toDateString(),
+                        'time_from' => '14:00',
+                        'time_to' => '17:00',
+                        'warehouse_id' => $warehouse['id'],
+                        'warehouse_name' => $warehouse['name'],
+                        'is_available' => true,
+                        'capacity' => 100,
+                        'capacity_used' => rand(30, 80),
+                        'coefficient' => rand(0, 1) ? 1.0 : 2.0,
+                        'is_demo' => true,
+                    ];
+                }
+            }
+
+            $startDate->addDay();
+        }
+
+        return $slots;
+    }
+
     /**
      * Рассчитать базовую аналитику на лету
      */
