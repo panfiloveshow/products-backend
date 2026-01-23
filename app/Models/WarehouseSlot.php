@@ -36,6 +36,7 @@ class WarehouseSlot extends Model
         'storage_coefficient',
         'delivery_coefficient',
         'booked_by_shipment_id',
+        'booked_by_supply_id',
         'booked_at',
         'synced_at',
     ];
@@ -63,6 +64,11 @@ class WarehouseSlot extends Model
         return $this->belongsTo(Shipment::class, 'booked_by_shipment_id');
     }
 
+    public function supply(): BelongsTo
+    {
+        return $this->belongsTo(Supply::class, 'booked_by_supply_id');
+    }
+
     public function scopeMarketplace($query, string $marketplace)
     {
         return $query->where('marketplace', $marketplace);
@@ -76,7 +82,8 @@ class WarehouseSlot extends Model
     public function scopeAvailable($query)
     {
         return $query->where('is_available', true)
-            ->whereNull('booked_by_shipment_id');
+            ->whereNull('booked_by_shipment_id')
+            ->whereNull('booked_by_supply_id');
     }
 
     public function scopeUpcoming($query)
@@ -110,10 +117,26 @@ class WarehouseSlot extends Model
         return true;
     }
 
+    public function bookForSupply(int $supplyId): bool
+    {
+        if (!$this->is_available || $this->booked_by_supply_id) {
+            return false;
+        }
+
+        $this->update([
+            'booked_by_supply_id' => $supplyId,
+            'booked_at' => now(),
+            'is_available' => false,
+        ]);
+
+        return true;
+    }
+
     public function release(): void
     {
         $this->update([
             'booked_by_shipment_id' => null,
+            'booked_by_supply_id' => null,
             'booked_at' => null,
             'is_available' => true,
         ]);

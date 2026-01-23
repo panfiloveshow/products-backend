@@ -226,28 +226,59 @@ class WarehouseSlotController extends Controller
 
     /**
      * POST /api/warehouse-slots/{id}/book
-     * Забронировать слот для поставки
+     * Забронировать слот для поставки (Shipment или Supply)
      */
     public function book(Request $request, string $id): JsonResponse
     {
         $validated = $request->validate([
-            'shipment_id' => 'required|exists:shipments,id',
+            'shipment_id' => 'nullable|exists:shipments,id',
+            'supply_id' => 'nullable|exists:supplies,id',
         ]);
+
+        if (empty($validated['shipment_id']) && empty($validated['supply_id'])) {
+            return response()->json([
+                'message' => 'Укажите shipment_id или supply_id',
+            ], 422);
+        }
 
         $slot = WarehouseSlot::findOrFail($id);
 
-        if (!$slot->is_available || $slot->booked_by_shipment_id) {
+        if (!$slot->is_available || $slot->booked_by_shipment_id || $slot->booked_by_supply_id) {
             return response()->json([
                 'message' => 'Слот недоступен для бронирования',
             ], 422);
         }
 
+        // Бронирование для Supply (Ozon FBO)
+        if (!empty($validated['supply_id'])) {
+            $supply = \App\Models\Supply::findOrFail($validated['supply_id']);
+            
+            $slot->bookForSupply($supply->id);
+
+            // Обновляем поставку
+            $supply->update([
+                'timeslot_id' => $slot->external_slot_id ?? $slot->id,
+                'timeslot_from' => $slot->from_datetime ?? $slot->date->setTimeFromTimeString($slot->time_from),
+                'timeslot_to' => $slot->to_datetime ?? $slot->date->setTimeFromTimeString($slot->time_to),
+                'planned_delivery_date' => $slot->date,
+            ]);
+
+            $supply->updateStatus(\App\Models\Supply::STATUS_SLOT_BOOKED);
+
+            return response()->json([
+                'message' => 'Слот забронирован',
+                'data' => [
+                    'slot' => $slot->fresh(),
+                    'supply' => $supply->fresh(),
+                ],
+            ]);
+        }
+
+        // Бронирование для Shipment (legacy)
         $shipment = Shipment::findOrFail($validated['shipment_id']);
 
-        // Бронируем слот
         $slot->book($shipment->id);
 
-        // Обновляем поставку
         $shipment->update([
             'slot' => [
                 'id' => $slot->id,
