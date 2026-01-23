@@ -982,43 +982,51 @@ class SupplyController extends Controller
         
         foreach ($apiClusters as $cluster) {
             $clusterId = $cluster['id'];
+            $warehouseIds = $cluster['warehouse_ids'] ?? [];
+            $warehousesCount = $cluster['warehouses_count'] ?? count($warehouseIds);
             
-            // Получаем склады кластера
-            try {
-                $warehouses = $ozon->supplies()->getClusterWarehouses($clusterId);
-                $warehousesCount = count($warehouses);
-            } catch (\Exception $e) {
-                $warehousesCount = $cluster['warehouses_count'] ?? 0;
-            }
-            
-            // Получаем рекомендации товаров для подсчёта SKU и единиц
-            try {
-                $recommendations = $ozon->supplies()->getClusterRecommendations($clusterId, $periodDays);
-                $skuCount = count($recommendations);
-                $unitsCount = array_sum(array_column($recommendations, 'recommended_qty'));
-                $avgDaysOfStock = $skuCount > 0 
-                    ? (int) round(array_sum(array_column($recommendations, 'days_of_stock')) / $skuCount)
-                    : 28;
-            } catch (\Exception $e) {
-                // Fallback на локальные данные
-                $localStats = $this->getLocalClusterStats($integration, $clusterId);
-                $skuCount = $localStats['sku_count'];
-                $unitsCount = $localStats['units_count'];
-                $avgDaysOfStock = $localStats['days_of_stock'];
-            }
+            // Получаем локальную статистику по складам кластера
+            $localStats = $this->getLocalClusterStatsByWarehouses($integration, $warehouseIds);
             
             $result[] = [
                 'id' => $clusterId,
                 'name' => $cluster['name'],
-                'region' => $cluster['region'] ?? null,
+                'type' => $cluster['type'] ?? null,
                 'warehouses_count' => $warehousesCount,
-                'sku_count' => $skuCount,
-                'units_count' => $unitsCount,
-                'days_of_stock' => $avgDaysOfStock,
+                'warehouse_ids' => $warehouseIds,
+                'sku_count' => $localStats['sku_count'],
+                'units_count' => $localStats['units_count'],
+                'days_of_stock' => $localStats['days_of_stock'],
             ];
         }
         
         return $result;
+    }
+
+    /**
+     * Получить локальную статистику по складам
+     */
+    private function getLocalClusterStatsByWarehouses(Integration $integration, array $warehouseIds): array
+    {
+        if (empty($warehouseIds)) {
+            // Если нет warehouse_ids — берём все данные по интеграции
+            $stats = \App\Models\InventoryWarehouse::where('integration_id', $integration->id)
+                ->where('marketplace', 'ozon')
+                ->selectRaw('COUNT(DISTINCT sku) as sku_count, SUM(quantity) as units_count, AVG(days_of_stock) as avg_days')
+                ->first();
+        } else {
+            $stats = \App\Models\InventoryWarehouse::where('integration_id', $integration->id)
+                ->where('marketplace', 'ozon')
+                ->whereIn('warehouse_id', $warehouseIds)
+                ->selectRaw('COUNT(DISTINCT sku) as sku_count, SUM(quantity) as units_count, AVG(days_of_stock) as avg_days')
+                ->first();
+        }
+        
+        return [
+            'sku_count' => $stats->sku_count ?? 0,
+            'units_count' => (int) ($stats->units_count ?? 0),
+            'days_of_stock' => (int) round($stats->avg_days ?? 28),
+        ];
     }
 
     /**

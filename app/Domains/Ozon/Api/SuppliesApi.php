@@ -447,11 +447,16 @@ class SuppliesApi implements SuppliesApiInterface
      * 
      * POST /v1/cluster/list
      * 
-     * @return array Список кластеров с id и названием
+     * Request: { "cluster_type": "CLUSTER_TYPE_OZON" }
+     * Response: { "clusters": [{ "id": int, "name": string, "logistic_clusters": [{ "warehouses": [...] }] }] }
+     * 
+     * @return array Список кластеров с id, названием и количеством складов
      */
     public function getClusters(): array
     {
-        $response = $this->client->post('/v1/cluster/list', []);
+        $response = $this->client->post('/v1/cluster/list', [
+            'cluster_type' => 'CLUSTER_TYPE_OZON',
+        ]);
 
         if (!$response) {
             return [];
@@ -459,13 +464,29 @@ class SuppliesApi implements SuppliesApiInterface
 
         $clusters = $response['result']['clusters'] ?? $response['clusters'] ?? [];
         
-        return array_map(fn($cluster) => [
-            'id' => (string) ($cluster['macrolocal_cluster_id'] ?? $cluster['id'] ?? null),
-            'name' => $cluster['name'] ?? null,
-            'region' => $cluster['region'] ?? null,
-            'warehouses_count' => $cluster['warehouses_count'] ?? 0,
-            'is_active' => $cluster['is_active'] ?? true,
-        ], $clusters);
+        return array_map(function ($cluster) {
+            // Считаем количество складов из logistic_clusters
+            $warehousesCount = 0;
+            $warehouseIds = [];
+            
+            $logisticClusters = $cluster['logistic_clusters'] ?? [];
+            foreach ($logisticClusters as $lc) {
+                $warehouses = $lc['warehouses'] ?? [];
+                $warehousesCount += count($warehouses);
+                foreach ($warehouses as $wh) {
+                    $warehouseIds[] = (string) ($wh['warehouse_id'] ?? $wh['id'] ?? null);
+                }
+            }
+            
+            return [
+                'id' => (string) ($cluster['id'] ?? null),
+                'name' => $cluster['name'] ?? null,
+                'type' => $cluster['type'] ?? 'CLUSTER_TYPE_OZON',
+                'warehouses_count' => $warehousesCount,
+                'warehouse_ids' => $warehouseIds,
+                'is_active' => true,
+            ];
+        }, $clusters);
     }
 
     /**
