@@ -1079,7 +1079,6 @@ class SupplyController extends Controller
     {
         // Получаем товары из нашей БД с остатками
         $products = \App\Models\Product::where('integration_id', $integration->id)
-            ->where('is_active', true)
             ->with(['inventoryWarehouses' => fn($q) => $q->where('marketplace', 'ozon')])
             ->limit(50)
             ->get();
