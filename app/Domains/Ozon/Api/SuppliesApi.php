@@ -485,8 +485,8 @@ class SuppliesApi implements SuppliesApiInterface
                     
                     $allWarehouseIds[] = $whId;
                     
-                    // Считаем только склады, принимающие поставки (FULL_FILLMENT и CROSS_DOCK)
-                    if (in_array($whType, ['FULL_FILLMENT', 'CROSS_DOCK'])) {
+                    // Считаем только склады фулфилмента (FULL_FILLMENT) — как на Ozon
+                    if ($whType === 'FULL_FILLMENT') {
                         $acceptingWarehousesCount++;
                         $acceptingWarehouseIds[] = $whId;
                     }
