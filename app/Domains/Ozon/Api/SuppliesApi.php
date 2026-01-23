@@ -458,6 +458,11 @@ class SuppliesApi implements SuppliesApiInterface
             'cluster_type' => 'CLUSTER_TYPE_OZON',
         ]);
 
+        // Логируем ответ для отладки
+        \Illuminate\Support\Facades\Log::info('Ozon getClusters response', [
+            'response' => $response,
+        ]);
+
         if (!$response) {
             return [];
         }
