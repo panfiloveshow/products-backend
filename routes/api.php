@@ -234,6 +234,7 @@ Route::prefix('supply-recommendations')->middleware('throttle:api')->group(funct
 Route::prefix('warehouse-slots')->middleware('throttle:api')->group(function () {
     Route::get('/', [App\Http\Controllers\Api\WarehouseSlotController::class, 'index']);
     Route::get('/warehouses', [App\Http\Controllers\Api\WarehouseSlotController::class, 'warehouses']);
+    Route::get('/for-supply/{supplyId}', [App\Http\Controllers\Api\WarehouseSlotController::class, 'forSupply']);
     Route::post('/sync', [App\Http\Controllers\Api\WarehouseSlotController::class, 'sync'])->middleware('throttle:sync');
     Route::post('/{id}/book', [App\Http\Controllers\Api\WarehouseSlotController::class, 'book']);
     Route::post('/{id}/release', [App\Http\Controllers\Api\WarehouseSlotController::class, 'release']);

@@ -88,6 +88,7 @@ class WarehouseSlotController extends Controller
                 'coefficient' => $i % 3 === 0 ? 0 : 1,
                 'is_available' => true,
                 'is_booked' => false,
+                'is_demo' => true,
                 'capacity' => 100,
                 'capacity_used' => rand(0, 50),
             ];
@@ -104,12 +105,75 @@ class WarehouseSlotController extends Controller
                 'coefficient' => $i % 2 === 0 ? 0 : 1,
                 'is_available' => true,
                 'is_booked' => false,
+                'is_demo' => true,
                 'capacity' => 100,
                 'capacity_used' => rand(0, 50),
             ];
         }
         
         return $slots;
+    }
+
+    /**
+     * GET /api/warehouse-slots/for-supply/{supplyId}
+     * Получить слоты для конкретной поставки (из Ozon API)
+     */
+    public function forSupply(int $supplyId): JsonResponse
+    {
+        $supply = \App\Models\Supply::findOrFail($supplyId);
+
+        if (!$supply->ozon_draft_id) {
+            return response()->json([
+                'message' => 'Сначала создайте черновик в Ozon',
+                'data' => [],
+                'hint' => 'Вызовите POST /api/supplies/{id}/create-draft',
+            ], 422);
+        }
+
+        try {
+            $ozon = \App\Domains\Ozon\OzonMarketplace::fromIntegration($supply->integration);
+            
+            $slots = $ozon->supplies()->getDraftTimeslots(
+                $supply->ozon_draft_id,
+                $supply->warehouse_id
+            );
+
+            // Сохраняем в кэш
+            foreach ($slots as $slotData) {
+                WarehouseSlot::updateOrCreate(
+                    [
+                        'marketplace' => 'ozon',
+                        'warehouse_id' => $supply->warehouse_id,
+                        'date' => $slotData['date'],
+                        'time_from' => $slotData['time_from'],
+                        'time_to' => $slotData['time_to'],
+                    ],
+                    [
+                        'external_slot_id' => $slotData['id'] ?? null,
+                        'warehouse_name' => $supply->warehouse_name,
+                        'from_datetime' => $slotData['from_datetime'] ?? null,
+                        'to_datetime' => $slotData['to_datetime'] ?? null,
+                        'is_available' => $slotData['is_available'] ?? true,
+                        'capacity' => $slotData['capacity'] ?? null,
+                        'synced_at' => now(),
+                    ]
+                );
+            }
+
+            return response()->json([
+                'message' => 'Success',
+                'data' => $slots,
+                'source' => 'ozon_api',
+                'supply_id' => $supplyId,
+                'draft_id' => $supply->ozon_draft_id,
+            ]);
+
+        } catch (\Exception $e) {
+            return response()->json([
+                'message' => 'Ошибка получения слотов: ' . $e->getMessage(),
+                'data' => [],
+            ], 422);
+        }
     }
 
     /**
