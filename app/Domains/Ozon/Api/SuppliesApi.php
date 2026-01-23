@@ -476,19 +476,34 @@ class SuppliesApi implements SuppliesApiInterface
             $allWarehouseIds = [];
             $acceptingWarehouseIds = [];
             
+            // Специализированные склады, которые не показываются для обычных товаров
+            $specializedKeywords = ['ВЕТАПТЕКА', 'ЮВЕЛИРН', 'НЕГАБАРИТ', 'ПАЛЛЕТН', 'ШИНЫ', 'КГТ'];
+            
             $logisticClusters = $cluster['logistic_clusters'] ?? [];
             foreach ($logisticClusters as $lc) {
                 $warehouses = $lc['warehouses'] ?? [];
                 foreach ($warehouses as $wh) {
                     $whId = (string) ($wh['warehouse_id'] ?? $wh['id'] ?? null);
                     $whType = $wh['type'] ?? '';
+                    $whName = $wh['name'] ?? '';
                     
                     $allWarehouseIds[] = $whId;
                     
-                    // Считаем только склады фулфилмента (FULL_FILLMENT) — как на Ozon
+                    // Считаем только склады фулфилмента (FULL_FILLMENT)
                     if ($whType === 'FULL_FILLMENT') {
-                        $acceptingWarehousesCount++;
-                        $acceptingWarehouseIds[] = $whId;
+                        // Исключаем специализированные склады (ветаптека, ювелирный, негабарит, паллетный, шины, КГТ)
+                        $isSpecialized = false;
+                        foreach ($specializedKeywords as $keyword) {
+                            if (stripos($whName, $keyword) !== false) {
+                                $isSpecialized = true;
+                                break;
+                            }
+                        }
+                        
+                        if (!$isSpecialized) {
+                            $acceptingWarehousesCount++;
+                            $acceptingWarehouseIds[] = $whId;
+                        }
                     }
                 }
             }
