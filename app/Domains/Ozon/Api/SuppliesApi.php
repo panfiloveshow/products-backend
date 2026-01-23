@@ -1073,4 +1073,228 @@ class SuppliesApi implements SuppliesApiInterface
             default => $this->createSupplyDraft($data), // Legacy fallback
         };
     }
+
+    // ========================================================================
+    // ДОПОЛНИТЕЛЬНЫЕ МЕТОДЫ ДЛЯ РАБОТЫ С ЗАЯВКАМИ
+    // ========================================================================
+
+    /**
+     * Получить подробную информацию о заявке на поставку
+     * 
+     * POST /v2/supply-order/get
+     * 
+     * @param string $supplyId ID заявки на поставку
+     * @return array Детальная информация о заявке
+     */
+    public function getSupplyOrderDetails(string $supplyId): array
+    {
+        $response = $this->client->post('/v2/supply-order/get', [
+            'supply_id' => $supplyId,
+        ]);
+
+        if (!$response) {
+            return [];
+        }
+
+        $result = $response['result'] ?? $response;
+        
+        return [
+            'supply_id' => $result['supply_id'] ?? $supplyId,
+            'status' => $result['status'] ?? null,
+            'created_at' => $result['created_at'] ?? null,
+            'updated_at' => $result['updated_at'] ?? null,
+            'warehouse_id' => $result['warehouse_id'] ?? null,
+            'warehouse_name' => $result['warehouse_name'] ?? null,
+            'timeslot' => $result['timeslot'] ?? null,
+            'items' => array_map(fn($item) => [
+                'sku' => $item['sku'] ?? null,
+                'offer_id' => $item['offer_id'] ?? null,
+                'name' => $item['name'] ?? null,
+                'quantity' => $item['quantity'] ?? 0,
+                'accepted_quantity' => $item['accepted_quantity'] ?? null,
+                'rejected_quantity' => $item['rejected_quantity'] ?? null,
+            ], $result['items'] ?? []),
+            'total_items' => $result['total_items'] ?? 0,
+            'total_quantity' => $result['total_quantity'] ?? 0,
+            'pass' => $result['pass'] ?? null,
+            'cargoes_count' => $result['cargoes_count'] ?? 0,
+        ];
+    }
+
+    /**
+     * Получить зоны размещения товаров по SKU перед поставкой
+     * 
+     * POST /v1/supply/placement/get
+     * 
+     * Определяет, в какую зону попадёт товар:
+     * - SORTABLE — сортируемый товар (обычный)
+     * - OVERSIZED — негабаритный товар
+     * - и другие зоны
+     * 
+     * @param array $skus Массив SKU товаров
+     * @return array Массив с зонами размещения
+     */
+    public function getPlacementZones(array $skus): array
+    {
+        $response = $this->client->post('/v1/supply/placement/get', [
+            'sku' => $skus,
+        ]);
+
+        if (!$response) {
+            return [];
+        }
+
+        $placements = $response['placement_element'] ?? $response['result']['placement_element'] ?? [];
+        
+        return array_map(fn($item) => [
+            'sku' => (string) ($item['sku'] ?? ''),
+            'zone' => $item['zone'] ?? 'UNKNOWN',
+            'zone_name' => $this->getZoneName($item['zone'] ?? ''),
+        ], $placements);
+    }
+
+    /**
+     * Получить человекочитаемое название зоны размещения
+     */
+    private function getZoneName(string $zone): string
+    {
+        return match ($zone) {
+            'SORTABLE' => 'Сортируемый',
+            'OVERSIZED' => 'Негабаритный',
+            'JEWELRY' => 'Ювелирный',
+            'VETERINARY' => 'Ветеринарный',
+            'PALLET' => 'Паллетный',
+            'TIRES' => 'Шины',
+            'KGT' => 'Крупногабаритный',
+            default => $zone,
+        };
+    }
+
+    /**
+     * Получить информацию о грузоместах заявки
+     * 
+     * POST /v1/cargoes/get
+     * 
+     * @param string $supplyId ID заявки на поставку
+     * @return array Информация о грузоместах
+     */
+    public function getCargoesInfo(string $supplyId): array
+    {
+        $response = $this->client->post('/v1/cargoes/get', [
+            'supply_id' => $supplyId,
+        ]);
+
+        if (!$response) {
+            return [];
+        }
+
+        $result = $response['result'] ?? $response;
+        $cargoes = $result['cargoes'] ?? [];
+        
+        return [
+            'supply_id' => $result['supply_id'] ?? $supplyId,
+            'cargoes' => array_map(fn($cargo) => [
+                'cargo_id' => $cargo['cargo_id'] ?? null,
+                'barcode' => $cargo['barcode'] ?? null,
+                'status' => $cargo['status'] ?? null,
+                'items' => array_map(fn($item) => [
+                    'sku' => $item['sku'] ?? null,
+                    'quantity' => $item['quantity'] ?? 0,
+                ], $cargo['items'] ?? []),
+                'dimensions' => [
+                    'length' => $cargo['length'] ?? null,
+                    'width' => $cargo['width'] ?? null,
+                    'height' => $cargo['height'] ?? null,
+                    'weight' => $cargo['weight'] ?? null,
+                ],
+            ], $cargoes),
+            'total_cargoes' => count($cargoes),
+        ];
+    }
+
+    /**
+     * Получить информацию о ценах товаров
+     * 
+     * POST /v1/product/info/prices
+     * 
+     * @param array $skus Массив SKU товаров (до 1000)
+     * @return array Информация о ценах
+     */
+    public function getProductPrices(array $skus): array
+    {
+        $response = $this->client->post('/v1/product/info/prices', [
+            'sku' => array_slice($skus, 0, 1000),
+        ]);
+
+        if (!$response) {
+            return [];
+        }
+
+        $items = $response['result'] ?? $response['items'] ?? [];
+        
+        return array_map(fn($item) => [
+            'sku' => (string) ($item['sku'] ?? ''),
+            'offer_id' => $item['offer_id'] ?? null,
+            'price' => $item['price'] ?? null,
+            'old_price' => $item['old_price'] ?? null,
+            'premium_price' => $item['premium_price'] ?? null,
+            'min_price' => $item['min_price'] ?? null,
+            'marketing_price' => $item['marketing_price'] ?? null,
+        ], $items);
+    }
+
+    /**
+     * Получить список заявок на поставку
+     * 
+     * POST /v2/supply-order/list
+     * 
+     * @param array $filters [
+     *   'status' => string[] — фильтр по статусам,
+     *   'warehouse_ids' => string[] — фильтр по складам,
+     *   'from_date' => string — дата начала (ISO 8601),
+     *   'to_date' => string — дата окончания (ISO 8601),
+     * ]
+     * @param int $limit Количество записей (макс. 1000)
+     * @param int $offset Смещение
+     * @return array Список заявок
+     */
+    public function getSupplyOrderList(array $filters = [], int $limit = 100, int $offset = 0): array
+    {
+        $body = [
+            'limit' => min($limit, 1000),
+            'offset' => $offset,
+        ];
+
+        if (!empty($filters['status'])) {
+            $body['status'] = $filters['status'];
+        }
+        if (!empty($filters['warehouse_ids'])) {
+            $body['warehouse_ids'] = $filters['warehouse_ids'];
+        }
+        if (!empty($filters['from_date'])) {
+            $body['from_date'] = $filters['from_date'];
+        }
+        if (!empty($filters['to_date'])) {
+            $body['to_date'] = $filters['to_date'];
+        }
+
+        $response = $this->client->post('/v2/supply-order/list', $body);
+
+        if (!$response) {
+            return [];
+        }
+
+        $orders = $response['result']['orders'] ?? $response['orders'] ?? [];
+        
+        return array_map(fn($order) => [
+            'supply_id' => $order['supply_id'] ?? null,
+            'status' => $order['status'] ?? null,
+            'created_at' => $order['created_at'] ?? null,
+            'warehouse_id' => $order['warehouse_id'] ?? null,
+            'warehouse_name' => $order['warehouse_name'] ?? null,
+            'total_items' => $order['total_items'] ?? 0,
+            'total_quantity' => $order['total_quantity'] ?? 0,
+            'timeslot' => $order['timeslot'] ?? null,
+        ], $orders);
+    }
 }
