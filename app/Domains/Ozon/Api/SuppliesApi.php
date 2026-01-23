@@ -836,6 +836,77 @@ class SuppliesApi implements SuppliesApiInterface
     }
 
     /**
+     * Получить рекомендации товаров для кластера
+     * 
+     * POST /v1/supply/recommendations
+     * 
+     * @param string $clusterId ID кластера
+     * @param int $days Период рекомендаций (по умолчанию 28 дней)
+     * @return array Список рекомендованных товаров
+     */
+    public function getClusterRecommendations(string $clusterId, int $days = 28): array
+    {
+        $response = $this->client->post('/v1/supply/recommendations', [
+            'macrolocal_cluster_id' => $clusterId,
+            'period_days' => $days,
+        ]);
+
+        if (!$response) {
+            return [];
+        }
+
+        $items = $response['result']['items'] ?? $response['items'] ?? [];
+        
+        return array_map(fn($item) => [
+            'sku' => $item['offer_id'] ?? $item['sku'] ?? null,
+            'product_id' => $item['product_id'] ?? null,
+            'name' => $item['name'] ?? null,
+            'barcode' => $item['barcode'] ?? null,
+            'recommended_qty' => $item['recommended_quantity'] ?? $item['quantity'] ?? 0,
+            'volume' => $item['volume'] ?? 0,
+            'current_stock' => $item['stock'] ?? $item['current_stock'] ?? 0,
+            'in_transit' => $item['in_transit'] ?? 0,
+            'avg_sales_28d' => $item['avg_daily_sales'] ?? $item['average_sales'] ?? 0,
+            'days_of_stock' => $item['days_of_stock'] ?? 0,
+            'priority' => $item['priority'] ?? 'normal',
+            'is_sortable' => $item['is_sortable'] ?? true,
+        ], $items);
+    }
+
+    /**
+     * Получить склады кластера
+     * 
+     * POST /v1/cluster/warehouses
+     * 
+     * @param string $clusterId ID кластера
+     * @return array Список складов в кластере
+     */
+    public function getClusterWarehouses(string $clusterId): array
+    {
+        $response = $this->client->post('/v1/cluster/warehouses', [
+            'macrolocal_cluster_id' => $clusterId,
+        ]);
+
+        if (!$response) {
+            // Fallback: получаем все FBO склады и фильтруем по кластеру
+            $allWarehouses = $this->getFboWarehouses();
+            return array_filter($allWarehouses, fn($wh) => $wh['cluster_id'] === $clusterId);
+        }
+
+        $warehouses = $response['result']['warehouses'] ?? $response['warehouses'] ?? [];
+        
+        return array_map(fn($wh) => [
+            'id' => (string) ($wh['warehouse_id'] ?? $wh['id'] ?? null),
+            'name' => $wh['name'] ?? null,
+            'type' => $wh['type'] ?? 'fbo',
+            'address' => $wh['address'] ?? null,
+            'city' => $wh['city'] ?? null,
+            'is_active' => $wh['is_active'] ?? true,
+            'accepts_supplies' => $wh['accepts_supplies'] ?? true,
+        ], $warehouses);
+    }
+
+    /**
      * Универсальный метод создания черновика (автовыбор типа)
      * 
      * @param array $data [

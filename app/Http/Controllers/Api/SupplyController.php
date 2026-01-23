@@ -784,9 +784,11 @@ class SupplyController extends Controller
     {
         $validated = $request->validate([
             'integration_id' => 'required|exists:integrations,id',
+            'period_days' => 'nullable|integer|min:7|max:90',
         ]);
 
         $integration = Integration::findOrFail($validated['integration_id']);
+        $periodDays = $validated['period_days'] ?? 28;
 
         if ($integration->marketplace !== 'ozon') {
             return response()->json([
@@ -801,13 +803,14 @@ class SupplyController extends Controller
             $apiClusters = $ozon->supplies()->getClusters();
             
             if (!empty($apiClusters)) {
-                // Обогащаем данными о товарах и остатках
-                $clusters = $this->enrichClustersWithStats($integration, $apiClusters);
+                // Получаем склады для каждого кластера и обогащаем данными
+                $clusters = $this->enrichClustersWithRealData($integration, $ozon, $apiClusters, $periodDays);
                 
                 return response()->json([
                     'success' => true,
                     'data' => $clusters,
                     'source' => 'ozon_api',
+                    'period_days' => $periodDays,
                 ]);
             }
         } catch (\Exception $e) {
@@ -824,12 +827,311 @@ class SupplyController extends Controller
             'success' => true,
             'data' => $fallbackClusters,
             'source' => 'fallback',
+            'period_days' => $periodDays,
             'message' => 'Используются демо-данные. Синхронизируйте кластеры с Ozon.',
         ]);
     }
 
     /**
-     * Обогатить кластеры статистикой по товарам
+     * Получить рекомендации товаров для кластера
+     * 
+     * GET /api/supplies/clusters/{clusterId}/products
+     */
+    public function getClusterProducts(Request $request, string $clusterId): JsonResponse
+    {
+        $validated = $request->validate([
+            'integration_id' => 'required|exists:integrations,id',
+            'period_days' => 'nullable|integer|min:7|max:90',
+            'tab' => 'nullable|in:recommendations,in_supply',
+        ]);
+
+        $integration = Integration::findOrFail($validated['integration_id']);
+        $periodDays = $validated['period_days'] ?? 28;
+        $tab = $validated['tab'] ?? 'recommendations';
+
+        if ($integration->marketplace !== 'ozon') {
+            return response()->json([
+                'success' => false,
+                'message' => 'Доступно только для Ozon',
+            ], 422);
+        }
+
+        try {
+            $ozon = \App\Domains\Ozon\OzonMarketplace::fromIntegration($integration);
+            
+            if ($tab === 'recommendations') {
+                // Получаем рекомендации из Ozon API
+                $products = $ozon->supplies()->getClusterRecommendations($clusterId, $periodDays);
+                
+                if (!empty($products)) {
+                    // Обогащаем данными из нашей БД
+                    $products = $this->enrichProductsWithLocalData($integration, $products);
+                    
+                    // Считаем статистику
+                    $totalSku = count($products);
+                    $totalUnits = array_sum(array_column($products, 'recommended_qty'));
+                    $totalVolume = array_sum(array_column($products, 'volume'));
+                    
+                    return response()->json([
+                        'success' => true,
+                        'data' => [
+                            'products' => $products,
+                            'summary' => [
+                                'total_sku' => $totalSku,
+                                'total_units' => $totalUnits,
+                                'total_volume' => round($totalVolume, 2),
+                            ],
+                        ],
+                        'cluster_id' => $clusterId,
+                        'period_days' => $periodDays,
+                        'tab' => $tab,
+                        'source' => 'ozon_api',
+                    ]);
+                }
+            } else {
+                // Товары в заявке — пока пустой список (заполняется пользователем)
+                return response()->json([
+                    'success' => true,
+                    'data' => [
+                        'products' => [],
+                        'summary' => [
+                            'total_sku' => 0,
+                            'total_units' => 0,
+                            'total_volume' => 0,
+                        ],
+                    ],
+                    'cluster_id' => $clusterId,
+                    'tab' => $tab,
+                ]);
+            }
+        } catch (\Exception $e) {
+            Log::warning('Failed to get cluster products from Ozon API', [
+                'integration_id' => $integration->id,
+                'cluster_id' => $clusterId,
+                'error' => $e->getMessage(),
+            ]);
+        }
+
+        // Fallback: генерируем демо-данные на основе наших товаров
+        $fallbackProducts = $this->generateFallbackClusterProducts($integration, $clusterId, $periodDays);
+
+        return response()->json([
+            'success' => true,
+            'data' => $fallbackProducts,
+            'cluster_id' => $clusterId,
+            'period_days' => $periodDays,
+            'tab' => $tab,
+            'source' => 'fallback',
+        ]);
+    }
+
+    /**
+     * Добавить товары в заявку кластера
+     * 
+     * POST /api/supplies/clusters/{clusterId}/add-products
+     */
+    public function addClusterProducts(Request $request, string $clusterId): JsonResponse
+    {
+        $validated = $request->validate([
+            'integration_id' => 'required|exists:integrations,id',
+            'products' => 'required|array|min:1',
+            'products.*.sku' => 'required|string',
+            'products.*.quantity' => 'required|integer|min:1',
+        ]);
+
+        $integration = Integration::findOrFail($validated['integration_id']);
+
+        if ($integration->marketplace !== 'ozon') {
+            return response()->json([
+                'success' => false,
+                'message' => 'Доступно только для Ozon',
+            ], 422);
+        }
+
+        // Сохраняем товары в сессию/кэш для последующего создания поставки
+        $cacheKey = "supply_draft_{$integration->id}_{$clusterId}";
+        $existingProducts = cache()->get($cacheKey, []);
+        
+        foreach ($validated['products'] as $product) {
+            $existingProducts[$product['sku']] = [
+                'sku' => $product['sku'],
+                'quantity' => $product['quantity'],
+                'added_at' => now()->toIso8601String(),
+            ];
+        }
+        
+        cache()->put($cacheKey, $existingProducts, now()->addHours(24));
+
+        return response()->json([
+            'success' => true,
+            'message' => 'Товары добавлены в заявку',
+            'data' => [
+                'cluster_id' => $clusterId,
+                'products_count' => count($existingProducts),
+                'products' => array_values($existingProducts),
+            ],
+        ]);
+    }
+
+    /**
+     * Обогатить кластеры реальными данными из Ozon API
+     */
+    private function enrichClustersWithRealData(Integration $integration, $ozon, array $apiClusters, int $periodDays): array
+    {
+        $result = [];
+        
+        foreach ($apiClusters as $cluster) {
+            $clusterId = $cluster['id'];
+            
+            // Получаем склады кластера
+            try {
+                $warehouses = $ozon->supplies()->getClusterWarehouses($clusterId);
+                $warehousesCount = count($warehouses);
+            } catch (\Exception $e) {
+                $warehousesCount = $cluster['warehouses_count'] ?? 0;
+            }
+            
+            // Получаем рекомендации товаров для подсчёта SKU и единиц
+            try {
+                $recommendations = $ozon->supplies()->getClusterRecommendations($clusterId, $periodDays);
+                $skuCount = count($recommendations);
+                $unitsCount = array_sum(array_column($recommendations, 'recommended_qty'));
+                $avgDaysOfStock = $skuCount > 0 
+                    ? (int) round(array_sum(array_column($recommendations, 'days_of_stock')) / $skuCount)
+                    : 28;
+            } catch (\Exception $e) {
+                // Fallback на локальные данные
+                $localStats = $this->getLocalClusterStats($integration, $clusterId);
+                $skuCount = $localStats['sku_count'];
+                $unitsCount = $localStats['units_count'];
+                $avgDaysOfStock = $localStats['days_of_stock'];
+            }
+            
+            $result[] = [
+                'id' => $clusterId,
+                'name' => $cluster['name'],
+                'region' => $cluster['region'] ?? null,
+                'warehouses_count' => $warehousesCount,
+                'sku_count' => $skuCount,
+                'units_count' => $unitsCount,
+                'days_of_stock' => $avgDaysOfStock,
+            ];
+        }
+        
+        return $result;
+    }
+
+    /**
+     * Получить локальную статистику по кластеру
+     */
+    private function getLocalClusterStats(Integration $integration, string $clusterId): array
+    {
+        $clusterMapping = $this->getClusterWarehouseMapping();
+        $warehouseIds = $clusterMapping[$clusterId] ?? [];
+        
+        if (empty($warehouseIds)) {
+            return ['sku_count' => 0, 'units_count' => 0, 'days_of_stock' => 28];
+        }
+        
+        $stats = \App\Models\InventoryWarehouse::where('integration_id', $integration->id)
+            ->where('marketplace', 'ozon')
+            ->whereIn('warehouse_id', $warehouseIds)
+            ->selectRaw('COUNT(DISTINCT sku) as sku_count, SUM(quantity) as units_count, AVG(days_of_stock) as avg_days')
+            ->first();
+        
+        return [
+            'sku_count' => $stats->sku_count ?? 0,
+            'units_count' => (int) ($stats->units_count ?? 0),
+            'days_of_stock' => (int) round($stats->avg_days ?? 28),
+        ];
+    }
+
+    /**
+     * Обогатить товары локальными данными
+     */
+    private function enrichProductsWithLocalData(Integration $integration, array $products): array
+    {
+        $skus = array_column($products, 'sku');
+        
+        $localProducts = \App\Models\Product::where('integration_id', $integration->id)
+            ->whereIn('sku', $skus)
+            ->get()
+            ->keyBy('sku');
+        
+        return array_map(function ($product) use ($localProducts) {
+            $local = $localProducts[$product['sku']] ?? null;
+            
+            if ($local) {
+                $product['name'] = $product['name'] ?? $local->name;
+                $product['barcode'] = $product['barcode'] ?? $local->barcode;
+                $product['image'] = $local->images[0] ?? null;
+                $product['price'] = $local->price;
+            }
+            
+            return $product;
+        }, $products);
+    }
+
+    /**
+     * Генерация fallback товаров для кластера
+     */
+    private function generateFallbackClusterProducts(Integration $integration, string $clusterId, int $periodDays): array
+    {
+        // Получаем товары из нашей БД с остатками
+        $products = \App\Models\Product::where('integration_id', $integration->id)
+            ->where('is_active', true)
+            ->with(['inventoryWarehouses' => fn($q) => $q->where('marketplace', 'ozon')])
+            ->limit(50)
+            ->get();
+        
+        $result = [];
+        foreach ($products as $product) {
+            $inventory = $product->inventoryWarehouses->first();
+            $currentStock = $inventory->quantity ?? 0;
+            $avgSales = $inventory->average_daily_sales ?? 0;
+            $daysOfStock = $avgSales > 0 ? (int) round($currentStock / $avgSales) : 999;
+            
+            // Рекомендуемое количество на период
+            $recommendedQty = max(0, (int) ceil($avgSales * $periodDays - $currentStock));
+            
+            if ($recommendedQty > 0) {
+                $result[] = [
+                    'sku' => $product->sku,
+                    'product_id' => $product->marketplace_id,
+                    'name' => $product->name,
+                    'barcode' => $product->barcode,
+                    'image' => $product->images[0] ?? null,
+                    'recommended_qty' => $recommendedQty,
+                    'volume' => round($recommendedQty * 0.5, 2), // примерный объём
+                    'current_stock' => $currentStock,
+                    'in_transit' => $inventory->in_transit ?? 0,
+                    'avg_sales_28d' => round($avgSales, 2),
+                    'days_of_stock' => $daysOfStock,
+                    'priority' => $daysOfStock <= 7 ? 'urgent' : ($daysOfStock <= 14 ? 'high' : 'normal'),
+                    'is_sortable' => true,
+                ];
+            }
+        }
+        
+        // Сортируем по приоритету (дни запаса)
+        usort($result, fn($a, $b) => $a['days_of_stock'] <=> $b['days_of_stock']);
+        
+        $totalSku = count($result);
+        $totalUnits = array_sum(array_column($result, 'recommended_qty'));
+        $totalVolume = array_sum(array_column($result, 'volume'));
+        
+        return [
+            'products' => $result,
+            'summary' => [
+                'total_sku' => $totalSku,
+                'total_units' => $totalUnits,
+                'total_volume' => round($totalVolume, 2),
+            ],
+        ];
+    }
+
+    /**
+     * Обогатить кластеры статистикой по товарам (legacy)
      */
     private function enrichClustersWithStats(Integration $integration, array $apiClusters): array
     {

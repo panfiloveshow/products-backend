@@ -312,6 +312,8 @@ Route::prefix('supplies')->middleware('throttle:api')->group(function () {
     
     // Кластеры и слоты приёмки (новый flow фронтенда)
     Route::get('/clusters', [App\Http\Controllers\Api\SupplyController::class, 'getClusters']);
+    Route::get('/clusters/{clusterId}/products', [App\Http\Controllers\Api\SupplyController::class, 'getClusterProducts']);
+    Route::post('/clusters/{clusterId}/add-products', [App\Http\Controllers\Api\SupplyController::class, 'addClusterProducts']);
     Route::get('/slots', [App\Http\Controllers\Api\SupplyController::class, 'getSlots']);
     Route::post('/sync-slots', [App\Http\Controllers\Api\SupplyController::class, 'syncSlots']);
     Route::get('/products-for-supply', [App\Http\Controllers\Api\SupplyController::class, 'getProductsForSupply']);
