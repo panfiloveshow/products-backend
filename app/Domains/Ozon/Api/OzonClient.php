@@ -45,13 +45,6 @@ class OzonClient
             // Если нужен пустой объект {} вместо пустого массива []
             $body = (empty($data) && $forceObject) ? (object)[] : $data;
             
-            // Логируем отправляемые данные для отладки
-            Log::info('Ozon API request', [
-                'endpoint' => $endpoint,
-                'body' => json_encode($body),
-                'client_id' => $this->clientId ? substr($this->clientId, 0, 4) . '***' : 'empty',
-            ]);
-            
             $response = Http::withHeaders($this->getHeaders())
                 ->timeout($this->timeout)
                 ->post(self::BASE_URL . $endpoint, $body);
