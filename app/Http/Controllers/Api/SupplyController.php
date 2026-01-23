@@ -772,8 +772,169 @@ class SupplyController extends Controller
     }
 
     // ========================================================================
-    // СЛОТЫ И СОЗДАНИЕ ПОСТАВКИ СО СЛОТОМ (новый flow фронтенда)
+    // КЛАСТЕРЫ, СЛОТЫ И СОЗДАНИЕ ПОСТАВКИ СО СЛОТОМ (новый flow фронтенда)
     // ========================================================================
+
+    /**
+     * Получить список кластеров Ozon с агрегированной статистикой
+     * 
+     * GET /api/supplies/clusters
+     */
+    public function getClusters(Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'integration_id' => 'required|exists:integrations,id',
+        ]);
+
+        $integration = Integration::findOrFail($validated['integration_id']);
+
+        if ($integration->marketplace !== 'ozon') {
+            return response()->json([
+                'success' => false,
+                'message' => 'Кластеры доступны только для Ozon',
+            ], 422);
+        }
+
+        // Пробуем получить кластеры из Ozon API
+        try {
+            $ozon = \App\Domains\Ozon\OzonMarketplace::fromIntegration($integration);
+            $apiClusters = $ozon->supplies()->getClusters();
+            
+            if (!empty($apiClusters)) {
+                // Обогащаем данными о товарах и остатках
+                $clusters = $this->enrichClustersWithStats($integration, $apiClusters);
+                
+                return response()->json([
+                    'success' => true,
+                    'data' => $clusters,
+                    'source' => 'ozon_api',
+                ]);
+            }
+        } catch (\Exception $e) {
+            Log::warning('Failed to get clusters from Ozon API', [
+                'integration_id' => $integration->id,
+                'error' => $e->getMessage(),
+            ]);
+        }
+
+        // Fallback: генерируем демо-кластеры
+        $fallbackClusters = $this->generateFallbackClusters($integration);
+
+        return response()->json([
+            'success' => true,
+            'data' => $fallbackClusters,
+            'source' => 'fallback',
+            'message' => 'Используются демо-данные. Синхронизируйте кластеры с Ozon.',
+        ]);
+    }
+
+    /**
+     * Обогатить кластеры статистикой по товарам
+     */
+    private function enrichClustersWithStats(Integration $integration, array $apiClusters): array
+    {
+        // Получаем остатки по складам
+        $inventoryByWarehouse = \App\Models\InventoryWarehouse::where('integration_id', $integration->id)
+            ->where('marketplace', 'ozon')
+            ->selectRaw('warehouse_id, COUNT(DISTINCT sku) as sku_count, SUM(quantity) as units_count, AVG(days_of_stock) as avg_days_of_stock')
+            ->groupBy('warehouse_id')
+            ->get()
+            ->keyBy('warehouse_id');
+
+        return array_map(function ($cluster) use ($inventoryByWarehouse) {
+            // Суммируем по всем складам кластера (пока упрощённо — по warehouse_id)
+            $warehouseIds = $cluster['warehouse_ids'] ?? [];
+            $skuCount = 0;
+            $unitsCount = 0;
+            $daysOfStock = 30;
+
+            foreach ($warehouseIds as $whId) {
+                if (isset($inventoryByWarehouse[$whId])) {
+                    $inv = $inventoryByWarehouse[$whId];
+                    $skuCount += $inv->sku_count;
+                    $unitsCount += $inv->units_count;
+                    $daysOfStock = min($daysOfStock, $inv->avg_days_of_stock ?? 30);
+                }
+            }
+
+            return [
+                'id' => $cluster['id'],
+                'name' => $cluster['name'],
+                'warehouses_count' => $cluster['warehouses_count'] ?? count($warehouseIds),
+                'sku_count' => $skuCount,
+                'units_count' => (int) $unitsCount,
+                'days_of_stock' => (int) round($daysOfStock),
+            ];
+        }, $apiClusters);
+    }
+
+    /**
+     * Генерация fallback кластеров для демонстрации
+     */
+    private function generateFallbackClusters(Integration $integration): array
+    {
+        // Получаем реальную статистику по остаткам
+        $totalStats = \App\Models\InventoryWarehouse::where('integration_id', $integration->id)
+            ->where('marketplace', 'ozon')
+            ->selectRaw('COUNT(DISTINCT sku) as sku_count, SUM(quantity) as units_count, AVG(days_of_stock) as avg_days')
+            ->first();
+
+        $skuCount = $totalStats->sku_count ?? 0;
+        $unitsCount = $totalStats->units_count ?? 0;
+        $avgDays = $totalStats->avg_days ?? 14;
+
+        // Распределяем по демо-кластерам
+        return [
+            [
+                'id' => 'cluster_msk',
+                'name' => 'Москва и МО',
+                'warehouses_count' => 5,
+                'sku_count' => (int) round($skuCount * 0.4),
+                'units_count' => (int) round($unitsCount * 0.4),
+                'days_of_stock' => max(3, (int) round($avgDays * 0.8)),
+            ],
+            [
+                'id' => 'cluster_spb',
+                'name' => 'Санкт-Петербург',
+                'warehouses_count' => 3,
+                'sku_count' => (int) round($skuCount * 0.2),
+                'units_count' => (int) round($unitsCount * 0.2),
+                'days_of_stock' => max(5, (int) round($avgDays * 1.0)),
+            ],
+            [
+                'id' => 'cluster_ekb',
+                'name' => 'Екатеринбург',
+                'warehouses_count' => 2,
+                'sku_count' => (int) round($skuCount * 0.15),
+                'units_count' => (int) round($unitsCount * 0.15),
+                'days_of_stock' => max(7, (int) round($avgDays * 1.2)),
+            ],
+            [
+                'id' => 'cluster_nsk',
+                'name' => 'Новосибирск',
+                'warehouses_count' => 2,
+                'sku_count' => (int) round($skuCount * 0.1),
+                'units_count' => (int) round($unitsCount * 0.1),
+                'days_of_stock' => max(10, (int) round($avgDays * 1.5)),
+            ],
+            [
+                'id' => 'cluster_krd',
+                'name' => 'Краснодар',
+                'warehouses_count' => 2,
+                'sku_count' => (int) round($skuCount * 0.1),
+                'units_count' => (int) round($unitsCount * 0.1),
+                'days_of_stock' => max(12, (int) round($avgDays * 1.3)),
+            ],
+            [
+                'id' => 'cluster_kzn',
+                'name' => 'Казань',
+                'warehouses_count' => 1,
+                'sku_count' => (int) round($skuCount * 0.05),
+                'units_count' => (int) round($unitsCount * 0.05),
+                'days_of_stock' => max(14, (int) round($avgDays * 1.4)),
+            ],
+        ];
+    }
 
     /**
      * Получить доступные слоты приёмки
@@ -787,6 +948,8 @@ class SupplyController extends Controller
             'date_from' => 'nullable|date',
             'date_to' => 'nullable|date',
             'warehouse_id' => 'nullable|string',
+            'cluster_ids' => 'nullable|array',
+            'cluster_ids.*' => 'string',
         ]);
 
         $integration = Integration::findOrFail($validated['integration_id']);
@@ -801,6 +964,10 @@ class SupplyController extends Controller
 
         $dateFrom = $validated['date_from'] ?? now()->toDateString();
         $dateTo = $validated['date_to'] ?? now()->addDays(14)->toDateString();
+        $clusterIds = $validated['cluster_ids'] ?? [];
+
+        // Маппинг кластеров к складам (для фильтрации)
+        $clusterToWarehouses = $this->getClusterWarehouseMapping();
 
         // Получаем слоты из БД
         $query = \App\Models\WarehouseSlot::query()
@@ -814,6 +981,19 @@ class SupplyController extends Controller
             $query->where('warehouse_id', $validated['warehouse_id']);
         }
 
+        // Фильтрация по кластерам
+        if (!empty($clusterIds)) {
+            $warehouseIds = [];
+            foreach ($clusterIds as $clusterId) {
+                if (isset($clusterToWarehouses[$clusterId])) {
+                    $warehouseIds = array_merge($warehouseIds, $clusterToWarehouses[$clusterId]);
+                }
+            }
+            if (!empty($warehouseIds)) {
+                $query->whereIn('warehouse_id', array_unique($warehouseIds));
+            }
+        }
+
         $slots = $query->get();
 
         // Если слотов нет — пробуем синхронизировать или возвращаем fallback
@@ -822,7 +1002,7 @@ class SupplyController extends Controller
             \App\Jobs\SyncWarehouseSlotsJob::dispatch($integration->id);
 
             // Возвращаем fallback-слоты для демонстрации
-            $fallbackSlots = $this->generateFallbackSlots($dateFrom, $dateTo);
+            $fallbackSlots = $this->generateFallbackSlots($dateFrom, $dateTo, $clusterIds);
             
             return response()->json([
                 'success' => true,
@@ -831,6 +1011,7 @@ class SupplyController extends Controller
                     'synced_at' => null,
                     'total' => count($fallbackSlots),
                     'source' => 'fallback',
+                    'cluster_ids' => $clusterIds,
                     'message' => 'Синхронизация слотов запущена. Обновите страницу через минуту.',
                 ],
             ]);
@@ -843,6 +1024,7 @@ class SupplyController extends Controller
             'time_to' => substr($slot->time_to, 0, 5),
             'warehouse_id' => $slot->warehouse_id,
             'warehouse_name' => $slot->warehouse_name,
+            'cluster_id' => $slot->cluster_id ?? $this->getClusterIdByWarehouse($slot->warehouse_id),
             'is_available' => $slot->is_available && !$slot->booked_by_supply_id,
             'capacity' => $slot->capacity,
             'capacity_used' => $slot->capacity_used ?? 0,
@@ -855,8 +1037,38 @@ class SupplyController extends Controller
             'meta' => [
                 'synced_at' => $slots->first()?->synced_at?->toIso8601String(),
                 'total' => $data->count(),
+                'cluster_ids' => $clusterIds,
             ],
         ]);
+    }
+
+    /**
+     * Маппинг кластеров к складам
+     */
+    private function getClusterWarehouseMapping(): array
+    {
+        return [
+            'cluster_msk' => ['22655170176000', '22655170177000', '22655170178000'],
+            'cluster_spb' => ['22655170179000', '22655170180000'],
+            'cluster_ekb' => ['22655170181000', '22655170182000'],
+            'cluster_nsk' => ['22655170183000'],
+            'cluster_krd' => ['22655170184000'],
+            'cluster_kzn' => ['22655170185000'],
+        ];
+    }
+
+    /**
+     * Получить ID кластера по ID склада
+     */
+    private function getClusterIdByWarehouse(string $warehouseId): ?string
+    {
+        $mapping = $this->getClusterWarehouseMapping();
+        foreach ($mapping as $clusterId => $warehouses) {
+            if (in_array($warehouseId, $warehouses)) {
+                return $clusterId;
+            }
+        }
+        return null;
     }
 
     /**
@@ -1195,16 +1407,57 @@ class SupplyController extends Controller
     /**
      * Генерация fallback слотов для демонстрации
      */
-    private function generateFallbackSlots(string $dateFrom, string $dateTo): array
+    private function generateFallbackSlots(string $dateFrom, string $dateTo, array $clusterIds = []): array
     {
         $slots = [];
         $startDate = \Carbon\Carbon::parse($dateFrom);
         $endDate = \Carbon\Carbon::parse($dateTo);
         
-        $warehouses = [
-            ['id' => '22655170176000', 'name' => 'Хоругвино'],
-            ['id' => '22655170177000', 'name' => 'Коледино'],
+        // Все склады по кластерам
+        $allWarehouses = [
+            'cluster_msk' => [
+                ['id' => '22655170176000', 'name' => 'Хоругвино'],
+                ['id' => '22655170177000', 'name' => 'Коледино'],
+                ['id' => '22655170178000', 'name' => 'Подольск'],
+            ],
+            'cluster_spb' => [
+                ['id' => '22655170179000', 'name' => 'Шушары'],
+                ['id' => '22655170180000', 'name' => 'Бугры'],
+            ],
+            'cluster_ekb' => [
+                ['id' => '22655170181000', 'name' => 'Екатеринбург'],
+            ],
+            'cluster_nsk' => [
+                ['id' => '22655170183000', 'name' => 'Новосибирск'],
+            ],
+            'cluster_krd' => [
+                ['id' => '22655170184000', 'name' => 'Краснодар'],
+            ],
+            'cluster_kzn' => [
+                ['id' => '22655170185000', 'name' => 'Казань'],
+            ],
         ];
+
+        // Фильтруем склады по выбранным кластерам
+        $warehouses = [];
+        if (empty($clusterIds)) {
+            // Если кластеры не выбраны — показываем все
+            foreach ($allWarehouses as $clusterId => $clusterWarehouses) {
+                foreach ($clusterWarehouses as $wh) {
+                    $wh['cluster_id'] = $clusterId;
+                    $warehouses[] = $wh;
+                }
+            }
+        } else {
+            foreach ($clusterIds as $clusterId) {
+                if (isset($allWarehouses[$clusterId])) {
+                    foreach ($allWarehouses[$clusterId] as $wh) {
+                        $wh['cluster_id'] = $clusterId;
+                        $warehouses[] = $wh;
+                    }
+                }
+            }
+        }
 
         while ($startDate <= $endDate) {
             // Пропускаем выходные
@@ -1218,6 +1471,7 @@ class SupplyController extends Controller
                         'time_to' => '12:00',
                         'warehouse_id' => $warehouse['id'],
                         'warehouse_name' => $warehouse['name'],
+                        'cluster_id' => $warehouse['cluster_id'],
                         'is_available' => true,
                         'capacity' => 100,
                         'capacity_used' => rand(20, 60),
@@ -1233,6 +1487,7 @@ class SupplyController extends Controller
                         'time_to' => '17:00',
                         'warehouse_id' => $warehouse['id'],
                         'warehouse_name' => $warehouse['name'],
+                        'cluster_id' => $warehouse['cluster_id'],
                         'is_available' => true,
                         'capacity' => 100,
                         'capacity_used' => rand(30, 80),
