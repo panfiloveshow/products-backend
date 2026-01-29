@@ -284,13 +284,23 @@ class ShipmentController extends Controller
                             if (empty($items)) {
                                 try {
                                     $bundleResponse = $marketplace->fboSupplyOrders()->getBundle((int) $externalSupplyId);
-                                    $items = $bundleResponse['result']['items']
-                                        ?? $bundleResponse['items']
-                                        ?? $bundleResponse['result']['products']
-                                        ?? $bundleResponse['products']
-                                        ?? [];
+                                    // Новый формат: bundles[].items[]
+                                    $bundles = $bundleResponse['bundles'] ?? [];
+                                    foreach ($bundles as $bundle) {
+                                        $bundleItems = $bundle['items'] ?? [];
+                                        $items = array_merge($items, $bundleItems);
+                                    }
+                                    // Fallback на старый формат
+                                    if (empty($items)) {
+                                        $items = $bundleResponse['result']['items']
+                                            ?? $bundleResponse['items']
+                                            ?? $bundleResponse['result']['products']
+                                            ?? $bundleResponse['products']
+                                            ?? [];
+                                    }
                                     \Illuminate\Support\Facades\Log::info('show: fetched bundle from Ozon', [
                                         'external_supply_id' => $externalSupplyId,
+                                        'bundles_count' => count($bundles),
                                         'items_count' => count($items),
                                     ]);
                                 } catch (\Exception $bundleError) {
@@ -1697,14 +1707,22 @@ class ShipmentController extends Controller
                 \Illuminate\Support\Facades\Log::info('getBundle: Ozon API response', [
                     'supply_order_id' => $supplyOrderId,
                     'bundle_keys' => array_keys($bundle ?? []),
-                    'result_keys' => isset($bundle['result']) ? array_keys($bundle['result']) : [],
-                    'raw_bundle' => $bundle,
+                    'bundles_count' => count($bundle['bundles'] ?? []),
                 ]);
-                $items = $bundle['result']['items']
-                    ?? $bundle['items']
-                    ?? $bundle['result']['products']
-                    ?? $bundle['products']
-                    ?? [];
+                // Новый формат: bundles[].items[]
+                $bundles = $bundle['bundles'] ?? [];
+                foreach ($bundles as $b) {
+                    $bundleItems = $b['items'] ?? [];
+                    $items = array_merge($items, $bundleItems);
+                }
+                // Fallback на старый формат
+                if (empty($items)) {
+                    $items = $bundle['result']['items']
+                        ?? $bundle['items']
+                        ?? $bundle['result']['products']
+                        ?? $bundle['products']
+                        ?? [];
+                }
             }
 
             $resolvedSupplyOrderId = null;
@@ -1719,11 +1737,20 @@ class ShipmentController extends Controller
 
                 if ($resolvedSupplyOrderId) {
                     $bundle = $marketplace->fboSupplyOrders()->getBundle((int) $resolvedSupplyOrderId);
-                    $items = $bundle['result']['items']
-                        ?? $bundle['items']
-                        ?? $bundle['result']['products']
-                        ?? $bundle['products']
-                        ?? [];
+                    // Новый формат: bundles[].items[]
+                    $bundles = $bundle['bundles'] ?? [];
+                    foreach ($bundles as $b) {
+                        $bundleItems = $b['items'] ?? [];
+                        $items = array_merge($items, $bundleItems);
+                    }
+                    // Fallback на старый формат
+                    if (empty($items)) {
+                        $items = $bundle['result']['items']
+                            ?? $bundle['items']
+                            ?? $bundle['result']['products']
+                            ?? $bundle['products']
+                            ?? [];
+                    }
 
                     if (!empty($items)) {
                         $shipment->update([

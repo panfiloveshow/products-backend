@@ -82,6 +82,8 @@ class FboSupplyOrdersApi
 
     /**
      * Получить состав заявки (товары)
+     * Ozon API: POST /v1/supply-order/bundle
+     * Требует bundle_ids - массив ID бандлов из supplies[].bundles[].id
      */
     public function getBundle(int $supplyOrderId): array
     {
@@ -89,15 +91,51 @@ class FboSupplyOrdersApi
             'supply_order_id' => $supplyOrderId,
         ]);
         
-        $response = $this->client->post('/v1/supply-order/bundle', [
+        // Сначала получаем детали заявки чтобы извлечь bundle_ids
+        $orderDetails = $this->get([$supplyOrderId]);
+        $orders = $orderDetails['orders'] ?? [];
+        $order = $orders[0] ?? null;
+        
+        if (!$order) {
+            Log::warning('Ozon FBO supply-order/bundle: order not found', [
+                'supply_order_id' => $supplyOrderId,
+            ]);
+            return [];
+        }
+        
+        // Извлекаем bundle_ids из supplies
+        $bundleIds = [];
+        $supplies = $order['supplies'] ?? [];
+        foreach ($supplies as $supply) {
+            $bundles = $supply['bundles'] ?? [];
+            foreach ($bundles as $bundle) {
+                if (!empty($bundle['id'])) {
+                    $bundleIds[] = (int) $bundle['id'];
+                }
+            }
+        }
+        
+        if (empty($bundleIds)) {
+            Log::info('Ozon FBO supply-order/bundle: no bundle_ids found', [
+                'supply_order_id' => $supplyOrderId,
+                'supplies_count' => count($supplies),
+            ]);
+            return [];
+        }
+        
+        Log::info('Ozon FBO supply-order/bundle: calling API', [
             'supply_order_id' => $supplyOrderId,
+            'bundle_ids' => $bundleIds,
+        ]);
+        
+        $response = $this->client->post('/v1/supply-order/bundle', [
+            'bundle_ids' => $bundleIds,
         ]);
 
         Log::info('Ozon FBO supply-order/bundle response', [
             'supply_order_id' => $supplyOrderId,
             'response_keys' => $response ? array_keys($response) : [],
-            'result_keys' => isset($response['result']) ? array_keys($response['result']) : [],
-            'items_count' => count($response['result']['items'] ?? $response['items'] ?? []),
+            'bundles_count' => count($response['bundles'] ?? []),
         ]);
 
         return $response ?? [];
