@@ -148,8 +148,8 @@ class ShipmentController extends Controller
             'slot_date' => $slot['date'] ?? null,
             'slot_time_from' => $slot['time_from'] ?? null,
             'slot_time_to' => $slot['time_to'] ?? null,
-            'items_count' => $shipment->total_items ?? $shipment->items->count(),
-            'total_quantity' => $shipment->total_quantity ?? $shipment->items->sum('quantity'),
+            'items_count' => $shipment->total_items ?: $shipment->items->count(),
+            'total_quantity' => $shipment->total_quantity ?: $shipment->items->sum('quantity'),
             'items' => $shipment->items->map(fn ($item) => [
                 'sku' => $item->sku,
                 'name' => $item->product_name ?? $item->sku,
