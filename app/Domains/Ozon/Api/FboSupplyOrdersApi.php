@@ -31,9 +31,12 @@ class FboSupplyOrdersApi
                 'DATA_FILLING',
                 'READY_TO_SUPPLY',
                 'IN_TRANSIT',
+                'AT_WAREHOUSE',
+                'ACCEPTING',
                 'ACCEPTANCE',
                 'ACCEPTED',
                 'PARTIALLY_ACCEPTED',
+                'CANCELLED',
             ];
         }
 
