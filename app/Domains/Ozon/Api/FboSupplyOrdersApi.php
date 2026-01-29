@@ -142,6 +142,28 @@ class FboSupplyOrdersApi
     }
 
     /**
+     * Получить товары заявки напрямую
+     * POST /v1/supply-order/items
+     */
+    public function getItems(int $supplyOrderId): array
+    {
+        Log::info('Ozon FBO supply-order/items request', [
+            'supply_order_id' => $supplyOrderId,
+        ]);
+        
+        $response = $this->client->post('/v1/supply-order/items', [
+            'supply_order_id' => $supplyOrderId,
+        ]);
+
+        Log::info('Ozon FBO supply-order/items response', [
+            'supply_order_id' => $supplyOrderId,
+            'items_count' => count($response['items'] ?? []),
+        ]);
+
+        return $response['items'] ?? [];
+    }
+
+    /**
      * Отмена заявки на поставку
      */
     public function cancel(int $supplyOrderId): array
