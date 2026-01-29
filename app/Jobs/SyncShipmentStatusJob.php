@@ -208,14 +208,16 @@ class SyncShipmentStatusJob implements ShouldQueue
     {
         return match (strtoupper($ozonStatus)) {
             'DRAFT' => Shipment::STATUS_DRAFT,
-            'AWAITING_CONFIRMATION' => Shipment::STATUS_PENDING_LOGISTICS,
-            'CONFIRMED' => Shipment::STATUS_APPROVED,
+            'AWAITING_CONFIRMATION' => Shipment::STATUS_PENDING_CONFIRMATION,
+            'CONFIRMED' => Shipment::STATUS_CONFIRMED,
+            'READY_TO_SUPPLY' => Shipment::STATUS_APPROVED,
             'IN_TRANSIT' => Shipment::STATUS_IN_TRANSIT,
-            'AT_WAREHOUSE' => Shipment::STATUS_IN_TRANSIT,
-            'ACCEPTING' => Shipment::STATUS_IN_TRANSIT,
+            'AT_WAREHOUSE' => Shipment::STATUS_ARRIVED,
+            'ACCEPTING' => Shipment::STATUS_PROCESSING,
+            'ACCEPTANCE' => Shipment::STATUS_PROCESSING,
             'ACCEPTED' => Shipment::STATUS_DELIVERED,
-            'PARTIALLY_ACCEPTED' => Shipment::STATUS_DELIVERED,
-            'CANCELLED' => Shipment::STATUS_REJECTED,
+            'PARTIALLY_ACCEPTED' => Shipment::STATUS_PARTIALLY_ACCEPTED,
+            'CANCELLED' => Shipment::STATUS_CANCELLED,
             default => Shipment::STATUS_PENDING_LOGISTICS,
         };
     }

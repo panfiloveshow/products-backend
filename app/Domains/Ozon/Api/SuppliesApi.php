@@ -143,32 +143,32 @@ class SuppliesApi implements SuppliesApiInterface
     }
 
     /**
-     * Получить список доступных складов
-     * 
-     * POST /v1/warehouse/list
+     * Получить список доступных складов Ozon (FBO)
+     * Использует кластеры для получения складов фулфилмента
      */
     public function getAvailableWarehouses(): array
     {
-        $response = $this->client->post('/v1/warehouse/list', []);
-
-        if (!$response) {
+        $clusters = $this->getClusters();
+        
+        if (empty($clusters)) {
             return [];
         }
 
-        $warehouses = $response['result'] ?? [];
+        $warehouses = [];
         
-        return array_map(fn($wh) => [
-            'id' => (string) ($wh['warehouse_id'] ?? null),
-            'name' => $wh['name'] ?? null,
-            'address' => $wh['address'] ?? null,
-            'city' => $wh['city'] ?? null,
-            'region' => $wh['region'] ?? null,
-            'is_rfbs' => $wh['is_rfbs'] ?? false,
-            'is_able_to_set_price' => $wh['is_able_to_set_price'] ?? false,
-            'has_entrusted_acceptance' => $wh['has_entrusted_acceptance'] ?? false,
-            'first_mile_type' => $wh['first_mile_type'] ?? null,
-            'status' => $wh['status'] ?? null,
-        ], $warehouses);
+        foreach ($clusters as $cluster) {
+            // Добавляем кластер как "склад" для упрощения выбора
+            $warehouses[] = [
+                'id' => (string) $cluster['id'],
+                'name' => $cluster['name'],
+                'type' => 'cluster',
+                'warehouses_count' => $cluster['warehouses_count'] ?? 0,
+                'accepting_warehouses_count' => $cluster['accepting_warehouses_count'] ?? 0,
+                'warehouse_ids' => $cluster['warehouse_ids'] ?? [],
+            ];
+        }
+
+        return $warehouses;
     }
 
     /**
@@ -508,8 +508,14 @@ class SuppliesApi implements SuppliesApiInterface
                 }
             }
             
+            // id — это ID кластера для API /v1/draft/create
+            // macrolocal_cluster_id — дополнительный идентификатор
+            $clusterId = $cluster['id'] ?? null;
+            $macrolocalClusterId = $cluster['macrolocal_cluster_id'] ?? null;
+            
             return [
-                'id' => (string) ($cluster['id'] ?? null),
+                'id' => (string) $clusterId, // Используем id кластера для API
+                'macrolocal_cluster_id' => (string) $macrolocalClusterId,
                 'name' => $cluster['name'] ?? null,
                 'type' => $cluster['type'] ?? 'CLUSTER_TYPE_OZON',
                 'warehouses_count' => $acceptingWarehousesCount,
@@ -532,33 +538,313 @@ class SuppliesApi implements SuppliesApiInterface
      */
     public function createDirectDraft(array $data): array
     {
-        $body = [
-            'macrolocal_cluster_id' => $data['macrolocal_cluster_id'] ?? '',
-        ];
-
+        $items = [];
         if (!empty($data['items'])) {
-            $body['items'] = array_map(fn($item) => [
-                'sku' => $item['sku'] ?? $item['offer_id'] ?? '',
-                'quantity' => $item['quantity'] ?? 0,
+            $items = array_map(fn($item) => [
+                'sku' => (int) ($item['sku'] ?? $item['product_id'] ?? 0),
+                'quantity' => (int) ($item['quantity'] ?? 0),
             ], $data['items']);
         }
 
-        $response = $this->client->post('/v1/draft/direct/create', $body);
+        // Используем актуальный эндпоинт /v1/draft/create
+        // Пробуем передать cluster_ids как массив int64 (числа)
+        $clusterId = (int) ($data['macrolocal_cluster_id'] ?? 0);
+        $body = [
+            'cluster_ids' => [$clusterId],
+            'items' => $items,
+            'type' => 'CREATE_TYPE_DIRECT',
+        ];
 
-        if (!$response || empty($response['result'])) {
+        \Illuminate\Support\Facades\Log::info('Ozon draft/create request', [
+            'body' => $body,
+        ]);
+
+        $response = $this->client->post('/v1/draft/create', $body);
+
+        \Illuminate\Support\Facades\Log::info('Ozon draft/create response', [
+            'response' => $response,
+        ]);
+
+        if (!$response || empty($response['operation_id'])) {
             throw new \RuntimeException(
-                'Не удалось создать черновик прямой поставки: ' . 
-                ($response['error']['message'] ?? 'Unknown error')
+                'Не удалось создать черновик поставки: ' . 
+                json_encode($response)
             );
         }
 
+        $operationId = $response['operation_id'];
+
+        // Ждём и получаем информацию о созданном черновике
+        // Ozon может обрабатывать запрос несколько секунд
+        $draftInfo = null;
+        $maxAttempts = 5;
+        $attempt = 0;
+        
+        while ($attempt < $maxAttempts) {
+            $attempt++;
+            sleep(2); // Ждём 2 секунды между попытками
+            
+            $draftInfo = $this->getDraftCreateInfo($operationId);
+            $status = $draftInfo['status'] ?? '';
+            
+            // Если статус не IN_PROGRESS — выходим
+            if ($status !== 'CALCULATION_STATUS_IN_PROGRESS') {
+                break;
+            }
+            
+            \Illuminate\Support\Facades\Log::debug('Ozon draft still in progress', [
+                'operation_id' => $operationId,
+                'attempt' => $attempt,
+            ]);
+        }
+        
+        \Illuminate\Support\Facades\Log::info('Ozon draft/create/info response', [
+            'operation_id' => $operationId,
+            'draft_info' => $draftInfo,
+        ]);
+
+        $draftId = null;
+        $errors = [];
+        $status = $draftInfo['status'] ?? 'UNKNOWN';
+        
+        // Сначала проверяем draft_id на верхнем уровне
+        if (!empty($draftInfo['draft_id']) && $draftInfo['draft_id'] !== 0) {
+            $draftId = (string) $draftInfo['draft_id'];
+        }
+        
+        // Если нет — ищем в clusters
+        if (!$draftId && !empty($draftInfo['clusters'])) {
+            foreach ($draftInfo['clusters'] as $cluster) {
+                if (!empty($cluster['draft_id']) && $cluster['draft_id'] !== 0) {
+                    $draftId = (string) $cluster['draft_id'];
+                    break;
+                }
+            }
+        }
+
+        // Обрабатываем ошибки
+        if (!empty($draftInfo['errors'])) {
+            foreach ($draftInfo['errors'] as $error) {
+                if (!empty($error['items_validation'])) {
+                    foreach ($error['items_validation'] as $item) {
+                        $reasons = $item['reasons'] ?? [];
+                        $sku = $item['sku'] ?? 'unknown';
+                        foreach ($reasons as $reason) {
+                            $errors[] = $this->translateOzonError($reason, $sku);
+                        }
+                    }
+                }
+                if (!empty($error['unknown_cluster_ids'])) {
+                    $errors[] = 'Неизвестные кластеры: ' . implode(', ', $error['unknown_cluster_ids']);
+                }
+                if (!empty($error['error_message'])) {
+                    $errors[] = $error['error_message'];
+                }
+            }
+        }
+
+        // Если статус FAILED и нет draft_id, выбрасываем исключение с понятным сообщением
+        if ($status === 'CALCULATION_STATUS_FAILED' && !$draftId) {
+            $errorMessage = !empty($errors) 
+                ? implode('; ', array_filter($errors))
+                : 'Не удалось создать черновик в Ozon';
+            throw new \RuntimeException($errorMessage);
+        }
+
         return [
-            'draft_id' => (string) ($response['result']['draft_id'] ?? null),
-            'status' => 'draft',
+            'draft_id' => $draftId ?? $operationId,
+            'operation_id' => $operationId,
+            'status' => $status === 'CALCULATION_STATUS_SUCCESS' ? 'draft' : 'pending',
             'supply_method' => 'direct',
             'macrolocal_cluster_id' => $data['macrolocal_cluster_id'] ?? null,
+            'errors' => $errors,
             'created_at' => now()->toIso8601String(),
         ];
+    }
+
+    /**
+     * Перевод ошибок Ozon API на русский
+     */
+    private function translateOzonError(string $reason, $sku): string
+    {
+        $translations = [
+            'ITEM_REJECTION_REASON_OUT_OF_ASSORTMENT' => "Товар SKU {$sku} не в ассортименте FBO (возможно, товар настроен только для FBS)",
+            'ITEM_REJECTION_REASON_NO_STOCK' => "Товар SKU {$sku} нет на складе",
+            'ITEM_REJECTION_REASON_BLOCKED' => "Товар SKU {$sku} заблокирован",
+            'ITEM_REJECTION_REASON_UNKNOWN' => "Товар SKU {$sku} отклонён по неизвестной причине",
+        ];
+
+        return $translations[$reason] ?? "Товар SKU {$sku}: {$reason}";
+    }
+
+    /**
+     * Получить информацию о созданном черновике
+     * 
+     * POST /v1/draft/create/info
+     */
+    public function getDraftCreateInfo(string $operationId): array
+    {
+        $response = $this->client->post('/v1/draft/create/info', [
+            'operation_id' => $operationId,
+        ]);
+
+        return $response ?? [];
+    }
+
+    /**
+     * Получить доступные таймслоты для черновика
+     * 
+     * POST /v1/draft/timeslot/info
+     */
+    public function getDraftTimeslots(int $draftId, int $warehouseId): array
+    {
+        // Запрашиваем слоты на ближайшие 14 дней
+        $dateFrom = now()->toIso8601String();
+        $dateTo = now()->addDays(14)->toIso8601String();
+
+        $response = $this->client->post('/v1/draft/timeslot/info', [
+            'draft_id' => $draftId,
+            'warehouse_ids' => [(string) $warehouseId],
+            'date_from' => $dateFrom,
+            'date_to' => $dateTo,
+        ]);
+
+        \Illuminate\Support\Facades\Log::info('Ozon draft/timeslot/info response', [
+            'draft_id' => $draftId,
+            'warehouse_id' => $warehouseId,
+            'response' => $response,
+        ]);
+
+        return $response ?? [];
+    }
+
+    /**
+     * Создать заявку на поставку из черновика
+     * 
+     * POST /v1/draft/supply/create
+     */
+    public function createSupplyFromDraft(int $draftId, int $warehouseId, ?array $timeslot = null): array
+    {
+        $body = [
+            'draft_id' => $draftId,
+            'warehouse_id' => $warehouseId,
+        ];
+
+        if ($timeslot) {
+            $body['timeslot'] = [
+                'from_in_timezone' => $timeslot['from'] ?? '',
+                'to_in_timezone' => $timeslot['to'] ?? '',
+            ];
+        }
+
+        \Illuminate\Support\Facades\Log::info('Ozon draft/supply/create request', [
+            'body' => $body,
+        ]);
+
+        $response = $this->client->post('/v1/draft/supply/create', $body);
+
+        \Illuminate\Support\Facades\Log::info('Ozon draft/supply/create response', [
+            'response' => $response,
+        ]);
+
+        return $response ?? [];
+    }
+
+    /**
+     * Получить статус создания заявки на поставку
+     * 
+     * POST /v1/supply/create/status
+     */
+    public function getSupplyCreateStatus(string $operationId): array
+    {
+        $response = $this->client->post('/v1/supply/create/status', [
+            'operation_id' => $operationId,
+        ]);
+
+        return $response ?? [];
+    }
+
+    /**
+     * Получить список заявок на поставку из Ozon
+     * 
+     * POST /v3/supply-order/list
+     */
+    public function getSupplyOrdersList(array $states = [], int $limit = 100, ?string $lastId = null): array
+    {
+        // Если статусы не указаны, запрашиваем все активные
+        // Используем формат из документации Ozon
+        if (empty($states)) {
+            $states = [
+                'DATA_FILLING',
+                'READY_TO_SUPPLY',
+                'IN_TRANSIT',
+                'ACCEPTANCE',
+                'ACCEPTED',
+                'PARTIALLY_ACCEPTED',
+            ];
+        }
+
+        $body = [
+            'filter' => [
+                'states' => $states,
+            ],
+            'limit' => $limit,
+            'sort_by' => 'ORDER_CREATION',
+            'sort_dir' => 'DESC',
+        ];
+
+        if ($lastId) {
+            $body['last_id'] = $lastId;
+        }
+
+        \Illuminate\Support\Facades\Log::info('Ozon /v3/supply-order/list request', [
+            'body' => $body,
+        ]);
+
+        $response = $this->client->post('/v3/supply-order/list', $body);
+
+        \Illuminate\Support\Facades\Log::info('Ozon /v3/supply-order/list response', [
+            'states' => $states,
+            'response' => $response,
+        ]);
+
+        return [
+            'order_ids' => $response['order_ids'] ?? [],
+            'last_id' => $response['last_id'] ?? null,
+        ];
+    }
+
+    /**
+     * Получить детали заявок на поставку
+     * 
+     * POST /v3/supply-order/get
+     */
+    public function getSupplyOrdersDetails(array $orderIds): array
+    {
+        $response = $this->client->post('/v3/supply-order/get', [
+            'order_ids' => array_map('intval', $orderIds),
+        ]);
+
+        \Illuminate\Support\Facades\Log::info('Ozon /v3/supply-order/get response', [
+            'order_ids' => $orderIds,
+            'orders_count' => count($response['orders'] ?? []),
+        ]);
+
+        return $response ?? [];
+    }
+
+    /**
+     * Получить состав поставки (товары)
+     * 
+     * POST /v1/supply-order/bundle
+     */
+    public function getSupplyOrderBundle(int $supplyOrderId): array
+    {
+        $response = $this->client->post('/v1/supply-order/bundle', [
+            'supply_order_id' => $supplyOrderId,
+        ]);
+
+        return $response ?? [];
     }
 
     /**
@@ -709,125 +995,54 @@ class SuppliesApi implements SuppliesApiInterface
         ];
     }
 
-    /**
-     * Получить таймслоты для черновика (новый API)
-     * 
-     * POST /v2/draft/timeslot/info
-     * 
-     * @param string $draftId ID черновика
-     * @param string $warehouseId ID склада в кластере
-     */
-    public function getDraftTimeslots(string $draftId, string $warehouseId): array
-    {
-        $response = $this->client->post('/v2/draft/timeslot/info', [
-            'draft_id' => $draftId,
-            'warehouse_id' => (int) $warehouseId,
-        ]);
+    // Метод getDraftTimeslots определён выше
 
-        if (!$response) {
-            return [];
-        }
+    // Метод createSupplyFromDraft определён выше
 
-        $slots = $response['result']['timeslots'] ?? $response['timeslots'] ?? [];
-        
-        return array_map(fn($slot) => [
-            'id' => $slot['timeslot_id'] ?? null,
-            'warehouse_id' => $warehouseId,
-            'date' => substr($slot['from'] ?? '', 0, 10),
-            'time_from' => substr($slot['from'] ?? '', 11, 5),
-            'time_to' => substr($slot['to'] ?? '', 11, 5),
-            'from_datetime' => $slot['from'] ?? null,
-            'to_datetime' => $slot['to'] ?? null,
-            'is_available' => $slot['is_available'] ?? true,
-            'capacity' => $slot['capacity'] ?? null,
-        ], $slots);
-    }
-
-    /**
-     * Создать поставку из черновика (новый API)
-     * 
-     * POST /v2/draft/timeslot/info (с параметрами для создания)
-     * 
-     * @param string $draftId ID черновика
-     * @param string $warehouseId ID склада
-     * @param string $timeslotId ID таймслота
-     */
-    public function createSupplyFromDraft(string $draftId, string $warehouseId, string $timeslotId): array
-    {
-        $response = $this->client->post('/v2/draft/timeslot/info', [
-            'draft_id' => $draftId,
-            'warehouse_id' => (int) $warehouseId,
-            'timeslot_id' => (int) $timeslotId,
-            'create_supply' => true,
-        ]);
-
-        if (!$response || !empty($response['error'])) {
-            throw new \RuntimeException(
-                'Не удалось создать поставку из черновика: ' . 
-                ($response['error']['message'] ?? 'Unknown error')
-            );
-        }
-
-        return [
-            'success' => true,
-            'draft_id' => $draftId,
-            'warehouse_id' => $warehouseId,
-            'timeslot_id' => $timeslotId,
-            'supply_order_id' => $response['result']['supply_order_id'] ?? null,
-            'created_at' => now()->toIso8601String(),
-        ];
-    }
-
-    /**
-     * Получить статус создания поставки
-     * 
-     * POST /v2/draft/supply/create/status
-     */
-    public function getSupplyCreateStatus(string $draftId): array
-    {
-        $response = $this->client->post('/v2/draft/supply/create/status', [
-            'draft_id' => $draftId,
-        ]);
-
-        if (!$response) {
-            return [];
-        }
-
-        $result = $response['result'] ?? [];
-        
-        return [
-            'draft_id' => $draftId,
-            'status' => $result['status'] ?? 'unknown',
-            'supply_order_id' => $result['supply_order_id'] ?? null,
-            'errors' => $result['errors'] ?? [],
-            'created_at' => $result['created_at'] ?? null,
-        ];
-    }
+    // Метод getSupplyCreateStatus определён выше
 
     /**
      * Получить список складов FBO
      * 
      * POST /v1/warehouse/fbo/list
      */
-    public function getFboWarehouses(): array
+    public function getFboWarehouses(array $params = []): array
     {
-        $response = $this->client->post('/v1/warehouse/fbo/list', []);
+        $body = [];
+
+        if (!empty($params['filter_by_supply_type'])) {
+            $body['filter_by_supply_type'] = $params['filter_by_supply_type'];
+        }
+
+        if (!empty($params['search'])) {
+            $body['search'] = $params['search'];
+        }
+
+        $response = $this->client->post('/v1/warehouse/fbo/list', $body, empty($body));
 
         if (!$response) {
             return [];
         }
 
-        $warehouses = $response['result']['warehouses'] ?? $response['result'] ?? [];
+        $result = $response['result'] ?? $response;
+        $warehouses = $result['warehouses']
+            ?? $result['search']
+            ?? $result['items']
+            ?? $result
+            ?? [];
         
         return array_map(fn($wh) => [
             'id' => (string) ($wh['warehouse_id'] ?? $wh['id'] ?? null),
             'name' => $wh['name'] ?? null,
-            'type' => $wh['type'] ?? null,
-            'address' => $wh['address'] ?? null,
-            'city' => $wh['city'] ?? null,
-            'region' => $wh['region'] ?? null,
-            'cluster_id' => $wh['macrolocal_cluster_id'] ?? null,
+            'type' => $wh['warehouse_type'] ?? $wh['type'] ?? null,
+            'address' => is_array($wh['address'] ?? null)
+                ? ($wh['address']['address'] ?? null)
+                : ($wh['address'] ?? null),
+            'city' => $wh['city'] ?? ($wh['address']['city'] ?? null),
+            'region' => $wh['region'] ?? ($wh['address']['region'] ?? null),
+            'cluster_id' => $wh['macrolocal_cluster_id'] ?? ($wh['address']['macrolocal_cluster_id'] ?? null),
             'cluster_name' => $wh['cluster_name'] ?? null,
+            'coordinates' => $wh['coordinates'] ?? ($wh['address']['coordinates'] ?? null),
             'is_active' => $wh['is_active'] ?? true,
         ], $warehouses);
     }
@@ -839,21 +1054,304 @@ class SuppliesApi implements SuppliesApiInterface
      */
     public function getSellerWarehouses(): array
     {
-        $response = $this->client->post('/v1/warehouse/fbo/seller/list', []);
+        $response = $this->client->post('/v1/warehouse/fbo/seller/list', [], true);
 
         if (!$response) {
             return [];
         }
 
-        $warehouses = $response['result']['warehouses'] ?? $response['result'] ?? [];
+        $result = $response['result'] ?? $response;
+        $warehouses = $result['warehouses'] ?? $result ?? [];
         
         return array_map(fn($wh) => [
-            'id' => (string) ($wh['warehouse_id'] ?? $wh['id'] ?? null),
-            'name' => $wh['name'] ?? null,
-            'address' => $wh['address'] ?? null,
-            'city' => $wh['city'] ?? null,
+            'id' => (string) ($wh['seller_warehouse_id'] ?? $wh['warehouse_id'] ?? $wh['id'] ?? null),
+            'name' => $wh['seller_warehouse_name'] ?? $wh['name'] ?? null,
+            'address' => $wh['address']['address'] ?? null,
+            'city' => $wh['address']['city'] ?? null,
+            'region' => $wh['address']['region'] ?? null,
+            'cluster_id' => $wh['address']['macrolocal_cluster_id'] ?? null,
+            'country_code' => $wh['address']['country_code'] ?? null,
+            'timezone' => $wh['address']['timezone'] ?? null,
+            'contacts' => $wh['contacts']['phone_numbers'] ?? [],
+            'courier_comment' => $wh['courier_comment'] ?? null,
+            'is_pickup' => $wh['is_pickup'] ?? false,
             'is_active' => $wh['is_active'] ?? true,
+            'working_days' => $wh['working_days'] ?? [],
         ], $warehouses);
+    }
+
+    /**
+     * Создать пропуск для поставки (данные водителя и ТС)
+     * 
+     * POST /v1/supply-order/pass/create
+     */
+    public function createSupplyOrderPass(string $supplyOrderId, array $vehicle): array
+    {
+        $body = [
+            'supply_order_id' => (int) $supplyOrderId,
+            'vehicle' => [
+                'driver_name' => $vehicle['driver_name'] ?? '',
+                'driver_phone' => $vehicle['driver_phone'] ?? '',
+                'vehicle_model' => $vehicle['vehicle_model'] ?? null,
+                'vehicle_number' => $vehicle['vehicle_number'] ?? '',
+            ],
+        ];
+
+        $response = $this->client->post('/v1/supply-order/pass/create', $body);
+
+        if (!$response || !empty($response['error'])) {
+            throw new \RuntimeException(
+                'Не удалось создать пропуск: ' .
+                ($response['error']['message'] ?? 'Unknown error')
+            );
+        }
+
+        return $response['result'] ?? $response;
+    }
+
+    /**
+     * Получить подробную информацию о заявке на поставку (v1)
+     * 
+     * POST /v1/supply-order/details
+     */
+    public function getSupplyOrderDetailsV1(string $supplyOrderId): array
+    {
+        $response = $this->client->post('/v1/supply-order/details', [
+            'supply_order_id' => (int) $supplyOrderId,
+        ]);
+
+        if (!$response || !empty($response['error'])) {
+            throw new \RuntimeException(
+                'Не удалось получить детали заявки: ' .
+                ($response['error']['message'] ?? 'Unknown error')
+            );
+        }
+
+        return $response['result'] ?? $response;
+    }
+
+    /**
+     * Получить доступные таймслоты для заявки
+     * 
+     * POST /v1/supply-order/timeslot/get
+     */
+    public function getSupplyOrderTimeslot(string $supplyOrderId, array $payload = []): array
+    {
+        $body = array_merge([
+            'supply_order_id' => (int) $supplyOrderId,
+        ], $payload);
+
+        $response = $this->client->post('/v1/supply-order/timeslot/get', $body);
+
+        if (!$response || !empty($response['error'])) {
+            throw new \RuntimeException(
+                'Не удалось получить таймслоты: ' .
+                ($response['error']['message'] ?? 'Unknown error')
+            );
+        }
+
+        return $response['result'] ?? $response;
+    }
+
+    /**
+     * Получить статус обновления таймслота заявки
+     * 
+     * POST /v1/supply-order/timeslot/status
+     */
+    public function getSupplyOrderTimeslotStatus(string $operationId): array
+    {
+        $response = $this->client->post('/v1/supply-order/timeslot/status', [
+            'operation_id' => $operationId,
+        ]);
+
+        if (!$response || !empty($response['error'])) {
+            throw new \RuntimeException(
+                'Не удалось получить статус таймслота: ' .
+                ($response['error']['message'] ?? 'Unknown error')
+            );
+        }
+
+        return $response['result'] ?? $response;
+    }
+
+    /**
+     * Обновить таймслот заявки
+     * 
+     * POST /v1/supply-order/timeslot/update
+     */
+    public function updateSupplyOrderTimeslot(string $supplyOrderId, string|int $timeslotId, array $payload = []): array
+    {
+        $body = array_merge([
+            'supply_order_id' => (int) $supplyOrderId,
+            'timeslot_id' => (int) $timeslotId,
+        ], $payload);
+
+        $response = $this->client->post('/v1/supply-order/timeslot/update', $body);
+
+        if (!$response || !empty($response['error'])) {
+            throw new \RuntimeException(
+                'Не удалось обновить таймслот: ' .
+                ($response['error']['message'] ?? 'Unknown error')
+            );
+        }
+
+        return $response['result'] ?? $response;
+    }
+
+    /**
+     * Редактирование состава заявки
+     * 
+     * POST /v1/supply-order/content/update
+     */
+    public function updateSupplyOrderContent(string $supplyOrderId, array $payload = []): array
+    {
+        $body = array_merge([
+            'supply_order_id' => (int) $supplyOrderId,
+        ], $payload);
+
+        $response = $this->client->post('/v1/supply-order/content/update', $body);
+
+        if (!$response || !empty($response['error'])) {
+            throw new \RuntimeException(
+                'Не удалось обновить состав заявки: ' .
+                ($response['error']['message'] ?? 'Unknown error')
+            );
+        }
+
+        return $response['result'] ?? $response;
+    }
+
+    /**
+     * Проверить новый состав заявки
+     * 
+     * POST /v1/supply-order/content/update/validation
+     */
+    public function validateSupplyOrderContent(string $supplyOrderId, array $payload = []): array
+    {
+        $body = array_merge([
+            'supply_order_id' => (int) $supplyOrderId,
+        ], $payload);
+
+        $response = $this->client->post('/v1/supply-order/content/update/validation', $body);
+
+        if (!$response || !empty($response['error'])) {
+            throw new \RuntimeException(
+                'Не удалось проверить состав заявки: ' .
+                ($response['error']['message'] ?? 'Unknown error')
+            );
+        }
+
+        return $response['result'] ?? $response;
+    }
+
+    /**
+     * Получить статус редактирования состава заявки
+     * 
+     * POST /v1/supply-order/content/update/status
+     */
+    public function getSupplyOrderContentUpdateStatus(string $operationId): array
+    {
+        $response = $this->client->post('/v1/supply-order/content/update/status', [
+            'operation_id' => $operationId,
+        ]);
+
+        if (!$response || !empty($response['error'])) {
+            throw new \RuntimeException(
+                'Не удалось получить статус редактирования состава: ' .
+                ($response['error']['message'] ?? 'Unknown error')
+            );
+        }
+
+        return $response['result'] ?? $response;
+    }
+
+    /**
+     * Сгенерировать акт приёмки (FBP)
+     * 
+     * POST /v1/fbp/act-from/create
+     */
+    public function createFbpAcceptanceAct(string $supplyOrderId, array $payload = []): array
+    {
+        $body = array_merge([
+            'supply_order_id' => (int) $supplyOrderId,
+        ], $payload);
+
+        $response = $this->client->post('/v1/fbp/act-from/create', $body);
+
+        if (!$response || !empty($response['error'])) {
+            throw new \RuntimeException(
+                'Не удалось создать акт приёмки: ' .
+                ($response['error']['message'] ?? 'Unknown error')
+            );
+        }
+
+        return $response['result'] ?? $response;
+    }
+
+    /**
+     * Получить статус генерации акта приёмки (FBP)
+     * 
+     * POST /v1/fbp/act-from/get
+     */
+    public function getFbpAcceptanceActStatus(string $operationId): array
+    {
+        $response = $this->client->post('/v1/fbp/act-from/get', [
+            'operation_id' => $operationId,
+        ]);
+
+        if (!$response || !empty($response['error'])) {
+            throw new \RuntimeException(
+                'Не удалось получить статус акта: ' .
+                ($response['error']['message'] ?? 'Unknown error')
+            );
+        }
+
+        return $response['result'] ?? $response;
+    }
+
+    /**
+     * Отредактировать таймслот в черновике прямой поставки (FBP)
+     * 
+     * POST /v1/fbp/draft/direct/timeslot/edit
+     */
+    public function editFbpDirectDraftTimeslot(string $draftId, string|int $timeslotId, array $payload = []): array
+    {
+        $body = array_merge([
+            'draft_id' => (string) $draftId,
+            'timeslot_id' => (int) $timeslotId,
+        ], $payload);
+
+        $response = $this->client->post('/v1/fbp/draft/direct/timeslot/edit', $body);
+
+        if (!$response || !empty($response['error'])) {
+            throw new \RuntimeException(
+                'Не удалось изменить таймслот черновика: ' .
+                ($response['error']['message'] ?? 'Unknown error')
+            );
+        }
+
+        return $response['result'] ?? $response;
+    }
+
+    /**
+     * Получить статус создания пропуска
+     * 
+     * POST /v1/supply-order/pass/status
+     */
+    public function getSupplyOrderPassStatus(string $operationId): array
+    {
+        $response = $this->client->post('/v1/supply-order/pass/status', [
+            'operation_id' => $operationId,
+        ]);
+
+        if (!$response || !empty($response['error'])) {
+            throw new \RuntimeException(
+                'Не удалось получить статус пропуска: ' .
+                ($response['error']['message'] ?? 'Unknown error')
+            );
+        }
+
+        return $response['result'] ?? $response;
     }
 
     /**
@@ -1297,4 +1795,5 @@ class SuppliesApi implements SuppliesApiInterface
             'timeslot' => $order['timeslot'] ?? null,
         ], $orders);
     }
+
 }

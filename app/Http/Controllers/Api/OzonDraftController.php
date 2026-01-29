@@ -863,13 +863,19 @@ class OzonDraftController extends Controller
     {
         $validated = $request->validate([
             'integration_id' => 'required|exists:integrations,id',
+            'filter_by_supply_type' => 'nullable|array',
+            'filter_by_supply_type.*' => 'string',
+            'search' => 'nullable|string',
         ]);
 
         try {
             $integration = Integration::findOrFail($validated['integration_id']);
             $ozon = OzonMarketplace::fromIntegration($integration);
             
-            $warehouses = $ozon->supplies()->getFboWarehouses();
+            $warehouses = $ozon->supplies()->getFboWarehouses([
+                'filter_by_supply_type' => $validated['filter_by_supply_type'] ?? null,
+                'search' => $validated['search'] ?? null,
+            ]);
 
             return response()->json([
                 'success' => true,

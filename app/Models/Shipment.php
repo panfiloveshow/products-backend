@@ -73,6 +73,48 @@ class Shipment extends Model
         ];
     }
 
+    /**
+     * Группировка статусов по разделам (как в Ozon Seller)
+     */
+    public static function getStatusGroups(): array
+    {
+        return [
+            'new' => [
+                'label' => 'Новые',
+                'statuses' => [self::STATUS_DRAFT, self::STATUS_PENDING_LOGISTICS],
+            ],
+            'preparing' => [
+                'label' => 'Подготовка к поставкам',
+                'statuses' => [self::STATUS_SUBMITTED, self::STATUS_PENDING_CONFIRMATION, self::STATUS_CONFIRMED, self::STATUS_APPROVED],
+            ],
+            'in_transit' => [
+                'label' => 'Товары в пути и приёмка',
+                'statuses' => [self::STATUS_SENT, self::STATUS_IN_TRANSIT, self::STATUS_ARRIVED, self::STATUS_PROCESSING],
+            ],
+            'confirmation' => [
+                'label' => 'Подтверждение актов',
+                'statuses' => [self::STATUS_PARTIALLY_ACCEPTED],
+            ],
+            'archive' => [
+                'label' => 'Архив',
+                'statuses' => [self::STATUS_DELIVERED, self::STATUS_REJECTED, self::STATUS_CANCELLED],
+            ],
+        ];
+    }
+
+    /**
+     * Получить группу статуса
+     */
+    public function getStatusGroup(): string
+    {
+        foreach (self::getStatusGroups() as $group => $data) {
+            if (in_array($this->status, $data['statuses'])) {
+                return $group;
+            }
+        }
+        return 'new';
+    }
+
     protected $fillable = [
         'supply_plan_id',
         'integration_id',

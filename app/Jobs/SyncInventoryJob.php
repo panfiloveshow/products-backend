@@ -122,12 +122,60 @@ class SyncInventoryJob implements ShouldQueue
                             'period' => "$dateFrom - $dateTo",
                         ]);
                     } else {
-                        Log::warning('Ozon placement cost not loaded, keeping previous values', [
+                        // Отчёт не загрузился (лимит API или ошибка) - загружаем предыдущие значения из БД
+                        Log::warning('Ozon placement cost not loaded, loading previous values from DB', [
                             'period' => "$dateFrom - $dateTo",
+                        ]);
+                        
+                        // Загружаем существующие данные о платном хранении из БД
+                        $existingStorageFees = InventoryWarehouse::where('marketplace', 'ozon')
+                            ->where('integration_id', $this->syncLog->integration_id)
+                            ->whereNotNull('storage_fee_total')
+                            ->where('storage_fee_total', '>', 0)
+                            ->get(['sku', 'storage_fee_total', 'storage_fee_report_from', 'storage_fee_report_to']);
+                        
+                        // Группируем по SKU (берём первую запись с данными)
+                        $seenSkus = [];
+                        foreach ($existingStorageFees as $record) {
+                            if (!isset($seenSkus[$record->sku])) {
+                                $storageCostBySku[$record->sku] = [
+                                    'storage_fee_total' => (float) $record->storage_fee_total,
+                                    'storage_fee_report_from' => $record->storage_fee_report_from,
+                                    'storage_fee_report_to' => $record->storage_fee_report_to,
+                                ];
+                                $seenSkus[$record->sku] = true;
+                            }
+                        }
+                        
+                        Log::info('Loaded previous storage fees from DB', [
+                            'count' => count($storageCostBySku),
                         ]);
                     }
                 } catch (\Exception $e) {
-                    Log::warning('Failed to load Ozon placement cost', ['error' => $e->getMessage()]);
+                    Log::warning('Failed to load Ozon placement cost, loading previous values from DB', ['error' => $e->getMessage()]);
+                    
+                    // Загружаем существующие данные о платном хранении из БД
+                    $existingStorageFees = InventoryWarehouse::where('marketplace', 'ozon')
+                        ->where('integration_id', $this->syncLog->integration_id)
+                        ->whereNotNull('storage_fee_total')
+                        ->where('storage_fee_total', '>', 0)
+                        ->get(['sku', 'storage_fee_total', 'storage_fee_report_from', 'storage_fee_report_to']);
+                    
+                    $seenSkus = [];
+                    foreach ($existingStorageFees as $record) {
+                        if (!isset($seenSkus[$record->sku])) {
+                            $storageCostBySku[$record->sku] = [
+                                'storage_fee_total' => (float) $record->storage_fee_total,
+                                'storage_fee_report_from' => $record->storage_fee_report_from,
+                                'storage_fee_report_to' => $record->storage_fee_report_to,
+                            ];
+                            $seenSkus[$record->sku] = true;
+                        }
+                    }
+                    
+                    Log::info('Loaded previous storage fees from DB after error', [
+                        'count' => count($storageCostBySku),
+                    ]);
                 }
             } elseif (method_exists($marketplace, 'getStorageCostBySku')) {
                 $storageCostBySku = $marketplace->getStorageCostBySku();

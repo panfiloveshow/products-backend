@@ -12,6 +12,11 @@ use App\Domains\Ozon\Api\WarehousesApi;
 use App\Domains\Ozon\Api\CategoriesApi;
 use App\Domains\Ozon\Api\StorageApi;
 use App\Domains\Ozon\Api\SuppliesApi;
+use App\Domains\Ozon\Api\FboSupplyOrdersApi;
+use App\Domains\Ozon\Api\FboCargoesApi;
+use App\Domains\Ozon\Api\FboPostingsApi;
+use App\Domains\Ozon\Api\FbsPostingsApi;
+use App\Domains\Ozon\Api\FbsReturnsApi;
 use App\Models\Integration;
 
 /**
@@ -37,6 +42,11 @@ class OzonMarketplace implements MarketplaceInterface
     private CategoriesApi $categories;
     private StorageApi $storage;
     private SuppliesApi $supplies;
+    private FboSupplyOrdersApi $fboSupplyOrders;
+    private FboCargoesApi $fboCargoes;
+    private FboPostingsApi $fboPostings;
+    private FbsPostingsApi $fbsPostings;
+    private FbsReturnsApi $fbsReturns;
     private ?Integration $integration;
 
     public function __construct(array $credentials = [], ?Integration $integration = null)
@@ -53,6 +63,11 @@ class OzonMarketplace implements MarketplaceInterface
         $this->categories = new CategoriesApi($this->client);
         $this->storage = new StorageApi($this->client);
         $this->supplies = new SuppliesApi($this->client);
+        $this->fboSupplyOrders = new FboSupplyOrdersApi($this->client);
+        $this->fboCargoes = new FboCargoesApi($this->client);
+        $this->fboPostings = new FboPostingsApi($this->client);
+        $this->fbsPostings = new FbsPostingsApi($this->client);
+        $this->fbsReturns = new FbsReturnsApi($this->client);
         $this->integration = $integration;
     }
 
@@ -844,11 +859,51 @@ class OzonMarketplace implements MarketplaceInterface
     }
 
     /**
-     * Получить API поставок
+     * Получить API поставок (legacy)
      */
     public function supplies(): SuppliesApi
     {
         return $this->supplies;
+    }
+
+    /**
+     * FBO: Заявки на поставку
+     */
+    public function fboSupplyOrders(): FboSupplyOrdersApi
+    {
+        return $this->fboSupplyOrders;
+    }
+
+    /**
+     * FBO: Грузоместа и этикетки
+     */
+    public function fboCargoes(): FboCargoesApi
+    {
+        return $this->fboCargoes;
+    }
+
+    /**
+     * FBO: Отправления (аналитика)
+     */
+    public function fboPostings(): FboPostingsApi
+    {
+        return $this->fboPostings;
+    }
+
+    /**
+     * FBS: Отправления
+     */
+    public function fbsPostings(): FbsPostingsApi
+    {
+        return $this->fbsPostings;
+    }
+
+    /**
+     * FBS: Возвраты
+     */
+    public function fbsReturns(): FbsReturnsApi
+    {
+        return $this->fbsReturns;
     }
     
     /**

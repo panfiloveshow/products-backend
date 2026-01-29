@@ -47,6 +47,7 @@ class OzonClient
             
             $response = Http::withHeaders($this->getHeaders())
                 ->timeout($this->timeout)
+                ->asJson()
                 ->post(self::BASE_URL . $endpoint, $body);
 
             if ($response->successful()) {

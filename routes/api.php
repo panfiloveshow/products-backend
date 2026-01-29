@@ -95,19 +95,30 @@ Route::prefix('inventory')->middleware('throttle:api')->group(function () {
 
 /*
 |--------------------------------------------------------------------------
-| Shipments Module
+| Shipments Module (FBO Поставки)
 |--------------------------------------------------------------------------
 */
 Route::prefix('shipments')->middleware('throttle:api')->group(function () {
+    // Список и статистика
     Route::get('/', [ShipmentController::class, 'index']);
-    Route::get('/slots', [ShipmentController::class, 'slots']);
-    Route::get('/marketplace-slots', [ShipmentController::class, 'marketplaceSlots']); // P0: реальные слоты из API
-    Route::get('/warehouses', [ShipmentController::class, 'warehouses']); // P0: склады из API
-    Route::get('/recommendations', [ShipmentController::class, 'recommendations']);
-    Route::get('/stats', [ShipmentController::class, 'stats']);
-    Route::post('/from-recommendation/{recommendationId}', [ShipmentController::class, 'createFromRecommendation']);
-    Route::post('/from-inventory-recommendations', [ShipmentController::class, 'createFromInventoryRecommendations']); // P1
+    Route::get('/statistics', [ShipmentController::class, 'statistics']);
+    Route::get('/stats', [ShipmentController::class, 'stats']); // Legacy
     
+    // Синхронизация с Ozon
+    Route::post('/sync-from-ozon', [ShipmentController::class, 'syncFromOzon']);
+    
+    // Склады, слоты и товары
+    Route::get('/warehouses', [ShipmentController::class, 'warehouses']);
+    Route::get('/products', [ShipmentController::class, 'products']); // Поиск товаров для добавления в поставку
+    Route::get('/slots', [ShipmentController::class, 'slots']);
+    Route::get('/marketplace-slots', [ShipmentController::class, 'marketplaceSlots']);
+    
+    // Рекомендации
+    Route::get('/recommendations', [ShipmentController::class, 'recommendations']);
+    Route::post('/from-recommendation/{recommendationId}', [ShipmentController::class, 'createFromRecommendation']);
+    Route::post('/from-inventory-recommendations', [ShipmentController::class, 'createFromInventoryRecommendations']);
+    
+    // CRUD
     Route::get('/{id}', [ShipmentController::class, 'show']);
     Route::post('/', [ShipmentController::class, 'store']);
     Route::put('/{id}', [ShipmentController::class, 'update']);
@@ -124,16 +135,69 @@ Route::prefix('shipments')->middleware('throttle:api')->group(function () {
     Route::post('/{id}/reject', [ShipmentController::class, 'reject']);
     Route::post('/{id}/send', [ShipmentController::class, 'send']);
     Route::post('/{id}/deliver', [ShipmentController::class, 'deliver']);
+    Route::post('/{id}/cancel', [ShipmentController::class, 'cancel']);
+    Route::post('/{id}/sync-status', [ShipmentController::class, 'syncStatus']);
     
     // Slots
     Route::post('/{id}/book-slot', [ShipmentController::class, 'bookSlot']);
     
-    // Labels (P2)
-    Route::post('/{id}/labels', [ShipmentController::class, 'generateLabels'])->middleware('throttle:export');
+    // Грузоместа и этикетки (FBO)
+    Route::get('/{id}/cargoes', [ShipmentController::class, 'getCargoes']);
+    Route::post('/{id}/cargoes', [ShipmentController::class, 'createCargoes']);
+    Route::post('/{id}/cargoes/labels', [ShipmentController::class, 'createCargoLabels']);
+    Route::get('/{id}/cargoes/labels/{taskId}', [ShipmentController::class, 'getCargoLabelsStatus']);
+    Route::get('/{id}/cargoes/labels/{fileGuid}/download', [ShipmentController::class, 'downloadCargoLabels']);
     
-    // Export
+    // Состав заявки
+    Route::get('/{id}/bundle', [ShipmentController::class, 'getBundle']);
+    
+    // Счётчики Ozon
+    Route::get('/ozon-counters', [ShipmentController::class, 'ozonCounters']);
+    
+    // Labels & Export
+    Route::get('/{id}/labels', [ShipmentController::class, 'generateLabels'])->middleware('throttle:export');
     Route::get('/{id}/export/pdf', [ShipmentController::class, 'exportPdf'])->middleware('throttle:export');
     Route::get('/{id}/export/csv', [ShipmentController::class, 'exportCsv'])->middleware('throttle:export');
+});
+
+/*
+|--------------------------------------------------------------------------
+| Postings Module (FBS Отгрузки)
+|--------------------------------------------------------------------------
+*/
+Route::prefix('postings')->middleware('throttle:api')->group(function () {
+    // Список и статистика
+    Route::get('/', [App\Http\Controllers\Api\PostingController::class, 'index']);
+    Route::get('/statistics', [App\Http\Controllers\Api\PostingController::class, 'statistics']);
+    
+    // Синхронизация
+    Route::post('/sync', [App\Http\Controllers\Api\PostingController::class, 'sync'])->middleware('throttle:sync');
+    
+    // Массовые операции
+    Route::post('/bulk-labels', [App\Http\Controllers\Api\PostingController::class, 'bulkLabels'])->middleware('throttle:export');
+    Route::post('/bulk-ship', [App\Http\Controllers\Api\PostingController::class, 'bulkShip']);
+    
+    // Акты приёма-передачи
+    Route::post('/act/create', [App\Http\Controllers\Api\PostingController::class, 'createAct']);
+    Route::get('/act/{actId}/download', [App\Http\Controllers\Api\PostingController::class, 'downloadAct'])->middleware('throttle:export');
+    
+    // CRUD
+    Route::get('/{id}', [App\Http\Controllers\Api\PostingController::class, 'show']);
+    
+    // Workflow
+    Route::post('/{id}/assemble', [App\Http\Controllers\Api\PostingController::class, 'assemble']);
+    Route::post('/{id}/pack', [App\Http\Controllers\Api\PostingController::class, 'pack']);
+    Route::post('/{id}/ship', [App\Http\Controllers\Api\PostingController::class, 'ship']);
+    Route::post('/{id}/cancel', [App\Http\Controllers\Api\PostingController::class, 'cancel']);
+    
+    // Этикетки
+    Route::get('/{id}/label', [App\Http\Controllers\Api\PostingController::class, 'label'])->middleware('throttle:export');
+    
+    // Причины отмены
+    Route::get('/cancel-reasons', [App\Http\Controllers\Api\PostingController::class, 'cancelReasons']);
+    
+    // Возвраты
+    Route::get('/returns', [App\Http\Controllers\Api\PostingController::class, 'returns']);
 });
 
 /*
@@ -271,16 +335,39 @@ Route::prefix('ozon')->middleware('throttle:api')->group(function () {
     // Supply Order endpoints (заявки на поставку)
     Route::post('/supply/orders', [App\Http\Controllers\Api\OzonSupplyController::class, 'getSupplyOrders']);
     Route::post('/supply/order', [App\Http\Controllers\Api\OzonSupplyController::class, 'getSupplyOrder']);
+    Route::post('/supply/order/details', [App\Http\Controllers\Api\OzonSupplyController::class, 'getSupplyOrderDetailsV1']);
     Route::post('/supply/order/status-counter', [App\Http\Controllers\Api\OzonSupplyController::class, 'getSupplyOrderStatusCounter']);
     
     // Timeslot endpoints (таймслоты)
     Route::post('/supply/order/timeslots', [App\Http\Controllers\Api\OzonSupplyController::class, 'getSupplyOrderTimeslots']);
+    Route::post('/supply/order/timeslot/get', [App\Http\Controllers\Api\OzonSupplyController::class, 'getSupplyOrderTimeslot']);
     Route::post('/supply/order/timeslot/update', [App\Http\Controllers\Api\OzonSupplyController::class, 'updateSupplyOrderTimeslot']);
+    Route::post('/supply/order/timeslot/status', [App\Http\Controllers\Api\OzonSupplyController::class, 'getSupplyOrderTimeslotStatus']);
     Route::post('/supply/order/timeslot/update/status', [App\Http\Controllers\Api\OzonSupplyController::class, 'getTimeslotUpdateStatus']);
+
+    // Content endpoints (редактирование состава заявки)
+    Route::post('/supply/order/content/update', [App\Http\Controllers\Api\OzonSupplyController::class, 'updateSupplyOrderContent']);
+    Route::post('/supply/order/content/update/validation', [App\Http\Controllers\Api\OzonSupplyController::class, 'validateSupplyOrderContent']);
+    Route::post('/supply/order/content/update/status', [App\Http\Controllers\Api\OzonSupplyController::class, 'getSupplyOrderContentUpdateStatus']);
     
     // Pass endpoints (пропуска - данные водителя и ТС)
     Route::post('/supply/order/pass/create', [App\Http\Controllers\Api\OzonSupplyController::class, 'createSupplyOrderPass']);
     Route::post('/supply/order/pass/status', [App\Http\Controllers\Api\OzonSupplyController::class, 'getPassCreateStatus']);
+
+    // FBP endpoints (акты/черновики)
+    Route::post('/fbp/act/create', [App\Http\Controllers\Api\OzonSupplyController::class, 'createFbpAcceptanceAct']);
+    Route::post('/fbp/act/status', [App\Http\Controllers\Api\OzonSupplyController::class, 'getFbpAcceptanceActStatus']);
+    Route::post('/fbp/draft/direct/timeslot/edit', [App\Http\Controllers\Api\OzonSupplyController::class, 'editFbpDirectDraftTimeslot']);
+
+    // FBO postings
+    Route::post('/posting/fbo/list', [App\Http\Controllers\Api\OzonSupplyController::class, 'getFboPostings']);
+    Route::post('/posting/fbo/get', [App\Http\Controllers\Api\OzonSupplyController::class, 'getFboPosting']);
+    Route::post('/posting/fbo/cancel-reasons', [App\Http\Controllers\Api\OzonSupplyController::class, 'getFboCancelReasons']);
+
+    // Returns/Removal
+    Route::post('/returns/list', [App\Http\Controllers\Api\OzonSupplyController::class, 'getReturns']);
+    Route::post('/removal/from-stock/list', [App\Http\Controllers\Api\OzonSupplyController::class, 'getRemovalFromStock']);
+    Route::post('/removal/from-supply/list', [App\Http\Controllers\Api\OzonSupplyController::class, 'getRemovalFromSupply']);
     
     // Cargoes endpoints (грузоместа)
     Route::post('/supply/cargoes/create', [App\Http\Controllers\Api\OzonSupplyController::class, 'createCargoes']);
@@ -309,6 +396,10 @@ Route::prefix('supplies')->middleware('throttle:api')->group(function () {
     Route::post('/recommendations/{id}/accept', [App\Http\Controllers\Api\SupplyController::class, 'acceptRecommendation']);
     Route::post('/recommendations/{id}/reject', [App\Http\Controllers\Api\SupplyController::class, 'rejectRecommendation']);
     Route::post('/recommendations/{id}/postpone', [App\Http\Controllers\Api\SupplyController::class, 'postponeRecommendation']);
+    Route::get('/recommendations/by-sku/{sku}', [App\Http\Controllers\Api\SupplyController::class, 'getRecommendationsBySku']);
+    Route::get('/recommendations/summary', [App\Http\Controllers\Api\SupplyController::class, 'getRecommendationsSummary']);
+    Route::get('/recommendations/map', [App\Http\Controllers\Api\SupplyController::class, 'getRecommendationsMap']);
+    Route::get('/recommendations/map-warehouses', [App\Http\Controllers\Api\SupplyController::class, 'getRecommendationsMapWarehouses']);
     
     // Кластеры и слоты приёмки (новый flow фронтенда)
     Route::get('/clusters', [App\Http\Controllers\Api\SupplyController::class, 'getClusters']);

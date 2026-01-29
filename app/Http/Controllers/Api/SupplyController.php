@@ -137,6 +137,329 @@ class SupplyController extends Controller
     }
 
     /**
+     * Получить все склады для SKU
+     * 
+     * GET /api/supplies/recommendations/by-sku/{sku}
+     * 
+     * Возвращает ВСЕ склады для указанного SKU, включая те где не нужна поставка.
+     * Это позволяет видеть полную картину распределения товара по складам.
+     */
+    public function getRecommendationsBySku(Request $request, string $sku): JsonResponse
+    {
+        $validated = $request->validate([
+            'integration_id' => 'required|exists:integrations,id',
+        ]);
+
+        $recommendations = SupplyRecommendation::where('integration_id', $validated['integration_id'])
+            ->where('sku', $sku)
+            ->orderByDesc('current_stock')
+            ->get();
+
+        // Агрегированные данные по SKU
+        $summary = [
+            'sku' => $sku,
+            'total_warehouses' => $recommendations->count(),
+            'total_stock' => $recommendations->sum('current_stock'),
+            'total_recommended_qty' => $recommendations->sum('recommended_qty'),
+            'warehouses_need_supply' => $recommendations->where('recommended_qty', '>', 0)->count(),
+            'warehouses_ok' => $recommendations->where('recommended_qty', 0)->count(),
+            'avg_days_of_stock' => round($recommendations->avg('days_of_stock'), 1),
+            'min_days_of_stock' => $recommendations->min('days_of_stock'),
+            'max_days_of_stock' => $recommendations->max('days_of_stock'),
+        ];
+
+        return response()->json([
+            'success' => true,
+            'data' => $recommendations,
+            'summary' => $summary,
+        ]);
+    }
+
+    /**
+     * Получить сводку по всем SKU
+     * 
+     * GET /api/supplies/recommendations/summary
+     * 
+     * Возвращает агрегированные данные по каждому SKU:
+     * - Общий остаток по ВСЕМ складам
+     * - Минимальные дни до OOS
+     * - Количество складов
+     * - Сколько нужно к поставке
+     */
+    public function getRecommendationsSummary(Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'integration_id' => 'required|exists:integrations,id',
+        ]);
+
+        // Получаем все рекомендации и группируем по SKU
+        $recommendations = SupplyRecommendation::where('integration_id', $validated['integration_id'])
+            ->whereIn('state', ['new', 'accepted', 'postponed'])
+            ->get();
+
+        $summary = [];
+        $grouped = $recommendations->groupBy('sku');
+
+        foreach ($grouped as $sku => $recs) {
+            $summary[$sku] = [
+                'sku' => $sku,
+                'product_name' => $recs->first()->product_name,
+                'total_warehouses' => $recs->count(),
+                'total_stock' => $recs->sum('current_stock'),
+                'total_in_transit' => $recs->sum('in_transit'),
+                'total_recommended_qty' => $recs->sum('recommended_qty'),
+                'warehouses_need_supply' => $recs->where('recommended_qty', '>', 0)->count(),
+                'warehouses_ok' => $recs->where('recommended_qty', 0)->count(),
+                'min_days_of_stock' => $recs->min('days_of_stock'),
+                'max_days_of_stock' => $recs->max('days_of_stock'),
+                'avg_days_of_stock' => round($recs->avg('days_of_stock'), 1),
+                'has_oos_risk' => $recs->where('oos_risk', true)->count() > 0,
+                'max_priority' => $recs->sortBy(function($r) {
+                    return ['A' => 1, 'B' => 2, 'C' => 3][$r->priority] ?? 4;
+                })->first()->priority ?? 'C',
+            ];
+        }
+
+        return response()->json([
+            'success' => true,
+            'data' => array_values($summary),
+            'total_skus' => count($summary),
+        ]);
+    }
+
+    /**
+     * Получить данные для карты кластеров
+     * 
+     * GET /api/supplies/recommendations/map
+     * 
+     * Возвращает кластеры с координатами и агрегированными данными по складам
+     */
+    public function getRecommendationsMap(Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'integration_id' => 'required|exists:integrations,id',
+            'sku' => 'nullable|string', // Фильтр по конкретному SKU
+        ]);
+
+        // Получаем все кластеры с координатами
+        $clusters = \App\Models\OzonWarehouseCluster::select(
+            'cluster_id',
+            'cluster_name',
+            'region',
+            'latitude',
+            'longitude'
+        )
+            ->whereNotNull('latitude')
+            ->whereNotNull('longitude')
+            ->groupBy('cluster_id', 'cluster_name', 'region', 'latitude', 'longitude')
+            ->get()
+            ->keyBy('cluster_id');
+
+        // Получаем рекомендации
+        $query = SupplyRecommendation::where('integration_id', $validated['integration_id'])
+            ->whereIn('state', ['new', 'accepted', 'postponed']);
+
+        if (!empty($validated['sku'])) {
+            $query->where('sku', $validated['sku']);
+        }
+
+        $recommendations = $query->get();
+
+        // Группируем по кластерам
+        $clusterData = [];
+        foreach ($recommendations as $rec) {
+            $clusterId = $rec->delivery_cluster_id;
+            if (!$clusterId) continue;
+
+            if (!isset($clusterData[$clusterId])) {
+                $cluster = $clusters->get($clusterId);
+                $clusterData[$clusterId] = [
+                    'cluster_id' => $clusterId,
+                    'cluster_name' => $rec->delivery_cluster_name ?? $cluster?->cluster_name ?? "Кластер {$clusterId}",
+                    'region' => $cluster?->region,
+                    'latitude' => $cluster?->latitude,
+                    'longitude' => $cluster?->longitude,
+                    'total_stock' => 0,
+                    'total_recommended_qty' => 0,
+                    'total_lost_revenue' => 0,
+                    'total_ozon_lost_profit' => 0,
+                    'warehouses_count' => 0,
+                    'warehouses_need_supply' => 0,
+                    'has_oos_risk' => false,
+                    'skus_count' => 0,
+                    'warehouses' => [],
+                ];
+            }
+
+            $clusterData[$clusterId]['total_stock'] += $rec->current_stock ?? 0;
+            $clusterData[$clusterId]['total_recommended_qty'] += $rec->recommended_qty ?? 0;
+            $clusterData[$clusterId]['total_lost_revenue'] += $rec->lost_revenue_potential ?? 0;
+            $clusterData[$clusterId]['total_ozon_lost_profit'] += $rec->ozon_lost_profit ?? 0;
+            $clusterData[$clusterId]['warehouses_count']++;
+            if (($rec->recommended_qty ?? 0) > 0) {
+                $clusterData[$clusterId]['warehouses_need_supply']++;
+            }
+            if ($rec->oos_risk) {
+                $clusterData[$clusterId]['has_oos_risk'] = true;
+            }
+
+            // Добавляем склад в список
+            $clusterData[$clusterId]['warehouses'][] = [
+                'warehouse_name' => $rec->warehouse_name,
+                'sku' => $rec->sku,
+                'current_stock' => $rec->current_stock,
+                'days_of_stock' => $rec->days_of_stock,
+                'recommended_qty' => $rec->recommended_qty,
+                'ozon_recommended_supply' => $rec->ozon_recommended_supply,
+                'ozon_lost_profit' => $rec->ozon_lost_profit,
+                'lost_revenue_potential' => $rec->lost_revenue_potential,
+                'priority' => $rec->priority,
+                'oos_risk' => $rec->oos_risk,
+            ];
+        }
+
+        // Подсчитываем уникальные SKU в каждом кластере
+        foreach ($clusterData as $clusterId => &$data) {
+            $data['skus_count'] = collect($data['warehouses'])->pluck('sku')->unique()->count();
+        }
+
+        // Определяем статус кластера
+        foreach ($clusterData as $clusterId => &$data) {
+            if ($data['has_oos_risk']) {
+                $data['status'] = 'critical'; // Красный - есть риск OOS
+            } elseif ($data['warehouses_need_supply'] > 0) {
+                $data['status'] = 'warning'; // Оранжевый - нужна поставка
+            } else {
+                $data['status'] = 'ok'; // Зеленый - всё в порядке
+            }
+        }
+
+        return response()->json([
+            'success' => true,
+            'data' => [
+                'clusters' => array_values($clusterData),
+                'total_clusters' => count($clusterData),
+                'summary' => [
+                    'total_stock' => collect($clusterData)->sum('total_stock'),
+                    'total_recommended_qty' => collect($clusterData)->sum('total_recommended_qty'),
+                    'total_lost_revenue' => collect($clusterData)->sum('total_lost_revenue'),
+                    'clusters_with_oos_risk' => collect($clusterData)->where('has_oos_risk', true)->count(),
+                    'clusters_need_supply' => collect($clusterData)->where('warehouses_need_supply', '>', 0)->count(),
+                ],
+            ],
+        ]);
+    }
+
+    /**
+     * Получить список складов для карты с полными данными
+     * 
+     * GET /api/supplies/recommendations/map-warehouses
+     *
+     * Возвращает склады с координатами, агрегированными метриками и списком рекомендаций
+     */
+    public function getRecommendationsMapWarehouses(Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'integration_id' => 'required|exists:integrations,id',
+            'sku' => 'nullable|string',
+            'state' => 'nullable|string',
+            'priority' => 'nullable|string',
+            'oos_risk' => 'nullable|boolean',
+        ]);
+
+        $query = SupplyRecommendation::where('integration_id', $validated['integration_id'])
+            ->whereIn('state', ['new', 'accepted', 'postponed']);
+
+        if (!empty($validated['sku'])) {
+            $query->where('sku', $validated['sku']);
+        }
+        if (!empty($validated['state']) && $validated['state'] !== 'all') {
+            $query->where('state', $validated['state']);
+        }
+        if (!empty($validated['priority']) && $validated['priority'] !== 'all') {
+            $query->where('priority', $validated['priority']);
+        }
+        if (isset($validated['oos_risk']) && $validated['oos_risk']) {
+            $query->where('oos_risk', true);
+        }
+
+        $recommendations = $query->get();
+        $mapping = \App\Models\OzonWarehouseCluster::getAllMapping();
+
+        // Группируем рекомендации по складам
+        $warehouseGroups = $recommendations->groupBy(function ($rec) {
+            return ($rec->warehouse_id ?? '') . '|' . ($rec->warehouse_name ?? '');
+        });
+
+        $warehouses = $warehouseGroups->map(function ($recs, $key) use ($mapping) {
+            $first = $recs->first();
+            $normalized = \App\Models\OzonWarehouseCluster::normalizeWarehouseName($first->warehouse_name ?? '');
+            $mapItem = $mapping[$normalized] ?? null;
+
+            // Агрегируем метрики по складу
+            $totalStock = $recs->sum('current_stock');
+            $totalInTransit = $recs->sum('in_transit');
+            $minDaysOfStock = $recs->min('days_of_stock') ?? 0;
+            $maxDaysOfStock = $recs->max('days_of_stock') ?? 0;
+            $totalRecommendedQty = $recs->sum('recommended_qty');
+            $hasOosRisk = $recs->contains('oos_risk', true);
+            $criticalCount = $recs->where('priority', 'A')->count();
+
+            // Формируем список рекомендаций для склада
+            $recList = $recs->map(function ($rec) {
+                return [
+                    'id' => $rec->id,
+                    'sku' => $rec->sku,
+                    'product_name' => $rec->product_name,
+                    'current_stock' => $rec->current_stock,
+                    'in_transit' => $rec->in_transit,
+                    'recommended_qty' => $rec->recommended_qty,
+                    'days_of_stock' => $rec->days_of_stock,
+                    'oos_risk' => $rec->oos_risk,
+                    'priority' => $rec->priority,
+                    'state' => $rec->state,
+                    'avg_daily_sales' => $rec->avg_sales_used,
+                    'price' => $rec->price,
+                ];
+            })->values();
+
+            return [
+                'warehouse_id' => $first->warehouse_id,
+                'warehouse_name' => $first->warehouse_name,
+                'cluster_name' => $first->cluster_name ?? $first->delivery_cluster_name ?? $mapItem['cluster_name'] ?? null,
+                'lat' => $mapItem['lat'] ?? null,
+                'lng' => $mapItem['lng'] ?? null,
+                'is_hub' => $mapItem['is_hub'] ?? false,
+                'total_stock' => $totalStock,
+                'total_in_transit' => $totalInTransit,
+                'min_days_of_stock' => $minDaysOfStock,
+                'max_days_of_stock' => $maxDaysOfStock,
+                'total_recommended_qty' => $totalRecommendedQty,
+                'has_oos_risk' => $hasOosRisk,
+                'critical_count' => $criticalCount,
+                'recommendations_count' => $recs->count(),
+                'recommendations' => $recList,
+            ];
+        })->values();
+
+        // Общая статистика
+        $stats = [
+            'total_warehouses' => $warehouses->count(),
+            'total_recommendations' => $recommendations->count(),
+            'total_to_supply' => $recommendations->sum('recommended_qty'),
+            'critical_count' => $recommendations->where('priority', 'A')->count(),
+            'oos_risk_count' => $recommendations->where('oos_risk', true)->count(),
+            'unique_skus' => $recommendations->pluck('sku')->unique()->count(),
+        ];
+
+        return response()->json([
+            'success' => true,
+            'data' => $warehouses,
+            'stats' => $stats,
+        ]);
+    }
+
+    /**
      * Принять рекомендацию
      * 
      * POST /api/supplies/recommendations/{id}/accept

@@ -28,7 +28,7 @@ class ShipmentService
 
             $shipment = Shipment::create([
                 'name' => $data['name'],
-                'status' => Shipment::STATUS_DRAFT,
+                'status' => $data['status'] ?? Shipment::STATUS_DRAFT,
                 'marketplace' => $data['marketplace'],
                 'shipment_type' => $data['shipment_type'] ?? 'fbo',
                 'warehouse_id' => $data['warehouse_id'] ?? null,
@@ -40,6 +40,7 @@ class ShipmentService
                 'description' => $data['description'] ?? null,
                 'truck_type' => $data['truck_type'] ?? null,
                 'truck_capacity' => $data['truck_capacity'] ?? null,
+                'external_supply_id' => $data['external_supply_id'] ?? null,
                 'created_by' => auth()->id() ?? Str::uuid(),
                 'created_by_name' => auth()->user()?->name ?? 'System',
             ]);
@@ -147,10 +148,10 @@ class ShipmentService
     public function bookSlot(Shipment $shipment, array $slotData): array
     {
         $slot = [
-            'id' => $slotData['slot_id'],
-            'date' => $slotData['date'],
-            'time_from' => $slotData['time_from'],
-            'time_to' => $slotData['time_to'],
+            'id' => $slotData['slot_id'] ?? $slotData['timeslot_id'] ?? null,
+            'date' => $slotData['date'] ?? null,
+            'time_from' => $slotData['time_from'] ?? null,
+            'time_to' => $slotData['time_to'] ?? null,
             'is_available' => false,
             'is_booked' => true,
             'booked_by' => auth()->id(),

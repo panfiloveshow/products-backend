@@ -16,16 +16,39 @@ use Illuminate\Support\Facades\Cache;
  * Supply Orders:
  * - POST /api/ozon/supply/orders - список заявок
  * - POST /api/ozon/supply/order - детали заявки
+ * - POST /api/ozon/supply/order/details - детали заявки (v1)
  * - POST /api/ozon/supply/order/status-counter - счётчик статусов
  * 
  * Timeslots:
  * - POST /api/ozon/supply/order/timeslots - доступные таймслоты
+ * - POST /api/ozon/supply/order/timeslot/get - таймслот по заявке
  * - POST /api/ozon/supply/order/timeslot/update - изменить таймслот
+ * - POST /api/ozon/supply/order/timeslot/status - статус обновления таймслота
  * - POST /api/ozon/supply/order/timeslot/update/status - статус изменения
+ * 
+ * Content:
+ * - POST /api/ozon/supply/order/content/update - редактирование состава
+ * - POST /api/ozon/supply/order/content/update/validation - проверка состава
+ * - POST /api/ozon/supply/order/content/update/status - статус редактирования
  * 
  * Pass (водитель и ТС):
  * - POST /api/ozon/supply/order/pass/create - добавить данные водителя
  * - POST /api/ozon/supply/order/pass/status - статус добавления
+ * 
+ * FBO Postings:
+ * - POST /api/ozon/posting/fbo/list - список отправлений
+ * - POST /api/ozon/posting/fbo/get - информация об отправлении
+ * - POST /api/ozon/posting/fbo/cancel-reasons - причины отмены
+ * 
+ * Returns/Removal:
+ * - POST /api/ozon/returns/list - возвраты FBO/FBS
+ * - POST /api/ozon/removal/from-stock/list - вывоз со стока
+ * - POST /api/ozon/removal/from-supply/list - вывоз с поставки
+ * 
+ * FBP:
+ * - POST /api/ozon/fbp/act/create - сгенерировать акт приёмки
+ * - POST /api/ozon/fbp/act/status - статус генерации акта
+ * - POST /api/ozon/fbp/draft/direct/timeslot/edit - изменить таймслот черновика
  * 
  * Cargoes (грузоместа):
  * - POST /api/ozon/supply/cargoes/create - создать грузоместа
@@ -81,6 +104,413 @@ class OzonSupplyController extends Controller
 
         } catch (\Exception $e) {
             Log::error('Failed to get Ozon supply orders', ['error' => $e->getMessage()]);
+            return response()->json(['success' => false, 'message' => $e->getMessage()], 422);
+        }
+    }
+
+    /**
+     * Получить подробную информацию о заявке на поставку (v1)
+     * 
+     * POST /api/ozon/supply/order/details
+     */
+    public function getSupplyOrderDetailsV1(Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'integration_id' => 'required|exists:integrations,id',
+            'supply_order_id' => 'required|integer',
+        ]);
+
+        try {
+            $integration = Integration::findOrFail($validated['integration_id']);
+            $ozon = OzonMarketplace::fromIntegration($integration);
+
+            $details = $ozon->supplies()->getSupplyOrderDetailsV1((string) $validated['supply_order_id']);
+
+            return response()->json([
+                'success' => true,
+                'data' => $details,
+            ]);
+        } catch (\Exception $e) {
+            Log::error('Failed to get Ozon supply order details v1', ['error' => $e->getMessage()]);
+            return response()->json(['success' => false, 'message' => $e->getMessage()], 422);
+        }
+    }
+
+    /**
+     * Таймслоты по заявке (v1)
+     * 
+     * POST /api/ozon/supply/order/timeslot/get
+     */
+    public function getSupplyOrderTimeslot(Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'integration_id' => 'required|exists:integrations,id',
+            'supply_order_id' => 'required|integer',
+            'date_from' => 'nullable|date',
+            'date_to' => 'nullable|date|after_or_equal:date_from',
+        ]);
+
+        try {
+            $integration = Integration::findOrFail($validated['integration_id']);
+            $ozon = OzonMarketplace::fromIntegration($integration);
+
+            $payload = $request->except(['integration_id', 'supply_order_id']);
+            $result = $ozon->supplies()->getSupplyOrderTimeslot(
+                (string) $validated['supply_order_id'],
+                $payload
+            );
+
+            return response()->json([
+                'success' => true,
+                'data' => $result,
+            ]);
+        } catch (\Exception $e) {
+            Log::error('Failed to get supply order timeslot', ['error' => $e->getMessage()]);
+            return response()->json(['success' => false, 'message' => $e->getMessage()], 422);
+        }
+    }
+
+    /**
+     * Статус обновления таймслота (v1)
+     * 
+     * POST /api/ozon/supply/order/timeslot/status
+     */
+    public function getSupplyOrderTimeslotStatus(Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'integration_id' => 'required|exists:integrations,id',
+            'operation_id' => 'required|string',
+        ]);
+
+        try {
+            $integration = Integration::findOrFail($validated['integration_id']);
+            $ozon = OzonMarketplace::fromIntegration($integration);
+
+            $result = $ozon->supplies()->getSupplyOrderTimeslotStatus($validated['operation_id']);
+
+            return response()->json([
+                'success' => true,
+                'data' => $result,
+            ]);
+        } catch (\Exception $e) {
+            Log::error('Failed to get supply order timeslot status', ['error' => $e->getMessage()]);
+            return response()->json(['success' => false, 'message' => $e->getMessage()], 422);
+        }
+    }
+
+    /**
+     * Редактировать состав заявки
+     * 
+     * POST /api/ozon/supply/order/content/update
+     */
+    public function updateSupplyOrderContent(Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'integration_id' => 'required|exists:integrations,id',
+            'supply_order_id' => 'required|integer',
+        ]);
+
+        try {
+            $integration = Integration::findOrFail($validated['integration_id']);
+            $ozon = OzonMarketplace::fromIntegration($integration);
+
+            $payload = $request->except(['integration_id', 'supply_order_id']);
+            $result = $ozon->supplies()->updateSupplyOrderContent(
+                (string) $validated['supply_order_id'],
+                $payload
+            );
+
+            $operationId = $result['operation_id'] ?? $result['task_id'] ?? null;
+            if ($operationId) {
+                Cache::put("ozon_content_update_task_{$validated['supply_order_id']}", [
+                    'operation_id' => $operationId,
+                    'status' => $result['status'] ?? 'processing',
+                    'created_at' => now()->toIso8601String(),
+                ], 3600);
+            }
+
+            return response()->json([
+                'success' => true,
+                'data' => $result,
+                'operation_id' => $operationId,
+                'message' => 'Состав заявки отправлен на обновление',
+            ]);
+        } catch (\Exception $e) {
+            Log::error('Failed to update supply order content', ['error' => $e->getMessage()]);
+            return response()->json(['success' => false, 'message' => $e->getMessage()], 422);
+        }
+    }
+
+    /**
+     * Проверить новый состав заявки
+     * 
+     * POST /api/ozon/supply/order/content/update/validation
+     */
+    public function validateSupplyOrderContent(Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'integration_id' => 'required|exists:integrations,id',
+            'supply_order_id' => 'required|integer',
+        ]);
+
+        try {
+            $integration = Integration::findOrFail($validated['integration_id']);
+            $ozon = OzonMarketplace::fromIntegration($integration);
+
+            $payload = $request->except(['integration_id', 'supply_order_id']);
+            $result = $ozon->supplies()->validateSupplyOrderContent(
+                (string) $validated['supply_order_id'],
+                $payload
+            );
+
+            return response()->json([
+                'success' => true,
+                'data' => $result,
+            ]);
+        } catch (\Exception $e) {
+            Log::error('Failed to validate supply order content', ['error' => $e->getMessage()]);
+            return response()->json(['success' => false, 'message' => $e->getMessage()], 422);
+        }
+    }
+
+    /**
+     * Статус редактирования состава заявки
+     * 
+     * POST /api/ozon/supply/order/content/update/status
+     */
+    public function getSupplyOrderContentUpdateStatus(Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'integration_id' => 'required|exists:integrations,id',
+            'supply_order_id' => 'required|integer',
+            'operation_id' => 'nullable|string',
+        ]);
+
+        try {
+            $cacheKey = "ozon_content_update_task_{$validated['supply_order_id']}";
+            $taskData = Cache::get($cacheKey);
+            $operationId = $validated['operation_id'] ?? ($taskData['operation_id'] ?? null);
+
+            if (!$operationId) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Не указан operation_id',
+                ], 422);
+            }
+
+            $integration = Integration::findOrFail($validated['integration_id']);
+            $ozon = OzonMarketplace::fromIntegration($integration);
+            $result = $ozon->supplies()->getSupplyOrderContentUpdateStatus($operationId);
+
+            $status = $result['status'] ?? $result['result'] ?? 'Unknown';
+
+            Cache::put($cacheKey, [
+                'operation_id' => $operationId,
+                'status' => $status,
+                'created_at' => $taskData['created_at'] ?? now()->toIso8601String(),
+            ], 3600);
+
+            return response()->json([
+                'success' => true,
+                'data' => [
+                    'status' => $status,
+                    'operation_id' => $operationId,
+                    'created_at' => $taskData['created_at'] ?? null,
+                ],
+            ]);
+        } catch (\Exception $e) {
+            Log::error('Failed to get supply order content update status', ['error' => $e->getMessage()]);
+            return response()->json(['success' => false, 'message' => $e->getMessage()], 422);
+        }
+    }
+
+    /**
+     * Список отправлений FBO
+     * 
+     * POST /api/ozon/posting/fbo/list
+     */
+    public function getFboPostings(Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'integration_id' => 'required|exists:integrations,id',
+            'limit' => 'nullable|integer|min:1|max:1000',
+            'offset' => 'nullable|integer|min:0',
+            'filter' => 'nullable|array',
+        ]);
+
+        try {
+            $integration = Integration::findOrFail($validated['integration_id']);
+            $ozon = OzonMarketplace::fromIntegration($integration);
+
+            $result = $ozon->fboPostings()->list(
+                $validated['filter'] ?? [],
+                $validated['limit'] ?? 50,
+                $validated['offset'] ?? 0
+            );
+
+            return response()->json([
+                'success' => true,
+                'data' => $result['postings'] ?? [],
+            ]);
+        } catch (\Exception $e) {
+            Log::error('Failed to get FBO postings', ['error' => $e->getMessage()]);
+            return response()->json(['success' => false, 'message' => $e->getMessage()], 422);
+        }
+    }
+
+    /**
+     * Информация об отправлении FBO
+     * 
+     * POST /api/ozon/posting/fbo/get
+     */
+    public function getFboPosting(Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'integration_id' => 'required|exists:integrations,id',
+            'posting_number' => 'required|string',
+        ]);
+
+        try {
+            $integration = Integration::findOrFail($validated['integration_id']);
+            $ozon = OzonMarketplace::fromIntegration($integration);
+
+            $result = $ozon->fboPostings()->get($validated['posting_number']);
+
+            return response()->json([
+                'success' => true,
+                'data' => $result,
+            ]);
+        } catch (\Exception $e) {
+            Log::error('Failed to get FBO posting', ['error' => $e->getMessage()]);
+            return response()->json(['success' => false, 'message' => $e->getMessage()], 422);
+        }
+    }
+
+    /**
+     * Причины отмены FBO отправлений
+     * 
+     * POST /api/ozon/posting/fbo/cancel-reasons
+     */
+    public function getFboCancelReasons(Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'integration_id' => 'required|exists:integrations,id',
+        ]);
+
+        try {
+            $integration = Integration::findOrFail($validated['integration_id']);
+            $ozon = OzonMarketplace::fromIntegration($integration);
+
+            $result = $ozon->fboPostings()->getCancelReasons();
+
+            return response()->json([
+                'success' => true,
+                'data' => $result,
+            ]);
+        } catch (\Exception $e) {
+            Log::error('Failed to get FBO cancel reasons', ['error' => $e->getMessage()]);
+            return response()->json(['success' => false, 'message' => $e->getMessage()], 422);
+        }
+    }
+
+    /**
+     * Возвраты FBO/FBS
+     * 
+     * POST /api/ozon/returns/list
+     */
+    public function getReturns(Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'integration_id' => 'required|exists:integrations,id',
+            'filter' => 'nullable|array',
+            'limit' => 'nullable|integer|min:1|max:1000',
+            'offset' => 'nullable|integer|min:0',
+        ]);
+
+        try {
+            $integration = Integration::findOrFail($validated['integration_id']);
+            $ozon = OzonMarketplace::fromIntegration($integration);
+            $client = $ozon->getClient();
+
+            $payload = $request->except(['integration_id']);
+            $response = $client->post('/v1/returns/list', $payload, empty($payload));
+
+            if (!$response) {
+                throw new \RuntimeException('Empty response from Ozon');
+            }
+
+            return response()->json([
+                'success' => true,
+                'data' => $response['result'] ?? $response,
+            ]);
+        } catch (\Exception $e) {
+            Log::error('Failed to get returns list', ['error' => $e->getMessage()]);
+            return response()->json(['success' => false, 'message' => $e->getMessage()], 422);
+        }
+    }
+
+    /**
+     * Отчёт по вывозу со стока (removal from stock)
+     * 
+     * POST /api/ozon/removal/from-stock/list
+     */
+    public function getRemovalFromStock(Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'integration_id' => 'required|exists:integrations,id',
+        ]);
+
+        try {
+            $integration = Integration::findOrFail($validated['integration_id']);
+            $ozon = OzonMarketplace::fromIntegration($integration);
+            $client = $ozon->getClient();
+
+            $payload = $request->except(['integration_id']);
+            $response = $client->post('/v1/removal/from-stock/list', $payload, empty($payload));
+
+            if (!$response) {
+                throw new \RuntimeException('Empty response from Ozon');
+            }
+
+            return response()->json([
+                'success' => true,
+                'data' => $response['result'] ?? $response,
+            ]);
+        } catch (\Exception $e) {
+            Log::error('Failed to get removal from stock list', ['error' => $e->getMessage()]);
+            return response()->json(['success' => false, 'message' => $e->getMessage()], 422);
+        }
+    }
+
+    /**
+     * Отчёт по вывозу с поставки (removal from supply)
+     * 
+     * POST /api/ozon/removal/from-supply/list
+     */
+    public function getRemovalFromSupply(Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'integration_id' => 'required|exists:integrations,id',
+        ]);
+
+        try {
+            $integration = Integration::findOrFail($validated['integration_id']);
+            $ozon = OzonMarketplace::fromIntegration($integration);
+            $client = $ozon->getClient();
+
+            $payload = $request->except(['integration_id']);
+            $response = $client->post('/v1/removal/from-supply/list', $payload, empty($payload));
+
+            if (!$response) {
+                throw new \RuntimeException('Empty response from Ozon');
+            }
+
+            return response()->json([
+                'success' => true,
+                'data' => $response['result'] ?? $response,
+            ]);
+        } catch (\Exception $e) {
+            Log::error('Failed to get removal from supply list', ['error' => $e->getMessage()]);
             return response()->json(['success' => false, 'message' => $e->getMessage()], 422);
         }
     }
@@ -229,23 +659,22 @@ class OzonSupplyController extends Controller
             $integration = Integration::findOrFail($validated['integration_id']);
             $ozon = OzonMarketplace::fromIntegration($integration);
             
-            $result = $ozon->supplies()->bookAcceptanceSlot(
+            $result = $ozon->supplies()->updateSupplyOrderTimeslot(
                 (string) $validated['supply_order_id'],
-                (string) $validated['timeslot_id']
+                $validated['timeslot_id']
             );
 
-            // Сохраняем task_id для проверки статуса
-            $taskId = $result['task_id'] ?? uniqid('timeslot_');
+            $operationId = $result['operation_id'] ?? $result['task_id'] ?? uniqid('timeslot_');
             Cache::put("ozon_timeslot_task_{$validated['supply_order_id']}", [
-                'task_id' => $taskId,
-                'status' => 'processing',
+                'operation_id' => $operationId,
+                'status' => $result['status'] ?? 'processing',
                 'created_at' => now()->toIso8601String(),
             ], 3600);
 
             return response()->json([
                 'success' => true,
                 'data' => [
-                    'task_id' => $taskId,
+                    'operation_id' => $operationId,
                     'supply_order_id' => $validated['supply_order_id'],
                     'timeslot_id' => $validated['timeslot_id'],
                 ],
@@ -268,38 +697,52 @@ class OzonSupplyController extends Controller
         $validated = $request->validate([
             'integration_id' => 'required|exists:integrations,id',
             'supply_order_id' => 'required|integer',
-            'task_id' => 'nullable|string',
+            'operation_id' => 'nullable|string',
         ]);
 
         try {
             $cacheKey = "ozon_timeslot_task_{$validated['supply_order_id']}";
             $taskData = Cache::get($cacheKey);
 
-            if (!$taskData) {
-                // Проверяем актуальный статус заявки
+            $operationId = $validated['operation_id'] ?? ($taskData['operation_id'] ?? null);
+
+            if ($operationId) {
                 $integration = Integration::findOrFail($validated['integration_id']);
                 $ozon = OzonMarketplace::fromIntegration($integration);
-                $supply = $ozon->supplies()->getSupplyDetails((string) $validated['supply_order_id']);
+                $status = $ozon->supplies()->getSupplyOrderTimeslotStatus($operationId);
+
+                $responseStatus = $status['status'] ?? $status['result'] ?? 'Unknown';
+
+                Cache::put($cacheKey, [
+                    'operation_id' => $operationId,
+                    'status' => $responseStatus,
+                    'created_at' => $taskData['created_at'] ?? now()->toIso8601String(),
+                ], 3600);
 
                 return response()->json([
                     'success' => true,
                     'data' => [
-                        'status' => 'completed',
-                        'supply_order_id' => $validated['supply_order_id'],
-                        'current_timeslot' => [
-                            'from' => $supply['timeslot_from'] ?? null,
-                            'to' => $supply['timeslot_to'] ?? null,
-                        ],
+                        'status' => $responseStatus,
+                        'operation_id' => $operationId,
+                        'created_at' => $taskData['created_at'] ?? null,
                     ],
                 ]);
             }
 
+            // Fallback: возвращаем текущий таймслот
+            $integration = Integration::findOrFail($validated['integration_id']);
+            $ozon = OzonMarketplace::fromIntegration($integration);
+            $supply = $ozon->supplies()->getSupplyDetails((string) $validated['supply_order_id']);
+
             return response()->json([
                 'success' => true,
                 'data' => [
-                    'status' => $taskData['status'] ?? 'processing',
-                    'task_id' => $taskData['task_id'] ?? null,
-                    'created_at' => $taskData['created_at'] ?? null,
+                    'status' => 'completed',
+                    'supply_order_id' => $validated['supply_order_id'],
+                    'current_timeslot' => [
+                        'from' => $supply['timeslot_from'] ?? null,
+                        'to' => $supply['timeslot_to'] ?? null,
+                    ],
                 ],
             ]);
 
@@ -319,33 +762,34 @@ class OzonSupplyController extends Controller
         $validated = $request->validate([
             'integration_id' => 'required|exists:integrations,id',
             'supply_order_id' => 'required|integer',
-            'driver' => 'required|array',
-            'driver.name' => 'required|string|max:200',
-            'driver.phone' => 'required|string|max:20',
-            'driver.car_number' => 'required|string|max:20',
-            'driver.car_model' => 'nullable|string|max:100',
+            'vehicle' => 'required|array',
+            'vehicle.driver_name' => 'required|string|max:200',
+            'vehicle.driver_phone' => 'required|string|max:20',
+            'vehicle.vehicle_number' => 'required|string|max:20',
+            'vehicle.vehicle_model' => 'nullable|string|max:100',
         ]);
 
         try {
             $integration = Integration::findOrFail($validated['integration_id']);
             $ozon = OzonMarketplace::fromIntegration($integration);
             
-            $result = $ozon->supplies()->setDriver(
+            $result = $ozon->supplies()->createSupplyOrderPass(
                 (string) $validated['supply_order_id'],
-                $validated['driver']
+                $validated['vehicle']
             );
 
-            $taskId = $result['task_id'] ?? uniqid('pass_');
+            $operationId = $result['operation_id'] ?? uniqid('pass_');
             Cache::put("ozon_pass_task_{$validated['supply_order_id']}", [
-                'task_id' => $taskId,
-                'status' => 'completed',
+                'operation_id' => $operationId,
+                'status' => $result['result'] ?? 'processing',
+                'errors' => $result['errors'] ?? $result['error_reasons'] ?? [],
                 'created_at' => now()->toIso8601String(),
             ], 3600);
 
             return response()->json([
                 'success' => true,
                 'data' => [
-                    'task_id' => $taskId,
+                    'operation_id' => $operationId,
                     'supply_order_id' => $validated['supply_order_id'],
                 ],
                 'message' => 'Данные водителя добавлены',
@@ -367,20 +811,177 @@ class OzonSupplyController extends Controller
         $validated = $request->validate([
             'integration_id' => 'required|exists:integrations,id',
             'supply_order_id' => 'required|integer',
-            'task_id' => 'nullable|string',
+            'operation_id' => 'nullable|string',
         ]);
 
-        $cacheKey = "ozon_pass_task_{$validated['supply_order_id']}";
-        $taskData = Cache::get($cacheKey);
+        try {
+            $cacheKey = "ozon_pass_task_{$validated['supply_order_id']}";
+            $taskData = Cache::get($cacheKey);
+            $operationId = $validated['operation_id'] ?? ($taskData['operation_id'] ?? null);
 
-        return response()->json([
-            'success' => true,
-            'data' => [
-                'status' => $taskData['status'] ?? 'completed',
-                'task_id' => $taskData['task_id'] ?? null,
-                'created_at' => $taskData['created_at'] ?? null,
-            ],
+            if (!$operationId) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Не указан operation_id',
+                ], 422);
+            }
+
+            $integration = Integration::findOrFail($validated['integration_id']);
+            $ozon = OzonMarketplace::fromIntegration($integration);
+            $status = $ozon->supplies()->getSupplyOrderPassStatus($operationId);
+
+            $responseStatus = $status['result'] ?? $status['status'] ?? 'Unknown';
+            $errors = $status['errors'] ?? $status['error_reasons'] ?? [];
+
+            Cache::put($cacheKey, [
+                'operation_id' => $operationId,
+                'status' => $responseStatus,
+                'errors' => $errors,
+                'created_at' => $taskData['created_at'] ?? now()->toIso8601String(),
+            ], 3600);
+
+            return response()->json([
+                'success' => true,
+                'data' => [
+                    'status' => $responseStatus,
+                    'operation_id' => $operationId,
+                    'errors' => $errors,
+                    'created_at' => $taskData['created_at'] ?? null,
+                ],
+            ]);
+        } catch (\Exception $e) {
+            Log::error('Failed to get pass create status', ['error' => $e->getMessage()]);
+            return response()->json(['success' => false, 'message' => $e->getMessage()], 422);
+        }
+    }
+
+    /**
+     * Сгенерировать акт приёмки (FBP)
+     * 
+     * POST /api/ozon/fbp/act/create
+     */
+    public function createFbpAcceptanceAct(Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'integration_id' => 'required|exists:integrations,id',
+            'supply_order_id' => 'required|integer',
         ]);
+
+        try {
+            $integration = Integration::findOrFail($validated['integration_id']);
+            $ozon = OzonMarketplace::fromIntegration($integration);
+
+            $payload = $request->except(['integration_id', 'supply_order_id']);
+            $result = $ozon->supplies()->createFbpAcceptanceAct(
+                (string) $validated['supply_order_id'],
+                $payload
+            );
+
+            $operationId = $result['operation_id'] ?? $result['task_id'] ?? uniqid('act_');
+            Cache::put("ozon_fbp_act_task_{$validated['supply_order_id']}", [
+                'operation_id' => $operationId,
+                'status' => $result['status'] ?? 'processing',
+                'created_at' => now()->toIso8601String(),
+            ], 3600);
+
+            return response()->json([
+                'success' => true,
+                'data' => [
+                    'operation_id' => $operationId,
+                    'supply_order_id' => $validated['supply_order_id'],
+                ],
+                'message' => 'Акт приёмки запрошен',
+            ], 201);
+        } catch (\Exception $e) {
+            Log::error('Failed to create FBP acceptance act', ['error' => $e->getMessage()]);
+            return response()->json(['success' => false, 'message' => $e->getMessage()], 422);
+        }
+    }
+
+    /**
+     * Получить статус генерации акта приёмки (FBP)
+     * 
+     * POST /api/ozon/fbp/act/status
+     */
+    public function getFbpAcceptanceActStatus(Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'integration_id' => 'required|exists:integrations,id',
+            'supply_order_id' => 'required|integer',
+            'operation_id' => 'nullable|string',
+        ]);
+
+        try {
+            $cacheKey = "ozon_fbp_act_task_{$validated['supply_order_id']}";
+            $taskData = Cache::get($cacheKey);
+            $operationId = $validated['operation_id'] ?? ($taskData['operation_id'] ?? null);
+
+            if (!$operationId) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Не указан operation_id',
+                ], 422);
+            }
+
+            $integration = Integration::findOrFail($validated['integration_id']);
+            $ozon = OzonMarketplace::fromIntegration($integration);
+            $status = $ozon->supplies()->getFbpAcceptanceActStatus($operationId);
+
+            $responseStatus = $status['status'] ?? $status['result'] ?? 'Unknown';
+
+            Cache::put($cacheKey, [
+                'operation_id' => $operationId,
+                'status' => $responseStatus,
+                'created_at' => $taskData['created_at'] ?? now()->toIso8601String(),
+            ], 3600);
+
+            return response()->json([
+                'success' => true,
+                'data' => [
+                    'status' => $responseStatus,
+                    'operation_id' => $operationId,
+                    'created_at' => $taskData['created_at'] ?? null,
+                ],
+            ]);
+        } catch (\Exception $e) {
+            Log::error('Failed to get FBP acceptance act status', ['error' => $e->getMessage()]);
+            return response()->json(['success' => false, 'message' => $e->getMessage()], 422);
+        }
+    }
+
+    /**
+     * Отредактировать таймслот в черновике прямой поставки (FBP)
+     * 
+     * POST /api/ozon/fbp/draft/direct/timeslot/edit
+     */
+    public function editFbpDirectDraftTimeslot(Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'integration_id' => 'required|exists:integrations,id',
+            'draft_id' => 'required|string',
+            'timeslot_id' => 'required|integer',
+        ]);
+
+        try {
+            $integration = Integration::findOrFail($validated['integration_id']);
+            $ozon = OzonMarketplace::fromIntegration($integration);
+
+            $payload = $request->except(['integration_id', 'draft_id', 'timeslot_id']);
+            $result = $ozon->supplies()->editFbpDirectDraftTimeslot(
+                $validated['draft_id'],
+                $validated['timeslot_id'],
+                $payload
+            );
+
+            return response()->json([
+                'success' => true,
+                'data' => $result,
+                'message' => 'Таймслот черновика обновлён',
+            ]);
+        } catch (\Exception $e) {
+            Log::error('Failed to edit FBP draft timeslot', ['error' => $e->getMessage()]);
+            return response()->json(['success' => false, 'message' => $e->getMessage()], 422);
+        }
     }
 
     /**
