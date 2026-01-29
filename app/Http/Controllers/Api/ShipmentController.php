@@ -296,15 +296,10 @@ class ShipmentController extends Controller
                             if (empty($items)) {
                                 try {
                                     $bundleResponse = $marketplace->fboSupplyOrders()->getBundle((int) $externalSupplyId);
-                                    // Извлекаем items из bundles
-                                    $bundles = $bundleResponse['bundles'] ?? [];
-                                    foreach ($bundles as $bundle) {
-                                        $bundleItems = $bundle['items'] ?? [];
-                                        $items = array_merge($items, $bundleItems);
-                                    }
+                                    // Ответ содержит items напрямую
+                                    $items = $bundleResponse['items'] ?? [];
                                     \Illuminate\Support\Facades\Log::info('show: fetched bundle from Ozon', [
                                         'external_supply_id' => $externalSupplyId,
-                                        'bundles_count' => count($bundles),
                                         'items_count' => count($items),
                                     ]);
                                 } catch (\Exception $bundleError) {
@@ -1709,15 +1704,10 @@ class ShipmentController extends Controller
                 ]);
                 try {
                     $bundleResponse = $marketplace->fboSupplyOrders()->getBundle($supplyOrderId);
-                    // Извлекаем items из bundles
-                    $bundles = $bundleResponse['bundles'] ?? [];
-                    foreach ($bundles as $bundle) {
-                        $bundleItems = $bundle['items'] ?? [];
-                        $items = array_merge($items, $bundleItems);
-                    }
+                    // Ответ содержит items напрямую
+                    $items = $bundleResponse['items'] ?? [];
                     \Illuminate\Support\Facades\Log::info('getBundle: response', [
                         'supply_order_id' => $supplyOrderId,
-                        'bundles_count' => count($bundles),
                         'items_count' => count($items),
                     ]);
                 } catch (\Exception $e) {
@@ -1741,11 +1731,7 @@ class ShipmentController extends Controller
                 if ($resolvedSupplyOrderId) {
                     try {
                         $bundleResponse = $marketplace->fboSupplyOrders()->getBundle((int) $resolvedSupplyOrderId);
-                        $bundles = $bundleResponse['bundles'] ?? [];
-                        foreach ($bundles as $bundle) {
-                            $bundleItems = $bundle['items'] ?? [];
-                            $items = array_merge($items, $bundleItems);
-                        }
+                        $items = $bundleResponse['items'] ?? [];
                     } catch (\Exception $e) {
                         \Illuminate\Support\Facades\Log::warning('getBundle: resolved failed', [
                             'resolved_supply_order_id' => $resolvedSupplyOrderId,
