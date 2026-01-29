@@ -83,7 +83,7 @@ class FboSupplyOrdersApi
     /**
      * Получить состав заявки (товары)
      * Ozon API: POST /v1/supply-order/bundle
-     * Требует bundle_ids - массив ID бандлов из supplies[].bundles[].id
+     * Требует bundle_ids - массив UUID бандлов из supplies[].bundle_id
      */
     public function getBundle(int $supplyOrderId): array
     {
@@ -103,15 +103,13 @@ class FboSupplyOrdersApi
             return [];
         }
         
-        // Извлекаем bundle_ids из supplies
+        // Извлекаем bundle_id (UUID) из supplies
         $bundleIds = [];
         $supplies = $order['supplies'] ?? [];
         foreach ($supplies as $supply) {
-            $bundles = $supply['bundles'] ?? [];
-            foreach ($bundles as $bundle) {
-                if (!empty($bundle['id'])) {
-                    $bundleIds[] = (int) $bundle['id'];
-                }
+            // bundle_id - это UUID строка на уровне supply
+            if (!empty($supply['bundle_id'])) {
+                $bundleIds[] = $supply['bundle_id'];
             }
         }
         
@@ -119,6 +117,7 @@ class FboSupplyOrdersApi
             Log::info('Ozon FBO supply-order/bundle: no bundle_ids found', [
                 'supply_order_id' => $supplyOrderId,
                 'supplies_count' => count($supplies),
+                'first_supply_keys' => isset($supplies[0]) ? array_keys($supplies[0]) : [],
             ]);
             return [];
         }
