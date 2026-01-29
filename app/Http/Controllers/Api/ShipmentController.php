@@ -835,12 +835,18 @@ class ShipmentController extends Controller
         return match ($state) {
             'DATA_FILLING' => Shipment::STATUS_SUBMITTED,
             'READY_TO_SUPPLY' => Shipment::STATUS_APPROVED,
+            'ACCEPTED_AT_SUPPLY_WAREHOUSE' => Shipment::STATUS_SENT,
             'IN_TRANSIT' => Shipment::STATUS_IN_TRANSIT,
             'AT_WAREHOUSE' => Shipment::STATUS_ARRIVED,
             'ACCEPTING' => Shipment::STATUS_PROCESSING,
             'ACCEPTANCE' => Shipment::STATUS_PROCESSING,
+            'ACCEPTANCE_AT_STORAGE_WAREHOUSE' => Shipment::STATUS_PROCESSING,
+            'REPORTS_CONFIRMATION_AWAITING' => Shipment::STATUS_PARTIALLY_ACCEPTED,
+            'REPORT_REJECTED' => Shipment::STATUS_PARTIALLY_ACCEPTED,
             'ACCEPTED' => Shipment::STATUS_DELIVERED,
+            'COMPLETED' => Shipment::STATUS_DELIVERED,
             'PARTIALLY_ACCEPTED' => Shipment::STATUS_PARTIALLY_ACCEPTED,
+            'REJECTED_AT_SUPPLY_WAREHOUSE' => Shipment::STATUS_REJECTED,
             'CANCELLED' => Shipment::STATUS_CANCELLED,
             default => Shipment::STATUS_SUBMITTED,
         };

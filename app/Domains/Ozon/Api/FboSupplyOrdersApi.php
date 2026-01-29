@@ -32,10 +32,16 @@ class FboSupplyOrdersApi
                 'READY_TO_SUPPLY',
                 'IN_TRANSIT',
                 'AT_WAREHOUSE',
+                'ACCEPTED_AT_SUPPLY_WAREHOUSE',
                 'ACCEPTING',
                 'ACCEPTANCE',
+                'ACCEPTANCE_AT_STORAGE_WAREHOUSE',
+                'REPORTS_CONFIRMATION_AWAITING',
+                'REPORT_REJECTED',
                 'ACCEPTED',
+                'COMPLETED',
                 'PARTIALLY_ACCEPTED',
+                'REJECTED_AT_SUPPLY_WAREHOUSE',
                 'CANCELLED',
             ];
         }
