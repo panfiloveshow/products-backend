@@ -129,6 +129,7 @@ class FboSupplyOrdersApi
         
         $response = $this->client->post('/v1/supply-order/bundle', [
             'bundle_ids' => $bundleIds,
+            'limit' => 100,
         ]);
 
         Log::info('Ozon FBO supply-order/bundle response', [
