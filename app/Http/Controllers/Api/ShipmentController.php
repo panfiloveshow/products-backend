@@ -658,10 +658,16 @@ class ShipmentController extends Controller
                 $ozonState = $order['state'] ?? $order['status'] ?? $order['order_state'] ?? '';
                 $status = $this->mapOzonStateToStatus($ozonState);
 
-                // Получаем информацию о складе
-                $dropoffWarehouseId = $order['dropoff_warehouse_id'] ?? $order['warehouse_id'] ?? $order['dropoff_point_id'] ?? null;
+                // Получаем информацию о складе из drop_off_warehouse
+                $dropOffWarehouse = $order['drop_off_warehouse'] ?? [];
+                $dropoffWarehouseId = $dropOffWarehouse['warehouse_id'] 
+                    ?? $order['dropoff_warehouse_id'] 
+                    ?? $order['warehouse_id'] 
+                    ?? $order['dropoff_point_id'] 
+                    ?? null;
                 $warehouseInfo = $dropoffWarehouseId ? ($warehouses[$dropoffWarehouseId] ?? null) : null;
-                $warehouseName = $order['dropoff_warehouse_name']
+                $warehouseName = $dropOffWarehouse['name']
+                    ?? $order['dropoff_warehouse_name']
                     ?? $order['dropoff_point_name']
                     ?? $order['warehouse_name']
                     ?? ($warehouseInfo['name'] ?? null);
