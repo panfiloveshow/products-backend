@@ -215,4 +215,120 @@ class FboSupplyOrdersApi
 
         return $response['counters'] ?? $response ?? [];
     }
+
+    /**
+     * Создать черновик заявки на поставку (прямая поставка)
+     * POST /v1/draft/create
+     * 
+     * @param array $items Массив товаров [['sku' => int, 'quantity' => int], ...]
+     * @param array $clusterIds Массив ID кластеров (опционально)
+     * @param string $type Тип поставки: CREATE_TYPE_DIRECT или CREATE_TYPE_CROSSDOCK
+     * @param int|null $dropOffPointWarehouseId ID точки отгрузки (только для crossdock)
+     */
+    public function createDirectDraft(array $items, array $clusterIds = [], string $type = 'CREATE_TYPE_DIRECT', ?int $dropOffPointWarehouseId = null): array
+    {
+        $body = [
+            'items' => $items,
+            'type' => $type,
+        ];
+
+        if (!empty($clusterIds)) {
+            $body['cluster_ids'] = $clusterIds;
+        }
+
+        if ($dropOffPointWarehouseId && $type === 'CREATE_TYPE_CROSSDOCK') {
+            $body['drop_off_point_warehouse_id'] = $dropOffPointWarehouseId;
+        }
+
+        Log::info('Ozon FBO draft/create request', ['body' => $body]);
+
+        $response = $this->client->post('/v1/draft/create', $body);
+
+        Log::info('Ozon FBO draft/create response', [
+            'operation_id' => $response['operation_id'] ?? null,
+            'response' => $response,
+        ]);
+
+        return [
+            'operation_id' => $response['operation_id'] ?? null,
+            'success' => !empty($response['operation_id']),
+        ];
+    }
+
+    /**
+     * Получить информацию о черновике
+     * POST /v1/draft/create/info
+     */
+    public function getDraftInfo(string $operationId): array
+    {
+        $response = $this->client->post('/v1/draft/create/info', [
+            'operation_id' => $operationId,
+        ]);
+
+        Log::info('Ozon FBO draft/create/info response', ['response' => $response]);
+
+        return $response ?? [];
+    }
+
+    /**
+     * Получить доступные таймслоты для черновика
+     * POST /v1/draft/timeslot/info
+     */
+    public function getDraftTimeslots(int $draftId): array
+    {
+        $response = $this->client->post('/v1/draft/timeslot/info', [
+            'draft_id' => $draftId,
+        ]);
+
+        Log::info('Ozon FBO draft/timeslot/info response', [
+            'draft_id' => $draftId,
+            'warehouses_count' => count($response['warehouses'] ?? []),
+        ]);
+
+        return $response ?? [];
+    }
+
+    /**
+     * Создать заявку на поставку из черновика
+     * POST /v1/draft/supply/create
+     */
+    public function createSupplyFromDraft(int $draftId, int $warehouseId, string $timeslotFrom, string $timeslotTo): array
+    {
+        $body = [
+            'draft_id' => $draftId,
+            'warehouse_id' => $warehouseId,
+            'timeslot' => [
+                'from_in_timezone' => $timeslotFrom,
+                'to_in_timezone' => $timeslotTo,
+            ],
+        ];
+
+        Log::info('Ozon FBO draft/supply/create request', ['body' => $body]);
+
+        $response = $this->client->post('/v1/draft/supply/create', $body);
+
+        Log::info('Ozon FBO draft/supply/create response', [
+            'operation_id' => $response['operation_id'] ?? null,
+        ]);
+
+        return [
+            'operation_id' => $response['operation_id'] ?? null,
+            'success' => !empty($response['operation_id']),
+        ];
+    }
+
+    /**
+     * Получить статус создания заявки
+     * POST /v1/supply/create/status
+     */
+    public function getSupplyCreateStatus(string $operationId): array
+    {
+        $response = $this->client->post('/v1/supply/create/status', [
+            'operation_id' => $operationId,
+        ]);
+
+        Log::info('Ozon FBO supply/create/status response', ['response' => $response]);
+
+        return $response ?? [];
+    }
 }
