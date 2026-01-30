@@ -113,6 +113,10 @@ Route::prefix('shipments')->middleware('throttle:api')->group(function () {
     Route::get('/slots', [ShipmentController::class, 'slots']);
     Route::get('/marketplace-slots', [ShipmentController::class, 'marketplaceSlots']);
     
+    // Черновик и реальные слоты от Ozon
+    Route::post('/create-draft', [ShipmentController::class, 'createDraft']);
+    Route::post('/draft-timeslots', [ShipmentController::class, 'getDraftTimeslots']);
+    
     // Рекомендации
     Route::get('/recommendations', [ShipmentController::class, 'recommendations']);
     Route::post('/from-recommendation/{recommendationId}', [ShipmentController::class, 'createFromRecommendation']);

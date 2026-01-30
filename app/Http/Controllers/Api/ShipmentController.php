@@ -2104,4 +2104,303 @@ class ShipmentController extends Controller
             return response()->json(['message' => $e->getMessage()], 500);
         }
     }
+
+    /**
+     * Создать черновик в Ozon (без создания заявки на поставку)
+     * 
+     * POST /api/shipments/create-draft
+     */
+    public function createDraft(Request $request): JsonResponse
+    {
+        $request->validate([
+            'integration_id' => 'required',
+            'warehouse_id' => 'required|string',
+            'cluster_id' => 'nullable|string',
+            'items' => 'required|array|min:1',
+            'items.*.sku' => 'required|string',
+            'items.*.quantity' => 'required|integer|min:1',
+        ]);
+
+        $integrationId = (string) $request->input('integration_id');
+        $integration = \App\Models\Integration::findOrFail($integrationId);
+        $warehouseId = $request->input('warehouse_id');
+        $clusterId = $request->input('cluster_id');
+        $items = $request->input('items');
+
+        if ($integration->marketplace !== 'ozon') {
+            return response()->json([
+                'message' => 'Черновики поддерживаются только для Ozon',
+            ], 422);
+        }
+
+        try {
+            $ozonItems = [];
+            foreach ($items as $item) {
+                $product = \App\Models\Product::where('sku', $item['sku'])
+                    ->where('integration_id', $integrationId)
+                    ->first();
+                
+                if ($product) {
+                    $ozonData = $product->ozon_data ?? [];
+                    $ozonSku = !empty($ozonData['sku']) ? (int) $ozonData['sku'] : ($product->marketplace_id ? (int) $product->marketplace_id : null);
+                    
+                    if ($ozonSku) {
+                        $ozonItems[] = [
+                            'sku' => $ozonSku,
+                            'quantity' => (int) $item['quantity'],
+                        ];
+                    }
+                }
+            }
+            
+            if (empty($ozonItems)) {
+                return response()->json([
+                    'message' => 'Не найдены товары с SKU для синхронизации с Ozon',
+                ], 422);
+            }
+            
+            $marketplace = \App\Domains\Ozon\OzonMarketplace::fromIntegration($integration);
+            $suppliesApi = $marketplace->fboSupplyOrders();
+            $suppliesPublicApi = $marketplace->supplies();
+
+            $clusterIdForDraft = $clusterId ?: null;
+
+            if (!$clusterId && method_exists($suppliesPublicApi, 'getFboWarehouses')) {
+                $fboWarehouses = $suppliesPublicApi->getFboWarehouses();
+                foreach ($fboWarehouses as $wh) {
+                    if ((string) ($wh['id'] ?? '') === (string) $warehouseId) {
+                        $clusterIdForDraft = (string) ($wh['cluster_id'] ?? $clusterIdForDraft);
+                        break;
+                    }
+                }
+            }
+
+            if (!$clusterIdForDraft && method_exists($suppliesPublicApi, 'getClusters')) {
+                $clusters = $suppliesPublicApi->getClusters();
+                foreach ($clusters as $cluster) {
+                    $warehouseIds = array_map('strval', $cluster['warehouse_ids'] ?? $cluster['all_warehouse_ids'] ?? []);
+                    if (in_array((string) $warehouseId, $warehouseIds, true)) {
+                        $clusterIdForDraft = (string) ($cluster['id'] ?? null);
+                        break;
+                    }
+                }
+            }
+
+            if (!$clusterIdForDraft) {
+                return response()->json([
+                    'message' => 'Не удалось определить кластер для выбранного склада',
+                ], 422);
+            }
+
+            $ozonDraft = $suppliesApi->createDirectDraft(
+                $ozonItems,
+                !empty($clusterIdForDraft) ? [(string) $clusterIdForDraft] : [],
+                'CREATE_TYPE_DIRECT'
+            );
+            
+            $operationId = $ozonDraft['operation_id'] ?? null;
+            
+            if (empty($operationId)) {
+                return response()->json([
+                    'message' => 'Не удалось создать черновик в Ozon: operation_id не получен',
+                ], 422);
+            }
+
+            // Ожидаем готовности черновика
+            $draftId = null;
+            $draftInfo = null;
+            $availableClusters = [];
+            $maxAttempts = 15;
+            
+            for ($attempt = 1; $attempt <= $maxAttempts; $attempt++) {
+                $draftInfo = $suppliesApi->getDraftInfo($operationId);
+                if (empty($draftInfo)) {
+                    usleep(2000000);
+                    continue;
+                }
+                $status = $draftInfo['status'] ?? '';
+                $draftId = $draftInfo['draft_id'] ?? null;
+                
+                if ($status === 'CALCULATION_STATUS_SUCCESS' || ($draftId && $draftId > 0)) {
+                    break;
+                }
+                
+                if ($status === 'CALCULATION_STATUS_ERROR' || $status === 'CALCULATION_STATUS_FAILED') {
+                    $errors = $draftInfo['errors'] ?? [];
+                    return response()->json([
+                        'message' => 'Ошибка создания черновика в Ozon: ' . json_encode($errors),
+                    ], 422);
+                }
+                
+                usleep(2000000);
+            }
+            
+            if (empty($draftId) || $draftId == 0) {
+                return response()->json([
+                    'message' => 'Черновик не был создан в Ozon после ожидания',
+                ], 422);
+            }
+
+            // Извлекаем доступные склады из черновика
+            $availableWarehouseId = null;
+            if (!empty($draftInfo['clusters'])) {
+                foreach ($draftInfo['clusters'] as $cluster) {
+                    $clusterData = [
+                        'cluster_id' => $cluster['cluster_id'] ?? null,
+                        'cluster_name' => $cluster['cluster_name'] ?? null,
+                        'warehouses' => [],
+                    ];
+
+                    foreach ($cluster['warehouses'] ?? [] as $wh) {
+                        $isAvailable = ($wh['status']['is_available'] ?? false) === true;
+                        $clusterData['warehouses'][] = [
+                            'warehouse_id' => $wh['supply_warehouse']['warehouse_id'] ?? null,
+                            'name' => $wh['supply_warehouse']['name'] ?? null,
+                            'address' => $wh['supply_warehouse']['address'] ?? null,
+                            'is_available' => $isAvailable,
+                            'invalid_reason' => $wh['status']['invalid_reason'] ?? null,
+                        ];
+
+                        if ($isAvailable && !$availableWarehouseId) {
+                            $availableWarehouseId = $wh['supply_warehouse']['warehouse_id'] ?? null;
+                        }
+                    }
+
+                    if (!empty($clusterData['warehouses'])) {
+                        $availableClusters[] = $clusterData;
+                    }
+                }
+            }
+
+            return response()->json([
+                'success' => true,
+                'draft_id' => $draftId,
+                'warehouse_id' => $availableWarehouseId,
+                'available_clusters' => $availableClusters,
+            ]);
+
+        } catch (\Exception $e) {
+            \Illuminate\Support\Facades\Log::error('Failed to create draft', [
+                'error' => $e->getMessage(),
+                'trace' => $e->getTraceAsString(),
+            ]);
+            
+            return response()->json([
+                'message' => 'Ошибка создания черновика: ' . $e->getMessage(),
+            ], 422);
+        }
+    }
+
+    /**
+     * Получить реальные таймслоты от Ozon для черновика
+     * 
+     * POST /api/shipments/draft-timeslots
+     */
+    public function getDraftTimeslots(Request $request): JsonResponse
+    {
+        $request->validate([
+            'integration_id' => 'required',
+            'draft_id' => 'required|integer',
+            'warehouse_id' => 'required',
+        ]);
+
+        $integrationId = (string) $request->input('integration_id');
+        $integration = \App\Models\Integration::findOrFail($integrationId);
+        $draftId = (int) $request->input('draft_id');
+        $warehouseId = (int) $request->input('warehouse_id');
+
+        if ($integration->marketplace !== 'ozon') {
+            return response()->json([
+                'message' => 'Таймслоты поддерживаются только для Ozon',
+            ], 422);
+        }
+
+        try {
+            $marketplace = \App\Domains\Ozon\OzonMarketplace::fromIntegration($integration);
+            $suppliesApi = $marketplace->supplies();
+
+            $timeslotsResponse = $suppliesApi->getDraftTimeslots($draftId, $warehouseId);
+
+            // Парсим слоты из разных структур ответа
+            $slots = [];
+            
+            // Структура 1: warehouses[].days[].timeslots[]
+            foreach ($timeslotsResponse['warehouses'] ?? [] as $wh) {
+                foreach ($wh['days'] ?? [] as $day) {
+                    $date = $day['date'] ?? null;
+                    foreach ($day['timeslots'] ?? [] as $slot) {
+                        $slots[] = [
+                            'id' => $slot['timeslot_id'] ?? md5(json_encode($slot)),
+                            'date' => $date ?? substr($slot['from'] ?? $slot['from_in_timezone'] ?? '', 0, 10),
+                            'time_from' => substr($slot['from_in_timezone'] ?? $slot['from'] ?? '', 11, 5),
+                            'time_to' => substr($slot['to_in_timezone'] ?? $slot['to'] ?? '', 11, 5),
+                            'from' => $slot['from_in_timezone'] ?? $slot['from'] ?? '',
+                            'to' => $slot['to_in_timezone'] ?? $slot['to'] ?? '',
+                            'is_available' => true,
+                        ];
+                    }
+                }
+            }
+            
+            // Структура 2: drop_off_warehouse_timeslots[].days[].timeslots[]
+            if (empty($slots)) {
+                foreach ($timeslotsResponse['drop_off_warehouse_timeslots'] ?? [] as $whTimeslots) {
+                    foreach ($whTimeslots['days'] ?? [] as $day) {
+                        $date = $day['date'] ?? null;
+                        foreach ($day['timeslots'] ?? [] as $slot) {
+                            $slots[] = [
+                                'id' => $slot['timeslot_id'] ?? md5(json_encode($slot)),
+                                'date' => $date ?? substr($slot['from'] ?? $slot['from_in_timezone'] ?? '', 0, 10),
+                                'time_from' => substr($slot['from_in_timezone'] ?? $slot['from'] ?? '', 11, 5),
+                                'time_to' => substr($slot['to_in_timezone'] ?? $slot['to'] ?? '', 11, 5),
+                                'from' => $slot['from_in_timezone'] ?? $slot['from'] ?? '',
+                                'to' => $slot['to_in_timezone'] ?? $slot['to'] ?? '',
+                                'is_available' => true,
+                            ];
+                        }
+                    }
+                }
+            }
+            
+            // Структура 3: days[].timeslots[] напрямую
+            if (empty($slots)) {
+                foreach ($timeslotsResponse['days'] ?? [] as $day) {
+                    $date = $day['date'] ?? null;
+                    foreach ($day['timeslots'] ?? [] as $slot) {
+                        $slots[] = [
+                            'id' => $slot['timeslot_id'] ?? md5(json_encode($slot)),
+                            'date' => $date ?? substr($slot['from'] ?? $slot['from_in_timezone'] ?? '', 0, 10),
+                            'time_from' => substr($slot['from_in_timezone'] ?? $slot['from'] ?? '', 11, 5),
+                            'time_to' => substr($slot['to_in_timezone'] ?? $slot['to'] ?? '', 11, 5),
+                            'from' => $slot['from_in_timezone'] ?? $slot['from'] ?? '',
+                            'to' => $slot['to_in_timezone'] ?? $slot['to'] ?? '',
+                            'is_available' => true,
+                        ];
+                    }
+                }
+            }
+
+            \Illuminate\Support\Facades\Log::info('Draft timeslots parsed', [
+                'draft_id' => $draftId,
+                'warehouse_id' => $warehouseId,
+                'slots_count' => count($slots),
+            ]);
+
+            return response()->json([
+                'success' => true,
+                'data' => $slots,
+            ]);
+
+        } catch (\Exception $e) {
+            \Illuminate\Support\Facades\Log::error('Failed to get draft timeslots', [
+                'error' => $e->getMessage(),
+                'draft_id' => $draftId,
+                'warehouse_id' => $warehouseId,
+            ]);
+            
+            return response()->json([
+                'message' => 'Ошибка получения таймслотов: ' . $e->getMessage(),
+            ], 422);
+        }
+    }
 }
