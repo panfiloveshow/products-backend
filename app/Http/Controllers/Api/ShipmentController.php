@@ -390,6 +390,7 @@ class ShipmentController extends Controller
         $request->validate([
             'integration_id' => 'required',
             'warehouse_id' => 'required|string',
+            'cluster_id' => 'nullable|string',
             'items' => 'required|array|min:1',
             'items.*.sku' => 'required|string',
             'items.*.quantity' => 'required|integer|min:1',
@@ -400,6 +401,7 @@ class ShipmentController extends Controller
         $integrationId = (string) $request->input('integration_id');
         $integration = \App\Models\Integration::findOrFail($integrationId);
         $warehouseId = $request->input('warehouse_id');
+        $clusterId = $request->input('cluster_id');
         $items = $request->input('items');
 
         $externalSupplyId = null;
@@ -443,11 +445,46 @@ class ShipmentController extends Controller
                 
                 $marketplace = \App\Domains\Ozon\OzonMarketplace::fromIntegration($integration);
                 $suppliesApi = $marketplace->fboSupplyOrders();
+                $suppliesPublicApi = $marketplace->supplies();
+
+                $requestedWarehouseId = null;
+                $clusterIdForDraft = $clusterId ?: null;
+
+                if (!$clusterId && method_exists($suppliesPublicApi, 'getFboWarehouses')) {
+                    $fboWarehouses = $suppliesPublicApi->getFboWarehouses();
+                    foreach ($fboWarehouses as $wh) {
+                        if ((string) ($wh['id'] ?? '') === (string) $warehouseId) {
+                            $requestedWarehouseId = (string) $wh['id'];
+                            $clusterIdForDraft = (string) ($wh['cluster_id'] ?? $clusterIdForDraft);
+                            break;
+                        }
+                    }
+                }
+
+                if (!$clusterIdForDraft && method_exists($suppliesPublicApi, 'getClusters')) {
+                    $clusters = $suppliesPublicApi->getClusters();
+                    foreach ($clusters as $cluster) {
+                        $warehouseIds = $cluster['warehouse_ids'] ?? $cluster['all_warehouse_ids'] ?? [];
+                        $warehouseIds = array_map('strval', $warehouseIds);
+
+                        if (in_array((string) $warehouseId, $warehouseIds, true)) {
+                            $clusterIdForDraft = (string) ($cluster['id'] ?? null);
+                            break;
+                        }
+                    }
+                }
+
+                if (!$clusterIdForDraft) {
+                    if ($requestedWarehouseId) {
+                        throw new \RuntimeException('Не удалось определить кластер для выбранного склада');
+                    }
+                    $clusterIdForDraft = $warehouseId;
+                }
                 
                 // Создаём черновик: items, cluster_ids (опционально), type
                 $ozonDraft = $suppliesApi->createDirectDraft(
                     $ozonItems,
-                    !empty($warehouseId) ? [(string) $warehouseId] : [],
+                    !empty($clusterIdForDraft) ? [(string) $clusterIdForDraft] : [],
                     'CREATE_TYPE_DIRECT'
                 );
                 
@@ -455,7 +492,7 @@ class ShipmentController extends Controller
                 
                 \Illuminate\Support\Facades\Log::info('Ozon draft created', [
                     'operation_id' => $operationId,
-                    'cluster_id' => $warehouseId,
+                    'cluster_id' => $clusterIdForDraft,
                     'items_count' => count($ozonItems),
                     'response' => $ozonDraft,
                 ]);
@@ -510,6 +547,7 @@ class ShipmentController extends Controller
                 }
 
                 $availableWarehouse = null;
+                $requestedWarehouse = null;
 
                 if (!empty($draftInfo['clusters'])) {
                     foreach ($draftInfo['clusters'] as $cluster) {
@@ -533,8 +571,15 @@ class ShipmentController extends Controller
 
                                 $clusterData['warehouses'][] = $warehouseData;
 
-                                if (($wh['status']['is_available'] ?? false) === true && !$availableWarehouse) {
+                                $isAvailable = ($wh['status']['is_available'] ?? false) === true;
+                                $warehouseIdValue = (string) ($wh['supply_warehouse']['warehouse_id'] ?? '');
+
+                                if ($isAvailable && !$availableWarehouse) {
                                     $availableWarehouse = $wh;
+                                }
+
+                                if ($requestedWarehouseId && $isAvailable && $warehouseIdValue === (string) $requestedWarehouseId) {
+                                    $requestedWarehouse = $wh;
                                 }
                             }
                         }
@@ -546,8 +591,14 @@ class ShipmentController extends Controller
                 }
 
                 // Если есть доступный склад — получаем таймслоты и создаём заявку
-                if ($availableWarehouse && $draftId && is_numeric($draftId)) {
-                    $warehouseIdForSupply = $availableWarehouse['supply_warehouse']['warehouse_id'] ?? null;
+                if ($requestedWarehouseId && !$requestedWarehouse) {
+                    throw new \RuntimeException('Выбранный склад недоступен для поставки. Выберите другой склад.');
+                }
+
+                $warehouseForSupply = $requestedWarehouse ?: $availableWarehouse;
+
+                if ($warehouseForSupply && $draftId && is_numeric($draftId)) {
+                    $warehouseIdForSupply = $warehouseForSupply['supply_warehouse']['warehouse_id'] ?? null;
                     
                     if ($warehouseIdForSupply) {
                         $timeslots = $suppliesApi->getDraftTimeslots((int) $draftId, (int) $warehouseIdForSupply);
@@ -659,6 +710,7 @@ class ShipmentController extends Controller
                         }
 
                         $externalSupplyId = (string) $supplyOrderId;
+                        $warehouseId = (string) $warehouseIdForSupply;
                     } else {
                         throw new \RuntimeException('Не удалось определить склад для поставки в Ozon');
                     }
@@ -761,14 +813,45 @@ class ShipmentController extends Controller
             $marketplace = \App\Domains\Ozon\OzonMarketplace::fromIntegration($integration);
             $suppliesApi = $marketplace->fboSupplyOrders();
 
-            // Получаем список заявок из Ozon
-            $listResponse = $suppliesApi->list([], 50);
-            $orderIds = $listResponse['order_ids'] ?? [];
+            // Получаем список заявок из Ozon (с пагинацией)
+            $orderIds = [];
+            $lastId = null;
+            $maxIterations = 20;
+            for ($page = 0; $page < $maxIterations; $page++) {
+                $listResponse = $suppliesApi->list([], 50, $lastId);
+                $batchIds = $listResponse['order_ids'] ?? [];
+                $orderIds = array_merge($orderIds, $batchIds);
+                $lastId = $listResponse['last_id'] ?? null;
+
+                if (empty($batchIds) || empty($lastId)) {
+                    break;
+                }
+            }
+
+            $ozonOrderIds = array_values(array_unique(array_map('strval', $orderIds)));
+            $deleted = 0;
+            $localShipments = Shipment::where('integration_id', $integrationId)
+                ->where('marketplace', 'ozon')
+                ->whereNotNull('external_supply_id')
+                ->get();
+
+            foreach ($localShipments as $shipment) {
+                if (!in_array((string) $shipment->external_supply_id, $ozonOrderIds, true)) {
+                    $shipment->items()->delete();
+                    $shipment->delete();
+                    $deleted++;
+                }
+            }
 
             if (empty($orderIds)) {
                 return response()->json([
-                    'message' => 'Нет заявок в Ozon',
+                    'message' => $deleted > 0
+                        ? "Синхронизация завершена: удалено {$deleted}"
+                        : 'Нет заявок в Ozon',
                     'synced' => 0,
+                    'updated' => 0,
+                    'deleted' => $deleted,
+                    'total_from_ozon' => 0,
                 ]);
             }
 
@@ -940,9 +1023,10 @@ class ShipmentController extends Controller
             }
 
             return response()->json([
-                'message' => "Синхронизация завершена: создано {$synced}, обновлено {$updated}",
+                'message' => "Синхронизация завершена: создано {$synced}, обновлено {$updated}, удалено {$deleted}",
                 'synced' => $synced,
                 'updated' => $updated,
+                'deleted' => $deleted,
                 'total_from_ozon' => count($orders),
             ]);
 
@@ -1541,7 +1625,30 @@ class ShipmentController extends Controller
                 ]);
             }
 
-            $warehouses = $suppliesApi->getAvailableWarehouses() ?? [];
+            $warehouses = [];
+
+            if ($marketplace === 'ozon') {
+                if (method_exists($suppliesApi, 'getClusters')) {
+                    $clusters = $suppliesApi->getClusters();
+                    foreach ($clusters as $cluster) {
+                        foreach ($cluster['warehouses'] ?? [] as $warehouse) {
+                            $warehouses[] = [
+                                'id' => (string) ($warehouse['id'] ?? $warehouse['warehouse_id'] ?? null),
+                                'name' => $warehouse['name'] ?? null,
+                                'type' => $warehouse['type'] ?? null,
+                                'cluster_id' => (string) ($cluster['id'] ?? null),
+                                'cluster_name' => $cluster['name'] ?? null,
+                            ];
+                        }
+                    }
+                }
+
+                if (empty($warehouses)) {
+                    $warehouses = $suppliesApi->getFboWarehouses() ?? [];
+                }
+            } else {
+                $warehouses = $suppliesApi->getAvailableWarehouses() ?? [];
+            }
 
             return response()->json([
                 'data' => $warehouses,

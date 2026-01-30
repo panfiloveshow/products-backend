@@ -233,7 +233,7 @@ class FboSupplyOrdersApi
         ];
 
         if (!empty($clusterIds)) {
-            $body['cluster_ids'] = $clusterIds;
+            $body['cluster_ids'] = array_map('intval', $clusterIds);
         }
 
         if ($dropOffPointWarehouseId && $type === 'CREATE_TYPE_CROSSDOCK') {
@@ -267,7 +267,7 @@ class FboSupplyOrdersApi
 
         Log::info('Ozon FBO draft/create/info response', ['response' => $response]);
 
-        return $response ?? [];
+        return $response['result'] ?? $response ?? [];
     }
 
     /**

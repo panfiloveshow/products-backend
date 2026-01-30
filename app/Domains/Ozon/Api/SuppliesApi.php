@@ -475,6 +475,7 @@ class SuppliesApi implements SuppliesApiInterface
             $acceptingWarehousesCount = 0;
             $allWarehouseIds = [];
             $acceptingWarehouseIds = [];
+            $acceptingWarehouses = [];
             
             // Специализированные склады, которые не показываются для обычных товаров
             $specializedKeywords = ['ВЕТАПТЕКА', 'ЮВЕЛИРН', 'НЕГАБАРИТ', 'ПАЛЛЕТН', 'ШИНЫ', 'КГТ'];
@@ -503,6 +504,11 @@ class SuppliesApi implements SuppliesApiInterface
                         if (!$isSpecialized) {
                             $acceptingWarehousesCount++;
                             $acceptingWarehouseIds[] = $whId;
+                            $acceptingWarehouses[] = [
+                                'id' => (string) $whId,
+                                'name' => $whName,
+                                'type' => $whType,
+                            ];
                         }
                     }
                 }
@@ -522,8 +528,30 @@ class SuppliesApi implements SuppliesApiInterface
                 'warehouse_ids' => $acceptingWarehouseIds,
                 'all_warehouse_ids' => $allWarehouseIds,
                 'is_active' => true,
+                'warehouses' => $acceptingWarehouses,
             ];
         }, $clusters);
+    }
+
+    private function buildClusterWarehouses(): array
+    {
+        $clusters = $this->getClusters();
+        $warehouses = [];
+
+        foreach ($clusters as $cluster) {
+            foreach ($cluster['warehouses'] ?? [] as $warehouse) {
+                $warehouses[] = [
+                    'id' => (string) ($warehouse['id'] ?? $warehouse['warehouse_id'] ?? null),
+                    'name' => $warehouse['name'] ?? null,
+                    'type' => $warehouse['type'] ?? null,
+                    'cluster_id' => (string) ($cluster['id'] ?? null),
+                    'cluster_name' => $cluster['name'] ?? null,
+                    'is_active' => $cluster['is_active'] ?? true,
+                ];
+            }
+        }
+
+        return $warehouses;
     }
 
     /**
@@ -1021,7 +1049,7 @@ class SuppliesApi implements SuppliesApiInterface
         $response = $this->client->post('/v1/warehouse/fbo/list', $body, empty($body));
 
         if (!$response) {
-            return [];
+            return $this->buildClusterWarehouses();
         }
 
         $result = $response['result'] ?? $response;
@@ -1031,7 +1059,7 @@ class SuppliesApi implements SuppliesApiInterface
             ?? $result
             ?? [];
         
-        return array_map(fn($wh) => [
+        $mapped = array_map(fn($wh) => [
             'id' => (string) ($wh['warehouse_id'] ?? $wh['id'] ?? null),
             'name' => $wh['name'] ?? null,
             'type' => $wh['warehouse_type'] ?? $wh['type'] ?? null,
@@ -1045,6 +1073,12 @@ class SuppliesApi implements SuppliesApiInterface
             'coordinates' => $wh['coordinates'] ?? ($wh['address']['coordinates'] ?? null),
             'is_active' => $wh['is_active'] ?? true,
         ], $warehouses);
+
+        $hasClusterInfo = collect($mapped)->contains(function ($wh) {
+            return !empty($wh['cluster_id']) || !empty($wh['address']);
+        });
+
+        return $hasClusterInfo ? $mapped : $this->buildClusterWarehouses();
     }
 
     /**

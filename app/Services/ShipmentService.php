@@ -369,7 +369,9 @@ class ShipmentService
 
             // Если склад не указан — получаем первый доступный
             if (!$warehouseId) {
-                $warehouses = $suppliesApi->getAvailableWarehouses();
+                $warehouses = $marketplace === 'ozon' && method_exists($suppliesApi, 'getFboWarehouses')
+                    ? $suppliesApi->getFboWarehouses()
+                    : $suppliesApi->getAvailableWarehouses();
                 $warehouseId = $warehouses[0]['id'] ?? null;
             }
 
