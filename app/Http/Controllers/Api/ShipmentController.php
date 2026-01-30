@@ -566,31 +566,73 @@ class ShipmentController extends Controller
                         // Берём первый доступный таймслот
                         $firstSlot = !empty($allSlots) ? $allSlots[0] : null;
 
-                        if ($firstSlot) {
-                            $supplyResult = $suppliesApi->createSupplyFromDraft(
-                                (int) $draftId,
-                                (int) $warehouseIdForSupply,
-                                [
-                                    'from' => $firstSlot['from'] ?? $firstSlot['from_in_timezone'] ?? '',
-                                    'to' => $firstSlot['to'] ?? $firstSlot['to_in_timezone'] ?? '',
-                                ]
-                            );
+                        if (!$firstSlot) {
+                            throw new \RuntimeException('Не удалось подобрать таймслот для поставки в Ozon');
+                        }
 
-                            \Illuminate\Support\Facades\Log::info('Ozon supply created', [
-                                'draft_id' => $draftId,
-                                'supply_result' => $supplyResult,
+                        $timeslotFrom = $firstSlot['from_in_timezone'] ?? $firstSlot['from'] ?? '';
+                        $timeslotTo = $firstSlot['to_in_timezone'] ?? $firstSlot['to'] ?? '';
+
+                        if (empty($timeslotFrom) || empty($timeslotTo)) {
+                            throw new \RuntimeException('Неверные данные таймслота для поставки в Ozon');
+                        }
+
+                        $supplyResult = $suppliesApi->createSupplyFromDraft(
+                            (int) $draftId,
+                            (int) $warehouseIdForSupply,
+                            $timeslotFrom,
+                            $timeslotTo
+                        );
+
+                        \Illuminate\Support\Facades\Log::info('Ozon supply create requested', [
+                            'draft_id' => $draftId,
+                            'supply_result' => $supplyResult,
+                        ]);
+
+                        $supplyOperationId = $supplyResult['operation_id'] ?? null;
+                        if (empty($supplyOperationId)) {
+                            throw new \RuntimeException('Не удалось создать поставку в Ozon: operation_id не получен');
+                        }
+
+                        // Ждём, пока Ozon создаст заявку на поставку и вернёт supply_order_id
+                        $supplyOrderId = null;
+                        $statusAttempts = 10;
+                        for ($i = 1; $i <= $statusAttempts; $i++) {
+                            $statusResponse = $suppliesApi->getSupplyCreateStatus($supplyOperationId);
+                            $status = $statusResponse['status'] ?? $statusResponse['state'] ?? '';
+                            $supplyOrderId = $statusResponse['supply_order_id']
+                                ?? ($statusResponse['supply_order_ids'][0] ?? null)
+                                ?? ($statusResponse['result']['supply_order_id'] ?? null);
+
+                            \Illuminate\Support\Facades\Log::info('Ozon supply status check', [
+                                'attempt' => $i,
+                                'operation_id' => $supplyOperationId,
+                                'status' => $status,
+                                'supply_order_id' => $supplyOrderId,
+                                'response' => $statusResponse,
                             ]);
 
-                            // Используем operation_id от создания заявки
-                            $externalSupplyId = $supplyResult['operation_id'] ?? $draftId;
-                        } else {
-                            $externalSupplyId = $draftId;
+                            if ($supplyOrderId) {
+                                break;
+                            }
+
+                            if (in_array($status, ['ERROR', 'FAILED', 'REJECTED'], true)) {
+                                throw new \RuntimeException('Ozon не создал поставку: ' . json_encode($statusResponse));
+                            }
+
+                            usleep(1000000);
                         }
+
+                        if (empty($supplyOrderId)) {
+                            throw new \RuntimeException('Ozon не вернул supply_order_id после ожидания');
+                        }
+
+                        $externalSupplyId = (string) $supplyOrderId;
                     } else {
-                        $externalSupplyId = $draftId;
+                        throw new \RuntimeException('Не удалось определить склад для поставки в Ozon');
                     }
                 } else {
-                    $externalSupplyId = $draftId;
+                    throw new \RuntimeException('Черновик не содержит доступных складов для поставки');
                 }
             } catch (\Exception $e) {
                 $syncError = $e->getMessage();
@@ -601,8 +643,12 @@ class ShipmentController extends Controller
             }
         }
 
-        // Определяем статус: если заявка создана в Ozon — submitted, иначе draft
-        $status = $externalSupplyId ? 'submitted' : 'draft';
+        if (empty($externalSupplyId)) {
+            return response()->json([
+                'message' => 'Не удалось создать поставку в Ozon',
+                'sync_error' => $syncError,
+            ], 422);
+        }
 
         $shipmentData = [
             'name' => 'Поставка ' . now()->format('d.m.Y H:i'),
@@ -610,27 +656,18 @@ class ShipmentController extends Controller
             'marketplace' => $integration->marketplace,
             'warehouse_id' => $warehouseId,
             'shipment_type' => 'fbo',
-            'status' => $status,
+            'status' => 'submitted',
             'items' => $items,
             'external_supply_id' => $externalSupplyId,
         ];
 
         $shipment = $this->shipmentService->create($shipmentData);
 
-        $response = [
+        return response()->json([
             'data' => $this->formatShipmentResponse($shipment->load(['items'])),
-            'message' => 'Поставка создана',
-        ];
-
-        if ($externalSupplyId) {
-            $response['ozon_draft_id'] = $externalSupplyId;
-            $response['message'] = 'Поставка создана и синхронизирована с Ozon';
-        } elseif ($syncError) {
-            $response['sync_error'] = $syncError;
-            $response['message'] = 'Поставка создана локально (ошибка синхронизации с Ozon)';
-        }
-
-        return response()->json($response, 201);
+            'message' => 'Поставка создана и синхронизирована с Ozon',
+            'ozon_supply_id' => $externalSupplyId,
+        ], 201);
     }
 
     public function update(UpdateShipmentRequest $request, string $id): JsonResponse
