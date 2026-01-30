@@ -404,6 +404,7 @@ class ShipmentController extends Controller
 
         $externalSupplyId = null;
         $syncError = null;
+        $availableClusters = [];
 
         // Пытаемся создать черновик в Ozon API
         if ($integration->marketplace === 'ozon') {
@@ -509,16 +510,37 @@ class ShipmentController extends Controller
                 }
 
                 $availableWarehouse = null;
-                
+
                 if (!empty($draftInfo['clusters'])) {
                     foreach ($draftInfo['clusters'] as $cluster) {
+                        $clusterData = [
+                            'cluster_id' => $cluster['cluster_id'] ?? null,
+                            'cluster_name' => $cluster['cluster_name'] ?? null,
+                            'warehouses' => [],
+                        ];
+
                         if (!empty($cluster['warehouses'])) {
                             foreach ($cluster['warehouses'] as $wh) {
-                                if (($wh['status']['is_available'] ?? false) === true) {
+                                $warehouseData = [
+                                    'warehouse_id' => $wh['supply_warehouse']['warehouse_id'] ?? null,
+                                    'name' => $wh['supply_warehouse']['name'] ?? null,
+                                    'address' => $wh['supply_warehouse']['address'] ?? null,
+                                    'is_available' => $wh['status']['is_available'] ?? false,
+                                    'state' => $wh['status']['state'] ?? null,
+                                    'invalid_reason' => $wh['status']['invalid_reason'] ?? null,
+                                    'bundle_ids' => $wh['bundle_ids'] ?? [],
+                                ];
+
+                                $clusterData['warehouses'][] = $warehouseData;
+
+                                if (($wh['status']['is_available'] ?? false) === true && !$availableWarehouse) {
                                     $availableWarehouse = $wh;
-                                    break 2;
                                 }
                             }
+                        }
+
+                        if (!empty($clusterData['warehouses'])) {
+                            $availableClusters[] = $clusterData;
                         }
                     }
                 }
@@ -648,6 +670,7 @@ class ShipmentController extends Controller
                 \Illuminate\Support\Facades\Log::warning('Failed to create Ozon draft', [
                     'error' => $syncError,
                     'macrolocal_cluster_id' => $warehouseId,
+                    'available_clusters_count' => count($availableClusters),
                 ]);
             }
         }
@@ -656,6 +679,7 @@ class ShipmentController extends Controller
             return response()->json([
                 'message' => 'Не удалось создать поставку в Ozon',
                 'sync_error' => $syncError,
+                'available_clusters' => $availableClusters,
             ], 422);
         }
 
