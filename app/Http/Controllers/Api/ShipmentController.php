@@ -458,7 +458,7 @@ class ShipmentController extends Controller
                 ]);
 
                 // Получаем информацию о доступных складах из черновика
-                $draftInfo = $suppliesApi->getDraftCreateInfo($ozonDraft['operation_id']);
+                $draftInfo = $suppliesApi->getDraftInfo($ozonDraft['operation_id']);
                 $availableWarehouse = null;
                 
                 if (!empty($draftInfo['clusters'])) {
