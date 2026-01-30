@@ -389,14 +389,14 @@ class ShipmentController extends Controller
     {
         $request->validate([
             'integration_id' => 'required',
-            'warehouse_id' => 'required|string',
-            'cluster_id' => 'nullable|string',
+            'warehouse_id' => 'required',
+            'cluster_id' => 'nullable',
             'items' => 'required|array|min:1',
             'items.*.sku' => 'required|string',
             'items.*.quantity' => 'required|integer|min:1',
             'items.*.barcode' => 'nullable|string',
-            'timeslot_from' => 'nullable|string',
-            'timeslot_to' => 'nullable|string',
+            'timeslot_from' => 'nullable',
+            'timeslot_to' => 'nullable',
         ]);
 
         // Приводим integration_id к строке для совместимости
