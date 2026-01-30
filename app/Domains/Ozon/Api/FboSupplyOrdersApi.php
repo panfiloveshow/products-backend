@@ -277,7 +277,7 @@ class FboSupplyOrdersApi
     public function getDraftTimeslots(int $draftId, ?int $warehouseId = null): array
     {
         $dateFrom = now()->toIso8601String();
-        $dateTo = now()->addDays(14)->toIso8601String();
+        $dateTo = now()->addDays(28)->toIso8601String();
 
         $body = [
             'draft_id' => $draftId,
