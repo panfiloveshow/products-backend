@@ -2392,7 +2392,6 @@ class ShipmentController extends Controller
 
             \Illuminate\Support\Facades\Log::info('Draft timeslots parsed', [
                 'draft_id' => $draftId,
-                'warehouse_id' => $warehouseId,
                 'slots_count' => count($slots),
             ]);
 
@@ -2400,16 +2399,122 @@ class ShipmentController extends Controller
                 'success' => true,
                 'data' => $slots,
             ]);
-
         } catch (\Exception $e) {
-            \Illuminate\Support\Facades\Log::error('Failed to get draft timeslots', [
-                'error' => $e->getMessage(),
-                'draft_id' => $draftId,
-                'warehouse_id' => $warehouseId,
-            ]);
-            
             return response()->json([
                 'message' => 'Ошибка получения таймслотов: ' . $e->getMessage(),
+            ], 422);
+        }
+    }
+
+    /**
+     * Подтвердить черновик и создать заявку в Ozon
+     *
+     * POST /api/shipments/confirm-draft
+     */
+    public function confirmDraft(Request $request): JsonResponse
+    {
+        $request->validate([
+            'integration_id' => 'required',
+            'draft_id' => 'required',
+            'warehouse_id' => 'required',
+            'items' => 'required|array|min:1',
+            'items.*.sku' => 'required|string',
+            'items.*.quantity' => 'required|integer|min:1',
+            'timeslot_from' => 'required',
+            'timeslot_to' => 'required',
+            'cluster_id' => 'nullable',
+        ]);
+
+        $integrationId = (string) $request->input('integration_id');
+        $integration = \App\Models\Integration::findOrFail($integrationId);
+        $draftId = $request->input('draft_id');
+        $warehouseId = $request->input('warehouse_id');
+        $items = $request->input('items');
+        $timeslotFrom = $request->input('timeslot_from');
+        $timeslotTo = $request->input('timeslot_to');
+
+        if ($integration->marketplace !== 'ozon') {
+            return response()->json([
+                'message' => 'Подтверждение черновика поддерживается только для Ozon',
+            ], 422);
+        }
+
+        try {
+            $marketplace = \App\Domains\Ozon\OzonMarketplace::fromIntegration($integration);
+            $suppliesApi = $marketplace->fboSupplyOrders();
+
+            $supplyResult = $suppliesApi->createSupplyFromDraft(
+                (int) $draftId,
+                (int) $warehouseId,
+                (string) $timeslotFrom,
+                (string) $timeslotTo
+            );
+
+            $supplyOperationId = $supplyResult['operation_id'] ?? null;
+            if (empty($supplyOperationId)) {
+                throw new \RuntimeException('Не удалось создать заявку в Ozon: operation_id не получен');
+            }
+
+            $supplyOrderId = null;
+            $statusAttempts = 10;
+            for ($i = 1; $i <= $statusAttempts; $i++) {
+                $statusResponse = $suppliesApi->getSupplyCreateStatus($supplyOperationId);
+                $status = $statusResponse['status'] ?? $statusResponse['state'] ?? '';
+                $supplyOrderId = $statusResponse['supply_order_id']
+                    ?? ($statusResponse['supply_order_ids'][0] ?? null)
+                    ?? ($statusResponse['result']['supply_order_id'] ?? null)
+                    ?? ($statusResponse['result']['order_ids'][0] ?? null);
+
+                \Illuminate\Support\Facades\Log::info('Ozon supply status check (confirmDraft)', [
+                    'attempt' => $i,
+                    'operation_id' => $supplyOperationId,
+                    'status' => $status,
+                    'supply_order_id' => $supplyOrderId,
+                    'response' => $statusResponse,
+                ]);
+
+                if ($supplyOrderId) {
+                    break;
+                }
+
+                if (in_array($status, ['ERROR', 'FAILED', 'REJECTED'], true)) {
+                    throw new \RuntimeException('Ozon не создал поставку: ' . json_encode($statusResponse));
+                }
+
+                usleep(1000000);
+            }
+
+            if (empty($supplyOrderId)) {
+                throw new \RuntimeException('Ozon не вернул supply_order_id после ожидания');
+            }
+
+            $shipmentData = [
+                'name' => 'Поставка ' . now()->format('d.m.Y H:i'),
+                'integration_id' => $integration->id,
+                'marketplace' => $integration->marketplace,
+                'warehouse_id' => (string) $warehouseId,
+                'shipment_type' => 'fbo',
+                'status' => 'submitted',
+                'items' => $items,
+                'external_supply_id' => (string) $supplyOrderId,
+            ];
+
+            $shipment = $this->shipmentService->create($shipmentData);
+
+            return response()->json([
+                'data' => $this->formatShipmentResponse($shipment->load(['items'])),
+                'message' => 'Поставка создана и синхронизирована с Ozon',
+                'ozon_supply_id' => (string) $supplyOrderId,
+            ], 201);
+        } catch (\Exception $e) {
+            \Illuminate\Support\Facades\Log::error('Failed to confirm Ozon draft', [
+                'error' => $e->getMessage(),
+                'draft_id' => $draftId,
+                'integration_id' => $integrationId,
+            ]);
+
+            return response()->json([
+                'message' => $e->getMessage(),
             ], 422);
         }
     }
