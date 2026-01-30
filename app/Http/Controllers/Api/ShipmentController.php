@@ -443,22 +443,29 @@ class ShipmentController extends Controller
                 $marketplace = \App\Domains\Ozon\OzonMarketplace::fromIntegration($integration);
                 $suppliesApi = $marketplace->fboSupplyOrders();
                 
-                // Используем новый API с macrolocal_cluster_id (warehouse_id = cluster_id)
-                $ozonDraft = $suppliesApi->createDirectDraft([
-                    'macrolocal_cluster_id' => $warehouseId,
-                    'items' => $ozonItems,
-                ]);
+                // Создаём черновик: items, cluster_ids (опционально), type
+                $ozonDraft = $suppliesApi->createDirectDraft(
+                    $ozonItems,
+                    !empty($warehouseId) ? [(string) $warehouseId] : [],
+                    'CREATE_TYPE_DIRECT'
+                );
                 
-                $draftId = $ozonDraft['draft_id'] ?? null;
+                $operationId = $ozonDraft['operation_id'] ?? null;
                 
                 \Illuminate\Support\Facades\Log::info('Ozon draft created', [
-                    'draft_id' => $draftId,
-                    'macrolocal_cluster_id' => $warehouseId,
+                    'operation_id' => $operationId,
+                    'cluster_id' => $warehouseId,
                     'items_count' => count($ozonItems),
+                    'response' => $ozonDraft,
                 ]);
 
+                if (empty($operationId)) {
+                    throw new \RuntimeException('Не удалось создать черновик в Ozon: operation_id не получен');
+                }
+
                 // Получаем информацию о доступных складах из черновика
-                $draftInfo = $suppliesApi->getDraftInfo($ozonDraft['operation_id']);
+                $draftInfo = $suppliesApi->getDraftInfo($operationId);
+                $draftId = $draftInfo['draft_id'] ?? null;
                 $availableWarehouse = null;
                 
                 if (!empty($draftInfo['clusters'])) {
