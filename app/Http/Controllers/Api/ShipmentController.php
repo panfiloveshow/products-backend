@@ -2114,8 +2114,8 @@ class ShipmentController extends Controller
     {
         $request->validate([
             'integration_id' => 'required',
-            'warehouse_id' => 'required|string',
-            'cluster_id' => 'nullable|string',
+            'warehouse_id' => 'required',
+            'cluster_id' => 'nullable',
             'items' => 'required|array|min:1',
             'items.*.sku' => 'required|string',
             'items.*.quantity' => 'required|integer|min:1',
@@ -2300,7 +2300,7 @@ class ShipmentController extends Controller
     {
         $request->validate([
             'integration_id' => 'required',
-            'draft_id' => 'required|integer',
+            'draft_id' => 'required',
             'warehouse_id' => 'required',
         ]);
 
