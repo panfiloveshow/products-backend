@@ -247,14 +247,18 @@ class FboSupplyOrdersApi
 
         $response = $this->client->post('/v1/draft/create', $body);
 
+        $operationId = $response['operation_id']
+            ?? ($response['result']['operation_id'] ?? null)
+            ?? ($response['result']['task_id'] ?? null);
+
         Log::info('Ozon FBO draft/create response', [
-            'operation_id' => $response['operation_id'] ?? null,
+            'operation_id' => $operationId,
             'response' => $response,
         ]);
 
         return [
-            'operation_id' => $response['operation_id'] ?? null,
-            'success' => !empty($response['operation_id']),
+            'operation_id' => $operationId,
+            'success' => !empty($operationId),
             'error' => $response['error'] ?? null,
             '_http_status' => $response['_http_status'] ?? null,
             'response' => $response,
