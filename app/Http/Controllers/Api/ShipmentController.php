@@ -415,34 +415,32 @@ class ShipmentController extends Controller
         // Пытаемся создать черновик в Ozon API
         if ($integration->marketplace === 'ozon') {
             try {
-                // Для /v1/draft/create используем offer_id (sku продавца)
+                // Для /v1/draft/create нужен числовой SKU Ozon из ozon_data.sku
                 $ozonItems = [];
+                $missingSkus = [];
                 foreach ($items as $item) {
                     $product = \App\Models\Product::where('sku', $item['sku'])
                         ->where('integration_id', $integrationId)
                         ->first();
 
-                    if ($product) {
-                        $draftSku = $product->sku ?: null;
-                        if (!$draftSku) {
-                            $ozonData = $product->ozon_data ?? [];
-                            $draftSku = $ozonData['sku'] ?? null;
-                        }
-                        if (!$draftSku && $product->marketplace_id) {
-                            $draftSku = (string) $product->marketplace_id;
-                        }
+                    $ozonSku = $product?->ozon_data['sku'] ?? null;
 
-                        if ($draftSku) {
-                            $ozonItems[] = [
-                                'sku' => (string) $draftSku,
-                                'quantity' => (int) $item['quantity'],
-                            ];
-                        }
+                    if (!empty($ozonSku)) {
+                        $ozonItems[] = [
+                            'sku' => (int) $ozonSku,
+                            'quantity' => (int) $item['quantity'],
+                        ];
+                    } else {
+                        $missingSkus[] = $item['sku'];
                     }
                 }
-                
+
+                if (!empty($missingSkus)) {
+                    throw new \RuntimeException('Нет Ozon SKU для товаров: ' . implode(', ', $missingSkus));
+                }
+
                 if (empty($ozonItems)) {
-                    throw new \RuntimeException('Не найдены товары с SKU для синхронизации с Ozon');
+                    throw new \RuntimeException('Не найдены товары с Ozon SKU для синхронизации');
                 }
                 
                 $marketplace = \App\Domains\Ozon\OzonMarketplace::fromIntegration($integration);
@@ -500,7 +498,9 @@ class ShipmentController extends Controller
                 ]);
 
                 if (empty($operationId)) {
-                    throw new \RuntimeException('Не удалось создать черновик в Ozon: operation_id не получен');
+                    $ozonError = $ozonDraft['error'] ?? null;
+                    $errorSuffix = $ozonError ? ' (' . json_encode($ozonError, JSON_UNESCAPED_UNICODE) . ')' : '';
+                    throw new \RuntimeException('Не удалось создать черновик в Ozon: operation_id не получен' . $errorSuffix);
                 }
 
                 // Ожидаем готовности черновика (polling)
@@ -2133,33 +2133,33 @@ class ShipmentController extends Controller
 
         try {
             $ozonItems = [];
+            $missingSkus = [];
             foreach ($items as $item) {
                 $product = \App\Models\Product::where('sku', $item['sku'])
                     ->where('integration_id', $integrationId)
                     ->first();
 
-                if ($product) {
-                    $draftSku = $product->sku ?: null;
-                    if (!$draftSku) {
-                        $ozonData = $product->ozon_data ?? [];
-                        $draftSku = $ozonData['sku'] ?? null;
-                    }
-                    if (!$draftSku && $product->marketplace_id) {
-                        $draftSku = (string) $product->marketplace_id;
-                    }
+                $ozonSku = $product?->ozon_data['sku'] ?? null;
 
-                    if ($draftSku) {
-                        $ozonItems[] = [
-                            'sku' => (string) $draftSku,
-                            'quantity' => (int) $item['quantity'],
-                        ];
-                    }
+                if (!empty($ozonSku)) {
+                    $ozonItems[] = [
+                        'sku' => (int) $ozonSku,
+                        'quantity' => (int) $item['quantity'],
+                    ];
+                } else {
+                    $missingSkus[] = $item['sku'];
                 }
             }
-            
+
+            if (!empty($missingSkus)) {
+                return response()->json([
+                    'message' => 'Нет Ozon SKU для товаров: ' . implode(', ', $missingSkus),
+                ], 422);
+            }
+
             if (empty($ozonItems)) {
                 return response()->json([
-                    'message' => 'Не найдены товары с SKU для синхронизации с Ozon',
+                    'message' => 'Не найдены товары с Ozon SKU для синхронизации',
                 ], 422);
             }
             
@@ -2205,8 +2205,10 @@ class ShipmentController extends Controller
             $operationId = $ozonDraft['operation_id'] ?? null;
             
             if (empty($operationId)) {
+                $ozonError = $ozonDraft['error'] ?? null;
+                $errorSuffix = $ozonError ? ' (' . json_encode($ozonError, JSON_UNESCAPED_UNICODE) . ')' : '';
                 return response()->json([
-                    'message' => 'Не удалось создать черновик в Ozon: operation_id не получен',
+                    'message' => 'Не удалось создать черновик в Ozon: operation_id не получен' . $errorSuffix,
                 ], 422);
             }
 
