@@ -334,11 +334,11 @@ class FboSupplyOrdersApi
 
     /**
      * Получить статус создания заявки
-     * POST /v1/supply/create/status
+     * POST /v1/draft/supply/create/status
      */
     public function getSupplyCreateStatus(string $operationId): array
     {
-        $response = $this->client->post('/v1/supply/create/status', [
+        $response = $this->client->post('/v1/draft/supply/create/status', [
             'operation_id' => $operationId,
         ]);
 
