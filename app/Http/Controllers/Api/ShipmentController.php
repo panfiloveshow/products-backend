@@ -395,6 +395,8 @@ class ShipmentController extends Controller
             'items.*.sku' => 'required|string',
             'items.*.quantity' => 'required|integer|min:1',
             'items.*.barcode' => 'nullable|string',
+            'timeslot_from' => 'nullable|string',
+            'timeslot_to' => 'nullable|string',
         ]);
 
         // Приводим integration_id к строке для совместимости
@@ -403,6 +405,8 @@ class ShipmentController extends Controller
         $warehouseId = $request->input('warehouse_id');
         $clusterId = $request->input('cluster_id');
         $items = $request->input('items');
+        $userTimeslotFrom = $request->input('timeslot_from');
+        $userTimeslotTo = $request->input('timeslot_to');
 
         $externalSupplyId = null;
         $syncError = null;
@@ -644,15 +648,20 @@ class ShipmentController extends Controller
                             'first_slot' => $allSlots[0] ?? null,
                         ]);
 
-                        // Берём первый доступный таймслот
-                        $firstSlot = !empty($allSlots) ? $allSlots[0] : null;
+                        // Используем выбранный пользователем таймслот или первый доступный
+                        $timeslotFrom = $userTimeslotFrom;
+                        $timeslotTo = $userTimeslotTo;
 
-                        if (!$firstSlot) {
-                            throw new \RuntimeException('Не удалось подобрать таймслот для поставки в Ozon');
+                        if (empty($timeslotFrom) || empty($timeslotTo)) {
+                            $firstSlot = !empty($allSlots) ? $allSlots[0] : null;
+
+                            if (!$firstSlot) {
+                                throw new \RuntimeException('Не удалось подобрать таймслот для поставки в Ozon');
+                            }
+
+                            $timeslotFrom = $firstSlot['from_in_timezone'] ?? $firstSlot['from'] ?? '';
+                            $timeslotTo = $firstSlot['to_in_timezone'] ?? $firstSlot['to'] ?? '';
                         }
-
-                        $timeslotFrom = $firstSlot['from_in_timezone'] ?? $firstSlot['from'] ?? '';
-                        $timeslotTo = $firstSlot['to_in_timezone'] ?? $firstSlot['to'] ?? '';
 
                         if (empty($timeslotFrom) || empty($timeslotTo)) {
                             throw new \RuntimeException('Неверные данные таймслота для поставки в Ozon');
