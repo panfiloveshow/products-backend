@@ -499,7 +499,9 @@ class ShipmentController extends Controller
 
                 if (empty($operationId)) {
                     $ozonError = $ozonDraft['error'] ?? null;
-                    $errorSuffix = $ozonError ? ' (' . json_encode($ozonError, JSON_UNESCAPED_UNICODE) . ')' : '';
+                    $ozonResponse = $ozonDraft['response'] ?? null;
+                    $details = $ozonError ?: $ozonResponse;
+                    $errorSuffix = $details ? ' (' . json_encode($details, JSON_UNESCAPED_UNICODE) . ')' : '';
                     throw new \RuntimeException('Не удалось создать черновик в Ozon: operation_id не получен' . $errorSuffix);
                 }
 
@@ -2206,7 +2208,9 @@ class ShipmentController extends Controller
             
             if (empty($operationId)) {
                 $ozonError = $ozonDraft['error'] ?? null;
-                $errorSuffix = $ozonError ? ' (' . json_encode($ozonError, JSON_UNESCAPED_UNICODE) . ')' : '';
+                $ozonResponse = $ozonDraft['response'] ?? null;
+                $details = $ozonError ?: $ozonResponse;
+                $errorSuffix = $details ? ' (' . json_encode($details, JSON_UNESCAPED_UNICODE) . ')' : '';
                 return response()->json([
                     'message' => 'Не удалось создать черновик в Ozon: operation_id не получен' . $errorSuffix,
                 ], 422);
