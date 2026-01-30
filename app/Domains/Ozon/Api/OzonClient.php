@@ -54,6 +54,18 @@ class OzonClient
                 return $response->json();
             }
 
+            $decoded = $response->json();
+            if (empty($decoded)) {
+                $decoded = [
+                    'error' => [
+                        'message' => $response->body(),
+                    ],
+                ];
+            }
+
+            $decoded['_error'] = true;
+            $decoded['_http_status'] = $response->status();
+
             Log::warning('Ozon API error', [
                 'endpoint' => $endpoint,
                 'status' => $response->status(),
@@ -62,7 +74,7 @@ class OzonClient
                 'has_api_key' => !empty($this->apiKey),
             ]);
 
-            return null;
+            return $decoded;
         } catch (\Exception $e) {
             Log::error('Ozon API exception', [
                 'endpoint' => $endpoint,

@@ -189,6 +189,8 @@ class FboSupplyOrdersApi
         return [
             'operation_id' => $response['operation_id'] ?? null,
             'success' => !empty($response['operation_id']),
+            'error' => $response['error'] ?? null,
+            '_http_status' => $response['_http_status'] ?? null,
         ];
     }
 
@@ -252,6 +254,8 @@ class FboSupplyOrdersApi
         return [
             'operation_id' => $response['operation_id'] ?? null,
             'success' => !empty($response['operation_id']),
+            'error' => $response['error'] ?? null,
+            '_http_status' => $response['_http_status'] ?? null,
         ];
     }
 
