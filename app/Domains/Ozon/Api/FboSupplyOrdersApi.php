@@ -274,15 +274,23 @@ class FboSupplyOrdersApi
      * Получить доступные таймслоты для черновика
      * POST /v1/draft/timeslot/info
      */
-    public function getDraftTimeslots(int $draftId): array
+    public function getDraftTimeslots(int $draftId, ?int $warehouseId = null): array
     {
-        $response = $this->client->post('/v1/draft/timeslot/info', [
+        $body = [
             'draft_id' => $draftId,
-        ]);
+        ];
+        
+        if ($warehouseId) {
+            $body['warehouse_id'] = $warehouseId;
+        }
+        
+        $response = $this->client->post('/v1/draft/timeslot/info', $body);
 
         Log::info('Ozon FBO draft/timeslot/info response', [
             'draft_id' => $draftId,
-            'warehouses_count' => count($response['warehouses'] ?? []),
+            'warehouse_id' => $warehouseId,
+            'response_keys' => $response ? array_keys($response) : [],
+            'response' => $response,
         ]);
 
         return $response ?? [];

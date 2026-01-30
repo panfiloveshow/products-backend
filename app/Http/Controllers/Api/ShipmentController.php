@@ -522,11 +522,34 @@ class ShipmentController extends Controller
                     if ($warehouseIdForSupply) {
                         $timeslots = $suppliesApi->getDraftTimeslots((int) $draftId, (int) $warehouseIdForSupply);
                         
-                        // Извлекаем слоты из ответа
+                        // Извлекаем слоты из ответа - проверяем разные структуры
                         $allSlots = [];
-                        $dropOffTimeslots = $timeslots['drop_off_warehouse_timeslots'] ?? [];
-                        foreach ($dropOffTimeslots as $whTimeslots) {
-                            foreach ($whTimeslots['days'] ?? [] as $day) {
+                        
+                        // Структура 1: warehouses[].days[].timeslots[]
+                        $warehouses = $timeslots['warehouses'] ?? [];
+                        foreach ($warehouses as $wh) {
+                            foreach ($wh['days'] ?? [] as $day) {
+                                foreach ($day['timeslots'] ?? [] as $slot) {
+                                    $allSlots[] = $slot;
+                                }
+                            }
+                        }
+                        
+                        // Структура 2: drop_off_warehouse_timeslots[].days[].timeslots[]
+                        if (empty($allSlots)) {
+                            $dropOffTimeslots = $timeslots['drop_off_warehouse_timeslots'] ?? [];
+                            foreach ($dropOffTimeslots as $whTimeslots) {
+                                foreach ($whTimeslots['days'] ?? [] as $day) {
+                                    foreach ($day['timeslots'] ?? [] as $slot) {
+                                        $allSlots[] = $slot;
+                                    }
+                                }
+                            }
+                        }
+                        
+                        // Структура 3: days[].timeslots[] напрямую
+                        if (empty($allSlots)) {
+                            foreach ($timeslots['days'] ?? [] as $day) {
                                 foreach ($day['timeslots'] ?? [] as $slot) {
                                     $allSlots[] = $slot;
                                 }
@@ -537,6 +560,7 @@ class ShipmentController extends Controller
                             'draft_id' => $draftId,
                             'warehouse_id' => $warehouseIdForSupply,
                             'timeslots_count' => count($allSlots),
+                            'first_slot' => $allSlots[0] ?? null,
                         ]);
 
                         // Берём первый доступный таймслот
