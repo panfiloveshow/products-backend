@@ -463,9 +463,43 @@ class ShipmentController extends Controller
                     throw new \RuntimeException('Не удалось создать черновик в Ozon: operation_id не получен');
                 }
 
-                // Получаем информацию о доступных складах из черновика
-                $draftInfo = $suppliesApi->getDraftInfo($operationId);
-                $draftId = $draftInfo['draft_id'] ?? null;
+                // Ожидаем готовности черновика (polling)
+                $draftId = null;
+                $draftInfo = null;
+                $maxAttempts = 10;
+                $attempt = 0;
+                
+                while ($attempt < $maxAttempts) {
+                    $attempt++;
+                    $draftInfo = $suppliesApi->getDraftInfo($operationId);
+                    $status = $draftInfo['status'] ?? '';
+                    $draftId = $draftInfo['draft_id'] ?? null;
+                    
+                    \Illuminate\Support\Facades\Log::info('Ozon draft status check', [
+                        'attempt' => $attempt,
+                        'status' => $status,
+                        'draft_id' => $draftId,
+                    ]);
+                    
+                    // Если статус завершён или есть draft_id > 0
+                    if ($status === 'CALCULATION_STATUS_SUCCESS' || ($draftId && $draftId > 0)) {
+                        break;
+                    }
+                    
+                    // Если ошибка
+                    if ($status === 'CALCULATION_STATUS_ERROR' || $status === 'CALCULATION_STATUS_FAILED') {
+                        $errors = $draftInfo['errors'] ?? [];
+                        throw new \RuntimeException('Ошибка создания черновика в Ozon: ' . json_encode($errors));
+                    }
+                    
+                    // Ждём 1 секунду перед следующей попыткой
+                    usleep(1000000);
+                }
+                
+                if (empty($draftId) || $draftId == 0) {
+                    throw new \RuntimeException('Черновик не был создан в Ozon после ' . $maxAttempts . ' попыток');
+                }
+
                 $availableWarehouse = null;
                 
                 if (!empty($draftInfo['clusters'])) {
