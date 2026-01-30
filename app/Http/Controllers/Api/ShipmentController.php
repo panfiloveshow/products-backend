@@ -1640,13 +1640,20 @@ class ShipmentController extends Controller
                 if (method_exists($suppliesApi, 'getClusters')) {
                     $clusters = $suppliesApi->getClusters();
                     foreach ($clusters as $cluster) {
-                        foreach ($cluster['warehouses'] ?? [] as $warehouse) {
+                        // Показываем только кластеры с доступными складами
+                        $clusterWarehouses = $cluster['warehouses'] ?? [];
+                        if (empty($clusterWarehouses)) {
+                            continue;
+                        }
+                        
+                        foreach ($clusterWarehouses as $warehouse) {
                             $warehouses[] = [
                                 'id' => (string) ($warehouse['id'] ?? $warehouse['warehouse_id'] ?? null),
                                 'name' => $warehouse['name'] ?? null,
                                 'type' => $warehouse['type'] ?? null,
                                 'cluster_id' => (string) ($cluster['id'] ?? null),
                                 'cluster_name' => $cluster['name'] ?? null,
+                                'warehouses_count' => $cluster['warehouses_count'] ?? count($clusterWarehouses),
                             ];
                         }
                     }

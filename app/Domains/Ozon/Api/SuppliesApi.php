@@ -726,9 +726,9 @@ class SuppliesApi implements SuppliesApiInterface
      */
     public function getDraftTimeslots(int $draftId, int $warehouseId): array
     {
-        // Запрашиваем слоты на ближайшие 14 дней
+        // Запрашиваем слоты на ближайшие 28 дней
         $dateFrom = now()->toIso8601String();
-        $dateTo = now()->addDays(14)->toIso8601String();
+        $dateTo = now()->addDays(28)->toIso8601String();
 
         $response = $this->client->post('/v1/draft/timeslot/info', [
             'draft_id' => $draftId,
