@@ -415,28 +415,26 @@ class ShipmentController extends Controller
         // Пытаемся создать черновик в Ozon API
         if ($integration->marketplace === 'ozon') {
             try {
-                // Получаем SKU из ozon_data для каждого товара
-                // Важно: для /v1/draft/create нужен ozon_data.sku, а не product_id (marketplace_id)
+                // Для /v1/draft/create используем offer_id (sku продавца)
                 $ozonItems = [];
                 foreach ($items as $item) {
                     $product = \App\Models\Product::where('sku', $item['sku'])
                         ->where('integration_id', $integrationId)
                         ->first();
-                    
+
                     if ($product) {
-                        // Приоритет: ozon_data.sku > marketplace_id
-                        $ozonSku = null;
-                        $ozonData = $product->ozon_data ?? [];
-                        if (!empty($ozonData['sku'])) {
-                            $ozonSku = (int) $ozonData['sku'];
-                        } elseif ($product->marketplace_id) {
-                            // Fallback на marketplace_id (product_id)
-                            $ozonSku = (int) $product->marketplace_id;
+                        $draftSku = $product->sku ?: null;
+                        if (!$draftSku) {
+                            $ozonData = $product->ozon_data ?? [];
+                            $draftSku = $ozonData['sku'] ?? null;
                         }
-                        
-                        if ($ozonSku) {
+                        if (!$draftSku && $product->marketplace_id) {
+                            $draftSku = (string) $product->marketplace_id;
+                        }
+
+                        if ($draftSku) {
                             $ozonItems[] = [
-                                'sku' => $ozonSku,
+                                'sku' => (string) $draftSku,
                                 'quantity' => (int) $item['quantity'],
                             ];
                         }
@@ -2139,14 +2137,20 @@ class ShipmentController extends Controller
                 $product = \App\Models\Product::where('sku', $item['sku'])
                     ->where('integration_id', $integrationId)
                     ->first();
-                
+
                 if ($product) {
-                    $ozonData = $product->ozon_data ?? [];
-                    $ozonSku = !empty($ozonData['sku']) ? (int) $ozonData['sku'] : ($product->marketplace_id ? (int) $product->marketplace_id : null);
-                    
-                    if ($ozonSku) {
+                    $draftSku = $product->sku ?: null;
+                    if (!$draftSku) {
+                        $ozonData = $product->ozon_data ?? [];
+                        $draftSku = $ozonData['sku'] ?? null;
+                    }
+                    if (!$draftSku && $product->marketplace_id) {
+                        $draftSku = (string) $product->marketplace_id;
+                    }
+
+                    if ($draftSku) {
                         $ozonItems[] = [
-                            'sku' => $ozonSku,
+                            'sku' => (string) $draftSku,
                             'quantity' => (int) $item['quantity'],
                         ];
                     }
