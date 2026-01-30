@@ -2452,7 +2452,11 @@ class ShipmentController extends Controller
 
             $supplyOperationId = $supplyResult['operation_id'] ?? null;
             if (empty($supplyOperationId)) {
-                throw new \RuntimeException('Не удалось создать заявку в Ozon: operation_id не получен');
+                $ozonError = $supplyResult['error'] ?? null;
+                $ozonResponse = $supplyResult['response'] ?? null;
+                $details = $ozonError ?: $ozonResponse;
+                $errorSuffix = $details ? ' (' . json_encode($details, JSON_UNESCAPED_UNICODE) . ')' : '';
+                throw new \RuntimeException('Не удалось создать заявку в Ozon: operation_id не получен' . $errorSuffix);
             }
 
             $supplyOrderId = null;
