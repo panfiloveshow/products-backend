@@ -466,12 +466,20 @@ class ShipmentController extends Controller
                 // Ожидаем готовности черновика (polling)
                 $draftId = null;
                 $draftInfo = null;
-                $maxAttempts = 10;
+                $maxAttempts = 15;
                 $attempt = 0;
                 
                 while ($attempt < $maxAttempts) {
                     $attempt++;
                     $draftInfo = $suppliesApi->getDraftInfo($operationId);
+                    if (empty($draftInfo)) {
+                        \Illuminate\Support\Facades\Log::warning('Ozon draft status empty (rate limit?)', [
+                            'attempt' => $attempt,
+                            'operation_id' => $operationId,
+                        ]);
+                        usleep(2000000);
+                        continue;
+                    }
                     $status = $draftInfo['status'] ?? '';
                     $draftId = $draftInfo['draft_id'] ?? null;
                     
@@ -493,11 +501,11 @@ class ShipmentController extends Controller
                     }
                     
                     // Ждём 1 секунду перед следующей попыткой
-                    usleep(1000000);
+                    usleep(2000000);
                 }
                 
                 if (empty($draftId) || $draftId == 0) {
-                    throw new \RuntimeException('Черновик не был создан в Ozon после ' . $maxAttempts . ' попыток');
+                    throw new \RuntimeException('Черновик не был создан в Ozon после ' . $maxAttempts . ' попыток (возможно лимит запросов)');
                 }
 
                 $availableWarehouse = null;
