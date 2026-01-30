@@ -610,7 +610,8 @@ class ShipmentController extends Controller
                             $status = $statusResponse['status'] ?? $statusResponse['state'] ?? '';
                             $supplyOrderId = $statusResponse['supply_order_id']
                                 ?? ($statusResponse['supply_order_ids'][0] ?? null)
-                                ?? ($statusResponse['result']['supply_order_id'] ?? null);
+                                ?? ($statusResponse['result']['supply_order_id'] ?? null)
+                                ?? ($statusResponse['result']['order_ids'][0] ?? null);
 
                             \Illuminate\Support\Facades\Log::info('Ozon supply status check', [
                                 'attempt' => $i,
