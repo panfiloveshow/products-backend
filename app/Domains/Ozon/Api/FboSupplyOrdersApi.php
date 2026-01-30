@@ -276,19 +276,26 @@ class FboSupplyOrdersApi
      */
     public function getDraftTimeslots(int $draftId, ?int $warehouseId = null): array
     {
+        $dateFrom = now()->toIso8601String();
+        $dateTo = now()->addDays(14)->toIso8601String();
+
         $body = [
             'draft_id' => $draftId,
+            'date_from' => $dateFrom,
+            'date_to' => $dateTo,
         ];
-        
+
         if ($warehouseId) {
-            $body['warehouse_id'] = $warehouseId;
+            $body['warehouse_ids'] = [(string) $warehouseId];
         }
-        
+
         $response = $this->client->post('/v1/draft/timeslot/info', $body);
 
         Log::info('Ozon FBO draft/timeslot/info response', [
             'draft_id' => $draftId,
             'warehouse_id' => $warehouseId,
+            'date_from' => $dateFrom,
+            'date_to' => $dateTo,
             'response_keys' => $response ? array_keys($response) : [],
             'response' => $response,
         ]);
