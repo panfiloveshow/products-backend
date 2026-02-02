@@ -876,10 +876,17 @@ class ShipmentController extends Controller
                 ]);
             }
 
-            // Получаем детали заявок
-            $detailsResponse = $suppliesApi->get($orderIds);
-            $orders = $detailsResponse['orders'] ?? [];
-            $warehouses = collect($detailsResponse['warehouses'] ?? [])->keyBy('warehouse_id');
+            // Получаем детали заявок (Ozon ограничивает размер списка)
+            $orders = [];
+            $warehouses = collect();
+            foreach (array_chunk($orderIds, 50) as $orderChunk) {
+                $detailsResponse = $suppliesApi->get($orderChunk);
+                $orders = array_merge($orders, $detailsResponse['orders'] ?? []);
+                if (!empty($detailsResponse['warehouses'] ?? null)) {
+                    $warehouses = $warehouses->merge($detailsResponse['warehouses']);
+                }
+            }
+            $warehouses = $warehouses->keyBy('warehouse_id');
 
             $synced = 0;
             $updated = 0;
