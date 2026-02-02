@@ -841,14 +841,26 @@ class ShipmentController extends Controller
             $deleted = 0;
             $localShipments = Shipment::where('integration_id', $integrationId)
                 ->where('marketplace', 'ozon')
-                ->whereNotNull('external_supply_id')
                 ->get();
 
             foreach ($localShipments as $shipment) {
-                if (!in_array((string) $shipment->external_supply_id, $ozonOrderIds, true)) {
+                $externalId = $shipment->external_supply_id
+                    ?? ($shipment->meta['external_supply_id'] ?? null)
+                    ?? ($shipment->meta['ozon_order_number'] ?? null);
+
+                if (empty($externalId)) {
+                    continue;
+                }
+
+                if (!in_array((string) $externalId, $ozonOrderIds, true)) {
                     $shipment->items()->delete();
                     $shipment->delete();
                     $deleted++;
+                    continue;
+                }
+
+                if (empty($shipment->external_supply_id)) {
+                    $shipment->update(['external_supply_id' => (string) $externalId]);
                 }
             }
 
