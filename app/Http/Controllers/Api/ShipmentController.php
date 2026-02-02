@@ -818,6 +818,8 @@ class ShipmentController extends Controller
             return response()->json(['message' => 'Интеграция не найдена или не Ozon'], 404);
         }
 
+        $fetchBundleItems = $request->boolean('with_bundle');
+
         try {
             $marketplace = \App\Domains\Ozon\OzonMarketplace::fromIntegration($integration);
             $suppliesApi = $marketplace->fboSupplyOrders();
@@ -932,7 +934,7 @@ class ShipmentController extends Controller
                 }
 
                 $bundleItems = [];
-                if (empty($items)) {
+                if ($fetchBundleItems && empty($items)) {
                     try {
                         \Illuminate\Support\Facades\Log::info('syncFromOzon: fetching bundle', [
                             'supply_order_id' => $supplyOrderId,
