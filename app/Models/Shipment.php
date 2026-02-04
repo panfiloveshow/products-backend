@@ -243,7 +243,7 @@ class Shipment extends Model
 
     public function canBeApproved(): bool
     {
-        return $this->status === self::STATUS_PENDING_LOGISTICS;
+        return in_array($this->status, [self::STATUS_PENDING_LOGISTICS, self::STATUS_SUBMITTED], true);
     }
 
     public function canBeSent(): bool

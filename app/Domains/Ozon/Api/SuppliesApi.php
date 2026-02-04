@@ -311,6 +311,35 @@ class SuppliesApi implements SuppliesApiInterface
     }
 
     /**
+     * Забронировать слот приёмки по ID (возвращает структурированный ответ)
+     * 
+     * POST /v1/supply/timeslot/set
+     */
+    public function bookAcceptanceSlotById(string $supplyOrderId, int $timeslotId): array
+    {
+        $body = [
+            'supply_order_id' => (int) $supplyOrderId,
+            'timeslot_id' => $timeslotId,
+        ];
+
+        \Illuminate\Support\Facades\Log::info('Ozon supply/timeslot/set request', ['body' => $body]);
+
+        $response = $this->client->post('/v1/supply/timeslot/set', $body);
+
+        \Illuminate\Support\Facades\Log::info('Ozon supply/timeslot/set response', [
+            'response_keys' => $response ? array_keys($response) : [],
+            'has_error' => !empty($response['error']) || !empty($response['code']),
+        ]);
+
+        return [
+            'success' => empty($response['error']) && empty($response['code']),
+            'response' => $response,
+            'error' => $response['error'] ?? $response['message'] ?? null,
+            '_http_status' => $response['_http_status'] ?? null,
+        ];
+    }
+
+    /**
      * Создать грузоместа
      * 
      * POST /v1/supply/cargo/create
@@ -560,6 +589,7 @@ class SuppliesApi implements SuppliesApiInterface
      * POST /v1/draft/direct/create
      * 
      * @param array $data [
+     *   'cluster_id' => string,
      *   'macrolocal_cluster_id' => string,
      *   'items' => [['sku' => string, 'quantity' => int], ...],
      * ]
@@ -576,7 +606,7 @@ class SuppliesApi implements SuppliesApiInterface
 
         // Используем актуальный эндпоинт /v1/draft/create
         // Пробуем передать cluster_ids как массив int64 (числа)
-        $clusterId = (int) ($data['macrolocal_cluster_id'] ?? 0);
+        $clusterId = (int) ($data['cluster_id'] ?? $data['macrolocal_cluster_id'] ?? 0);
         $body = [
             'cluster_ids' => [$clusterId],
             'items' => $items,
@@ -721,29 +751,166 @@ class SuppliesApi implements SuppliesApiInterface
 
     /**
      * Получить доступные таймслоты для черновика
-     * 
-     * POST /v1/draft/timeslot/info
+     *
+     * POST /v2/draft/timeslot/info
      */
-    public function getDraftTimeslots(int $draftId, int $warehouseId): array
+    public function getDraftTimeslots(int $draftId, int $warehouseId, ?int $clusterId = null, ?string $warehouseName = null): array
     {
         // Запрашиваем слоты на ближайшие 28 дней
-        $dateFrom = now()->toIso8601String();
-        $dateTo = now()->addDays(28)->toIso8601String();
+        $dateFrom = now()->toDateString();
+        $dateTo = now()->addDays(27)->toDateString();
 
-        $response = $this->client->post('/v1/draft/timeslot/info', [
-            'draft_id' => $draftId,
-            'warehouse_ids' => [(string) $warehouseId],
+        $clusterIdHint = $clusterId
+            ?? \App\Models\OzonWarehouseCluster::getClusterIdByWarehouse($warehouseName ?? '')
+            ?? \App\Models\OzonWarehouseCluster::getClusterIdByWarehouse((string) $warehouseId);
+
+        $resolvedClusterId = $clusterIdHint ? (int) $clusterIdHint : null;
+        $macrolocalClusterId = null;
+
+        foreach ($this->getClusters() as $cluster) {
+            $warehouseIds = $cluster['warehouse_ids'] ?? $cluster['all_warehouse_ids'] ?? [];
+            $warehouseIds = array_map('strval', $warehouseIds);
+            $clusterIdValue = (string) ($cluster['id'] ?? '');
+            $macroIdValue = (string) ($cluster['macrolocal_cluster_id'] ?? '');
+
+            if (
+                in_array((string) $warehouseId, $warehouseIds, true)
+                || ($clusterIdHint && ((string) $clusterIdHint === $clusterIdValue || (string) $clusterIdHint === $macroIdValue))
+            ) {
+                $resolvedClusterId = (int) ($cluster['id'] ?? $clusterIdHint ?? 0);
+                $macrolocalClusterId = (int) ($cluster['macrolocal_cluster_id'] ?? $cluster['id'] ?? 0);
+                break;
+            }
+        }
+
+        if (!$macrolocalClusterId && $resolvedClusterId) {
+            $macrolocalClusterId = $resolvedClusterId;
+        }
+
+        if (!$macrolocalClusterId) {
+            \Illuminate\Support\Facades\Log::warning('Ozon draft timeslots: cluster_id not resolved', [
+                'draft_id' => $draftId,
+                'warehouse_id' => $warehouseId,
+                'warehouse_name' => $warehouseName,
+            ]);
+
+            return [];
+        }
+
+        $response = $this->client->post('/v2/draft/timeslot/info', [
+            'draft_id' => (int) $draftId,
             'date_from' => $dateFrom,
             'date_to' => $dateTo,
+            'selected_cluster_warehouses' => [[
+                'macrolocal_cluster_id' => (int) $macrolocalClusterId,
+                'storage_warehouse_id' => (int) $warehouseId,
+            ]],
         ]);
 
-        \Illuminate\Support\Facades\Log::info('Ozon draft/timeslot/info response', [
+        $groups = $response['result']['drop_off_warehouse_timeslots']
+            ?? $response['drop_off_warehouse_timeslots']
+            ?? $response['result']['warehouses']
+            ?? $response['warehouses']
+            ?? [];
+        $flatSlots = $response['result']['timeslots'] ?? $response['timeslots'] ?? [];
+        $shouldFallback = !$response
+            || !empty($response['_error'])
+            || !empty($response['error_reason'])
+            || (empty($groups) && empty($flatSlots));
+
+        if ($shouldFallback) {
+            $fallbackResponse = $this->client->post('/v1/draft/timeslot/info', [
+                'draft_id' => (int) $draftId,
+                'warehouse_ids' => [(string) $warehouseId],
+                'date_from' => $dateFrom . 'T00:00:00Z',
+                'date_to' => $dateTo . 'T23:59:59Z',
+            ]);
+
+            \Illuminate\Support\Facades\Log::info('Ozon draft/timeslot/info v1 fallback', [
+                'draft_id' => $draftId,
+                'warehouse_id' => $warehouseId,
+                'cluster_id' => $resolvedClusterId,
+                'macrolocal_cluster_id' => $macrolocalClusterId,
+                'response' => $fallbackResponse,
+            ]);
+
+            $response = $fallbackResponse ?: $response;
+            $groups = $response['result']['drop_off_warehouse_timeslots']
+                ?? $response['drop_off_warehouse_timeslots']
+                ?? $response['result']['warehouses']
+                ?? $response['warehouses']
+                ?? [];
+            $flatSlots = $response['result']['timeslots'] ?? $response['timeslots'] ?? [];
+        }
+
+        \Illuminate\Support\Facades\Log::info('Ozon draft/timeslot/info v2 response', [
             'draft_id' => $draftId,
             'warehouse_id' => $warehouseId,
+            'cluster_id' => $resolvedClusterId,
+            'macrolocal_cluster_id' => $macrolocalClusterId,
             'response' => $response,
         ]);
 
-        return $response ?? [];
+        $slots = [];
+
+        foreach ($groups as $group) {
+            $groupWarehouseId = (string) ($group['storage_warehouse_id']
+                ?? $group['drop_off_warehouse_id']
+                ?? $warehouseId);
+            $groupClusterId = (string) ($group['macrolocal_cluster_id'] ?? $resolvedClusterId ?? $macrolocalClusterId);
+
+            foreach ($group['days'] ?? [] as $day) {
+                $date = $day['date_in_timezone'] ?? $day['date'] ?? null;
+                foreach ($day['timeslots'] ?? [] as $slot) {
+                    $from = $slot['from_in_timezone'] ?? $slot['from'] ?? null;
+                    $to = $slot['to_in_timezone'] ?? $slot['to'] ?? null;
+                    $slotId = $slot['timeslot_id'] ?? $slot['id'] ?? null;
+                    if (!$slotId && $from && $to) {
+                        $slotId = substr(sha1($groupWarehouseId . '|' . $from . '|' . $to), 0, 32);
+                    }
+
+                    $slots[] = [
+                        'id' => $slotId,
+                        'warehouse_id' => $groupWarehouseId,
+                        'cluster_id' => $groupClusterId,
+                        'date' => $date ? substr($date, 0, 10) : substr((string) $from, 0, 10),
+                        'time_from' => $from ? substr($from, 11, 5) : null,
+                        'time_to' => $to ? substr($to, 11, 5) : null,
+                        'from_datetime' => $from,
+                        'to_datetime' => $to,
+                        'is_available' => $slot['is_available'] ?? true,
+                        'capacity' => $slot['capacity'] ?? null,
+                    ];
+                }
+            }
+        }
+
+        if (empty($slots)) {
+            $flatSlots = $response['result']['timeslots'] ?? $response['timeslots'] ?? [];
+            foreach ($flatSlots as $slot) {
+                $from = $slot['from_in_timezone'] ?? $slot['from'] ?? null;
+                $to = $slot['to_in_timezone'] ?? $slot['to'] ?? null;
+                $slotId = $slot['timeslot_id'] ?? $slot['id'] ?? null;
+                if (!$slotId && $from && $to) {
+                    $slotId = substr(sha1($warehouseId . '|' . $from . '|' . $to), 0, 32);
+                }
+
+                $slots[] = [
+                    'id' => $slotId,
+                    'warehouse_id' => (string) $warehouseId,
+                    'cluster_id' => (string) $resolvedClusterId,
+                    'date' => substr((string) $from, 0, 10),
+                    'time_from' => $from ? substr($from, 11, 5) : null,
+                    'time_to' => $to ? substr($to, 11, 5) : null,
+                    'from_datetime' => $from,
+                    'to_datetime' => $to,
+                    'is_available' => $slot['is_available'] ?? true,
+                    'capacity' => $slot['capacity'] ?? null,
+                ];
+            }
+        }
+
+        return $slots;
     }
 
     /**
@@ -1151,14 +1318,16 @@ class SuppliesApi implements SuppliesApiInterface
     public function getSupplyOrderDetailsV1(string $supplyOrderId): array
     {
         $response = $this->client->post('/v1/supply-order/details', [
-            'supply_order_id' => (int) $supplyOrderId,
+            'order_id' => (int) $supplyOrderId,
         ]);
 
-        if (!$response || !empty($response['error'])) {
-            throw new \RuntimeException(
-                'Не удалось получить детали заявки: ' .
-                ($response['error']['message'] ?? 'Unknown error')
-            );
+        \Illuminate\Support\Facades\Log::info('Ozon supply-order/details response', [
+            'order_id' => $supplyOrderId,
+            'response_keys' => $response ? array_keys($response) : [],
+        ]);
+
+        if (!$response || !empty($response['error']) || !empty($response['code'])) {
+            return $response ?? [];
         }
 
         return $response['result'] ?? $response;
@@ -1171,17 +1340,49 @@ class SuppliesApi implements SuppliesApiInterface
      */
     public function getSupplyOrderTimeslot(string $supplyOrderId, array $payload = []): array
     {
-        $body = array_merge([
+        $body = [
             'supply_order_id' => (int) $supplyOrderId,
-        ], $payload);
+        ];
+        
+        // Добавляем даты если указаны
+        if (!empty($payload['date_from'])) {
+            $body['date_from'] = $payload['date_from'];
+        }
+        if (!empty($payload['date_to'])) {
+            $body['date_to'] = $payload['date_to'];
+        }
 
-        $response = $this->client->post('/v1/supply-order/timeslot/get', $body);
+        \Illuminate\Support\Facades\Log::info('Ozon supply-order/timeslot/get request', ['body' => $body]);
 
-        if (!$response || !empty($response['error'])) {
-            throw new \RuntimeException(
-                'Не удалось получить таймслоты: ' .
-                ($response['error']['message'] ?? 'Unknown error')
-            );
+        // Retry логика для rate limit
+        $maxAttempts = 3;
+        $response = null;
+        
+        for ($attempt = 1; $attempt <= $maxAttempts; $attempt++) {
+            if ($attempt > 1) {
+                $delay = 2 * $attempt; // 4, 6 секунд
+                \Illuminate\Support\Facades\Log::warning("Ozon timeslot/get rate limit, waiting {$delay}s before attempt {$attempt}");
+                sleep($delay);
+            }
+            
+            $response = $this->client->post('/v1/supply-order/timeslot/get', $body);
+            
+            $httpStatus = $response['_http_status'] ?? null;
+            $errorCode = $response['code'] ?? null;
+            
+            if ($httpStatus !== 429 && (int) $errorCode !== 8) {
+                break;
+            }
+        }
+
+        \Illuminate\Support\Facades\Log::info('Ozon supply-order/timeslot/get response', [
+            'order_id' => $supplyOrderId,
+            'response_keys' => $response ? array_keys($response) : [],
+            'first_timeslot' => ($response['result']['timeslots'][0] ?? $response['timeslots'][0] ?? null),
+        ]);
+
+        if (!$response || !empty($response['error']) || !empty($response['code'])) {
+            return $response ?? [];
         }
 
         return $response['result'] ?? $response;
@@ -1209,27 +1410,43 @@ class SuppliesApi implements SuppliesApiInterface
     }
 
     /**
-     * Обновить таймслот заявки
+     * Установить таймслот для заявки FBO
      * 
-     * POST /v1/supply-order/timeslot/update
+     * POST /v1/fbp/draft/direct/timeslot/edit
+     * 
+     * Использует timeslot_start напрямую без поиска timeslot_id
      */
-    public function updateSupplyOrderTimeslot(string $supplyOrderId, string|int $timeslotId, array $payload = []): array
+    public function setSupplyOrderTimeslot(string $supplyOrderId, string $timeslotFrom, string $timeslotTo): array
     {
-        $body = array_merge([
-            'supply_order_id' => (int) $supplyOrderId,
-            'timeslot_id' => (int) $timeslotId,
-        ], $payload);
-
-        $response = $this->client->post('/v1/supply-order/timeslot/update', $body);
-
-        if (!$response || !empty($response['error'])) {
-            throw new \RuntimeException(
-                'Не удалось обновить таймслот: ' .
-                ($response['error']['message'] ?? 'Unknown error')
-            );
+        // Убедимся, что timestamp в правильном формате с Z
+        if (!str_ends_with($timeslotFrom, 'Z')) {
+            $timeslotFrom = rtrim($timeslotFrom, 'Z') . 'Z';
+        }
+        if (!str_ends_with($timeslotTo, 'Z')) {
+            $timeslotTo = rtrim($timeslotTo, 'Z') . 'Z';
         }
 
-        return $response['result'] ?? $response;
+        $body = [
+            'supply_id' => $supplyOrderId,
+            'timeslot_start' => $timeslotFrom,
+        ];
+
+        \Illuminate\Support\Facades\Log::info('Ozon fbp/draft/direct/timeslot/edit request', ['body' => $body]);
+
+        $response = $this->client->post('/v1/fbp/draft/direct/timeslot/edit', $body);
+
+        \Illuminate\Support\Facades\Log::info('Ozon fbp/draft/direct/timeslot/edit response', [
+            'response_keys' => $response ? array_keys($response) : [],
+            'has_error' => !empty($response['error']) || !empty($response['code']),
+            'response' => $response,
+        ]);
+
+        return [
+            'success' => empty($response['error']) && empty($response['code']),
+            'response' => $response,
+            'error' => $response['error'] ?? $response['message'] ?? null,
+            '_http_status' => $response['_http_status'] ?? null,
+        ];
     }
 
     /**

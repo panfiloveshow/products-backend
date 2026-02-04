@@ -9,6 +9,78 @@
 - Мониторинг жизненного цикла поставки
 - Аналитика и уведомления
 
+## 📦 Создание поставки FBO — эталонный порядок в ЛК Ozon (25 шагов)
+
+FBO → **Заявки на поставку**
+
+| # | Шаг в ЛК Ozon | API Endpoint | Метод |
+|---|---------------|--------------|-------|
+| 1 | FBO - Заявки на поставку | `GET /api/supplies` | index |
+| 2 | Создать поставку | — | UI |
+| 3 | Выбираем кластер (ставим галочку) | `GET /api/supplies/clusters` | getClusters |
+| 4 | Товары в заявке | `GET /api/supplies/clusters/{id}/products?tab=in_supply` | getClusterProducts |
+| 5 | Добавить | — | UI |
+| 6 | Выбираем товар | — | UI |
+| 7 | Проставляем количество | — | UI |
+| 8 | Сохранить | `POST /api/supplies/clusters/{id}/add-products` | addClusterProducts |
+| 9 | Способ доставки | — | UI |
+| 10 | Выбираем ПВЗ или СЦ | `POST /api/supplies/clusters/{id}/delivery` | setClusterDeliveryMethod |
+| 11 | Сохранить | (в том же endpoint) | — |
+| 12 | Далее | — | UI |
+| 13 | Выбираем склад | `POST /api/supplies/clusters/{id}/warehouse` | setClusterWarehouse |
+| 14 | Дата и время | — | UI |
+| 15 | Выбираем слот | `GET /api/supplies/slots` | getSlots |
+| 16 | Подтвердить | — | UI |
+| 17 | Создать поставку | `POST /api/supplies/create-with-slot` | createWithSlot |
+| 18 | Укажите количество грузомест | — | UI |
+| 19 | Добавить грузоместа | `POST /api/supplies/{id}/packages` | store |
+| 20 | Указываем коробы/паллеты | `PUT /api/supplies/{id}/packages/{pkgId}` | update |
+| 21 | Три точки (⋮) | — | UI |
+| 22 | Указать состав | — | UI |
+| 23 | В грузоместе - Добавить | `POST /api/supplies/{id}/packages/{pkgId}/items` | addItem |
+| 24 | Годен до (срок годности) | `expiry_date` в addItem | — |
+| 25 | Сохранить состав | `POST /api/supplies/{id}/packages/{pkgId}/pack` | pack |
+
+### Пример полного flow (curl)
+
+```bash
+# 1. Получить список кластеров
+GET /api/supplies/clusters?integration_id=1
+
+# 2. Получить товары для кластера
+GET /api/supplies/clusters/cluster_msk/products?integration_id=1&tab=recommendations
+
+# 3. Добавить товары в заявку
+POST /api/supplies/clusters/cluster_msk/add-products
+{ "integration_id": 1, "products": [{"sku": "SKU001", "quantity": 100}] }
+
+# 4. Выбрать способ доставки (ПВЗ)
+POST /api/supplies/clusters/cluster_msk/delivery
+{ "integration_id": 1, "delivery_type": "pvz" }
+
+# 5. Выбрать склад
+POST /api/supplies/clusters/cluster_msk/warehouse
+{ "integration_id": 1, "warehouse_id": "22655170176000" }
+
+# 6. Получить слоты
+GET /api/supplies/slots?integration_id=1&cluster_ids[]=cluster_msk
+
+# 7. Создать поставку со слотом
+POST /api/supplies/create-with-slot
+{ "integration_id": 1, "cluster_id": "cluster_msk", "slot_id": "slot_123" }
+
+# 8. Создать грузоместо
+POST /api/supplies/42/packages
+{ "package_type": "box" }
+
+# 9. Добавить товар в грузоместо
+POST /api/supplies/42/packages/1/items
+{ "sku": "SKU001", "quantity": 50, "expiry_date": "2026-12-31" }
+
+# 10. Упаковать грузоместо
+POST /api/supplies/42/packages/1/pack
+```
+
 ## Архитектура
 
 ```
@@ -47,7 +119,34 @@
 
 ## API Endpoints
 
-### Рекомендации
+### Новый flow FBO (соответствует шагам 1-24 из ЛК Ozon)
+
+| Шаг | Метод | Endpoint | Описание |
+|-----|-------|----------|----------|
+| 1-2 | GET | `/api/supplies/clusters` | Получить кластеры |
+| 3-7 | POST | `/api/supplies/clusters/{clusterId}/add-products` | Добавить товары в заявку |
+| 8-9 | POST | `/api/supplies/clusters/{clusterId}/delivery` | Выбрать ПВЗ или СЦ |
+| 10-11 | POST | `/api/supplies/clusters/{clusterId}/warehouse` | Выбрать склад внутри кластера |
+| 12-13 | GET | `/api/supplies/slots` | Получить слоты приёмки |
+| 14-15 | POST | `/api/supplies/create-with-slot` | Создать поставку со слотом |
+| 16-18 | POST | `/api/supplies/{id}/packages` | Создать грузоместо |
+| 19-22 | POST | `/api/supplies/{id}/packages/{pkgId}/items` | Добавить товар в грузоместо |
+| 23-24 | POST | `/api/supplies/{id}/packages/{pkgId}/pack` | Сохранить состав (упаковать) |
+
+### Кластеры и слоты
+
+| Метод | Endpoint | Описание |
+|-------|----------|----------|
+| GET | `/api/supplies/clusters` | Список кластеров с рекомендациями |
+| GET | `/api/supplies/clusters/{clusterId}/products` | Товары кластера (рекомендации/в заявке) |
+| POST | `/api/supplies/clusters/{clusterId}/add-products` | Добавить товары в заявку кластера |
+| POST | `/api/supplies/clusters/{clusterId}/delivery` | Указать способ доставки (pvz/sc) |
+| POST | `/api/supplies/clusters/{clusterId}/warehouse` | Указать склад внутри кластера |
+| GET | `/api/supplies/slots` | Слоты приёмки по складам |
+| POST | `/api/supplies/sync-slots` | Синхронизировать слоты |
+| POST | `/api/supplies/create-with-slot` | Создать поставку со слотом |
+
+### Рекомендации (legacy)
 
 | Метод | Endpoint | Описание |
 |-------|----------|----------|
@@ -57,12 +156,12 @@
 | POST | `/api/supplies/recommendations/{id}/reject` | Отклонить рекомендацию |
 | POST | `/api/supplies/recommendations/{id}/postpone` | Отложить рекомендацию |
 
-### Поставки
+### Поставки CRUD
 
 | Метод | Endpoint | Описание |
 |-------|----------|----------|
 | GET | `/api/supplies` | Список поставок |
-| POST | `/api/supplies` | Создать поставку из рекомендаций |
+| POST | `/api/supplies` | Создать поставку из рекомендаций (legacy) |
 | GET | `/api/supplies/stats` | Статистика поставок |
 | GET | `/api/supplies/{id}` | Детали поставки |
 | GET | `/api/supplies/{id}/events` | События поставки |
@@ -74,6 +173,32 @@
 | POST | `/api/supplies/{id}/ship` | Отметить отгрузку |
 | POST | `/api/supplies/{id}/cancel` | Отменить поставку |
 | POST | `/api/supplies/{id}/sync-status` | Синхронизировать статус |
+
+### Грузоместа (шаги 16-24)
+
+| Метод | Endpoint | Описание |
+|-------|----------|----------|
+| GET | `/api/supplies/{id}/packages` | Список грузомест |
+| POST | `/api/supplies/{id}/packages` | Создать грузоместо |
+| GET | `/api/supplies/{id}/packages/summary` | Сводка по грузоместам |
+| POST | `/api/supplies/{id}/packages/auto-pack` | Авто-распределение товаров |
+| GET | `/api/supplies/{id}/packages/{pkgId}` | Детали грузоместа |
+| PUT | `/api/supplies/{id}/packages/{pkgId}` | Обновить грузоместо |
+| DELETE | `/api/supplies/{id}/packages/{pkgId}` | Удалить грузоместо |
+| POST | `/api/supplies/{id}/packages/{pkgId}/items` | Добавить товар (+ expiry_date) |
+| DELETE | `/api/supplies/{id}/packages/{pkgId}/items/{itemId}` | Удалить товар |
+| POST | `/api/supplies/{id}/packages/{pkgId}/pack` | Упаковать грузоместо |
+| POST | `/api/supplies/{id}/packages/{pkgId}/label` | Этикетка грузоместа |
+
+### Документы
+
+| Метод | Endpoint | Описание |
+|-------|----------|----------|
+| GET | `/api/supplies/{id}/documents` | Список документов |
+| GET | `/api/supplies/{id}/documents/{docId}` | Детали документа |
+| GET | `/api/supplies/{id}/documents/{docId}/download` | Скачать документ |
+| POST | `/api/supplies/{id}/labels/generate-all` | Сгенерировать все этикетки |
+| POST | `/api/supplies/{id}/documents/packing-list` | Упаковочный лист |
 
 ### Настройки
 

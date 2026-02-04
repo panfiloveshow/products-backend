@@ -2,6 +2,7 @@
 
 namespace App\Http\Controllers\Api;
 
+use App\Domains\Ozon\OzonMarketplace;
 use App\Http\Controllers\Controller;
 use App\Models\Integration;
 use App\Models\Supply;
@@ -100,7 +101,17 @@ class SupplyController extends Controller
 
         try {
             $integration = Integration::findOrFail($validated['integration_id']);
-            
+
+            if ($integration->marketplace !== 'ozon') {
+                return response()->json([
+                    'success' => false,
+                    'error' => [
+                        'code' => 'MARKETPLACE_NOT_SUPPORTED',
+                        'message' => 'Доступно только для Ozon',
+                    ],
+                ], 422);
+            }
+
             $recommendations = $this->recommendationService->calculateRecommendations(
                 $integration,
                 $validated['cluster_id'] ?? null
@@ -580,7 +591,7 @@ class SupplyController extends Controller
      * 
      * GET /api/supplies/{id}
      */
-    public function show(int $id): JsonResponse
+    public function show(string $id): JsonResponse
     {
         $supply = Supply::with(['items', 'events', 'createdBy', 'responsible', 'supplyPlan'])
             ->findOrFail($id);
@@ -942,7 +953,7 @@ class SupplyController extends Controller
      * 
      * GET /api/supplies/{id}/events
      */
-    public function getEvents(int $id): JsonResponse
+    public function getEvents(string $id): JsonResponse
     {
         $supply = Supply::findOrFail($id);
 
@@ -1143,15 +1154,12 @@ class SupplyController extends Controller
             ]);
         }
 
-        // Fallback: генерируем демо-кластеры
-        $fallbackClusters = $this->generateFallbackClusters($integration);
-
         return response()->json([
             'success' => true,
-            'data' => $fallbackClusters,
-            'source' => 'fallback',
+            'data' => [],
+            'source' => 'empty',
             'period_days' => $periodDays,
-            'message' => 'Используются демо-данные. Синхронизируйте кластеры с Ozon.',
+            'message' => 'Кластеры не найдены. Проверьте интеграцию Ozon и повторите синхронизацию.',
         ]);
     }
 
@@ -1185,9 +1193,10 @@ class SupplyController extends Controller
 
         if ($tab === 'in_supply') {
             // Товары в заявке — из кэша
-            $cacheKey = "supply_draft_{$integration->id}_{$clusterId}";
+            $cacheKey = $this->getSupplyDraftCacheKey($integration->id, $clusterId);
             $draftProducts = cache()->get($cacheKey, []);
-            
+            $draftMeta = cache()->get($this->getSupplyDraftMetaKey($integration->id, $clusterId), []);
+
             return response()->json([
                 'success' => true,
                 'data' => [
@@ -1197,6 +1206,7 @@ class SupplyController extends Controller
                         'total_units' => array_sum(array_column($draftProducts, 'quantity')),
                         'total_volume' => 0,
                     ],
+                    'draft_meta' => $draftMeta,
                 ],
                 'cluster_id' => $clusterId,
                 'tab' => $tab,
@@ -1411,7 +1421,7 @@ class SupplyController extends Controller
         }
 
         // Сохраняем товары в сессию/кэш для последующего создания поставки
-        $cacheKey = "supply_draft_{$integration->id}_{$clusterId}";
+        $cacheKey = $this->getSupplyDraftCacheKey($integration->id, $clusterId);
         $existingProducts = cache()->get($cacheKey, []);
         
         foreach ($validated['products'] as $product) {
@@ -1431,6 +1441,136 @@ class SupplyController extends Controller
                 'cluster_id' => $clusterId,
                 'products_count' => count($existingProducts),
                 'products' => array_values($existingProducts),
+            ],
+        ]);
+    }
+
+    /**
+     * Указать способ доставки для кластера (ПВЗ/СЦ)
+     * 
+     * POST /api/supplies/clusters/{clusterId}/delivery
+     */
+    public function setClusterDeliveryMethod(Request $request, string $clusterId): JsonResponse
+    {
+        $validated = $request->validate([
+            'integration_id' => 'required|exists:integrations,id',
+            'delivery_type' => 'required|in:pvz,sc',
+        ]);
+
+        $integration = Integration::findOrFail($validated['integration_id']);
+
+        if ($integration->marketplace !== 'ozon') {
+            return response()->json([
+                'success' => false,
+                'message' => 'Доступно только для Ozon',
+            ], 422);
+        }
+
+        $metaKey = $this->getSupplyDraftMetaKey($integration->id, $clusterId);
+        $meta = cache()->get($metaKey, []);
+
+        $meta['delivery_type'] = $validated['delivery_type'];
+        $meta['delivery_type_label'] = $validated['delivery_type'] === 'pvz' ? 'ПВЗ' : 'СЦ';
+        $meta['delivery_selected_at'] = now()->toIso8601String();
+
+        cache()->put($metaKey, $meta, now()->addHours(24));
+
+        return response()->json([
+            'success' => true,
+            'message' => 'Способ доставки сохранён',
+            'data' => [
+                'cluster_id' => $clusterId,
+                'delivery_type' => $meta['delivery_type'],
+                'delivery_type_label' => $meta['delivery_type_label'],
+            ],
+        ]);
+    }
+
+    /**
+     * Указать склад внутри кластера
+     * 
+     * POST /api/supplies/clusters/{clusterId}/warehouse
+     */
+    public function setClusterWarehouse(Request $request, string $clusterId): JsonResponse
+    {
+        $validated = $request->validate([
+            'integration_id' => 'required|exists:integrations,id',
+            'warehouse_id' => 'required|string',
+            'warehouse_name' => 'nullable|string',
+        ]);
+
+        $integration = Integration::findOrFail($validated['integration_id']);
+
+        if ($integration->marketplace !== 'ozon') {
+            return response()->json([
+                'success' => false,
+                'message' => 'Доступно только для Ozon',
+            ], 422);
+        }
+
+        $metaKey = $this->getSupplyDraftMetaKey($integration->id, $clusterId);
+        $meta = cache()->get($metaKey, []);
+
+        if (empty($meta['delivery_type'])) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Сначала выберите способ доставки (ПВЗ или СЦ)',
+            ], 422);
+        }
+
+        $warehouseId = (string) $validated['warehouse_id'];
+        $warehouseName = $validated['warehouse_name'] ?? null;
+        $resolvedClusterId = null;
+
+        try {
+            $ozon = OzonMarketplace::fromIntegration($integration);
+            $clusters = $ozon->supplies()->getClusters();
+
+            foreach ($clusters as $cluster) {
+                $warehouseIds = $cluster['warehouse_ids'] ?? $cluster['all_warehouse_ids'] ?? [];
+                $warehouseIds = array_map('strval', $warehouseIds);
+
+                if (in_array($warehouseId, $warehouseIds, true)) {
+                    $resolvedClusterId = (string) ($cluster['id'] ?? null);
+                    if (!$warehouseName) {
+                        foreach ($cluster['warehouses'] ?? [] as $wh) {
+                            if ((string) ($wh['id'] ?? '') === $warehouseId) {
+                                $warehouseName = $wh['name'] ?? null;
+                                break;
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+        } catch (\Exception $e) {
+            Log::warning('Failed to resolve Ozon warehouse info', [
+                'integration_id' => $integration->id,
+                'warehouse_id' => $warehouseId,
+                'error' => $e->getMessage(),
+            ]);
+        }
+
+        if ($resolvedClusterId && (string) $resolvedClusterId !== (string) $clusterId) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Выбранный склад не относится к указанному кластеру',
+            ], 422);
+        }
+
+        $meta['warehouse_id'] = $warehouseId;
+        $meta['warehouse_name'] = $warehouseName;
+        $meta['warehouse_selected_at'] = now()->toIso8601String();
+
+        cache()->put($metaKey, $meta, now()->addHours(24));
+
+        return response()->json([
+            'success' => true,
+            'message' => 'Склад сохранён',
+            'data' => [
+                'cluster_id' => $clusterId,
+                'warehouse_id' => $warehouseId,
+                'warehouse_name' => $warehouseName,
             ],
         ]);
     }
@@ -1818,73 +1958,6 @@ class SupplyController extends Controller
         }, $apiClusters);
     }
 
-    /**
-     * Генерация fallback кластеров для демонстрации
-     */
-    private function generateFallbackClusters(Integration $integration): array
-    {
-        // Получаем реальную статистику по остаткам
-        $totalStats = \App\Models\InventoryWarehouse::where('integration_id', $integration->id)
-            ->where('marketplace', 'ozon')
-            ->selectRaw('COUNT(DISTINCT sku) as sku_count, SUM(quantity) as units_count, AVG(days_of_stock) as avg_days')
-            ->first();
-
-        $skuCount = $totalStats->sku_count ?? 0;
-        $unitsCount = $totalStats->units_count ?? 0;
-        $avgDays = $totalStats->avg_days ?? 14;
-
-        // Распределяем по демо-кластерам
-        return [
-            [
-                'id' => 'cluster_msk',
-                'name' => 'Москва и МО',
-                'warehouses_count' => 5,
-                'sku_count' => (int) round($skuCount * 0.4),
-                'units_count' => (int) round($unitsCount * 0.4),
-                'days_of_stock' => max(3, (int) round($avgDays * 0.8)),
-            ],
-            [
-                'id' => 'cluster_spb',
-                'name' => 'Санкт-Петербург',
-                'warehouses_count' => 3,
-                'sku_count' => (int) round($skuCount * 0.2),
-                'units_count' => (int) round($unitsCount * 0.2),
-                'days_of_stock' => max(5, (int) round($avgDays * 1.0)),
-            ],
-            [
-                'id' => 'cluster_ekb',
-                'name' => 'Екатеринбург',
-                'warehouses_count' => 2,
-                'sku_count' => (int) round($skuCount * 0.15),
-                'units_count' => (int) round($unitsCount * 0.15),
-                'days_of_stock' => max(7, (int) round($avgDays * 1.2)),
-            ],
-            [
-                'id' => 'cluster_nsk',
-                'name' => 'Новосибирск',
-                'warehouses_count' => 2,
-                'sku_count' => (int) round($skuCount * 0.1),
-                'units_count' => (int) round($unitsCount * 0.1),
-                'days_of_stock' => max(10, (int) round($avgDays * 1.5)),
-            ],
-            [
-                'id' => 'cluster_krd',
-                'name' => 'Краснодар',
-                'warehouses_count' => 2,
-                'sku_count' => (int) round($skuCount * 0.1),
-                'units_count' => (int) round($unitsCount * 0.1),
-                'days_of_stock' => max(12, (int) round($avgDays * 1.3)),
-            ],
-            [
-                'id' => 'cluster_kzn',
-                'name' => 'Казань',
-                'warehouses_count' => 1,
-                'sku_count' => (int) round($skuCount * 0.05),
-                'units_count' => (int) round($unitsCount * 0.05),
-                'days_of_stock' => max(14, (int) round($avgDays * 1.4)),
-            ],
-        ];
-    }
 
     /**
      * Получить доступные слоты приёмки
@@ -1946,26 +2019,24 @@ class SupplyController extends Controller
 
         $slots = $query->get();
 
-        // Если слотов нет — пробуем синхронизировать или возвращаем fallback
+        // Если слотов нет — пробуем синхронизировать
         if ($slots->isEmpty()) {
             // Запускаем синхронизацию в фоне
             \App\Jobs\SyncWarehouseSlotsJob::dispatch($integration->id);
 
-            // Возвращаем fallback-слоты для демонстрации
-            $fallbackSlots = $this->generateFallbackSlots($dateFrom, $dateTo, $clusterIds);
-            
             return response()->json([
                 'success' => true,
-                'data' => $fallbackSlots,
+                'data' => [],
                 'meta' => [
                     'synced_at' => null,
-                    'total' => count($fallbackSlots),
-                    'source' => 'fallback',
+                    'total' => 0,
+                    'source' => 'empty',
                     'cluster_ids' => $clusterIds,
-                    'message' => 'Синхронизация слотов запущена. Обновите страницу через минуту.',
+                    'message' => 'Слоты не найдены. Синхронизация запущена, обновите страницу через минуту.',
                 ],
             ]);
         }
+
 
         $data = $slots->map(fn($slot) => [
             'id' => $slot->external_slot_id ?? $slot->id,
@@ -2110,15 +2181,47 @@ class SupplyController extends Controller
     {
         $validated = $request->validate([
             'integration_id' => 'required|exists:integrations,id',
+            'cluster_id' => 'required|string',
             'slot_id' => 'required|string',
-            'items' => 'required|array|min:1',
-            'items.*.sku' => 'required|string',
-            'items.*.qty' => 'required|integer|min:1',
             'name' => 'nullable|string|max:255',
             'comment' => 'nullable|string|max:1000',
         ]);
 
         $integration = Integration::findOrFail($validated['integration_id']);
+
+        $clusterId = $validated['cluster_id'];
+        $draftProducts = cache()->get($this->getSupplyDraftCacheKey($integration->id, $clusterId), []);
+        $draftMeta = cache()->get($this->getSupplyDraftMetaKey($integration->id, $clusterId), []);
+
+        if (empty($draftProducts)) {
+            return response()->json([
+                'success' => false,
+                'error' => [
+                    'code' => 'DRAFT_EMPTY',
+                    'message' => 'Сначала добавьте товары в заявку',
+                ],
+            ], 422);
+        }
+
+        if (empty($draftMeta['delivery_type'])) {
+            return response()->json([
+                'success' => false,
+                'error' => [
+                    'code' => 'DELIVERY_NOT_SELECTED',
+                    'message' => 'Сначала выберите способ доставки (ПВЗ или СЦ)',
+                ],
+            ], 422);
+        }
+
+        if (empty($draftMeta['warehouse_id'])) {
+            return response()->json([
+                'success' => false,
+                'error' => [
+                    'code' => 'WAREHOUSE_NOT_SELECTED',
+                    'message' => 'Сначала выберите склад',
+                ],
+            ], 422);
+        }
 
         // 1. Найти и проверить слот
         $slot = \App\Models\WarehouseSlot::where(function ($q) use ($validated) {
@@ -2148,7 +2251,10 @@ class SupplyController extends Controller
             ], 422);
         }
 
-        if ($slot->date->isPast()) {
+        $slotStart = $slot->from_datetime
+            ?? $slot->date->setTimeFromTimeString($slot->time_from);
+
+        if ($slotStart && $slotStart->isPast()) {
             return response()->json([
                 'success' => false,
                 'error' => [
@@ -2158,18 +2264,61 @@ class SupplyController extends Controller
             ], 422);
         }
 
+        // Проверка соответствия слота выбранному складу
+        if ((string) $slot->warehouse_id !== (string) $draftMeta['warehouse_id']) {
+            return response()->json([
+                'success' => false,
+                'error' => [
+                    'code' => 'WAREHOUSE_MISMATCH',
+                    'message' => 'Выбранный слот не соответствует выбранному складу',
+                ],
+            ], 422);
+        }
+
+        // Проверка соответствия слота кластеру
+        $clusterIdFromSlot = \App\Models\OzonWarehouseCluster::getClusterIdByWarehouse($slot->warehouse_name ?? '')
+            ?? \App\Models\OzonWarehouseCluster::getClusterIdByWarehouse((string) $slot->warehouse_id);
+
+        if ($clusterIdFromSlot && (string) $clusterIdFromSlot !== (string) $clusterId) {
+            return response()->json([
+                'success' => false,
+                'error' => [
+                    'code' => 'CLUSTER_MISMATCH',
+                    'message' => 'Выбранный слот не относится к выбранному кластеру',
+                ],
+            ], 422);
+        }
+
         // 2. Валидация товаров
         $invalidItems = [];
         $validItems = [];
 
-        foreach ($validated['items'] as $item) {
+        foreach ($draftProducts as $draftItem) {
+            $qty = (int) ($draftItem['quantity'] ?? 0);
+            if ($qty < 1) {
+                $invalidItems[] = [
+                    'sku' => $draftItem['sku'] ?? null,
+                    'reason' => 'Количество должно быть больше 0',
+                ];
+                continue;
+            }
+
+            $sku = $draftItem['sku'] ?? null;
+            if (!$sku) {
+                $invalidItems[] = [
+                    'sku' => null,
+                    'reason' => 'SKU не указан',
+                ];
+                continue;
+            }
+
             $product = \App\Models\Product::where('integration_id', $integration->id)
-                ->where('sku', $item['sku'])
+                ->where('sku', $sku)
                 ->first();
 
             if (!$product) {
                 $invalidItems[] = [
-                    'sku' => $item['sku'],
+                    'sku' => $sku,
                     'reason' => 'Товар не найден',
                 ];
                 continue;
@@ -2177,9 +2326,9 @@ class SupplyController extends Controller
 
             // Проверка кратности
             $packMultiple = $product->pack_multiple ?? 1;
-            if ($packMultiple > 1 && $item['qty'] % $packMultiple !== 0) {
+            if ($packMultiple > 1 && $qty % $packMultiple !== 0) {
                 $invalidItems[] = [
-                    'sku' => $item['sku'],
+                    'sku' => $sku,
                     'reason' => "Количество должно быть кратно {$packMultiple}",
                 ];
                 continue;
@@ -2187,8 +2336,8 @@ class SupplyController extends Controller
 
             $validItems[] = [
                 'product' => $product,
-                'sku' => $item['sku'],
-                'quantity' => $item['qty'],
+                'sku' => $sku,
+                'quantity' => $qty,
             ];
         }
 
@@ -2204,23 +2353,38 @@ class SupplyController extends Controller
         }
 
         // 3. Создать поставку
-        try {
-            $supplyName = $validated['name'] 
-                ?? "Поставка {$slot->date->format('d M')} {$slot->time_from}";
+        $supplyName = $validated['name']
+            ?? "Поставка {$slot->date->format('d M')} {$slot->time_from}";
+        $timeslotId = (string) ($slot->external_slot_id ?? $slot->id);
+        $timeslotFrom = $slot->from_datetime ?? $slot->date->setTimeFromTimeString($slot->time_from);
+        $timeslotTo = $slot->to_datetime ?? $slot->date->setTimeFromTimeString($slot->time_to);
+        $clusterId = $clusterIdFromSlot
+            ?? \App\Models\OzonWarehouseCluster::getClusterIdByWarehouse($slot->warehouse_name ?? '')
+            ?? \App\Models\OzonWarehouseCluster::getClusterIdByWarehouse((string) $slot->warehouse_id)
+            ?? $clusterId;
+        $clusterName = \App\Models\OzonWarehouseCluster::getClusterNameByWarehouse($slot->warehouse_name ?? '')
+            ?? \App\Models\OzonWarehouseCluster::getClusterNameByWarehouse((string) $slot->warehouse_id);
 
-            $supply = \DB::transaction(function () use ($integration, $slot, $validItems, $supplyName, $validated) {
+        try {
+            $supply = \DB::transaction(function () use ($integration, $slot, $validItems, $supplyName, $validated, $timeslotId, $timeslotFrom, $timeslotTo, $clusterId, $clusterName) {
                 // Создаём поставку
                 $supply = Supply::create([
                     'integration_id' => $integration->id,
                     'supply_type' => Supply::TYPE_FBO,
                     'supply_method' => Supply::METHOD_DIRECT,
+                    'cluster_id' => $clusterId,
+                    'cluster_name' => $clusterName,
                     'warehouse_id' => $slot->warehouse_id,
                     'warehouse_name' => $slot->warehouse_name,
-                    'timeslot_id' => $slot->external_slot_id ?? $slot->id,
-                    'timeslot_from' => $slot->from_datetime ?? $slot->date->setTimeFromTimeString($slot->time_from),
-                    'timeslot_to' => $slot->to_datetime ?? $slot->date->setTimeFromTimeString($slot->time_to),
+                    'timeslot_id' => $timeslotId,
+                    'timeslot_from' => $timeslotFrom,
+                    'timeslot_to' => $timeslotTo,
                     'planned_delivery_date' => $slot->date,
                     'status' => Supply::STATUS_DRAFT,
+                    'meta' => [
+                        'delivery_type' => $draftMeta['delivery_type'] ?? null,
+                        'delivery_type_label' => $draftMeta['delivery_type_label'] ?? null,
+                    ],
                     'comment' => $validated['comment'] ?? null,
                     'created_by' => auth()->id(),
                 ]);
@@ -2243,13 +2407,6 @@ class SupplyController extends Controller
                 // Пересчитываем итоги
                 $supply->recalculateTotals();
 
-                // Бронируем слот
-                $slot->update([
-                    'booked_by_supply_id' => $supply->id,
-                    'booked_at' => now(),
-                    'is_available' => false,
-                ]);
-
                 // Логируем событие
                 $supply->logEvent(\App\Models\SupplyEvent::TYPE_CREATED, [
                     'title' => 'Поставка создана со слотом',
@@ -2258,28 +2415,6 @@ class SupplyController extends Controller
 
                 return $supply;
             });
-
-            return response()->json([
-                'success' => true,
-                'data' => [
-                    'id' => $supply->id,
-                    'name' => $supplyName,
-                    'status' => $supply->status,
-                    'ozon_supply_id' => $supply->ozon_supply_id,
-                    'slot' => [
-                        'id' => $slot->external_slot_id ?? $slot->id,
-                        'date' => $slot->date->toDateString(),
-                        'time_from' => substr($slot->time_from, 0, 5),
-                        'time_to' => substr($slot->time_to, 0, 5),
-                        'warehouse_name' => $slot->warehouse_name,
-                        'is_booked' => true,
-                    ],
-                    'items_count' => count($validItems),
-                    'total_qty' => collect($validItems)->sum('quantity'),
-                    'created_at' => $supply->created_at->toIso8601String(),
-                ],
-                'message' => 'Поставка создана. Слот забронирован.',
-            ], 201);
 
         } catch (\Exception $e) {
             Log::error('Failed to create supply with slot', [
@@ -2296,6 +2431,80 @@ class SupplyController extends Controller
                 ],
             ], 500);
         }
+
+        try {
+            $this->supplyService->createOzonDraft($supply);
+        } catch (\Exception $e) {
+            Log::error('Failed to create Ozon draft for supply', [
+                'error' => $e->getMessage(),
+                'supply_id' => $supply->id,
+            ]);
+
+            return response()->json([
+                'success' => false,
+                'error' => [
+                    'code' => 'OZON_DRAFT_ERROR',
+                    'message' => $e->getMessage(),
+                ],
+            ], 422);
+        }
+
+        $warning = null;
+        try {
+            $this->supplyService->bookTimeslot($supply, $timeslotId);
+            $slot->update([
+                'booked_by_supply_id' => $supply->id,
+                'booked_at' => now(),
+                'is_available' => false,
+            ]);
+        } catch (\Exception $e) {
+            $warning = $e->getMessage();
+            Log::warning('Failed to book Ozon slot for supply', [
+                'error' => $warning,
+                'supply_id' => $supply->id,
+                'timeslot_id' => $timeslotId,
+            ]);
+        }
+
+        cache()->forget($this->getSupplyDraftCacheKey($integration->id, $clusterId));
+        cache()->forget($this->getSupplyDraftMetaKey($integration->id, $clusterId));
+
+        $supply->refresh();
+        $slot->refresh();
+
+        $response = [
+            'success' => true,
+            'data' => [
+                'id' => $supply->id,
+                'name' => $supplyName,
+                'status' => $supply->status,
+                'ozon_draft_id' => $supply->ozon_draft_id,
+                'ozon_supply_id' => $supply->ozon_supply_id,
+                'slot' => [
+                    'id' => $timeslotId,
+                    'date' => $slot->date->toDateString(),
+                    'time_from' => substr($slot->time_from, 0, 5),
+                    'time_to' => substr($slot->time_to, 0, 5),
+                    'warehouse_name' => $slot->warehouse_name,
+                    'is_booked' => $slot->booked_by_supply_id === $supply->id,
+                ],
+                'items_count' => count($validItems),
+                'total_qty' => collect($validItems)->sum('quantity'),
+                'created_at' => $supply->created_at->toIso8601String(),
+            ],
+            'message' => $warning
+                ? 'Черновик создан в Ozon, но слот не забронирован.'
+                : 'Поставка создана. Слот забронирован.',
+        ];
+
+        if ($warning) {
+            $response['warning'] = [
+                'code' => 'OZON_SLOT_ERROR',
+                'message' => $warning,
+            ];
+        }
+
+        return response()->json($response, 201);
     }
 
     /**
@@ -2354,104 +2563,6 @@ class SupplyController extends Controller
         }
     }
 
-    /**
-     * Генерация fallback слотов для демонстрации
-     */
-    private function generateFallbackSlots(string $dateFrom, string $dateTo, array $clusterIds = []): array
-    {
-        $slots = [];
-        $startDate = \Carbon\Carbon::parse($dateFrom);
-        $endDate = \Carbon\Carbon::parse($dateTo);
-        
-        // Все склады по кластерам
-        $allWarehouses = [
-            'cluster_msk' => [
-                ['id' => '22655170176000', 'name' => 'Хоругвино'],
-                ['id' => '22655170177000', 'name' => 'Коледино'],
-                ['id' => '22655170178000', 'name' => 'Подольск'],
-            ],
-            'cluster_spb' => [
-                ['id' => '22655170179000', 'name' => 'Шушары'],
-                ['id' => '22655170180000', 'name' => 'Бугры'],
-            ],
-            'cluster_ekb' => [
-                ['id' => '22655170181000', 'name' => 'Екатеринбург'],
-            ],
-            'cluster_nsk' => [
-                ['id' => '22655170183000', 'name' => 'Новосибирск'],
-            ],
-            'cluster_krd' => [
-                ['id' => '22655170184000', 'name' => 'Краснодар'],
-            ],
-            'cluster_kzn' => [
-                ['id' => '22655170185000', 'name' => 'Казань'],
-            ],
-        ];
-
-        // Фильтруем склады по выбранным кластерам
-        $warehouses = [];
-        if (empty($clusterIds)) {
-            // Если кластеры не выбраны — показываем все
-            foreach ($allWarehouses as $clusterId => $clusterWarehouses) {
-                foreach ($clusterWarehouses as $wh) {
-                    $wh['cluster_id'] = $clusterId;
-                    $warehouses[] = $wh;
-                }
-            }
-        } else {
-            foreach ($clusterIds as $clusterId) {
-                if (isset($allWarehouses[$clusterId])) {
-                    foreach ($allWarehouses[$clusterId] as $wh) {
-                        $wh['cluster_id'] = $clusterId;
-                        $warehouses[] = $wh;
-                    }
-                }
-            }
-        }
-
-        while ($startDate <= $endDate) {
-            // Пропускаем выходные
-            if (!$startDate->isWeekend()) {
-                foreach ($warehouses as $warehouse) {
-                    // Утренний слот
-                    $slots[] = [
-                        'id' => 'demo_' . $startDate->format('Ymd') . '_' . $warehouse['id'] . '_am',
-                        'date' => $startDate->toDateString(),
-                        'time_from' => '09:00',
-                        'time_to' => '12:00',
-                        'warehouse_id' => $warehouse['id'],
-                        'warehouse_name' => $warehouse['name'],
-                        'cluster_id' => $warehouse['cluster_id'],
-                        'is_available' => true,
-                        'capacity' => 100,
-                        'capacity_used' => rand(20, 60),
-                        'coefficient' => rand(0, 1) ? 1.0 : 1.5,
-                        'is_demo' => true,
-                    ];
-
-                    // Дневной слот
-                    $slots[] = [
-                        'id' => 'demo_' . $startDate->format('Ymd') . '_' . $warehouse['id'] . '_pm',
-                        'date' => $startDate->toDateString(),
-                        'time_from' => '14:00',
-                        'time_to' => '17:00',
-                        'warehouse_id' => $warehouse['id'],
-                        'warehouse_name' => $warehouse['name'],
-                        'cluster_id' => $warehouse['cluster_id'],
-                        'is_available' => true,
-                        'capacity' => 100,
-                        'capacity_used' => rand(30, 80),
-                        'coefficient' => rand(0, 1) ? 1.0 : 2.0,
-                        'is_demo' => true,
-                    ];
-                }
-            }
-
-            $startDate->addDay();
-        }
-
-        return $slots;
-    }
 
     /**
      * Рассчитать базовую аналитику на лету
@@ -2490,5 +2601,15 @@ class SupplyController extends Controller
             'calculated_at' => now()->toIso8601String(),
             'is_realtime' => true,
         ];
+    }
+
+    private function getSupplyDraftCacheKey(int $integrationId, string $clusterId): string
+    {
+        return "supply_draft_{$integrationId}_{$clusterId}";
+    }
+
+    private function getSupplyDraftMetaKey(int $integrationId, string $clusterId): string
+    {
+        return "supply_draft_meta_{$integrationId}_{$clusterId}";
     }
 }

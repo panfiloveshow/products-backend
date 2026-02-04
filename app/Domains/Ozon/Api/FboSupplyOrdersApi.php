@@ -178,6 +178,7 @@ class FboSupplyOrdersApi
     public function cancel(int $supplyOrderId): array
     {
         $response = $this->client->post('/v1/supply-order/cancel', [
+            'order_id' => $supplyOrderId,
             'supply_order_id' => $supplyOrderId,
         ]);
 
@@ -266,18 +267,51 @@ class FboSupplyOrdersApi
     }
 
     /**
-     * Получить информацию о черновике
-     * POST /v1/draft/create/info
+     * Получить статус операции создания черновика
+     * POST /v1/draft/create/info (для получения draft_id по operation_id)
      */
-    public function getDraftInfo(string $operationId): array
+    public function getDraftCreateStatus(string $operationId): array
     {
         $response = $this->client->post('/v1/draft/create/info', [
             'operation_id' => $operationId,
         ]);
 
-        Log::info('Ozon FBO draft/create/info response', ['response' => $response]);
+        Log::info('Ozon FBO v1/draft/create/info response', ['operation_id' => $operationId, 'response' => $response]);
 
         return $response['result'] ?? $response ?? [];
+    }
+
+    /**
+     * Получить информацию о черновике с доступностью складов
+     * POST /v2/draft/create/info (обновлённый API с availability_status)
+     */
+    public function getDraftInfo(string $draftId): array
+    {
+        $response = $this->client->post('/v2/draft/create/info', [
+            'draft_id' => (int) $draftId,
+        ]);
+
+        Log::info('Ozon FBO v2/draft/create/info response', ['draft_id' => $draftId, 'response' => $response]);
+
+        // Нормализуем структуру — преобразуем availability_status в is_available
+        $clusters = $response['clusters'] ?? [];
+        foreach ($clusters as &$cluster) {
+            if (isset($cluster['warehouses'])) {
+                foreach ($cluster['warehouses'] as &$warehouse) {
+                    // state: AVAILABLE, NOT_AVAILABLE, UNSPECIFIED
+                    $state = $warehouse['availability_status']['state'] ?? 'UNSPECIFIED';
+                    $warehouse['is_available'] = ($state === 'AVAILABLE');
+                    $warehouse['invalid_reason'] = $warehouse['availability_status']['invalid_reason'] ?? null;
+                }
+            }
+        }
+
+        return [
+            'clusters' => $clusters,
+            'draft_id' => $response['draft_id'] ?? $draftId,
+            'status' => $response['status'] ?? null,
+            'total_items_count' => $response['total_items_count'] ?? 0,
+        ];
     }
 
     /**
@@ -363,5 +397,44 @@ class FboSupplyOrdersApi
         Log::info('Ozon FBO supply/create/status response', ['response' => $response]);
 
         return $response ?? [];
+    }
+
+    /**
+     * Изменить таймслот заявки на поставку
+     * POST /v1/fbp/order/direct/timeslot/edit
+     * 
+     * @param int $supplyOrderId ID заявки на поставку
+     * @param string $timeslotFrom Начало таймслота (ISO 8601 с Z)
+     * @param string $timeslotTo Конец таймслота (ISO 8601 с Z)
+     * @return array
+     */
+    public function editTimeslot(int $supplyOrderId, string $timeslotFrom, string $timeslotTo): array
+    {
+        // Убедимся, что timestamp в правильном формате с Z
+        if (!str_ends_with($timeslotFrom, 'Z')) {
+            $timeslotFrom = rtrim($timeslotFrom, 'Z') . 'Z';
+        }
+        if (!str_ends_with($timeslotTo, 'Z')) {
+            $timeslotTo = rtrim($timeslotTo, 'Z') . 'Z';
+        }
+
+        $body = [
+            'supply_id' => (string) $supplyOrderId,
+            'timeslot_start' => $timeslotFrom,
+            'timeslot_end' => $timeslotTo,
+        ];
+
+        Log::info('Ozon FBO fbp/order/direct/timeslot/edit request', ['body' => $body]);
+
+        $response = $this->client->post('/v1/fbp/order/direct/timeslot/edit', $body);
+
+        Log::info('Ozon FBO fbp/order/direct/timeslot/edit response', ['response' => $response]);
+
+        return [
+            'success' => empty($response['error']) && empty($response['code']),
+            'response' => $response,
+            'error' => $response['error'] ?? $response['message'] ?? null,
+            '_http_status' => $response['_http_status'] ?? null,
+        ];
     }
 }

@@ -410,6 +410,8 @@ Route::prefix('supplies')->middleware('throttle:api')->group(function () {
     Route::get('/clusters', [App\Http\Controllers\Api\SupplyController::class, 'getClusters']);
     Route::get('/clusters/{clusterId}/products', [App\Http\Controllers\Api\SupplyController::class, 'getClusterProducts']);
     Route::post('/clusters/{clusterId}/add-products', [App\Http\Controllers\Api\SupplyController::class, 'addClusterProducts']);
+    Route::post('/clusters/{clusterId}/delivery', [App\Http\Controllers\Api\SupplyController::class, 'setClusterDeliveryMethod']);
+    Route::post('/clusters/{clusterId}/warehouse', [App\Http\Controllers\Api\SupplyController::class, 'setClusterWarehouse']);
     Route::get('/slots', [App\Http\Controllers\Api\SupplyController::class, 'getSlots']);
     Route::post('/sync-slots', [App\Http\Controllers\Api\SupplyController::class, 'syncSlots']);
     Route::get('/products-for-supply', [App\Http\Controllers\Api\SupplyController::class, 'getProductsForSupply']);
@@ -439,6 +441,26 @@ Route::prefix('supplies')->middleware('throttle:api')->group(function () {
     
     // Аналитика
     Route::get('/analytics', [App\Http\Controllers\Api\SupplyController::class, 'getAnalytics']);
+    
+    // Грузоместа
+    Route::get('/{supplyId}/packages', [App\Http\Controllers\Api\SupplyPackageController::class, 'index']);
+    Route::post('/{supplyId}/packages', [App\Http\Controllers\Api\SupplyPackageController::class, 'store']);
+    Route::get('/{supplyId}/packages/summary', [App\Http\Controllers\Api\SupplyPackageController::class, 'summary']);
+    Route::post('/{supplyId}/packages/auto-pack', [App\Http\Controllers\Api\SupplyPackageController::class, 'autoPack']);
+    Route::get('/{supplyId}/packages/{packageId}', [App\Http\Controllers\Api\SupplyPackageController::class, 'show']);
+    Route::put('/{supplyId}/packages/{packageId}', [App\Http\Controllers\Api\SupplyPackageController::class, 'update']);
+    Route::delete('/{supplyId}/packages/{packageId}', [App\Http\Controllers\Api\SupplyPackageController::class, 'destroy']);
+    Route::post('/{supplyId}/packages/{packageId}/items', [App\Http\Controllers\Api\SupplyPackageController::class, 'addItem']);
+    Route::delete('/{supplyId}/packages/{packageId}/items/{itemId}', [App\Http\Controllers\Api\SupplyPackageController::class, 'removeItem']);
+    Route::post('/{supplyId}/packages/{packageId}/pack', [App\Http\Controllers\Api\SupplyPackageController::class, 'pack']);
+    Route::post('/{supplyId}/packages/{packageId}/label', [App\Http\Controllers\Api\SupplyDocumentController::class, 'generatePackageLabel']);
+    
+    // Документы
+    Route::get('/{supplyId}/documents', [App\Http\Controllers\Api\SupplyDocumentController::class, 'index']);
+    Route::get('/{supplyId}/documents/{documentId}', [App\Http\Controllers\Api\SupplyDocumentController::class, 'show']);
+    Route::get('/{supplyId}/documents/{documentId}/download', [App\Http\Controllers\Api\SupplyDocumentController::class, 'download'])->name('api.supplies.documents.download');
+    Route::post('/{supplyId}/labels/generate-all', [App\Http\Controllers\Api\SupplyDocumentController::class, 'generateAllLabels']);
+    Route::post('/{supplyId}/documents/packing-list', [App\Http\Controllers\Api\SupplyDocumentController::class, 'generatePackingList']);
 });
 
 /*

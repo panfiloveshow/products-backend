@@ -458,6 +458,79 @@ POST /api/supplies/{id}/cancel            // Отменить
 POST /api/supplies/{id}/sync-status       // Синхронизировать статус
 ```
 
+---
+
+## 2.10 Новый flow FBO (кластер → товары → ПВЗ/СЦ → склад → слот)
+
+### 2.10.1 Получить кластеры
+
+```http
+GET /api/supplies/clusters
+```
+
+### 2.10.2 Получить товары кластера
+
+```http
+GET /api/supplies/clusters/{clusterId}/products
+```
+
+### 2.10.3 Добавить товары в заявку
+
+```http
+POST /api/supplies/clusters/{clusterId}/add-products
+```
+
+### 2.10.4 Указать способ доставки (ПВЗ/СЦ)
+
+```http
+POST /api/supplies/clusters/{clusterId}/delivery
+```
+
+Body:
+```json
+{
+  "integration_id": 1,
+  "delivery_type": "pvz" // "pvz" | "sc"
+}
+```
+
+### 2.10.5 Указать склад внутри кластера
+
+```http
+POST /api/supplies/clusters/{clusterId}/warehouse
+```
+
+Body:
+```json
+{
+  "integration_id": 1,
+  "warehouse_id": "22655170176000",
+  "warehouse_name": "Хоругвино"
+}
+```
+
+### 2.10.6 Получить слоты по выбранному складу
+
+```http
+GET /api/supplies/slots?integration_id=1&warehouse_id=22655170176000
+```
+
+### 2.10.7 Создать поставку с выбранным слотом
+
+```http
+POST /api/supplies/create-with-slot
+```
+
+Body:
+```json
+{
+  "integration_id": 1,
+  "cluster_id": "cluster_123",
+  "slot_id": "slot_001",
+  "comment": "Срочная поставка"
+}
+```
+
 **Cancel Body:**
 
 ```json
@@ -721,14 +794,24 @@ PUT /api/supplies/settings
 ## 6. Workflow поставки
 
 ```
-1. Выбрать рекомендации → POST /api/supplies (создать поставку)
+Новый flow (как в ЛК Ozon):
+1. Выбрать кластер → GET /api/supplies/clusters
+2. Добавить товары → POST /api/supplies/clusters/{clusterId}/add-products
+3. Указать ПВЗ/СЦ → POST /api/supplies/clusters/{clusterId}/delivery
+4. Указать склад → POST /api/supplies/clusters/{clusterId}/warehouse
+5. Выбрать слот → GET /api/supplies/slots
+6. Создать поставку → POST /api/supplies/create-with-slot
+7. Начать сборку → POST /api/supplies/{id}/start-preparing
+8. Готово к отгрузке → POST /api/supplies/{id}/ready-to-ship
+9. Отгрузить → POST /api/supplies/{id}/ship
+10. Ждать приёмку (статус обновится автоматически через sync)
+
+Legacy flow (черновик → слот) остаётся для совместимости:
+1. Создать поставку → POST /api/supplies
 2. Создать черновик → POST /api/supplies/{id}/create-draft
 3. Получить слоты → GET /api/supplies/{id}/timeslots
 4. Забронировать слот → POST /api/supplies/{id}/book-slot
-5. Начать сборку → POST /api/supplies/{id}/start-preparing
-6. Готово к отгрузке → POST /api/supplies/{id}/ready-to-ship
-7. Отгрузить → POST /api/supplies/{id}/ship
-8. Ждать приёмку (статус обновится автоматически через sync)
+5. Дальше как выше
 ```
 
 ---
@@ -939,7 +1022,7 @@ interface SupplySettings {
 
 ## 9. Важные замечания
 
-1. **Порядок действий:** Нельзя забронировать слот без черновика в Ozon
+1. **Порядок действий:** В новом flow нельзя создать поставку без выбора ПВЗ/СЦ и склада кластера.
 2. **Статусы:** Некоторые действия доступны только в определённых статусах (см. `is_editable`, `can_create_draft`, `can_book_slot`)
 3. **OOS риск:** Рекомендации с `oos_risk: true` требуют приоритетного внимания
 4. **Кэш слотов:** Слоты кэшируются на 30 минут, можно принудительно обновить через `use_cache=false`

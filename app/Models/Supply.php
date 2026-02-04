@@ -173,6 +173,16 @@ class Supply extends Model
         return $this->hasMany(SupplyRecommendation::class);
     }
 
+    public function packages(): HasMany
+    {
+        return $this->hasMany(SupplyPackage::class);
+    }
+
+    public function documents(): HasMany
+    {
+        return $this->hasMany(SupplyDocument::class);
+    }
+
     // === Scopes ===
 
     public function scopeStatus($query, $status)

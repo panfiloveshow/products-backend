@@ -2135,7 +2135,7 @@ class ShipmentController extends Controller
     {
         $request->validate([
             'integration_id' => 'required',
-            'warehouse_id' => 'required',
+            'warehouse_id' => 'nullable',
             'cluster_id' => 'nullable',
             'items' => 'required|array|min:1',
             'items.*.sku' => 'required|string',
@@ -2188,94 +2188,186 @@ class ShipmentController extends Controller
             
             $marketplace = \App\Domains\Ozon\OzonMarketplace::fromIntegration($integration);
             $suppliesApi = $marketplace->fboSupplyOrders();
-            $suppliesPublicApi = $marketplace->supplies();
 
-            $clusterIdForDraft = $clusterId ?: null;
+            // ВАЖНО: Всегда создаём черновик БЕЗ кластера (пустой массив),
+            // чтобы получить мультикластерный черновик и узнать доступность складов
+            // для конкретных товаров. Ozon определяет доступность по категориям товаров.
+            // Кластер будет выбран позже при бронировании слота.
 
-            if (!$clusterId && method_exists($suppliesPublicApi, 'getFboWarehouses')) {
-                $fboWarehouses = $suppliesPublicApi->getFboWarehouses();
-                foreach ($fboWarehouses as $wh) {
-                    if ((string) ($wh['id'] ?? '') === (string) $warehouseId) {
-                        $clusterIdForDraft = (string) ($wh['cluster_id'] ?? $clusterIdForDraft);
-                        break;
-                    }
+            // Создаём черновик (без кластера — Ozon вернёт все доступные склады)
+            // Обрабатываем rate limit (429) с небольшим ретраем
+            \Log::info('[FBO Draft] Начинаем создание черновика', [
+                'integration_id' => $integrationId,
+                'items_count' => count($ozonItems),
+                'items' => $ozonItems,
+            ]);
+            
+            $ozonDraft = null;
+            $maxCreateAttempts = 3;
+            for ($attempt = 1; $attempt <= $maxCreateAttempts; $attempt++) {
+                \Log::info("[FBO Draft] Попытка создания черновика #{$attempt}");
+                
+                $ozonDraft = $suppliesApi->createDirectDraft(
+                    $ozonItems,
+                    [], // Пустой массив кластеров — мультикластерный черновик
+                    'CREATE_TYPE_DIRECT'
+                );
+
+                \Log::info("[FBO Draft] Ответ createDirectDraft", [
+                    'attempt' => $attempt,
+                    'response' => $ozonDraft,
+                ]);
+
+                $httpStatus = $ozonDraft['_http_status'] ?? null;
+                $errorCode = $ozonDraft['error']['code'] ?? $ozonDraft['code'] ?? null;
+                $isRateLimit = $httpStatus === 429 || (int) $errorCode === 8;
+
+                if (!$isRateLimit) {
+                    break;
                 }
-            }
 
-            if (!$clusterIdForDraft && method_exists($suppliesPublicApi, 'getClusters')) {
-                $clusters = $suppliesPublicApi->getClusters();
-                foreach ($clusters as $cluster) {
-                    $warehouseIds = array_map('strval', $cluster['warehouse_ids'] ?? $cluster['all_warehouse_ids'] ?? []);
-                    if (in_array((string) $warehouseId, $warehouseIds, true)) {
-                        $clusterIdForDraft = (string) ($cluster['id'] ?? null);
-                        break;
-                    }
-                }
+                \Log::warning("[FBO Draft] Rate limit, ждём перед повтором", ['attempt' => $attempt]);
+                usleep(1000000 * $attempt);
             }
-
-            if (!$clusterIdForDraft) {
-                return response()->json([
-                    'message' => 'Не удалось определить кластер для выбранного склада',
-                ], 422);
-            }
-
-            $ozonDraft = $suppliesApi->createDirectDraft(
-                $ozonItems,
-                !empty($clusterIdForDraft) ? [(string) $clusterIdForDraft] : [],
-                'CREATE_TYPE_DIRECT'
-            );
             
             $operationId = $ozonDraft['operation_id'] ?? null;
             
             if (empty($operationId)) {
                 $ozonError = $ozonDraft['error'] ?? null;
                 $ozonResponse = $ozonDraft['response'] ?? null;
-                $details = $ozonError ?: $ozonResponse;
+                $ozonMessage = $ozonDraft['message'] ?? null;
+                $details = $ozonError ?: $ozonResponse ?: $ozonMessage;
                 $errorSuffix = $details ? ' (' . json_encode($details, JSON_UNESCAPED_UNICODE) . ')' : '';
+                $httpStatus = $ozonDraft['_http_status'] ?? null;
+                $errorCode = $ozonDraft['error']['code'] ?? $ozonDraft['code'] ?? null;
+
+                \Log::error('[FBO Draft] operation_id не получен', [
+                    'ozon_draft' => $ozonDraft,
+                    'http_status' => $httpStatus,
+                    'error_code' => $errorCode,
+                ]);
+
+                if ($httpStatus === 429 || (int) $errorCode === 8) {
+                    return response()->json([
+                        'message' => 'Превышен лимит запросов к Ozon. Подождите 1–2 минуты и попробуйте снова.',
+                    ], 429);
+                }
+
                 return response()->json([
                     'message' => 'Не удалось создать черновик в Ozon: operation_id не получен' . $errorSuffix,
+                    'debug' => [
+                        'ozon_response' => $ozonDraft,
+                    ],
                 ], 422);
             }
 
-            // Ожидаем готовности черновика
+            \Log::info('[FBO Draft] operation_id получен', ['operation_id' => $operationId]);
+
+            // Шаг 1: Ожидаем готовности черновика через v1 API (получаем draft_id)
+            // ВАЖНО: Ozon имеет строгий rate limit, поэтому используем экспоненциальную задержку
             $draftId = null;
-            $draftInfo = null;
-            $availableClusters = [];
-            $maxAttempts = 15;
+            $draftStatus = null;
+            $lastCreateStatus = null;
+            $maxAttempts = 10;
+            $baseDelay = 3; // секунды
+            $rateLimitHits = 0;
             
             for ($attempt = 1; $attempt <= $maxAttempts; $attempt++) {
-                $draftInfo = $suppliesApi->getDraftInfo($operationId);
-                if (empty($draftInfo)) {
-                    usleep(2000000);
+                // Экспоненциальная задержка: 3, 4, 5, 6... секунд + дополнительно при rate limit
+                $delay = $baseDelay + ($attempt - 1) + ($rateLimitHits * 5);
+                if ($attempt > 1) {
+                    \Log::info("[FBO Draft] Ждём {$delay} сек перед попыткой #{$attempt}");
+                    sleep($delay);
+                }
+                
+                $createStatus = $suppliesApi->getDraftCreateStatus($operationId);
+                $lastCreateStatus = $createStatus;
+                
+                // Проверяем rate limit
+                $httpStatus = $createStatus['_http_status'] ?? null;
+                $errorCode = $createStatus['code'] ?? null;
+                $isRateLimit = $httpStatus === 429 || (int) $errorCode === 8;
+                
+                if ($isRateLimit) {
+                    $rateLimitHits++;
+                    \Log::warning("[FBO Draft] Rate limit при проверке статуса, попытка #{$attempt}, всего rate limit: {$rateLimitHits}");
+                    
+                    if ($rateLimitHits >= 3) {
+                        // После 3 rate limit — ждём дольше
+                        \Log::info("[FBO Draft] Много rate limit, ждём 30 секунд");
+                        sleep(30);
+                    }
                     continue;
                 }
-                $status = $draftInfo['status'] ?? '';
-                $draftId = $draftInfo['draft_id'] ?? null;
+                
+                \Log::info("[FBO Draft] Проверка статуса черновика #{$attempt}", [
+                    'operation_id' => $operationId,
+                    'response' => $createStatus,
+                ]);
+                
+                if (empty($createStatus)) {
+                    continue;
+                }
+                
+                $status = $createStatus['status'] ?? '';
+                $draftId = $createStatus['draft_id'] ?? null;
                 
                 if ($status === 'CALCULATION_STATUS_SUCCESS' || ($draftId && $draftId > 0)) {
+                    $draftStatus = $status;
+                    \Log::info('[FBO Draft] Черновик готов', ['draft_id' => $draftId, 'status' => $status]);
                     break;
                 }
                 
                 if ($status === 'CALCULATION_STATUS_ERROR' || $status === 'CALCULATION_STATUS_FAILED') {
-                    $errors = $draftInfo['errors'] ?? [];
+                    $errors = $createStatus['errors'] ?? [];
+                    \Log::error('[FBO Draft] Ошибка создания черновика', ['status' => $status, 'errors' => $errors]);
                     return response()->json([
-                        'message' => 'Ошибка создания черновика в Ozon: ' . json_encode($errors),
+                        'message' => 'Ошибка создания черновика в Ozon: ' . json_encode($errors, JSON_UNESCAPED_UNICODE),
+                        'debug' => [
+                            'status' => $status,
+                            'errors' => $errors,
+                            'full_response' => $createStatus,
+                        ],
                     ], 422);
                 }
-                
-                usleep(2000000);
             }
             
             if (empty($draftId) || $draftId == 0) {
+                \Log::error('[FBO Draft] draft_id не получен после ожидания', [
+                    'operation_id' => $operationId,
+                    'last_status' => $lastCreateStatus,
+                    'attempts' => $maxAttempts,
+                    'rate_limit_hits' => $rateLimitHits,
+                ]);
+                
+                $errorMessage = 'Черновик не был создан в Ozon после ожидания';
+                if ($rateLimitHits > 0) {
+                    $errorMessage = "Превышен лимит запросов к Ozon (rate limit: {$rateLimitHits} раз). Подождите 2-3 минуты и попробуйте снова.";
+                }
+                
                 return response()->json([
-                    'message' => 'Черновик не был создан в Ozon после ожидания',
+                    'message' => $errorMessage,
+                    'debug' => [
+                        'operation_id' => $operationId,
+                        'last_status_response' => $lastCreateStatus,
+                        'attempts_made' => $maxAttempts,
+                    ],
                 ], 422);
             }
 
-            // Извлекаем доступные склады из черновика
+            // Шаг 2: Извлекаем информацию о кластерах и складах из v1 API ответа
+            // v1 API уже возвращает clusters с warehouses и их доступностью
+            $availableClusters = [];
             $availableWarehouseId = null;
-            if (!empty($draftInfo['clusters'])) {
-                foreach ($draftInfo['clusters'] as $cluster) {
+            
+            $clustersFromV1 = $lastCreateStatus['clusters'] ?? [];
+            
+            \Log::info('[FBO Draft] Обработка кластеров из v1 API', [
+                'clusters_count' => count($clustersFromV1),
+            ]);
+
+            if (!empty($clustersFromV1)) {
+                foreach ($clustersFromV1 as $cluster) {
                     $clusterData = [
                         'cluster_id' => $cluster['cluster_id'] ?? null,
                         'cluster_name' => $cluster['cluster_name'] ?? null,
@@ -2283,17 +2375,24 @@ class ShipmentController extends Controller
                     ];
 
                     foreach ($cluster['warehouses'] ?? [] as $wh) {
-                        $isAvailable = ($wh['status']['is_available'] ?? false) === true;
+                        // v1 API: данные в supply_warehouse и status
+                        $supplyWarehouse = $wh['supply_warehouse'] ?? [];
+                        $status = $wh['status'] ?? [];
+                        $isAvailable = $status['is_available'] ?? false;
+                        
+                        $warehouseId = $supplyWarehouse['warehouse_id'] ?? $wh['warehouse_id'] ?? null;
+                        
                         $clusterData['warehouses'][] = [
-                            'warehouse_id' => $wh['supply_warehouse']['warehouse_id'] ?? null,
-                            'name' => $wh['supply_warehouse']['name'] ?? null,
-                            'address' => $wh['supply_warehouse']['address'] ?? null,
+                            'warehouse_id' => $warehouseId,
+                            'name' => $supplyWarehouse['name'] ?? $wh['name'] ?? null,
+                            'address' => $supplyWarehouse['address'] ?? $wh['address'] ?? null,
                             'is_available' => $isAvailable,
-                            'invalid_reason' => $wh['status']['invalid_reason'] ?? null,
+                            'invalid_reason' => $status['invalid_reason'] ?? null,
+                            'bundle_ids' => $wh['bundle_ids'] ?? [],
                         ];
 
                         if ($isAvailable && !$availableWarehouseId) {
-                            $availableWarehouseId = $wh['supply_warehouse']['warehouse_id'] ?? null;
+                            $availableWarehouseId = $warehouseId;
                         }
                     }
 
@@ -2302,6 +2401,12 @@ class ShipmentController extends Controller
                     }
                 }
             }
+            
+            \Log::info('[FBO Draft] Результат', [
+                'draft_id' => $draftId,
+                'available_clusters_count' => count($availableClusters),
+                'first_available_warehouse' => $availableWarehouseId,
+            ]);
 
             return response()->json([
                 'success' => true,
@@ -2348,72 +2453,17 @@ class ShipmentController extends Controller
 
         try {
             $marketplace = \App\Domains\Ozon\OzonMarketplace::fromIntegration($integration);
+            // Используем supplies API, который уже парсит слоты и делает fallback на v1 API
             $suppliesApi = $marketplace->supplies();
 
-            $timeslotsResponse = $suppliesApi->getDraftTimeslots($draftId, $warehouseId);
-
-            // Парсим слоты из разных структур ответа
-            $slots = [];
-            
-            // Структура 1: warehouses[].days[].timeslots[]
-            foreach ($timeslotsResponse['warehouses'] ?? [] as $wh) {
-                foreach ($wh['days'] ?? [] as $day) {
-                    $date = $day['date'] ?? null;
-                    foreach ($day['timeslots'] ?? [] as $slot) {
-                        $slots[] = [
-                            'id' => $slot['timeslot_id'] ?? md5(json_encode($slot)),
-                            'date' => $date ?? substr($slot['from'] ?? $slot['from_in_timezone'] ?? '', 0, 10),
-                            'time_from' => substr($slot['from_in_timezone'] ?? $slot['from'] ?? '', 11, 5),
-                            'time_to' => substr($slot['to_in_timezone'] ?? $slot['to'] ?? '', 11, 5),
-                            'from' => $slot['from_in_timezone'] ?? $slot['from'] ?? '',
-                            'to' => $slot['to_in_timezone'] ?? $slot['to'] ?? '',
-                            'is_available' => true,
-                        ];
-                    }
-                }
-            }
-            
-            // Структура 2: drop_off_warehouse_timeslots[].days[].timeslots[]
-            if (empty($slots)) {
-                foreach ($timeslotsResponse['drop_off_warehouse_timeslots'] ?? [] as $whTimeslots) {
-                    foreach ($whTimeslots['days'] ?? [] as $day) {
-                        $date = $day['date'] ?? null;
-                        foreach ($day['timeslots'] ?? [] as $slot) {
-                            $slots[] = [
-                                'id' => $slot['timeslot_id'] ?? md5(json_encode($slot)),
-                                'date' => $date ?? substr($slot['from'] ?? $slot['from_in_timezone'] ?? '', 0, 10),
-                                'time_from' => substr($slot['from_in_timezone'] ?? $slot['from'] ?? '', 11, 5),
-                                'time_to' => substr($slot['to_in_timezone'] ?? $slot['to'] ?? '', 11, 5),
-                                'from' => $slot['from_in_timezone'] ?? $slot['from'] ?? '',
-                                'to' => $slot['to_in_timezone'] ?? $slot['to'] ?? '',
-                                'is_available' => true,
-                            ];
-                        }
-                    }
-                }
-            }
-            
-            // Структура 3: days[].timeslots[] напрямую
-            if (empty($slots)) {
-                foreach ($timeslotsResponse['days'] ?? [] as $day) {
-                    $date = $day['date'] ?? null;
-                    foreach ($day['timeslots'] ?? [] as $slot) {
-                        $slots[] = [
-                            'id' => $slot['timeslot_id'] ?? md5(json_encode($slot)),
-                            'date' => $date ?? substr($slot['from'] ?? $slot['from_in_timezone'] ?? '', 0, 10),
-                            'time_from' => substr($slot['from_in_timezone'] ?? $slot['from'] ?? '', 11, 5),
-                            'time_to' => substr($slot['to_in_timezone'] ?? $slot['to'] ?? '', 11, 5),
-                            'from' => $slot['from_in_timezone'] ?? $slot['from'] ?? '',
-                            'to' => $slot['to_in_timezone'] ?? $slot['to'] ?? '',
-                            'is_available' => true,
-                        ];
-                    }
-                }
-            }
+            // SuppliesApi.getDraftTimeslots возвращает уже нормализованный массив слотов
+            $slots = $suppliesApi->getDraftTimeslots($draftId, $warehouseId);
 
             \Illuminate\Support\Facades\Log::info('Draft timeslots parsed', [
                 'draft_id' => $draftId,
+                'warehouse_id' => $warehouseId,
                 'slots_count' => count($slots),
+                'first_slot' => $slots[0] ?? null,
             ]);
 
             return response()->json([
@@ -2453,6 +2503,14 @@ class ShipmentController extends Controller
         $items = $request->input('items');
         $timeslotFrom = $request->input('timeslot_from');
         $timeslotTo = $request->input('timeslot_to');
+        
+        // Ozon требует формат ISO 8601 с Z на конце
+        if ($timeslotFrom && !str_ends_with($timeslotFrom, 'Z')) {
+            $timeslotFrom = rtrim($timeslotFrom, 'Z') . 'Z';
+        }
+        if ($timeslotTo && !str_ends_with($timeslotTo, 'Z')) {
+            $timeslotTo = rtrim($timeslotTo, 'Z') . 'Z';
+        }
 
         if ($integration->marketplace !== 'ozon') {
             return response()->json([
@@ -2464,18 +2522,50 @@ class ShipmentController extends Controller
             $marketplace = \App\Domains\Ozon\OzonMarketplace::fromIntegration($integration);
             $suppliesApi = $marketplace->fboSupplyOrders();
 
-            $supplyResult = $suppliesApi->createSupplyFromDraft(
-                (int) $draftId,
-                (int) $warehouseId,
-                (string) $timeslotFrom,
-                (string) $timeslotTo
-            );
+            // Обрабатываем rate limit с ретраями
+            $supplyResult = null;
+            $maxAttempts = 3;
+            for ($attempt = 1; $attempt <= $maxAttempts; $attempt++) {
+                if ($attempt > 1) {
+                    $delay = 3 * $attempt; // 6, 9 секунд
+                    \Log::info("[Confirm Draft] Rate limit, ждём {$delay} сек перед попыткой #{$attempt}");
+                    sleep($delay);
+                }
+                
+                $supplyResult = $suppliesApi->createSupplyFromDraft(
+                    (int) $draftId,
+                    (int) $warehouseId,
+                    (string) $timeslotFrom,
+                    (string) $timeslotTo
+                );
+                
+                $httpStatus = $supplyResult['_http_status'] ?? null;
+                $errorCode = $supplyResult['code'] ?? $supplyResult['error']['code'] ?? null;
+                $isRateLimit = $httpStatus === 429 || (int) $errorCode === 8;
+                
+                if (!$isRateLimit) {
+                    break;
+                }
+                
+                \Log::warning("[Confirm Draft] Rate limit при создании поставки, попытка #{$attempt}");
+            }
 
             $supplyOperationId = $supplyResult['operation_id'] ?? null;
             if (empty($supplyOperationId)) {
                 $ozonError = $supplyResult['error'] ?? null;
                 $ozonResponse = $supplyResult['response'] ?? null;
-                $details = $ozonError ?: $ozonResponse;
+                $ozonMessage = $supplyResult['message'] ?? null;
+                $httpStatus = $supplyResult['_http_status'] ?? null;
+                $errorCode = $supplyResult['code'] ?? $supplyResult['error']['code'] ?? null;
+                
+                // Проверяем rate limit
+                if ($httpStatus === 429 || (int) $errorCode === 8) {
+                    return response()->json([
+                        'message' => 'Превышен лимит запросов к Ozon. Подождите 2-3 минуты и попробуйте снова.',
+                    ], 429);
+                }
+                
+                $details = $ozonError ?: $ozonResponse ?: $ozonMessage;
                 $errorSuffix = $details ? ' (' . json_encode($details, JSON_UNESCAPED_UNICODE) . ')' : '';
                 throw new \RuntimeException('Не удалось создать заявку в Ozon: operation_id не получен' . $errorSuffix);
             }

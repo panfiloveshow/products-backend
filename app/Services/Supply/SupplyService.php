@@ -168,11 +168,30 @@ class SupplyService
         $integration = $supply->integration;
         $ozon = OzonMarketplace::fromIntegration($integration);
 
-        // Подготавливаем товары
-        $items = $supply->items->map(fn($item) => [
-            'sku' => $item->sku,
-            'quantity' => $item->planned_qty,
-        ])->toArray();
+        // Подготавливаем товары (Ozon требует числовой SKU)
+        $invalidSkus = [];
+        $items = $supply->items->map(function ($item) use (&$invalidSkus) {
+            $product = $item->product;
+            $ozonSku = $item->ozon_product_id
+                ?? $product?->ozon_product_id
+                ?? ($product?->ozon_data['sku'] ?? null)
+                ?? ($product?->ozon_data['product_id'] ?? null)
+                ?? $product?->marketplace_id
+                ?? $item->sku;
+
+            if (!$ozonSku || !is_numeric($ozonSku)) {
+                $invalidSkus[] = $item->sku;
+            }
+
+            return [
+                'sku' => $ozonSku,
+                'quantity' => $item->planned_qty,
+            ];
+        })->toArray();
+
+        if (!empty($invalidSkus)) {
+            throw new \RuntimeException('Не удалось определить числовой Ozon SKU для товаров: ' . implode(', ', $invalidSkus));
+        }
 
         $startTime = microtime(true);
 
@@ -180,6 +199,7 @@ class SupplyService
             // Выбираем метод создания черновика
             $result = match ($supply->supply_method) {
                 Supply::METHOD_DIRECT => $ozon->supplies()->createDirectDraft([
+                    'cluster_id' => $supply->cluster_id,
                     'macrolocal_cluster_id' => $supply->cluster_id,
                     'items' => $items,
                 ]),
@@ -285,7 +305,9 @@ class SupplyService
         
         $slots = $ozon->supplies()->getDraftTimeslots(
             $supply->ozon_draft_id,
-            $supply->warehouse_id
+            $supply->warehouse_id,
+            $supply->cluster_id,
+            $supply->warehouse_name
         );
 
         // Обновляем кэш
@@ -319,24 +341,40 @@ class SupplyService
         $startTime = microtime(true);
 
         try {
+            $slotData = TimeslotCache::where('timeslot_id', $timeslotId)->first();
+
+            $timeslotPayload = null;
+            if ($slotData?->datetime_from && $slotData?->datetime_to) {
+                $timeslotPayload = [
+                    'from' => $slotData->datetime_from->toIso8601String(),
+                    'to' => $slotData->datetime_to->toIso8601String(),
+                ];
+            } elseif ($supply->timeslot_from && $supply->timeslot_to) {
+                $timeslotPayload = [
+                    'from' => $supply->timeslot_from->toIso8601String(),
+                    'to' => $supply->timeslot_to->toIso8601String(),
+                ];
+            }
+
             $result = $ozon->supplies()->createSupplyFromDraft(
-                $supply->ozon_draft_id,
-                $supply->warehouse_id,
-                $timeslotId
+                (int) $supply->ozon_draft_id,
+                (int) $supply->warehouse_id,
+                $timeslotPayload
             );
 
             $duration = (int) ((microtime(true) - $startTime) * 1000);
 
-            // Получаем данные слота из кэша
-            $slotData = TimeslotCache::where('timeslot_id', $timeslotId)->first();
+            $timeslotFrom = $slotData?->datetime_from ?? $supply->timeslot_from;
+            $timeslotTo = $slotData?->datetime_to ?? $supply->timeslot_to;
+            $plannedDeliveryDate = $slotData?->slot_date ?? $supply->planned_delivery_date;
 
             // Обновляем поставку
             $supply->update([
                 'ozon_supply_id' => $result['supply_order_id'] ?? null,
                 'timeslot_id' => $timeslotId,
-                'timeslot_from' => $slotData?->datetime_from,
-                'timeslot_to' => $slotData?->datetime_to,
-                'planned_delivery_date' => $slotData?->slot_date,
+                'timeslot_from' => $timeslotFrom,
+                'timeslot_to' => $timeslotTo,
+                'planned_delivery_date' => $plannedDeliveryDate,
                 'ozon_response' => $result,
             ]);
 
