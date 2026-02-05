@@ -139,6 +139,12 @@ class ShipmentController extends Controller
             ?? ($shipment->meta['cluster_name'] ?? null);
         $meta = $shipment->meta ?? [];
         $gtdPath = $meta['gtd_file_path'] ?? null;
+        $gtdDownloadUrl = $gtdPath && \Route::has('api.shipments.gtd.download')
+            ? route('api.shipments.gtd.download', ['id' => $shipment->id])
+            : null;
+        $gtdTemplateUrl = \Route::has('api.shipments.gtd.template')
+            ? route('api.shipments.gtd.template', ['id' => $shipment->id])
+            : null;
         
         return [
             'id' => $shipment->id,
@@ -167,10 +173,8 @@ class ShipmentController extends Controller
                 'external_supply_id' => $shipment->external_supply_id,
                 'gtd_file_name' => $meta['gtd_file_name'] ?? null,
                 'gtd_uploaded_at' => $meta['gtd_uploaded_at'] ?? null,
-                'gtd_download_url' => $gtdPath
-                    ? route('api.shipments.gtd.download', ['id' => $shipment->id])
-                    : null,
-                'gtd_template_url' => route('api.shipments.gtd.template', ['id' => $shipment->id]),
+                'gtd_download_url' => $gtdDownloadUrl,
+                'gtd_template_url' => $gtdTemplateUrl,
             ]),
             'created_at' => $shipment->created_at?->toIso8601String(),
         ];
