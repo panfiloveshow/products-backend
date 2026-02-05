@@ -1246,21 +1246,32 @@ class SuppliesApi implements SuppliesApiInterface
             'input_data' => $data,
         ]);
 
-        $response = $this->client->post('/v1/draft/create', $body);
+        $response = null;
+        $maxAttempts = 3;
+        for ($attempt = 1; $attempt <= $maxAttempts; $attempt++) {
+            $response = $this->client->post('/v1/draft/create', $body);
 
-        \Log::info('Ozon crossdock draft response', [
-            'response' => $response,
-        ]);
+            \Log::info('Ozon crossdock draft response', [
+                'attempt' => $attempt,
+                'response' => $response,
+            ]);
 
-        if (!$response || empty($response['result'])) {
-            $errorMsg = $response['error']['message'] 
-                ?? $response['message'] 
-                ?? ($response['error'] ?? 'Unknown error');
-            if (is_array($errorMsg)) {
-                $errorMsg = json_encode($errorMsg);
+            if ($response && !empty($response['result'])) {
+                break;
             }
+
+            $errorMsg = $response['error']['message']
+                ?? $response['message']
+                ?? ($response['error'] ?? 'Unknown error');
+            $errorText = is_array($errorMsg) ? json_encode($errorMsg) : (string) $errorMsg;
+
+            if (str_contains(mb_strtolower($errorText), 'rate limit') && $attempt < $maxAttempts) {
+                sleep(1);
+                continue;
+            }
+
             throw new \RuntimeException(
-                'Не удалось создать черновик кросс-док поставки: ' . $errorMsg
+                'Не удалось создать черновик кросс-док поставки: ' . $errorText
             );
         }
 
@@ -1374,63 +1385,86 @@ class SuppliesApi implements SuppliesApiInterface
 
     /**
      * Fetch real warehouse coordinates from /v1/warehouse/list API
-     * Uses cache to avoid rate limiting (coordinates cached for 1 hour)
+     * Uses file cache to avoid rate limiting (cached for 24 hours)
      */
     private function fetchWarehouseCoordinates(): array
     {
-        // Use cache to avoid rate limiting - coordinates don't change often
-        $cacheKey = 'ozon_warehouse_coordinates';
-        
-        return \Cache::remember($cacheKey, 3600, function () {
-            $coordinates = [];
-            
-            // Only fetch a few major cities to minimize API calls
-            $searchTerms = ['Москва', 'Екатеринбург', 'Санкт-Петербург', 'Казань', 'Краснодар'];
-            
-            foreach ($searchTerms as $search) {
-                try {
-                    // Add delay between requests to avoid rate limit
-                    if (!empty($coordinates)) {
-                        usleep(200000); // 200ms delay
-                    }
-                    
-                    $response = $this->client->post('/v1/warehouse/list', [
-                        'search' => $search,
-                    ]);
-                    
-                    if (!$response) continue;
-                    
-                    $result = $response['result'] ?? $response;
-                    $warehouses = $result['search'] ?? $result['warehouses'] ?? [];
-                    
-                    foreach ($warehouses as $wh) {
-                        $whId = (string) ($wh['warehouse_id'] ?? $wh['id'] ?? null);
-                        $rawCoords = $wh['coordinates'] ?? null;
-                        
-                        if ($whId && is_array($rawCoords)) {
-                            $lat = $rawCoords['latitude'] ?? null;
-                            $lng = $rawCoords['longitude'] ?? null;
-                            if ($lat !== null && $lng !== null) {
-                                $coordinates[$whId] = [
-                                    'lat' => (float) $lat,
-                                    'lng' => (float) $lng,
-                                ];
-                            }
-                        }
-                    }
-                } catch (\Exception $e) {
-                    \Log::warning('Failed to fetch warehouse coordinates for: ' . $search, [
-                        'error' => $e->getMessage(),
-                    ]);
+        $cacheFile = storage_path('app/ozon_warehouse_coordinates.json');
+        $cacheTtl = 86400; // 24 hours
+
+        if (file_exists($cacheFile)) {
+            $mtime = filemtime($cacheFile);
+            if ($mtime && (time() - $mtime) < $cacheTtl) {
+                $cached = json_decode(file_get_contents($cacheFile), true);
+                if (is_array($cached)) {
+                    return $cached;
                 }
             }
-            
-            \Log::info('Fetched and cached warehouse coordinates', [
-                'count' => count($coordinates),
-            ]);
-            
-            return $coordinates;
-        });
+        }
+
+        $coordinates = [];
+        // Keep minimal to avoid rate limit spikes
+        $searchTerms = ['Москва', 'Санкт-Петербург', 'Екатеринбург'];
+
+        foreach ($searchTerms as $search) {
+            try {
+                if (!empty($coordinates)) {
+                    sleep(1); // 1 request/sec
+                }
+
+                $response = $this->client->post('/v1/warehouse/list', [
+                    'search' => $search,
+                ]);
+
+                if (!$response) {
+                    continue;
+                }
+
+                $errorMessage = $response['error']['message']
+                    ?? $response['message']
+                    ?? null;
+                if ($errorMessage && str_contains(mb_strtolower($errorMessage), 'rate limit')) {
+                    \Log::warning('Ozon rate limit while fetching coordinates', [
+                        'search' => $search,
+                        'message' => $errorMessage,
+                    ]);
+                    break;
+                }
+
+                $result = $response['result'] ?? $response;
+                $warehouses = $result['search'] ?? $result['warehouses'] ?? [];
+
+                foreach ($warehouses as $wh) {
+                    $whId = (string) ($wh['warehouse_id'] ?? $wh['id'] ?? null);
+                    $rawCoords = $wh['coordinates'] ?? null;
+
+                    if ($whId && is_array($rawCoords)) {
+                        $lat = $rawCoords['latitude'] ?? null;
+                        $lng = $rawCoords['longitude'] ?? null;
+                        if ($lat !== null && $lng !== null) {
+                            $coordinates[$whId] = [
+                                'lat' => (float) $lat,
+                                'lng' => (float) $lng,
+                            ];
+                        }
+                    }
+                }
+            } catch (\Exception $e) {
+                \Log::warning('Failed to fetch warehouse coordinates for: ' . $search, [
+                    'error' => $e->getMessage(),
+                ]);
+            }
+        }
+
+        if (!empty($coordinates)) {
+            file_put_contents($cacheFile, json_encode($coordinates));
+        }
+
+        \Log::info('Fetched warehouse coordinates', [
+            'count' => count($coordinates),
+        ]);
+
+        return $coordinates;
     }
 
     /**
