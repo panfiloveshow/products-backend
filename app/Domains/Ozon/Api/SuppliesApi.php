@@ -1216,9 +1216,19 @@ class SuppliesApi implements SuppliesApiInterface
     {
         $clusterId = $data['macrolocal_cluster_id'] ?? '';
         
+        // Items go inside cluster_info per Ozon API spec
+        $items = [];
+        if (!empty($data['items'])) {
+            $items = array_map(fn($item) => [
+                'sku' => (string) ($item['sku'] ?? $item['offer_id'] ?? ''),
+                'quantity' => (int) ($item['quantity'] ?? 0),
+            ], $data['items']);
+        }
+        
         $body = [
             'cluster_info' => [
                 'macrolocal_cluster_id' => (string) $clusterId,
+                'items' => $items,
             ],
             'delivery_scheme' => strtoupper($data['delivery_scheme'] ?? 'DROP_OFF'),
         ];
@@ -1230,13 +1240,6 @@ class SuppliesApi implements SuppliesApiInterface
             ];
         } else {
             $body['seller_warehouse_id'] = $data['seller_warehouse_id'] ?? '';
-        }
-
-        if (!empty($data['items'])) {
-            $body['items'] = array_map(fn($item) => [
-                'sku' => (string) ($item['sku'] ?? $item['offer_id'] ?? ''),
-                'quantity' => (int) ($item['quantity'] ?? 0),
-            ], $data['items']);
         }
 
         \Log::info('Ozon crossdock draft request', [
