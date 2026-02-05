@@ -1386,21 +1386,14 @@ class SuppliesApi implements SuppliesApiInterface
      */
     public function getFboWarehouses(array $params = []): array
     {
-        $body = [];
+        // Use /v1/cluster/list instead of /v1/warehouse/fbo/list
+        // because fbo/list requires search param with filter_by_supply_type
+        $response = $this->client->post('/v1/cluster/list', [
+            'cluster_type' => 'CLUSTER_TYPE_OZON',
+        ]);
 
-        if (!empty($params['filter_by_supply_type'])) {
-            $body['filter_by_supply_type'] = $params['filter_by_supply_type'];
-        }
-
-        if (!empty($params['search'])) {
-            $body['search'] = $params['search'];
-        }
-
-        $response = $this->client->post('/v1/warehouse/fbo/list', $body, empty($body));
-
-        \Log::info('Ozon FBO warehouses response', [
-            'request_body' => $body,
-            'response' => $response,
+        \Log::info('Ozon FBO warehouses response (from cluster/list)', [
+            'response_keys' => is_array($response) ? array_keys($response) : 'not_array',
         ]);
 
         if (!$response) {
@@ -1408,52 +1401,34 @@ class SuppliesApi implements SuppliesApiInterface
         }
 
         $result = $response['result'] ?? $response;
+        $clusters = $result['clusters'] ?? [];
         
-        // Debug: log response structure
-        \Log::info('Ozon FBO response structure', [
-            'response_keys' => is_array($response) ? array_keys($response) : 'not_array',
-            'result_keys' => is_array($result) ? array_keys($result) : 'not_array',
-            'has_result_clusters' => isset($result['clusters']),
-            'has_response_clusters' => isset($response['clusters']),
-        ]);
-        
-        // Ozon returns nested structure: clusters -> logistic_clusters -> warehouses
-        // We need to flatten all warehouses from all clusters
-        // clusters can be in result.clusters or response.clusters
+        // Flatten all warehouses from all clusters
         $warehouses = [];
-        $clusters = $result['clusters'] ?? $response['clusters'] ?? [];
-        
-        if (!empty($clusters)) {
-            foreach ($clusters as $cluster) {
-                $clusterId = $cluster['macrolocal_cluster_id'] ?? $cluster['id'] ?? null;
-                $clusterName = $cluster['name'] ?? null;
-                $logisticClusters = $cluster['logistic_clusters'] ?? [];
-                
-                foreach ($logisticClusters as $lc) {
-                    $lcWarehouses = $lc['warehouses'] ?? [];
-                    foreach ($lcWarehouses as $wh) {
-                        $wh['_cluster_id'] = $clusterId;
-                        $wh['_cluster_name'] = $clusterName;
-                        $warehouses[] = $wh;
-                    }
+        foreach ($clusters as $cluster) {
+            $clusterId = $cluster['macrolocal_cluster_id'] ?? $cluster['id'] ?? null;
+            $clusterName = $cluster['name'] ?? null;
+            $logisticClusters = $cluster['logistic_clusters'] ?? [];
+            
+            foreach ($logisticClusters as $lc) {
+                $lcWarehouses = $lc['warehouses'] ?? [];
+                foreach ($lcWarehouses as $wh) {
+                    $wh['_cluster_id'] = $clusterId;
+                    $wh['_cluster_name'] = $clusterName;
+                    $warehouses[] = $wh;
                 }
             }
-        }
-        
-        // Fallback to flat structure if no clusters
-        if (empty($warehouses)) {
-            $warehouses = $result['warehouses']
-                ?? $result['search']
-                ?? $result['items']
-                ?? $result
-                ?? [];
         }
         
         \Log::info('Ozon FBO warehouses parsed', [
             'clusters_count' => count($clusters),
             'warehouses_count' => count($warehouses),
-            'sample_types' => array_unique(array_column(array_slice($warehouses, 0, 20), 'type')),
+            'sample_types' => array_unique(array_column(array_slice($warehouses, 0, 50), 'type')),
         ]);
+        
+        if (empty($warehouses)) {
+            return $this->buildClusterWarehouses();
+        }
         
         $mapped = array_map(function($wh) {
             // Normalize coordinates from Ozon API format
