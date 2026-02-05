@@ -1465,6 +1465,70 @@ class SuppliesApi implements SuppliesApiInterface
     }
 
     /**
+     * Получить точки отгрузки для кросс-докинга (ПВЗ и СЦ)
+     * 
+     * POST /v1/warehouse/list
+     * 
+     * Возвращает ПВЗ (WAREHOUSE_TYPE_DELIVERY_POINT) и СЦ (WAREHOUSE_TYPE_SORTING_CENTER)
+     * для отгрузки товаров при кросс-докинге.
+     */
+    public function getCrossdockDropOffPoints(string $search = ''): array
+    {
+        $body = [
+            'filter_by_supply_type' => ['CREATE_TYPE_CROSSDOCK'],
+        ];
+        
+        if (!empty($search) && strlen($search) >= 4) {
+            $body['search'] = $search;
+        }
+
+        $response = $this->client->post('/v1/warehouse/list', $body);
+
+        \Log::info('Ozon crossdock drop-off points response', [
+            'request_body' => $body,
+            'response' => $response,
+        ]);
+
+        if (!$response) {
+            return [];
+        }
+
+        $result = $response['result'] ?? $response;
+        $warehouses = $result['search'] ?? $result['warehouses'] ?? $result ?? [];
+        
+        return array_map(function($wh) {
+            $rawCoords = $wh['coordinates'] ?? null;
+            $coordinates = null;
+            
+            if (is_array($rawCoords)) {
+                $lat = $rawCoords['latitude'] ?? null;
+                $lng = $rawCoords['longitude'] ?? null;
+                if ($lat !== null && $lng !== null) {
+                    $coordinates = [
+                        'lat' => (float) $lat,
+                        'lng' => (float) $lng,
+                    ];
+                }
+            }
+            
+            $warehouseType = $wh['warehouse_type'] ?? '';
+            $pointType = 'sc';
+            if (str_contains($warehouseType, 'DELIVERY_POINT')) {
+                $pointType = 'pvz';
+            }
+            
+            return [
+                'id' => (string) ($wh['warehouse_id'] ?? null),
+                'name' => $wh['name'] ?? null,
+                'type' => $pointType,
+                'warehouse_type' => $warehouseType,
+                'address' => $wh['address'] ?? null,
+                'coordinates' => $coordinates,
+            ];
+        }, $warehouses);
+    }
+
+    /**
      * Получить список складов продавца (для Pick Up)
      * 
      * POST /v1/warehouse/fbo/seller/list
