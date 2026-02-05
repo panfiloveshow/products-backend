@@ -1398,6 +1398,11 @@ class SuppliesApi implements SuppliesApiInterface
 
         $response = $this->client->post('/v1/warehouse/fbo/list', $body, empty($body));
 
+        \Log::info('Ozon FBO warehouses response', [
+            'request_body' => $body,
+            'response' => $response,
+        ]);
+
         if (!$response) {
             return $this->buildClusterWarehouses();
         }
