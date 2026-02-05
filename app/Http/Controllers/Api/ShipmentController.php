@@ -850,6 +850,10 @@ class ShipmentController extends Controller
         $warehouseId = $request->input('warehouse_id');
         $clusterId = $request->input('cluster_id');
         $items = $request->input('items');
+        $deliveryMethod = $request->input('delivery_method', 'direct');
+        $dropOffPointId = $request->input('drop_off_point_id');
+        $dropOffPointType = $request->input('drop_off_point_type');
+        $deliveryScheme = $request->input('delivery_scheme', 'drop_off');
         $userTimeslotFrom = $request->input('timeslot_from');
         $userTimeslotTo = $request->input('timeslot_to');
 
@@ -930,7 +934,13 @@ class ShipmentController extends Controller
                 $ozonDraft = $suppliesApi->createDirectDraft(
                     $ozonItems,
                     !empty($clusterIdForDraft) ? [(string) $clusterIdForDraft] : [],
-                    'CREATE_TYPE_DIRECT'
+                    'CREATE_TYPE_DIRECT',
+                    [
+                        'drop_off' => [
+                            'point_id' => $dropOffPointId,
+                            'point_type' => $dropOffPointType,
+                        ],
+                    ]
                 );
                 
                 $operationId = $ozonDraft['operation_id'] ?? null;
@@ -1271,6 +1281,7 @@ class ShipmentController extends Controller
         try {
             $marketplace = \App\Domains\Ozon\OzonMarketplace::fromIntegration($integration);
             $suppliesApi = $marketplace->fboSupplyOrders();
+            $suppliesPublicApi = $marketplace->supplies();
 
             // Получаем список заявок из Ozon (с пагинацией)
             $orderIds = [];
@@ -2876,6 +2887,10 @@ class ShipmentController extends Controller
             'integration_id' => 'required',
             'warehouse_id' => 'nullable',
             'cluster_id' => 'nullable',
+            'delivery_method' => 'nullable|in:direct,crossdock',
+            'drop_off_point_id' => 'nullable|string',
+            'drop_off_point_type' => 'nullable|string',
+            'delivery_scheme' => 'nullable|in:drop_off,pick_up',
             'items' => 'required|array|min:1',
             'items.*.sku' => 'required|string',
             'items.*.quantity' => 'required|integer|min:1',
@@ -2886,6 +2901,10 @@ class ShipmentController extends Controller
         $warehouseId = $request->input('warehouse_id');
         $clusterId = $request->input('cluster_id');
         $items = $request->input('items');
+        $deliveryMethod = $request->input('delivery_method', 'direct');
+        $dropOffPointId = $request->input('drop_off_point_id');
+        $dropOffPointType = $request->input('drop_off_point_type');
+        $deliveryScheme = $request->input('delivery_scheme', 'drop_off');
 
         if ($integration->marketplace !== 'ozon') {
             return response()->json([
@@ -2927,6 +2946,7 @@ class ShipmentController extends Controller
             
             $marketplace = \App\Domains\Ozon\OzonMarketplace::fromIntegration($integration);
             $suppliesApi = $marketplace->fboSupplyOrders();
+            $suppliesPublicApi = $marketplace->supplies();
 
             // ВАЖНО: Всегда создаём черновик БЕЗ кластера (пустой массив),
             // чтобы получить мультикластерный черновик и узнать доступность складов
@@ -2945,11 +2965,105 @@ class ShipmentController extends Controller
             $maxCreateAttempts = 3;
             for ($attempt = 1; $attempt <= $maxCreateAttempts; $attempt++) {
                 \Log::info("[FBO Draft] Попытка создания черновика #{$attempt}");
-                
+
+                $clusterIds = !empty($clusterId) ? [(string) $clusterId] : [];
+                $isCrossdock = $deliveryMethod === 'crossdock'
+                    || !empty($dropOffPointId)
+                    || !empty($dropOffPointType)
+                    || (!empty($deliveryScheme) && $deliveryScheme !== 'drop_off');
+                if ($isCrossdock) {
+                    $deliveryMethod = 'crossdock';
+                }
+                $draftType = $isCrossdock ? 'CREATE_TYPE_CROSSDOCK' : 'CREATE_TYPE_DIRECT';
+
+                if ($draftType === 'CREATE_TYPE_CROSSDOCK' && empty($dropOffPointId)) {
+                    return response()->json([
+                        'message' => 'Не указана точка отгрузки для кросс-докинга',
+                    ], 422);
+                }
+
+                if ($draftType === 'CREATE_TYPE_CROSSDOCK' && empty($dropOffPointType)) {
+                    return response()->json([
+                        'message' => 'Не указан тип точки отгрузки для кросс-докинга',
+                    ], 422);
+                }
+
+                if ($draftType === 'CREATE_TYPE_CROSSDOCK' && empty($clusterId)) {
+                    return response()->json([
+                        'message' => 'Не указан кластер для кросс-докинга',
+                    ], 422);
+                }
+
+                if ($draftType === 'CREATE_TYPE_CROSSDOCK') {
+                    $crossdockDraft = $suppliesPublicApi->createCrossdockDraft([
+                        'macrolocal_cluster_id' => (string) $clusterId,
+                        'delivery_scheme' => $deliveryScheme,
+                        'point_id' => (string) $dropOffPointId,
+                        'point_type' => (string) $dropOffPointType,
+                        'items' => $ozonItems,
+                    ]);
+
+                    $draftId = $crossdockDraft['draft_id'] ?? null;
+                    if (empty($draftId)) {
+                        return response()->json([
+                            'message' => 'Не удалось создать черновик кросс-докинга',
+                            'debug' => [
+                                'response' => $crossdockDraft,
+                            ],
+                        ], 422);
+                    }
+
+                    $draftInfo = $suppliesPublicApi->getDraftInfo((string) $draftId);
+                    $warehouses = $draftInfo['warehouses'] ?? [];
+                    $clustersMap = [];
+                    $availableWarehouseId = null;
+
+                    foreach ($warehouses as $warehouse) {
+                        $warehouseClusterId = (string) ($warehouse['cluster_id'] ?? '');
+                        if (!empty($clusterId) && $warehouseClusterId !== (string) $clusterId) {
+                            continue;
+                        }
+                        if (empty($clustersMap[$warehouseClusterId])) {
+                            $clustersMap[$warehouseClusterId] = [
+                                'cluster_id' => $warehouse['cluster_id'] ?? $clusterId,
+                                'cluster_name' => $warehouse['cluster_name'] ?? null,
+                                'warehouses' => [],
+                            ];
+                        }
+
+                        $isAvailable = $warehouse['is_available'] ?? true;
+                        $warehouseIdValue = $warehouse['warehouse_id'] ?? null;
+                        $clustersMap[$warehouseClusterId]['warehouses'][] = [
+                            'warehouse_id' => $warehouseIdValue,
+                            'name' => $warehouse['warehouse_name'] ?? null,
+                            'address' => $warehouse['address'] ?? null,
+                            'is_available' => $isAvailable,
+                            'invalid_reason' => $warehouse['invalid_reason'] ?? null,
+                            'bundle_ids' => [],
+                        ];
+
+                        if ($isAvailable && !$availableWarehouseId) {
+                            $availableWarehouseId = $warehouseIdValue;
+                        }
+                    }
+
+                    $availableClusters = array_values(array_filter($clustersMap, function ($cluster) {
+                        return !empty($cluster['warehouses']);
+                    }));
+
+                    return response()->json([
+                        'success' => true,
+                        'draft_id' => $draftId,
+                        'warehouse_id' => $availableWarehouseId,
+                        'available_clusters' => $availableClusters,
+                    ]);
+                }
+
                 $ozonDraft = $suppliesApi->createDirectDraft(
                     $ozonItems,
-                    [], // Пустой массив кластеров — мультикластерный черновик
-                    'CREATE_TYPE_DIRECT'
+                    $clusterIds,
+                    $draftType,
+                    $draftType === 'CREATE_TYPE_CROSSDOCK' ? (int) $dropOffPointId : null
                 );
 
                 \Log::info("[FBO Draft] Ответ createDirectDraft", [
@@ -3141,6 +3255,22 @@ class ShipmentController extends Controller
                 }
             }
             
+            if ($draftType === 'CREATE_TYPE_CROSSDOCK' && !empty($clusterId)) {
+                $availableClusters = array_values(array_filter($availableClusters, function ($cluster) use ($clusterId) {
+                    return (string) ($cluster['cluster_id'] ?? '') === (string) $clusterId;
+                }));
+
+                $availableWarehouseId = null;
+                foreach ($availableClusters as $cluster) {
+                    foreach ($cluster['warehouses'] ?? [] as $warehouse) {
+                        if (!empty($warehouse['is_available'])) {
+                            $availableWarehouseId = $warehouse['warehouse_id'] ?? null;
+                            break 2;
+                        }
+                    }
+                }
+            }
+
             \Log::info('[FBO Draft] Результат', [
                 'draft_id' => $draftId,
                 'available_clusters_count' => count($availableClusters),
@@ -3177,12 +3307,16 @@ class ShipmentController extends Controller
             'integration_id' => 'required',
             'draft_id' => 'required',
             'warehouse_id' => 'required',
+            'cluster_id' => 'nullable',
+            'warehouse_name' => 'nullable|string',
         ]);
 
         $integrationId = (string) $request->input('integration_id');
         $integration = \App\Models\Integration::findOrFail($integrationId);
         $draftId = (int) $request->input('draft_id');
         $warehouseId = (int) $request->input('warehouse_id');
+        $clusterId = $request->input('cluster_id');
+        $warehouseName = $request->input('warehouse_name');
 
         if ($integration->marketplace !== 'ozon') {
             return response()->json([
@@ -3196,7 +3330,12 @@ class ShipmentController extends Controller
             $suppliesApi = $marketplace->supplies();
 
             // SuppliesApi.getDraftTimeslots возвращает уже нормализованный массив слотов
-            $slots = $suppliesApi->getDraftTimeslots($draftId, $warehouseId);
+            $slots = $suppliesApi->getDraftTimeslots(
+                $draftId,
+                $warehouseId,
+                $clusterId ? (int) $clusterId : null,
+                $warehouseName
+            );
 
             \Illuminate\Support\Facades\Log::info('Draft timeslots parsed', [
                 'draft_id' => $draftId,
