@@ -874,17 +874,17 @@ class OzonDraftController extends Controller
             $suppliesApi = $ozon->supplies();
             
             $filterTypes = $validated['filter_by_supply_type'] ?? [];
+            $search = $validated['search'] ?? '';
             $isCrossdock = in_array('CREATE_TYPE_CROSSDOCK', $filterTypes);
             
-            // For crossdock use /v1/warehouse/list to get PVZ and SC points
-            if ($isCrossdock && method_exists($suppliesApi, 'getCrossdockDropOffPoints')) {
-                $warehouses = $suppliesApi->getCrossdockDropOffPoints(
-                    $validated['search'] ?? ''
-                );
+            // For crossdock with search (min 4 chars) use /v1/warehouse/list for PVZ/SC
+            // Otherwise use /v1/warehouse/fbo/list which returns all FBO points
+            if ($isCrossdock && strlen($search) >= 4 && method_exists($suppliesApi, 'getCrossdockDropOffPoints')) {
+                $warehouses = $suppliesApi->getCrossdockDropOffPoints($search);
             } else {
                 $warehouses = $suppliesApi->getFboWarehouses([
                     'filter_by_supply_type' => $filterTypes,
-                    'search' => $validated['search'] ?? null,
+                    'search' => $search ?: null,
                 ]);
             }
 
