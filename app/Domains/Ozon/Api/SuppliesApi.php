@@ -1374,59 +1374,63 @@ class SuppliesApi implements SuppliesApiInterface
 
     /**
      * Fetch real warehouse coordinates from /v1/warehouse/list API
-     * by searching major cities. Returns array [warehouse_id => ['lat' => x, 'lng' => y]]
+     * Uses cache to avoid rate limiting (coordinates cached for 1 hour)
      */
     private function fetchWarehouseCoordinates(): array
     {
-        $coordinates = [];
+        // Use cache to avoid rate limiting - coordinates don't change often
+        $cacheKey = 'ozon_warehouse_coordinates';
         
-        // Search terms to fetch warehouses with real coordinates
-        $searchTerms = [
-            'Москва', 'Екатеринбург', 'Санкт-Петербург', 'Казань', 'Новосибирск',
-            'Краснодар', 'Ростов', 'Воронеж', 'Самара', 'Нижний', 'Челябинск',
-            'Пермь', 'Волгоград', 'Красноярск', 'Уфа', 'Омск', 'Тюмень',
-            'Домодедово', 'Хоругвино', 'Коледино', 'Софьино', 'Пушкино',
-            'Адыгейск', 'Жуковский', 'Гривно', 'Давыдовское', 'Ватутинки',
-        ];
-        
-        foreach ($searchTerms as $search) {
-            try {
-                $response = $this->client->post('/v1/warehouse/list', [
-                    'search' => $search,
-                ]);
-                
-                if (!$response) continue;
-                
-                $result = $response['result'] ?? $response;
-                $warehouses = $result['search'] ?? $result['warehouses'] ?? [];
-                
-                foreach ($warehouses as $wh) {
-                    $whId = (string) ($wh['warehouse_id'] ?? $wh['id'] ?? null);
-                    $rawCoords = $wh['coordinates'] ?? null;
+        return \Cache::remember($cacheKey, 3600, function () {
+            $coordinates = [];
+            
+            // Only fetch a few major cities to minimize API calls
+            $searchTerms = ['Москва', 'Екатеринбург', 'Санкт-Петербург', 'Казань', 'Краснодар'];
+            
+            foreach ($searchTerms as $search) {
+                try {
+                    // Add delay between requests to avoid rate limit
+                    if (!empty($coordinates)) {
+                        usleep(200000); // 200ms delay
+                    }
                     
-                    if ($whId && is_array($rawCoords)) {
-                        $lat = $rawCoords['latitude'] ?? null;
-                        $lng = $rawCoords['longitude'] ?? null;
-                        if ($lat !== null && $lng !== null) {
-                            $coordinates[$whId] = [
-                                'lat' => (float) $lat,
-                                'lng' => (float) $lng,
-                            ];
+                    $response = $this->client->post('/v1/warehouse/list', [
+                        'search' => $search,
+                    ]);
+                    
+                    if (!$response) continue;
+                    
+                    $result = $response['result'] ?? $response;
+                    $warehouses = $result['search'] ?? $result['warehouses'] ?? [];
+                    
+                    foreach ($warehouses as $wh) {
+                        $whId = (string) ($wh['warehouse_id'] ?? $wh['id'] ?? null);
+                        $rawCoords = $wh['coordinates'] ?? null;
+                        
+                        if ($whId && is_array($rawCoords)) {
+                            $lat = $rawCoords['latitude'] ?? null;
+                            $lng = $rawCoords['longitude'] ?? null;
+                            if ($lat !== null && $lng !== null) {
+                                $coordinates[$whId] = [
+                                    'lat' => (float) $lat,
+                                    'lng' => (float) $lng,
+                                ];
+                            }
                         }
                     }
+                } catch (\Exception $e) {
+                    \Log::warning('Failed to fetch warehouse coordinates for: ' . $search, [
+                        'error' => $e->getMessage(),
+                    ]);
                 }
-            } catch (\Exception $e) {
-                \Log::warning('Failed to fetch warehouse coordinates for: ' . $search, [
-                    'error' => $e->getMessage(),
-                ]);
             }
-        }
-        
-        \Log::info('Fetched real warehouse coordinates', [
-            'count' => count($coordinates),
-        ]);
-        
-        return $coordinates;
+            
+            \Log::info('Fetched and cached warehouse coordinates', [
+                'count' => count($coordinates),
+            ]);
+            
+            return $coordinates;
+        });
     }
 
     /**
