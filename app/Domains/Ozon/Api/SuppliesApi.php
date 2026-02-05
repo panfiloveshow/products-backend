@@ -1234,6 +1234,7 @@ class SuppliesApi implements SuppliesApiInterface
             ],
             'delivery_info' => [
                 'delivery_scheme' => $deliveryScheme,
+                'type' => $deliveryScheme,
             ],
         ];
 
