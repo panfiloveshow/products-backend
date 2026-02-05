@@ -1216,44 +1216,37 @@ class SuppliesApi implements SuppliesApiInterface
     {
         $clusterId = $data['macrolocal_cluster_id'] ?? '';
         
-        // Items go inside cluster_info per Ozon API spec
+        // Items array per Ozon API spec
         $items = [];
         if (!empty($data['items'])) {
             $items = array_map(fn($item) => [
-                'sku' => (string) ($item['sku'] ?? $item['offer_id'] ?? ''),
+                'sku' => (int) ($item['sku'] ?? $item['offer_id'] ?? 0),
                 'quantity' => (int) ($item['quantity'] ?? 0),
             ], $data['items']);
         }
         
-        $deliveryScheme = strtoupper($data['delivery_scheme'] ?? 'DROP_OFF');
-        
+        // Use /v1/draft/create endpoint with correct format
+        // type: CREATE_TYPE_CROSSDOCK or CREATE_TYPE_DIRECT
+        // drop_off_point_warehouse_id: warehouse ID for crossdock
         $body = [
-            'cluster_info' => [
-                'macrolocal_cluster_id' => (string) $clusterId,
-                'items' => $items,
-            ],
-            'delivery_info' => [
-                'delivery_scheme' => $deliveryScheme,
-                'type' => $deliveryScheme,
-            ],
+            'cluster_ids' => !empty($clusterId) ? [(string) $clusterId] : [],
+            'type' => 'CREATE_TYPE_CROSSDOCK',
+            'items' => $items,
         ];
 
-        if (strtolower($data['delivery_scheme'] ?? 'drop_off') === 'drop_off') {
-            $body['delivery_info']['drop_off_point'] = [
-                'id' => (string) ($data['point_id'] ?? ''),
-                'type' => $data['point_type'] ?? '',
-            ];
-        } else {
-            $body['delivery_info']['seller_warehouse_id'] = $data['seller_warehouse_id'] ?? '';
+        // Add drop_off_point_warehouse_id for crossdock
+        $pointId = $data['point_id'] ?? '';
+        if (!empty($pointId)) {
+            $body['drop_off_point_warehouse_id'] = (int) $pointId;
         }
 
         \Log::info('Ozon crossdock draft request', [
-            'endpoint' => '/v1/draft/crossdock/create',
+            'endpoint' => '/v1/draft/create',
             'body' => $body,
             'input_data' => $data,
         ]);
 
-        $response = $this->client->post('/v1/draft/crossdock/create', $body);
+        $response = $this->client->post('/v1/draft/create', $body);
 
         \Log::info('Ozon crossdock draft response', [
             'response' => $response,
