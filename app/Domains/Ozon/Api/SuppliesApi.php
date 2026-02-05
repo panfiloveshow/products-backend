@@ -1225,21 +1225,25 @@ class SuppliesApi implements SuppliesApiInterface
             ], $data['items']);
         }
         
+        $deliveryScheme = strtoupper($data['delivery_scheme'] ?? 'DROP_OFF');
+        
         $body = [
             'cluster_info' => [
                 'macrolocal_cluster_id' => (string) $clusterId,
                 'items' => $items,
             ],
-            'delivery_scheme' => strtoupper($data['delivery_scheme'] ?? 'DROP_OFF'),
+            'delivery_info' => [
+                'delivery_scheme' => $deliveryScheme,
+            ],
         ];
 
         if (strtolower($data['delivery_scheme'] ?? 'drop_off') === 'drop_off') {
-            $body['drop_off_point'] = [
+            $body['delivery_info']['drop_off_point'] = [
                 'id' => (string) ($data['point_id'] ?? ''),
                 'type' => $data['point_type'] ?? '',
             ];
         } else {
-            $body['seller_warehouse_id'] = $data['seller_warehouse_id'] ?? '';
+            $body['delivery_info']['seller_warehouse_id'] = $data['seller_warehouse_id'] ?? '';
         }
 
         \Log::info('Ozon crossdock draft request', [
