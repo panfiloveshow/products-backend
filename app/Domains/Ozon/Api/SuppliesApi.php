@@ -1440,6 +1440,12 @@ class SuppliesApi implements SuppliesApiInterface
                 ?? [];
         }
         
+        \Log::info('Ozon FBO warehouses parsed', [
+            'clusters_count' => count($clusters),
+            'warehouses_count' => count($warehouses),
+            'sample_types' => array_unique(array_column(array_slice($warehouses, 0, 20), 'type')),
+        ]);
+        
         $mapped = array_map(function($wh) {
             // Normalize coordinates from Ozon API format
             $rawCoords = $wh['coordinates'] ?? ($wh['address']['coordinates'] ?? null);
