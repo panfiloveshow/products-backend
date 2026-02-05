@@ -1219,9 +1219,9 @@ class SuppliesApi implements SuppliesApiInterface
             'delivery_scheme' => strtoupper($data['delivery_scheme'] ?? 'DROP_OFF'),
         ];
 
-        if (($data['delivery_scheme'] ?? '') === 'drop_off') {
+        if (strtolower($data['delivery_scheme'] ?? 'drop_off') === 'drop_off') {
             $body['drop_off_point'] = [
-                'id' => $data['point_id'] ?? '',
+                'id' => (string) ($data['point_id'] ?? ''),
                 'type' => $data['point_type'] ?? '',
             ];
         } else {
@@ -1230,17 +1230,32 @@ class SuppliesApi implements SuppliesApiInterface
 
         if (!empty($data['items'])) {
             $body['items'] = array_map(fn($item) => [
-                'sku' => $item['sku'] ?? $item['offer_id'] ?? '',
-                'quantity' => $item['quantity'] ?? 0,
+                'sku' => (string) ($item['sku'] ?? $item['offer_id'] ?? ''),
+                'quantity' => (int) ($item['quantity'] ?? 0),
             ], $data['items']);
         }
 
+        \Log::info('Ozon crossdock draft request', [
+            'endpoint' => '/v1/draft/crossdock/create',
+            'body' => $body,
+            'input_data' => $data,
+        ]);
+
         $response = $this->client->post('/v1/draft/crossdock/create', $body);
 
+        \Log::info('Ozon crossdock draft response', [
+            'response' => $response,
+        ]);
+
         if (!$response || empty($response['result'])) {
+            $errorMsg = $response['error']['message'] 
+                ?? $response['message'] 
+                ?? ($response['error'] ?? 'Unknown error');
+            if (is_array($errorMsg)) {
+                $errorMsg = json_encode($errorMsg);
+            }
             throw new \RuntimeException(
-                'Не удалось создать черновик кросс-док поставки: ' . 
-                ($response['error']['message'] ?? 'Unknown error')
+                'Не удалось создать черновик кросс-док поставки: ' . $errorMsg
             );
         }
 
