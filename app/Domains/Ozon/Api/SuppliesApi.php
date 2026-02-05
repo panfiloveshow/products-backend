@@ -1409,6 +1409,14 @@ class SuppliesApi implements SuppliesApiInterface
 
         $result = $response['result'] ?? $response;
         
+        // Debug: log response structure
+        \Log::info('Ozon FBO response structure', [
+            'response_keys' => is_array($response) ? array_keys($response) : 'not_array',
+            'result_keys' => is_array($result) ? array_keys($result) : 'not_array',
+            'has_result_clusters' => isset($result['clusters']),
+            'has_response_clusters' => isset($response['clusters']),
+        ]);
+        
         // Ozon returns nested structure: clusters -> logistic_clusters -> warehouses
         // We need to flatten all warehouses from all clusters
         // clusters can be in result.clusters or response.clusters
