@@ -1380,14 +1380,70 @@ class SuppliesApi implements SuppliesApiInterface
     // Метод getSupplyCreateStatus определён выше
 
     /**
+     * Fetch real warehouse coordinates from /v1/warehouse/list API
+     * by searching major cities. Returns array [warehouse_id => ['lat' => x, 'lng' => y]]
+     */
+    private function fetchWarehouseCoordinates(): array
+    {
+        $coordinates = [];
+        
+        // Search terms to fetch warehouses with real coordinates
+        $searchTerms = [
+            'Москва', 'Екатеринбург', 'Санкт-Петербург', 'Казань', 'Новосибирск',
+            'Краснодар', 'Ростов', 'Воронеж', 'Самара', 'Нижний', 'Челябинск',
+            'Пермь', 'Волгоград', 'Красноярск', 'Уфа', 'Омск', 'Тюмень',
+            'Домодедово', 'Хоругвино', 'Коледино', 'Софьино', 'Пушкино',
+            'Адыгейск', 'Жуковский', 'Гривно', 'Давыдовское', 'Ватутинки',
+        ];
+        
+        foreach ($searchTerms as $search) {
+            try {
+                $response = $this->client->post('/v1/warehouse/list', [
+                    'search' => $search,
+                ]);
+                
+                if (!$response) continue;
+                
+                $result = $response['result'] ?? $response;
+                $warehouses = $result['search'] ?? $result['warehouses'] ?? [];
+                
+                foreach ($warehouses as $wh) {
+                    $whId = (string) ($wh['warehouse_id'] ?? $wh['id'] ?? null);
+                    $rawCoords = $wh['coordinates'] ?? null;
+                    
+                    if ($whId && is_array($rawCoords)) {
+                        $lat = $rawCoords['latitude'] ?? null;
+                        $lng = $rawCoords['longitude'] ?? null;
+                        if ($lat !== null && $lng !== null) {
+                            $coordinates[$whId] = [
+                                'lat' => (float) $lat,
+                                'lng' => (float) $lng,
+                            ];
+                        }
+                    }
+                }
+            } catch (\Exception $e) {
+                \Log::warning('Failed to fetch warehouse coordinates for: ' . $search, [
+                    'error' => $e->getMessage(),
+                ]);
+            }
+        }
+        
+        \Log::info('Fetched real warehouse coordinates', [
+            'count' => count($coordinates),
+        ]);
+        
+        return $coordinates;
+    }
+
+    /**
      * Получить список складов FBO
      * 
      * POST /v1/warehouse/fbo/list
      */
     public function getFboWarehouses(array $params = []): array
     {
-        // Use /v1/cluster/list instead of /v1/warehouse/fbo/list
-        // because fbo/list requires search param with filter_by_supply_type
+        // First get all warehouses from /v1/cluster/list (no coordinates)
         $response = $this->client->post('/v1/cluster/list', [
             'cluster_type' => 'CLUSTER_TYPE_OZON',
         ]);
@@ -1395,6 +1451,9 @@ class SuppliesApi implements SuppliesApiInterface
         \Log::info('Ozon FBO warehouses response (from cluster/list)', [
             'response_keys' => is_array($response) ? array_keys($response) : 'not_array',
         ]);
+        
+        // Then get real coordinates from /v1/warehouse/list by searching major cities
+        $warehouseCoordinates = $this->fetchWarehouseCoordinates();
 
         if (!$response) {
             return $this->buildClusterWarehouses();
@@ -1636,30 +1695,36 @@ class SuppliesApi implements SuppliesApiInterface
             'НИНО' => [56.2965, 43.9361],
         ];
         
-        $mapped = array_map(function($wh) use ($cityCoordinates) {
-            // Normalize coordinates from Ozon API format
-            $rawCoords = $wh['coordinates'] ?? ($wh['address']['coordinates'] ?? null);
+        $mapped = array_map(function($wh) use ($cityCoordinates, $warehouseCoordinates) {
+            $warehouseId = (string) ($wh['warehouse_id'] ?? $wh['id'] ?? null);
             $coordinates = null;
             
-            if (is_array($rawCoords)) {
-                // Ozon returns { latitude: number, longitude: number }
-                $lat = $rawCoords['latitude'] ?? $rawCoords['lat'] ?? null;
-                $lng = $rawCoords['longitude'] ?? $rawCoords['lng'] ?? $rawCoords['lon'] ?? null;
-                if ($lat !== null && $lng !== null) {
-                    $coordinates = [
-                        'lat' => (float) $lat,
-                        'lng' => (float) $lng,
-                    ];
+            // First try to get real coordinates from /v1/warehouse/list cache
+            if (isset($warehouseCoordinates[$warehouseId])) {
+                $coordinates = $warehouseCoordinates[$warehouseId];
+            }
+            
+            // Then try coordinates from cluster/list response
+            if (!$coordinates) {
+                $rawCoords = $wh['coordinates'] ?? ($wh['address']['coordinates'] ?? null);
+                if (is_array($rawCoords)) {
+                    $lat = $rawCoords['latitude'] ?? $rawCoords['lat'] ?? null;
+                    $lng = $rawCoords['longitude'] ?? $rawCoords['lng'] ?? $rawCoords['lon'] ?? null;
+                    if ($lat !== null && $lng !== null) {
+                        $coordinates = [
+                            'lat' => (float) $lat,
+                            'lng' => (float) $lng,
+                        ];
+                    }
                 }
             }
             
-            // If no coordinates from API, try to extract from warehouse name
+            // Fallback: extract from warehouse name using city coordinates
             if (!$coordinates) {
                 $whName = strtoupper($wh['name'] ?? '');
                 foreach ($cityCoordinates as $city => $coords) {
                     if (str_contains($whName, $city)) {
-                        // Add small random offset to prevent markers from stacking
-                        $offset = (crc32($wh['warehouse_id'] ?? $wh['name'] ?? '') % 100) / 10000;
+                        $offset = (crc32($warehouseId ?? $wh['name'] ?? '') % 100) / 10000;
                         $coordinates = [
                             'lat' => $coords[0] + $offset,
                             'lng' => $coords[1] + $offset,
