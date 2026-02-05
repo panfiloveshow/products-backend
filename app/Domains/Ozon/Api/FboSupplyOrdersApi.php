@@ -179,7 +179,6 @@ class FboSupplyOrdersApi
     {
         $response = $this->client->post('/v1/supply-order/cancel', [
             'order_id' => $supplyOrderId,
-            'supply_order_id' => $supplyOrderId,
         ]);
 
         Log::info('Ozon FBO supply-order/cancel', [

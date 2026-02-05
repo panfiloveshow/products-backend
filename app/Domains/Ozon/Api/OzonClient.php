@@ -86,6 +86,36 @@ class OzonClient
     }
 
     /**
+     * Скачать файл (PDF) из Ozon API
+     */
+    public function download(string $endpoint): ?string
+    {
+        try {
+            $response = Http::withHeaders($this->getHeaders())
+                ->timeout($this->timeout)
+                ->get(self::BASE_URL . $endpoint);
+
+            if ($response->successful()) {
+                return $response->body();
+            }
+
+            Log::warning('Ozon API file download error', [
+                'endpoint' => $endpoint,
+                'status' => $response->status(),
+                'body' => $response->body(),
+            ]);
+
+            return null;
+        } catch (\Exception $e) {
+            Log::error('Ozon API file download exception', [
+                'endpoint' => $endpoint,
+                'error' => $e->getMessage(),
+            ]);
+            return null;
+        }
+    }
+
+    /**
      * GET запрос к API
      */
     public function get(string $endpoint, array $params = []): ?array

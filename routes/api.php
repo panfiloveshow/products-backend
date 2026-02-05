@@ -133,6 +133,8 @@ Route::prefix('shipments')->middleware('throttle:api')->group(function () {
     Route::post('/{id}/items', [ShipmentController::class, 'addItem']);
     Route::put('/{id}/items/{itemId}', [ShipmentController::class, 'updateItem']);
     Route::delete('/{id}/items/{itemId}', [ShipmentController::class, 'removeItem']);
+    Route::get('/items/template', [ShipmentController::class, 'downloadItemsTemplate']);
+    Route::post('/items/upload', [ShipmentController::class, 'uploadItemsFile']);
     
     // Workflow
     Route::post('/{id}/submit', [ShipmentController::class, 'submit']);
@@ -149,9 +151,19 @@ Route::prefix('shipments')->middleware('throttle:api')->group(function () {
     // Грузоместа и этикетки (FBO)
     Route::get('/{id}/cargoes', [ShipmentController::class, 'getCargoes']);
     Route::post('/{id}/cargoes', [ShipmentController::class, 'createCargoes']);
+    Route::post('/{id}/cargoes/sync-ozon', [ShipmentController::class, 'syncCargoesFromOzon']);
+    Route::put('/{id}/cargoes/{cargoId}/items', [ShipmentController::class, 'updateCargoItems']);
     Route::post('/{id}/cargoes/labels', [ShipmentController::class, 'createCargoLabels']);
     Route::get('/{id}/cargoes/labels/{taskId}', [ShipmentController::class, 'getCargoLabelsStatus']);
     Route::get('/{id}/cargoes/labels/{fileGuid}/download', [ShipmentController::class, 'downloadCargoLabels']);
+
+    // Документы поставки (ГТД)
+    Route::post('/{id}/gtd', [ShipmentController::class, 'uploadGtd']);
+    Route::get('/{id}/gtd/download', [ShipmentController::class, 'downloadGtd'])->name('api.shipments.gtd.download');
+    Route::get('/{id}/gtd/template', [ShipmentController::class, 'downloadGtdTemplate'])->name('api.shipments.gtd.template');
+
+    // Прогноз стоимости поставки (Ozon)
+    Route::post('/{id}/cost-forecast', [ShipmentController::class, 'getCostForecast']);
     
     // Состав заявки
     Route::get('/{id}/bundle', [ShipmentController::class, 'getBundle']);

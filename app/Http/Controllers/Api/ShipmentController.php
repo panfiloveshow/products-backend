@@ -16,6 +16,11 @@ use App\Models\ShipmentRecommendation;
 use App\Services\ShipmentService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Storage;
+use PhpOffice\PhpSpreadsheet\Spreadsheet;
+use PhpOffice\PhpSpreadsheet\IOFactory;
+use PhpOffice\PhpSpreadsheet\Reader\Csv;
+use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
 
 class ShipmentController extends Controller
 {
@@ -132,6 +137,8 @@ class ShipmentController extends Controller
         $warehouseName = $shipment->warehouse_name
             ?? ($shipment->meta['warehouse_name'] ?? null)
             ?? ($shipment->meta['cluster_name'] ?? null);
+        $meta = $shipment->meta ?? [];
+        $gtdPath = $meta['gtd_file_path'] ?? null;
         
         return [
             'id' => $shipment->id,
@@ -140,6 +147,7 @@ class ShipmentController extends Controller
             'warehouse_id' => $shipment->warehouse_id,
             'warehouse_name' => $warehouseName,
             'status' => $shipment->status,
+            'external_supply_id' => $shipment->external_supply_id,
             'external_status' => $shipment->external_status,
             'status_label' => Shipment::getStatuses()[$shipment->status] ?? $shipment->status,
             'status_color' => $this->getStatusColor($shipment->status),
@@ -155,11 +163,399 @@ class ShipmentController extends Controller
                 'name' => $item->product_name ?? $item->sku,
                 'quantity' => $item->quantity ?? 0,
             ])->toArray(),
-            'meta' => array_merge($shipment->meta ?? [], [
+            'meta' => array_merge($meta, [
                 'external_supply_id' => $shipment->external_supply_id,
+                'gtd_file_name' => $meta['gtd_file_name'] ?? null,
+                'gtd_uploaded_at' => $meta['gtd_uploaded_at'] ?? null,
+                'gtd_download_url' => $gtdPath
+                    ? route('api.shipments.gtd.download', ['id' => $shipment->id])
+                    : null,
+                'gtd_template_url' => route('api.shipments.gtd.template', ['id' => $shipment->id]),
             ]),
             'created_at' => $shipment->created_at?->toIso8601String(),
         ];
+    }
+
+    /**
+     * Загрузить ГТД для поставки
+     * POST /api/shipments/{id}/gtd
+     */
+    public function uploadGtd(Request $request, string $id): JsonResponse
+    {
+        $shipment = Shipment::findOrFail($id);
+
+        $request->validate([
+            'file' => 'required|file|mimes:xls,xlsx,csv|max:10240',
+        ]);
+
+        $file = $request->file('file');
+        $directory = "shipments/{$shipment->id}/gtd";
+        $filename = 'gtd_' . now()->format('Ymd_His') . '.' . $file->getClientOriginalExtension();
+        $path = $file->storeAs($directory, $filename);
+
+        $meta = $shipment->meta ?? [];
+        $meta['gtd_file_path'] = $path;
+        $meta['gtd_file_name'] = $file->getClientOriginalName();
+        $meta['gtd_uploaded_at'] = now()->toIso8601String();
+
+        $shipment->update([
+            'meta' => $meta,
+        ]);
+
+        return response()->json([
+            'success' => true,
+            'data' => [
+                'file_name' => $meta['gtd_file_name'],
+                'download_url' => route('api.shipments.gtd.download', ['id' => $shipment->id]),
+                'uploaded_at' => $meta['gtd_uploaded_at'],
+            ],
+            'message' => 'ГТД загружен',
+        ]);
+    }
+
+    /**
+     * Скачать ГТД
+     * GET /api/shipments/{id}/gtd/download
+     */
+    public function downloadGtd(string $id)
+    {
+        $shipment = Shipment::findOrFail($id);
+        $meta = $shipment->meta ?? [];
+        $path = $meta['gtd_file_path'] ?? null;
+
+        if (!$path || !Storage::exists($path)) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Файл ГТД не найден',
+            ], 404);
+        }
+
+        $filename = $meta['gtd_file_name'] ?? basename($path);
+
+        return Storage::download($path, $filename);
+    }
+
+    /**
+     * Скачать шаблон ГТД
+     * GET /api/shipments/{id}/gtd/template
+     */
+    public function downloadGtdTemplate(string $id)
+    {
+        $shipment = Shipment::with('items')->findOrFail($id);
+
+        $spreadsheet = new Spreadsheet();
+        $sheet = $spreadsheet->getActiveSheet();
+        $sheet->setTitle('GTD');
+
+        $sheet->setCellValue('A1', 'SKU');
+        $sheet->setCellValue('B1', 'Название');
+        $sheet->setCellValue('C1', 'Номер ГТД');
+
+        $row = 2;
+        foreach ($shipment->items as $item) {
+            $sheet->setCellValue("A{$row}", $item->sku);
+            $sheet->setCellValue("B{$row}", $item->product_name ?? $item->sku);
+            $sheet->setCellValue("C{$row}", '');
+            $row++;
+        }
+
+        $writer = new Xlsx($spreadsheet);
+        $filename = "gtd_template_{$shipment->id}.xlsx";
+
+        return response()->streamDownload(function () use ($writer) {
+            $writer->save('php://output');
+        }, $filename, [
+            'Content-Type' => 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        ]);
+    }
+
+    /**
+     * Скачать шаблон для массового добавления товаров
+     * GET /api/shipments/items/template
+     */
+    public function downloadItemsTemplate()
+    {
+        $spreadsheet = new Spreadsheet();
+        $sheet = $spreadsheet->getActiveSheet();
+        $sheet->setTitle('Items');
+
+        $sheet->setCellValue('A1', 'SKU');
+        $sheet->setCellValue('B1', 'Количество');
+
+        $sheet->setCellValue('A2', 'SKU-123');
+        $sheet->setCellValue('B2', 10);
+
+        $writer = new Xlsx($spreadsheet);
+        $filename = 'shipment_items_template.xlsx';
+
+        return response()->streamDownload(function () use ($writer) {
+            $writer->save('php://output');
+        }, $filename, [
+            'Content-Type' => 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        ]);
+    }
+
+    /**
+     * Загрузить файл с товарами для массового добавления
+     * POST /api/shipments/items/upload
+     */
+    public function uploadItemsFile(Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'file' => 'required|file|mimes:xls,xlsx,csv|max:10240',
+            'integration_id' => 'nullable|integer|exists:integrations,id',
+        ]);
+
+        $file = $request->file('file');
+        $extension = strtolower($file->getClientOriginalExtension());
+
+        if ($extension === 'csv') {
+            $reader = new Csv();
+            $reader->setDelimiter(';');
+            $reader->setEnclosure('"');
+            $spreadsheet = $reader->load($file->getRealPath());
+            $rows = $spreadsheet->getActiveSheet()->toArray(null, true, true, true);
+
+            $firstRow = $rows[1] ?? [];
+            $nonEmpty = array_filter($firstRow, fn ($value) => $value !== null && $value !== '');
+            if (count($nonEmpty) <= 1) {
+                $reader->setDelimiter(',');
+                $spreadsheet = $reader->load($file->getRealPath());
+            }
+        } else {
+            $spreadsheet = IOFactory::load($file->getRealPath());
+        }
+
+        $sheet = $spreadsheet->getActiveSheet();
+        $rows = $sheet->toArray(null, true, true, true);
+
+        $headerRow = $rows[1] ?? [];
+        $skuColumn = 'A';
+        $qtyColumn = 'B';
+
+        foreach ($headerRow as $col => $value) {
+            $label = mb_strtolower(trim((string) $value));
+            if (in_array($label, ['sku', 'артикул', 'seller sku', 'seller_sku'], true)) {
+                $skuColumn = $col;
+            }
+            if (str_contains($label, 'кол') || str_contains($label, 'quantity')) {
+                $qtyColumn = $col;
+            }
+        }
+
+        $itemsBySku = [];
+        $errors = [];
+        $skipped = 0;
+
+        foreach ($rows as $rowIndex => $row) {
+            if ($rowIndex === 1) {
+                continue;
+            }
+
+            $sku = trim((string) ($row[$skuColumn] ?? ''));
+            $qtyRaw = $row[$qtyColumn] ?? null;
+
+            if ($sku === '') {
+                $skipped++;
+                continue;
+            }
+
+            $quantity = (int) $qtyRaw;
+            if ($quantity <= 0) {
+                $errors[] = [
+                    'row' => $rowIndex,
+                    'sku' => $sku,
+                    'message' => 'Количество должно быть больше 0',
+                ];
+                continue;
+            }
+
+            $itemsBySku[$sku] = ($itemsBySku[$sku] ?? 0) + $quantity;
+        }
+
+        if (empty($itemsBySku)) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Файл не содержит товаров для добавления',
+            ], 422);
+        }
+
+        $items = [];
+        $integrationId = $validated['integration_id'] ?? null;
+
+        $productsQuery = \App\Models\Product::query()->whereIn('sku', array_keys($itemsBySku));
+        if ($integrationId) {
+            $productsQuery->where('integration_id', $integrationId);
+        }
+        $products = $productsQuery->get()->keyBy('sku');
+
+        foreach ($itemsBySku as $sku => $quantity) {
+            $product = $products->get($sku);
+            $items[] = [
+                'sku' => $sku,
+                'quantity' => $quantity,
+                'name' => $product?->name,
+                'barcode' => $product?->barcode ?? null,
+            ];
+        }
+
+        return response()->json([
+            'success' => true,
+            'data' => [
+                'items' => $items,
+                'errors' => $errors,
+                'skipped' => $skipped,
+            ],
+        ]);
+    }
+
+    /**
+     * Прогноз стоимости поставки (Ozon)
+     * POST /api/shipments/{id}/cost-forecast
+     */
+    public function getCostForecast(string $id): JsonResponse
+    {
+        $shipment = Shipment::with('items')->findOrFail($id);
+
+        if ($shipment->marketplace !== 'ozon') {
+            return response()->json([
+                'success' => false,
+                'message' => 'Прогноз стоимости доступен только для Ozon',
+            ], 422);
+        }
+
+        $integration = \App\Models\Integration::find($shipment->integration_id);
+        if (!$integration) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Интеграция не найдена',
+            ], 422);
+        }
+
+        $warehouseId = $shipment->warehouse_id
+            ?? ($shipment->meta['warehouse_id'] ?? null);
+
+        if (!$warehouseId) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Не указан склад для прогноза стоимости',
+            ], 422);
+        }
+
+        try {
+            $ozon = \App\Domains\Ozon\OzonMarketplace::fromIntegration($integration);
+            $suppliesApi = $ozon->supplies();
+
+            $ozonItems = [];
+            $missingSkus = [];
+
+            foreach ($shipment->items as $item) {
+                $product = \App\Models\Product::where('sku', $item->sku)
+                    ->where('integration_id', $integration->id)
+                    ->first();
+
+                $ozonSku = $product?->ozon_data['sku'] ?? null;
+
+                if (!empty($ozonSku)) {
+                    $ozonItems[] = [
+                        'sku' => (int) $ozonSku,
+                        'quantity' => (int) ($item->quantity ?? 0),
+                    ];
+                } else {
+                    $missingSkus[] = $item->sku;
+                }
+            }
+
+            if (!empty($missingSkus)) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Нет Ozon SKU для товаров: ' . implode(', ', $missingSkus),
+                ], 422);
+            }
+
+            if (empty($ozonItems)) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Нет товаров для расчёта',
+                ], 422);
+            }
+
+            $clusterId = $shipment->meta['cluster_id'] ?? null;
+
+            if (!$clusterId && method_exists($suppliesApi, 'getFboWarehouses')) {
+                $fboWarehouses = $suppliesApi->getFboWarehouses();
+                foreach ($fboWarehouses as $wh) {
+                    if ((string) ($wh['id'] ?? '') === (string) $warehouseId) {
+                        $clusterId = (string) ($wh['cluster_id'] ?? $clusterId);
+                        break;
+                    }
+                }
+            }
+
+            if (!$clusterId && method_exists($suppliesApi, 'getClusters')) {
+                $clusters = $suppliesApi->getClusters();
+                foreach ($clusters as $cluster) {
+                    $warehouseIds = $cluster['warehouse_ids'] ?? $cluster['all_warehouse_ids'] ?? [];
+                    $warehouseIds = array_map('strval', $warehouseIds);
+
+                    if (in_array((string) $warehouseId, $warehouseIds, true)) {
+                        $clusterId = (string) ($cluster['id'] ?? null);
+                        break;
+                    }
+                }
+            }
+
+            if (!$clusterId) {
+                $clusterId = (string) $warehouseId;
+            }
+
+            $draft = $suppliesApi->createDirectDraft([
+                'cluster_id' => $clusterId,
+                'items' => $ozonItems,
+            ]);
+
+            $draftId = $draft['draft_id'] ?? null;
+            if (!$draftId) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Не удалось создать черновик для расчёта стоимости',
+                ], 422);
+            }
+
+            $draftInfo = $suppliesApi->getDraftInfo((string) $draftId);
+            $warehouses = $draftInfo['warehouses'] ?? [];
+            $warehouseInfo = null;
+
+            foreach ($warehouses as $wh) {
+                if ((string) ($wh['warehouse_id'] ?? '') === (string) $warehouseId) {
+                    $warehouseInfo = $wh;
+                    break;
+                }
+            }
+
+            if (!$warehouseInfo && !empty($warehouses)) {
+                $warehouseInfo = $warehouses[0];
+            }
+
+            $estimatedCost = $warehouseInfo['estimated_cost'] ?? null;
+
+            return response()->json([
+                'success' => true,
+                'data' => [
+                    'draft_id' => $draftId,
+                    'warehouse_id' => $warehouseInfo['warehouse_id'] ?? (string) $warehouseId,
+                    'warehouse_name' => $warehouseInfo['warehouse_name'] ?? null,
+                    'estimated_cost' => $estimatedCost,
+                    'items_count' => $warehouseInfo['items_count'] ?? null,
+                    'total_quantity' => $warehouseInfo['total_quantity'] ?? null,
+                ],
+            ]);
+        } catch (\Exception $e) {
+            return response()->json([
+                'success' => false,
+                'message' => $e->getMessage(),
+            ], 422);
+        }
     }
 
     /**
@@ -216,6 +612,51 @@ class ShipmentController extends Controller
         }
 
         return [$date, $timeFrom, $timeTo];
+    }
+
+    /**
+     * Попытаться найти supply_order_id по supply_id (длинный ID)
+     */
+    private function resolveSupplyOrderIdBySupplyId(\App\Domains\Ozon\OzonMarketplace $ozon, string $supplyId): ?string
+    {
+        try {
+            $suppliesApi = $ozon->fboSupplyOrders();
+            $lastId = null;
+            $maxIterations = 20;
+
+            for ($page = 0; $page < $maxIterations; $page++) {
+                $listResponse = $suppliesApi->list([], 50, $lastId);
+                $orderIds = $listResponse['order_ids'] ?? [];
+                $lastId = $listResponse['last_id'] ?? null;
+
+                if (empty($orderIds)) {
+                    break;
+                }
+
+                foreach (array_chunk($orderIds, 50) as $chunk) {
+                    $details = $suppliesApi->get($chunk);
+                    foreach ($details['orders'] ?? [] as $order) {
+                        $orderId = (string) ($order['order_id'] ?? $order['id'] ?? null);
+                        foreach ($order['supplies'] ?? [] as $supply) {
+                            if ((string) ($supply['supply_id'] ?? '') === (string) $supplyId) {
+                                return $orderId ?: null;
+                            }
+                        }
+                    }
+                }
+
+                if (empty($lastId)) {
+                    break;
+                }
+            }
+        } catch (\Exception $e) {
+            \Log::warning('resolveSupplyOrderIdBySupplyId failed', [
+                'supply_id' => $supplyId,
+                'error' => $e->getMessage(),
+            ]);
+        }
+
+        return null;
     }
 
     public function show(string $id, Request $request): JsonResponse
@@ -753,6 +1194,9 @@ class ShipmentController extends Controller
             'status' => 'submitted',
             'items' => $items,
             'external_supply_id' => $externalSupplyId,
+            'meta' => [
+                'external_supply_id' => $externalSupplyId,
+            ],
         ];
 
         $shipment = $this->shipmentService->create($shipmentData);
@@ -1287,8 +1731,87 @@ class ShipmentController extends Controller
             ], 422);
         }
 
+        $externalSupplyId = $shipment->external_supply_id
+            ?? ($shipment->meta['external_supply_id'] ?? null)
+            ?? ($shipment->meta['ozon_order_number'] ?? null);
+
+        if ($shipment->marketplace === 'ozon' && $externalSupplyId) {
+            $integration = \App\Models\Integration::find($shipment->integration_id);
+
+            if (!$integration) {
+                return response()->json([
+                    'message' => 'Интеграция не найдена',
+                ], 422);
+            }
+
+            try {
+                if (!is_numeric($externalSupplyId) || (int) $externalSupplyId <= 0) {
+                    return response()->json([
+                        'message' => 'Некорректный ID заявки для отмены',
+                    ], 422);
+                }
+
+                $ozon = \App\Domains\Ozon\OzonMarketplace::fromIntegration($integration);
+                $supplyOrderId = (string) $externalSupplyId;
+
+                // Если передали supply_id (длинный), пытаемся найти supply_order_id
+                if (strlen($supplyOrderId) > 10) {
+                    $resolvedOrderId = $this->resolveSupplyOrderIdBySupplyId($ozon, $supplyOrderId);
+                    if (!$resolvedOrderId) {
+                        return response()->json([
+                            'message' => 'Не удалось определить supply_order_id для отмены',
+                        ], 422);
+                    }
+
+                    $supplyOrderId = $resolvedOrderId;
+                    $meta = $shipment->meta ?? [];
+                    $meta['external_supply_id'] = $resolvedOrderId;
+                    $shipment->update([
+                        'external_supply_id' => $resolvedOrderId,
+                        'meta' => $meta,
+                    ]);
+                }
+
+                $cancelResult = $ozon->fboSupplyOrders()->cancel((int) $supplyOrderId);
+
+                if (empty($cancelResult['success'])) {
+                    return response()->json([
+                        'message' => $cancelResult['error'] ?? 'Не удалось отменить поставку в Ozon',
+                        'debug' => $cancelResult['response'] ?? null,
+                    ], 422);
+                }
+
+                $operationId = $cancelResult['operation_id'] ?? null;
+                if ($operationId) {
+                    for ($i = 1; $i <= 5; $i++) {
+                        $cancelStatus = $ozon->fboSupplyOrders()->getCancelStatus($operationId);
+                        $status = $cancelStatus['status']
+                            ?? $cancelStatus['state']
+                            ?? ($cancelStatus['result']['status'] ?? null);
+
+                        if (in_array($status, ['CANCELLED', 'CANCELED', 'SUCCESS', 'DONE', 'OK'], true)) {
+                            break;
+                        }
+
+                        if (in_array($status, ['FAILED', 'ERROR', 'REJECTED'], true)) {
+                            return response()->json([
+                                'message' => 'Ozon не отменил поставку: ' . json_encode($cancelStatus, JSON_UNESCAPED_UNICODE),
+                            ], 422);
+                        }
+
+                        usleep(1000000);
+                    }
+                }
+            } catch (\Exception $e) {
+                return response()->json([
+                    'message' => 'Ошибка отмены в Ozon: ' . $e->getMessage(),
+                ], 422);
+            }
+        }
+
         $shipment->update([
             'status' => Shipment::STATUS_CANCELLED,
+            'external_status' => $shipment->marketplace === 'ozon' ? 'CANCELLED' : $shipment->external_status,
         ]);
 
         return response()->json([
@@ -1791,40 +2314,122 @@ class ShipmentController extends Controller
     /**
      * Получить грузоместа заявки
      * GET /api/shipments/{id}/cargoes
+     * 
+     * Возвращает локальные грузоместа из БД + данные из Ozon API
      */
     public function getCargoes(Request $request, string $id): JsonResponse
     {
         $shipment = Shipment::findOrFail($id);
+        
+        // Получаем локальные грузоместа из meta
+        $localCargoes = $shipment->meta['cargoes'] ?? [];
+        
+        // Пробуем получить из Ozon API если есть интеграция
+        $ozonCargoes = [];
         $integration = \App\Models\Integration::find($shipment->integration_id);
-
-        if (!$integration || $integration->marketplace !== 'ozon') {
-            return response()->json(['message' => 'Только для Ozon'], 422);
+        
+        if ($integration && $integration->marketplace === 'ozon' && $shipment->external_supply_id) {
+            try {
+                $marketplace = \App\Domains\Ozon\OzonMarketplace::fromIntegration($integration);
+                $supplyOrderId = (int) $shipment->external_supply_id;
+                $ozonCargoes = $marketplace->fboCargoes()->get($supplyOrderId);
+            } catch (\Exception $e) {
+                // Игнорируем ошибку Ozon API, возвращаем локальные данные
+                \Log::warning('Failed to get Ozon cargoes', ['error' => $e->getMessage()]);
+            }
         }
 
-        try {
-            $marketplace = \App\Domains\Ozon\OzonMarketplace::fromIntegration($integration);
-            $supplyOrderId = (int) $shipment->external_supply_id;
-            
-            $cargoes = $marketplace->fboCargoes()->get($supplyOrderId);
+        // Форматируем локальные грузоместа в стандартный формат
+        $formattedCargoes = collect($localCargoes)->map(function ($cargo, $index) {
+            return [
+                'id' => $cargo['id'] ?? $index + 1,
+                'supply_id' => $cargo['supply_id'] ?? null,
+                'barcode' => $cargo['barcode'] ?? 'PKG-' . str_pad($index + 1, 4, '0', STR_PAD_LEFT),
+                'package_type' => $cargo['package_type'] ?? $cargo['type'] ?? 'box',
+                'sequence_number' => $cargo['sequence_number'] ?? $index + 1,
+                'status' => $cargo['status'] ?? 'draft',
+                'weight' => $cargo['weight'] ?? null,
+                'length' => $cargo['length'] ?? null,
+                'width' => $cargo['width'] ?? null,
+                'height' => $cargo['height'] ?? null,
+                'items_count' => $cargo['items_count'] ?? 0,
+                'total_quantity' => $cargo['total_quantity'] ?? 0,
+                'items' => $cargo['items'] ?? [],
+                'created_at' => $cargo['created_at'] ?? now()->toIso8601String(),
+            ];
+        })->values()->toArray();
 
-            return response()->json(['data' => $cargoes]);
-        } catch (\Exception $e) {
-            return response()->json(['message' => $e->getMessage()], 500);
-        }
+        return response()->json([
+            'success' => true,
+            'data' => $formattedCargoes,
+            'ozon_cargoes' => $ozonCargoes,
+            'summary' => [
+                'total_packages' => count($formattedCargoes),
+                'total_items' => collect($formattedCargoes)->sum('items_count'),
+                'total_quantity' => collect($formattedCargoes)->sum('total_quantity'),
+                'by_status' => collect($formattedCargoes)->groupBy('status')->map->count(),
+            ],
+        ]);
     }
 
     /**
-     * Создать грузоместа для заявки
+     * Создать грузоместо для заявки
      * POST /api/shipments/{id}/cargoes
+     * 
+     * Поддерживает два формата:
+     * 1. Простой: { package_type: 'box' } - создаёт пустое грузоместо
+     * 2. Полный: { cargoes: [...] } - создаёт грузоместа с товарами (для Ozon API)
      */
     public function createCargoes(Request $request, string $id): JsonResponse
     {
+        $shipment = Shipment::findOrFail($id);
+        
+        // Простой формат - создание одного грузоместа
+        if ($request->has('package_type')) {
+            $request->validate([
+                'package_type' => 'required|in:box,pallet,mono_pallet',
+                'weight' => 'nullable|numeric|min:0',
+                'length' => 'nullable|numeric|min:0',
+                'width' => 'nullable|numeric|min:0',
+                'height' => 'nullable|numeric|min:0',
+            ]);
+            
+            $meta = $shipment->meta ?? [];
+            $cargoes = $meta['cargoes'] ?? [];
+            
+            $newCargo = [
+                'id' => count($cargoes) + 1,
+                'package_type' => $request->input('package_type'),
+                'sequence_number' => count($cargoes) + 1,
+                'barcode' => 'PKG-' . $shipment->id . '-' . str_pad(count($cargoes) + 1, 3, '0', STR_PAD_LEFT),
+                'status' => 'draft',
+                'weight' => $request->input('weight'),
+                'length' => $request->input('length'),
+                'width' => $request->input('width'),
+                'height' => $request->input('height'),
+                'items_count' => 0,
+                'total_quantity' => 0,
+                'items' => [],
+                'created_at' => now()->toIso8601String(),
+            ];
+            
+            $cargoes[] = $newCargo;
+            $meta['cargoes'] = $cargoes;
+            $shipment->update(['meta' => $meta]);
+            
+            return response()->json([
+                'success' => true,
+                'data' => $newCargo,
+                'message' => 'Грузоместо создано',
+            ], 201);
+        }
+        
+        // Полный формат - для Ozon API
         $request->validate([
             'cargoes' => 'required|array|min:1',
             'cargoes.*.items' => 'required|array',
         ]);
 
-        $shipment = Shipment::findOrFail($id);
         $integration = \App\Models\Integration::find($shipment->integration_id);
 
         if (!$integration || $integration->marketplace !== 'ozon') {
@@ -1838,11 +2443,141 @@ class ShipmentController extends Controller
             $result = $marketplace->fboCargoes()->create($supplyOrderId, $request->input('cargoes'));
 
             return response()->json([
+                'success' => true,
                 'data' => $result,
-                'message' => 'Грузоместа созданы',
+                'message' => 'Грузоместа созданы в Ozon',
             ]);
         } catch (\Exception $e) {
-            return response()->json(['message' => $e->getMessage()], 500);
+            return response()->json(['success' => false, 'message' => $e->getMessage()], 500);
+        }
+    }
+
+    /**
+     * Обновить товары в грузоместе
+     * PUT /api/shipments/{id}/cargoes/{cargoId}/items
+     */
+    public function updateCargoItems(Request $request, string $id, int $cargoId): JsonResponse
+    {
+        $shipment = Shipment::findOrFail($id);
+        
+        $request->validate([
+            'items' => 'required|array',
+            'items.*.sku' => 'required|string',
+            'items.*.quantity' => 'required|integer|min:1',
+            'items.*.offer_id' => 'nullable|string',
+            'items.*.barcode' => 'nullable|string',
+        ]);
+        
+        $meta = $shipment->meta ?? [];
+        $cargoes = $meta['cargoes'] ?? [];
+        
+        $cargoIndex = collect($cargoes)->search(fn($c) => ($c['id'] ?? 0) == $cargoId);
+        
+        if ($cargoIndex === false) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Грузоместо не найдено',
+            ], 404);
+        }
+        
+        $items = $request->input('items');
+        $cargoes[$cargoIndex]['items'] = $items;
+        $cargoes[$cargoIndex]['items_count'] = count($items);
+        $cargoes[$cargoIndex]['total_quantity'] = collect($items)->sum('quantity');
+        
+        $meta['cargoes'] = $cargoes;
+        $shipment->update(['meta' => $meta]);
+        
+        return response()->json([
+            'success' => true,
+            'data' => $cargoes[$cargoIndex],
+            'message' => 'Товары обновлены',
+        ]);
+    }
+
+    /**
+     * Синхронизировать грузоместа из Ozon в локальную поставку
+     * POST /api/shipments/{id}/cargoes/sync-ozon
+     */
+    public function syncCargoesFromOzon(Request $request, string $id): JsonResponse
+    {
+        $shipment = Shipment::findOrFail($id);
+        $integration = \App\Models\Integration::find($shipment->integration_id);
+
+        if (!$integration || $integration->marketplace !== 'ozon') {
+            return response()->json(['message' => 'Только для Ozon'], 422);
+        }
+
+        if (!$shipment->external_supply_id) {
+            return response()->json(['message' => 'Нет external_supply_id'], 422);
+        }
+
+        try {
+            $marketplace = \App\Domains\Ozon\OzonMarketplace::fromIntegration($integration);
+            $supplyOrderId = (int) $shipment->external_supply_id;
+
+            // Получаем supply_id
+            $orderDetails = $marketplace->supplies()->getSupplyOrdersDetails([$supplyOrderId]);
+            $supplyId = $orderDetails['orders'][0]['supplies'][0]['supply_id'] ?? null;
+
+            if (!$supplyId) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Не удалось найти supply_id для заявки',
+                ], 422);
+            }
+
+            // Получаем грузоместа через /v1/cargoes/get
+            $client = $marketplace->getClient();
+            $cargoResponse = $client->post('/v1/cargoes/get', [
+                'supply_ids' => [(int) $supplyId],
+            ]);
+
+            $ozonCargoes = $cargoResponse['supply'][0]['cargoes'] ?? [];
+            $mappedCargoes = collect($ozonCargoes)->values()->map(function ($cargo, $index) {
+                $type = strtolower($cargo['type'] ?? 'box');
+                if (!in_array($type, ['box', 'pallet'], true)) {
+                    $type = 'box';
+                }
+
+                $ozonCargoId = $cargo['cargo_id'] ?? null;
+                $localId = $index + 1;
+
+                return [
+                    'id' => $localId,
+                    'ozon_cargo_id' => $ozonCargoId,
+                    'package_type' => $type,
+                    'sequence_number' => $localId,
+                    'barcode' => (string) ($ozonCargoId ?? ('OZON-' . $localId)),
+                    'status' => $cargo['tracking_info']['status'] ?? 'ozon',
+                    'weight' => $cargo['weight'] ?? null,
+                    'length' => $cargo['length'] ?? null,
+                    'width' => $cargo['width'] ?? null,
+                    'height' => $cargo['height'] ?? null,
+                    'items_count' => count($cargo['items'] ?? []),
+                    'total_quantity' => collect($cargo['items'] ?? [])->sum('quantity'),
+                    'items' => $cargo['items'] ?? [],
+                    'created_at' => now()->toIso8601String(),
+                    'source' => 'ozon',
+                ];
+            })->values()->toArray();
+
+            $meta = $shipment->meta ?? [];
+            $meta['cargoes'] = $mappedCargoes;
+            $shipment->update(['meta' => $meta]);
+
+            return response()->json([
+                'success' => true,
+                'data' => $mappedCargoes,
+                'ozon_cargoes' => $ozonCargoes,
+                'message' => 'Грузоместа синхронизированы с Ozon',
+            ]);
+        } catch (\Exception $e) {
+            \Log::error('Failed to sync cargoes from Ozon', [
+                'error' => $e->getMessage(),
+                'trace' => $e->getTraceAsString(),
+            ]);
+            return response()->json(['success' => false, 'message' => $e->getMessage()], 500);
         }
     }
 
@@ -2612,6 +3347,9 @@ class ShipmentController extends Controller
                 'status' => 'submitted',
                 'items' => $items,
                 'external_supply_id' => (string) $supplyOrderId,
+                'meta' => [
+                    'external_supply_id' => (string) $supplyOrderId,
+                ],
             ];
 
             $shipment = $this->shipmentService->create($shipmentData);

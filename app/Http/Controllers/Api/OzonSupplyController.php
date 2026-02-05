@@ -11,6 +11,7 @@ use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\RateLimiter;
 
 /**
  * Контроллер для полного цикла работы с поставками Ozon FBO
@@ -831,6 +832,28 @@ class OzonSupplyController extends Controller
         ]);
 
         try {
+            $dateFrom = $validated['date_from'] ?? now()->format('Y-m-d');
+            $dateTo = $validated['date_to'] ?? now()->addDays(28)->format('Y-m-d');
+            $cacheKey = "ozon_timeslots_{$validated['integration_id']}_{$validated['supply_order_id']}_{$dateFrom}_{$dateTo}";
+            $cached = Cache::get($cacheKey);
+
+            if (!empty($cached)) {
+                return response()->json([
+                    'success' => true,
+                    'data' => $cached,
+                ]);
+            }
+
+            $rateKey = "ozon_timeslots_rate_{$validated['integration_id']}";
+            if (RateLimiter::tooManyAttempts($rateKey, 1)) {
+                $retryAfter = RateLimiter::availableIn($rateKey);
+                return response()->json([
+                    'success' => false,
+                    'message' => "Превышен лимит запросов Ozon. Повторите через {$retryAfter} сек.",
+                ], 429);
+            }
+            RateLimiter::hit($rateKey, 2);
+
             $integration = Integration::findOrFail($validated['integration_id']);
             $ozon = OzonMarketplace::fromIntegration($integration);
             
@@ -858,14 +881,38 @@ class OzonSupplyController extends Controller
                 return response()->json(['success' => false, 'message' => 'Не указан warehouse_id'], 422);
             }
 
-            // Используем /v1/supply-order/timeslot/get для существующей заявки
-            $timeslotData = $ozon->supplies()->getSupplyOrderTimeslot(
+            // Используем актуальный /v1/fbp/order/direct/timeslot/list для существующей заявки
+            $timeslotData = $ozon->supplies()->getFbpOrderDirectTimeslotList(
                 (string) $validated['supply_order_id'],
                 [
-                    'date_from' => $validated['date_from'] ?? now()->format('Y-m-d'),
-                    'date_to' => $validated['date_to'] ?? now()->addDays(28)->format('Y-m-d'),
+                    'date_from' => $dateFrom,
+                    'date_to' => $dateTo,
                 ]
             );
+
+            if (!empty($timeslotData['error']) || !empty($timeslotData['code'])) {
+                Log::warning('getSupplyOrderTimeslots: direct endpoint failed, fallback to supply-order/timeslot/get', [
+                    'supply_order_id' => $validated['supply_order_id'],
+                    'error' => $timeslotData['error']['message'] ?? $timeslotData['message'] ?? null,
+                ]);
+
+                $timeslotData = $ozon->supplies()->getSupplyOrderTimeslot(
+                    (string) $validated['supply_order_id'],
+                    [
+                        'date_from' => $dateFrom,
+                        'date_to' => $dateTo,
+                    ]
+                );
+            }
+
+            if (!empty($timeslotData['error']) || !empty($timeslotData['code'])) {
+                return response()->json([
+                    'success' => false,
+                    'message' => $timeslotData['error']['message']
+                        ?? $timeslotData['message']
+                        ?? 'Не удалось получить таймслоты Ozon',
+                ], 422);
+            }
             
             Log::info('getSupplyOrderTimeslots: raw response', [
                 'supply_order_id' => $validated['supply_order_id'],
@@ -921,13 +968,19 @@ class OzonSupplyController extends Controller
                 'first_slot' => $formattedSlots[0] ?? null,
             ]);
 
+            $payload = [
+                'timeslots' => $formattedSlots,
+                'supply_order_id' => $validated['supply_order_id'],
+                'warehouse_id' => $warehouseId,
+            ];
+
+            if (!empty($formattedSlots)) {
+                Cache::put($cacheKey, $payload, 300);
+            }
+
             return response()->json([
                 'success' => true,
-                'data' => [
-                    'timeslots' => $formattedSlots,
-                    'supply_order_id' => $validated['supply_order_id'],
-                    'warehouse_id' => $warehouseId,
-                ],
+                'data' => $payload,
             ]);
 
         } catch (\Exception $e) {
@@ -1381,7 +1434,9 @@ class OzonSupplyController extends Controller
             $slotTo
         );
 
-        $supplyOperationId = $supplyResult['operation_id'] ?? null;
+        $supplyOperationId = $supplyResult['operation_id']
+            ?? ($supplyResult['result']['operation_id'] ?? null)
+            ?? ($supplyResult['result']['task_id'] ?? null);
         if (empty($supplyOperationId)) {
             throw new \RuntimeException('Не удалось создать поставку в Ozon: operation_id не получен');
         }
@@ -1652,47 +1707,100 @@ class OzonSupplyController extends Controller
     }
 
     /**
-     * Создать грузоместа
+     * Создать грузоместа с товарным составом
      * 
      * POST /api/ozon/supply/cargoes/create
+     * 
+     * ВАЖНО: Ozon API использует supply_id (из orders.supplies.supply_id),
+     * а не supply_order_id. Нужно сначала получить supply_id через /v2/supply-order/get
      * 
      * До 40 паллет или 30 коробок
      */
     public function createCargoes(Request $request): JsonResponse
     {
         $validated = $request->validate([
-            'integration_id' => 'required|exists:integrations,id',
+            'integration_id' => 'nullable|exists:integrations,id',
             'supply_order_id' => 'required|integer',
             'containers' => 'required|array|min:1|max:40',
-            'containers.*.type' => 'required|in:pallet,box',
-            'containers.*.weight' => 'required|numeric|min:0',
-            'containers.*.length' => 'required|numeric|min:0',
-            'containers.*.width' => 'required|numeric|min:0',
-            'containers.*.height' => 'required|numeric|min:0',
+            'containers.*.type' => 'required|in:pallet,box,PALLET,BOX',
+            'containers.*.weight' => 'nullable|numeric|min:0',
+            'containers.*.length' => 'nullable|numeric|min:0',
+            'containers.*.width' => 'nullable|numeric|min:0',
+            'containers.*.height' => 'nullable|numeric|min:0',
             'containers.*.items' => 'nullable|array',
+            'containers.*.items.*.offer_id' => 'nullable|string',
+            'containers.*.items.*.sku' => 'nullable|string',
+            'containers.*.items.*.barcode' => 'nullable|string',
+            'containers.*.items.*.quantity' => 'nullable|integer|min:1',
+            'delete_current_version' => 'nullable|boolean',
         ]);
 
         try {
-            $integration = Integration::findOrFail($validated['integration_id']);
+            $supplyOrderId = (int) $validated['supply_order_id'];
+            
+            // Находим shipment по external_supply_id чтобы получить правильный integration_id
+            $shipment = \App\Models\Shipment::where('external_supply_id', (string) $supplyOrderId)->first();
+            
+            if (!$shipment) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Заявка не найдена',
+                ], 404);
+            }
+            
+            $integration = Integration::findOrFail($shipment->integration_id);
             $ozon = OzonMarketplace::fromIntegration($integration);
             
+            // Получаем детали заявки через /v3/supply-order/get чтобы найти supply_id
+            $orderDetails = $ozon->supplies()->getSupplyOrdersDetails([$supplyOrderId]);
+            
+            // supply_id находится в orders[0].supplies[0].supply_id
+            $supplyId = null;
+            if (!empty($orderDetails['orders'][0]['supplies'][0]['supply_id'])) {
+                $supplyId = $orderDetails['orders'][0]['supplies'][0]['supply_id'];
+            }
+            
+            if (!$supplyId) {
+                Log::warning('Could not find supply_id in order details', [
+                    'supply_order_id' => $supplyOrderId,
+                    'order_details' => $orderDetails,
+                ]);
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Не удалось найти supply_id для заявки. Возможно, заявка ещё не готова для добавления грузомест.',
+                ], 422);
+            }
+            
+            Log::info('Creating cargoes', [
+                'supply_order_id' => $supplyOrderId,
+                'supply_id' => $supplyId,
+                'containers_count' => count($validated['containers']),
+            ]);
+            
             $result = $ozon->supplies()->createCargo(
-                (string) $validated['supply_order_id'],
-                ['containers' => $validated['containers']]
+                (string) $supplyId,
+                [
+                    'containers' => $validated['containers'],
+                    'delete_current_version' => $validated['delete_current_version'] ?? false,
+                ]
             );
 
             return response()->json([
                 'success' => true,
                 'data' => [
                     'supply_order_id' => $validated['supply_order_id'],
+                    'supply_id' => $supplyId,
+                    'operation_id' => $result['operation_id'] ?? null,
                     'containers_count' => count($validated['containers']),
-                    'cargo_ids' => $result['cargo_ids'] ?? [],
                 ],
                 'message' => 'Грузоместа созданы',
             ], 201);
 
         } catch (\Exception $e) {
-            Log::error('Failed to create Ozon cargoes', ['error' => $e->getMessage()]);
+            Log::error('Failed to create Ozon cargoes', [
+                'error' => $e->getMessage(),
+                'trace' => $e->getTraceAsString(),
+            ]);
             return response()->json(['success' => false, 'message' => $e->getMessage()], 422);
         }
     }
@@ -1701,33 +1809,74 @@ class OzonSupplyController extends Controller
      * Получить информацию о грузоместах
      * 
      * POST /api/ozon/supply/cargoes/info
+     * 
+     * Использует /v1/cargoes/get для получения грузомест из Ozon
      */
     public function getCargoesInfo(Request $request): JsonResponse
     {
         $validated = $request->validate([
-            'integration_id' => 'required|exists:integrations,id',
+            'integration_id' => 'nullable|exists:integrations,id',
             'supply_order_id' => 'required|integer',
         ]);
 
         try {
-            $integration = Integration::findOrFail($validated['integration_id']);
+            $supplyOrderId = (int) $validated['supply_order_id'];
+            
+            // Находим shipment по external_supply_id чтобы получить правильный integration_id
+            $shipment = \App\Models\Shipment::where('external_supply_id', (string) $supplyOrderId)->first();
+            
+            if (!$shipment) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Заявка не найдена',
+                ], 404);
+            }
+            
+            $integration = Integration::findOrFail($shipment->integration_id);
             $ozon = OzonMarketplace::fromIntegration($integration);
             
-            // Получаем детали заявки с информацией о грузоместах
-            $supply = $ozon->supplies()->getSupplyDetails((string) $validated['supply_order_id']);
+            // Сначала получаем supply_id из /v3/supply-order/get
+            $orderDetails = $ozon->supplies()->getSupplyOrdersDetails([$supplyOrderId]);
+            
+            $supplyId = null;
+            $cargoes = [];
+            
+            if (!empty($orderDetails['orders'][0]['supplies'][0]['supply_id'])) {
+                $supplyId = $orderDetails['orders'][0]['supplies'][0]['supply_id'];
+                
+                // Получаем грузоместа через /v1/cargoes/get
+                $client = $ozon->getClient();
+                $cargoResponse = $client->post('/v1/cargoes/get', [
+                    'supply_ids' => [(int) $supplyId],
+                ]);
+                
+                Log::info('getCargoesInfo: /v1/cargoes/get response', [
+                    'supply_id' => $supplyId,
+                    'response' => $cargoResponse,
+                ]);
+                
+                // Извлекаем грузоместа из ответа
+                if (!empty($cargoResponse['supply'][0]['cargoes'])) {
+                    $cargoes = $cargoResponse['supply'][0]['cargoes'];
+                }
+            }
             
             return response()->json([
                 'success' => true,
                 'data' => [
-                    'supply_order_id' => $validated['supply_order_id'],
-                    'cargoes' => $supply['raw_data']['cargoes'] ?? [],
-                    'total_weight' => $supply['raw_data']['total_weight'] ?? 0,
-                    'total_volume' => $supply['raw_data']['total_volume'] ?? 0,
+                    'supply_order_id' => $supplyOrderId,
+                    'supply_id' => $supplyId,
+                    'cargoes' => $cargoes,
+                    'total_weight' => 0,
+                    'total_volume' => 0,
                 ],
             ]);
 
         } catch (\Exception $e) {
-            Log::error('Failed to get Ozon cargoes info', ['error' => $e->getMessage()]);
+            Log::error('Failed to get Ozon cargoes info', [
+                'error' => $e->getMessage(),
+                'trace' => $e->getTraceAsString(),
+            ]);
             return response()->json(['success' => false, 'message' => $e->getMessage()], 422);
         }
     }
@@ -1740,27 +1889,44 @@ class OzonSupplyController extends Controller
     public function createCargoesLabels(Request $request): JsonResponse
     {
         $validated = $request->validate([
-            'integration_id' => 'required|exists:integrations,id',
+            'integration_id' => 'nullable|exists:integrations,id',
             'supply_order_id' => 'required|integer',
             'cargo_ids' => 'nullable|array',
         ]);
 
         try {
-            $taskId = uniqid('labels_');
-            
-            // Сохраняем задачу на генерацию
-            Cache::put("ozon_labels_task_{$validated['supply_order_id']}", [
-                'task_id' => $taskId,
-                'status' => 'completed', // В реальности будет processing -> completed
-                'supply_order_id' => $validated['supply_order_id'],
-                'created_at' => now()->toIso8601String(),
-            ], 3600);
+            $supplyOrderId = (int) $validated['supply_order_id'];
+            $shipment = Shipment::where('external_supply_id', (string) $supplyOrderId)->first();
+            $integration = $shipment
+                ? Integration::findOrFail($shipment->integration_id)
+                : Integration::findOrFail($validated['integration_id']);
+
+            $ozon = OzonMarketplace::fromIntegration($integration);
+
+            $orderDetails = $ozon->supplies()->getSupplyOrdersDetails([$supplyOrderId]);
+            $supplyId = $orderDetails['orders'][0]['supplies'][0]['supply_id'] ?? null;
+
+            if (!$supplyId) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Не удалось найти supply_id для заявки',
+                ], 422);
+            }
+
+            $cargoIds = array_values($validated['cargo_ids'] ?? []);
+            $result = $ozon->supplies()->createCargoLabels((string) $supplyId, $cargoIds);
+            $operationId = $result['operation_id'] ?? null;
+
+            if ($operationId) {
+                Cache::put("ozon_labels_operation_{$supplyOrderId}", $operationId, 3600);
+            }
 
             return response()->json([
                 'success' => true,
                 'data' => [
-                    'task_id' => $taskId,
-                    'supply_order_id' => $validated['supply_order_id'],
+                    'operation_id' => $operationId,
+                    'supply_order_id' => $supplyOrderId,
+                    'supply_id' => (string) $supplyId,
                 ],
                 'message' => 'Генерация этикеток запущена',
             ], 201);
@@ -1779,21 +1945,55 @@ class OzonSupplyController extends Controller
     public function getCargoesLabelsStatus(Request $request): JsonResponse
     {
         $validated = $request->validate([
-            'integration_id' => 'required|exists:integrations,id',
+            'integration_id' => 'nullable|exists:integrations,id',
             'supply_order_id' => 'required|integer',
             'task_id' => 'nullable|string',
         ]);
 
-        $cacheKey = "ozon_labels_task_{$validated['supply_order_id']}";
-        $taskData = Cache::get($cacheKey);
+        $supplyOrderId = (int) $validated['supply_order_id'];
+        $shipment = Shipment::where('external_supply_id', (string) $supplyOrderId)->first();
+        $integration = $shipment
+            ? Integration::findOrFail($shipment->integration_id)
+            : Integration::findOrFail($validated['integration_id']);
+
+        $ozon = OzonMarketplace::fromIntegration($integration);
+
+        $orderDetails = $ozon->supplies()->getSupplyOrdersDetails([$supplyOrderId]);
+        $supplyId = $orderDetails['orders'][0]['supplies'][0]['supply_id'] ?? null;
+
+        if (!$supplyId) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Не удалось найти supply_id для заявки',
+            ], 422);
+        }
+
+        $operationId = $validated['task_id']
+            ?? Cache::get("ozon_labels_operation_{$supplyOrderId}");
+
+        if (!$operationId) {
+            return response()->json([
+                'success' => true,
+                'data' => [
+                    'status' => 'processing',
+                    'task_id' => null,
+                    'file_guid' => null,
+                    'download_url' => null,
+                ],
+            ]);
+        }
+
+        $status = $ozon->supplies()->getCargoLabelsStatus((string) $operationId);
+        $fileGuid = $status['file_guid'] ?? null;
 
         return response()->json([
             'success' => true,
             'data' => [
-                'status' => $taskData['status'] ?? 'completed',
-                'task_id' => $taskData['task_id'] ?? null,
-                'download_url' => $taskData['status'] === 'completed' 
-                    ? "/api/ozon/supply/cargoes/labels/download?supply_order_id={$validated['supply_order_id']}&integration_id={$validated['integration_id']}"
+                'status' => $status['status'] ?? null,
+                'task_id' => $status['task_id'] ?? null,
+                'file_guid' => $fileGuid,
+                'download_url' => $fileGuid
+                    ? "/api/ozon/supply/cargoes/labels/download?supply_order_id={$supplyOrderId}&integration_id={$integration->id}&file_guid={$fileGuid}"
                     : null,
             ],
         ]);
@@ -1807,19 +2007,57 @@ class OzonSupplyController extends Controller
     public function downloadCargoesLabels(Request $request)
     {
         $validated = $request->validate([
-            'integration_id' => 'required|exists:integrations,id',
+            'integration_id' => 'nullable|exists:integrations,id',
             'supply_order_id' => 'required|integer',
+            'file_guid' => 'nullable|string',
         ]);
 
         try {
-            // В реальной реализации здесь будет запрос к Ozon API для получения PDF
-            // Пока возвращаем заглушку
-            
-            $pdfContent = $this->generateLabelsPdf($validated['supply_order_id']);
-            
+            $supplyOrderId = (int) $validated['supply_order_id'];
+            $shipment = Shipment::where('external_supply_id', (string) $supplyOrderId)->first();
+            $integration = $shipment
+                ? Integration::findOrFail($shipment->integration_id)
+                : Integration::findOrFail($validated['integration_id']);
+
+            $ozon = OzonMarketplace::fromIntegration($integration);
+
+            $orderDetails = $ozon->supplies()->getSupplyOrdersDetails([$supplyOrderId]);
+            $supplyId = $orderDetails['orders'][0]['supplies'][0]['supply_id'] ?? null;
+
+            if (!$supplyId) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Не удалось найти supply_id для заявки',
+                ], 422);
+            }
+
+            $fileGuid = $validated['file_guid'] ?? null;
+            if (!$fileGuid) {
+                $operationId = Cache::get("ozon_labels_operation_{$supplyOrderId}");
+                if ($operationId) {
+                    $status = $ozon->supplies()->getCargoLabelsStatus((string) $operationId);
+                    $fileGuid = $status['file_guid'] ?? null;
+                }
+            }
+
+            if (!$fileGuid) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Этикетки ещё не готовы',
+                ], 422);
+            }
+
+            $pdfContent = $ozon->getClient()->download("/v1/cargoes-label/file/{$fileGuid}");
+            if (!$pdfContent) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Не удалось скачать этикетки',
+                ], 422);
+            }
+
             return response($pdfContent, 200, [
                 'Content-Type' => 'application/pdf',
-                'Content-Disposition' => "attachment; filename=labels_{$validated['supply_order_id']}.pdf",
+                'Content-Disposition' => "attachment; filename=labels_{$supplyOrderId}.pdf",
             ]);
 
         } catch (\Exception $e) {

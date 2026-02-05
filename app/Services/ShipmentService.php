@@ -41,6 +41,7 @@ class ShipmentService
                 'truck_type' => $data['truck_type'] ?? null,
                 'truck_capacity' => $data['truck_capacity'] ?? null,
                 'external_supply_id' => $data['external_supply_id'] ?? null,
+                'meta' => $data['meta'] ?? null,
                 'created_by' => auth()->id() ?? Str::uuid(),
                 'created_by_name' => auth()->user()?->name ?? 'System',
             ]);

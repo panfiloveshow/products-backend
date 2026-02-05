@@ -340,38 +340,194 @@ class SuppliesApi implements SuppliesApiInterface
     }
 
     /**
-     * Создать грузоместа
+     * Создать грузоместа с товарным составом
      * 
-     * POST /v1/supply/cargo/create
+     * POST /v1/cargoes/create (новый endpoint с декабря 2024)
+     * 
+     * Формат Ozon API:
+     * - supply_id: ID поставки (из /v2/supply-order/get -> orders.supplies.supply_id)
+     * - cargoes: массив объектов {key: string, value: {type: "BOX"|"PALLET", items: [...]}}
+     * - delete_current_version: удалить предыдущие грузоместа
+     * 
+     * @see https://docs.ozon.ru/api/seller/
      */
     public function createCargo(string $supplyId, array $cargoData): array
     {
+        // Формируем грузоместа в формате Ozon API
+        $cargoes = [];
+        $index = 1;
+        
+        foreach ($cargoData['containers'] ?? [] as $container) {
+            $type = strtoupper($container['type'] ?? 'box');
+            if ($type === 'PALLET') {
+                $type = 'PALLET';
+            } else {
+                $type = 'BOX';
+            }
+            
+            // Формируем items для грузоместа
+            $items = [];
+            foreach ($container['items'] ?? [] as $item) {
+                $items[] = [
+                    'offer_id' => (string) ($item['offer_id'] ?? $item['sku'] ?? ''),
+                    'barcode' => (string) ($item['barcode'] ?? ''),
+                    'quantity' => (int) ($item['quantity'] ?? 1),
+                    'quant' => (int) ($item['quant'] ?? 1),
+                ];
+            }
+            
+            // Если items пустой, создаём пустое грузоместо
+            $cargoes[] = [
+                'key' => 'cargo_' . $index,
+                'value' => [
+                    'type' => $type,
+                    'items' => $items,
+                ],
+            ];
+            $index++;
+        }
+
         $body = [
-            'supply_order_id' => (int) $supplyId,
-            'containers' => array_map(fn($container) => [
-                'container_type' => $container['type'] ?? 'box',
-                'weight' => $container['weight'] ?? 0,
-                'length' => $container['length'] ?? 0,
-                'width' => $container['width'] ?? 0,
-                'height' => $container['height'] ?? 0,
-                'items' => $container['items'] ?? [],
-            ], $cargoData['containers'] ?? []),
+            'supply_id' => (int) $supplyId,
+            'cargoes' => $cargoes,
+            'delete_current_version' => $cargoData['delete_current_version'] ?? false,
         ];
 
-        $response = $this->client->post('/v1/supply/cargo/create', $body);
+        \Log::info('Ozon createCargo request', ['body' => $body]);
 
-        if (!$response || !empty($response['error'])) {
-            throw new \RuntimeException(
-                'Не удалось создать грузоместа: ' . 
-                ($response['error']['message'] ?? 'Unknown error')
-            );
+        $response = $this->client->post('/v1/cargoes/create', $body);
+
+        \Log::info('Ozon createCargo response', ['response' => $response]);
+
+        if (!$response || !empty($response['errors'])) {
+            $errorMessage = $response['errors']['error_reasons'][0] 
+                ?? $response['error']['message'] 
+                ?? $response['message'] 
+                ?? json_encode($response);
+            throw new \RuntimeException('Не удалось создать грузоместа: ' . $errorMessage);
         }
 
         return [
             'success' => true,
             'supply_id' => $supplyId,
-            'containers_count' => count($cargoData['containers'] ?? []),
+            'operation_id' => $response['operation_id'] ?? null,
+            'containers_count' => count($cargoes),
         ];
+    }
+    
+    /**
+     * Получить статус создания грузомест
+     * 
+     * POST /v2/cargoes/create/info
+     */
+    public function getCargoCreateInfo(string $supplyId): array
+    {
+        $body = [
+            'supply_id' => (int) $supplyId,
+        ];
+
+        $response = $this->client->post('/v2/cargoes/create/info', $body);
+
+        return [
+            'success' => empty($response['error']),
+            'data' => $response,
+        ];
+    }
+    
+    /**
+     * Удалить грузоместо
+     * 
+     * POST /v1/cargoes/delete
+     */
+    public function deleteCargo(string $supplyId, int $cargoId): array
+    {
+        $body = [
+            'supply_id' => (int) $supplyId,
+            'cargo_id' => $cargoId,
+        ];
+
+        $response = $this->client->post('/v1/cargoes/delete', $body);
+
+        return [
+            'success' => empty($response['error']),
+            'operation_id' => $response['operation_id'] ?? null,
+        ];
+    }
+    
+    /**
+     * Создать этикетки для грузомест
+     * 
+     * POST /v1/cargoes-label/create
+     */
+    public function createCargoLabels(string $supplyId, array $cargoIds = []): array
+    {
+        $cargoes = [];
+        foreach ($cargoIds as $cargoId) {
+            $cargoes[] = ['cargo_id' => (int) $cargoId];
+        }
+        
+        $body = [
+            'supply_id' => (int) $supplyId,
+            'cargoes' => $cargoes,
+        ];
+
+        $response = $this->client->post('/v1/cargoes-label/create', $body);
+
+        if (!$response || !empty($response['_error']) || !empty($response['errors'])) {
+            $errorMessage = $response['errors']['error_reasons'][0]
+                ?? $response['message']
+                ?? json_encode($response);
+            throw new \RuntimeException('Не удалось создать этикетки: ' . $errorMessage);
+        }
+
+        return [
+            'success' => true,
+            'operation_id' => $response['operation_id'] ?? null,
+        ];
+    }
+    
+    /**
+     * Получить статус и file_guid этикеток
+     * 
+     * POST /v1/cargoes-label/get
+     */
+    public function getCargoLabelsStatus(string $operationId): array
+    {
+        $body = [
+            'operation_id' => (string) $operationId,
+        ];
+
+        $response = $this->client->post('/v1/cargoes-label/get', $body);
+
+        $fileGuid = $response['file_guid']
+            ?? $response['result']['file_guid']
+            ?? $response['result']['file_guid_list'][0]
+            ?? $response['result']['file_guids'][0]
+            ?? null;
+        $status = $response['status']
+            ?? $response['result']['status']
+            ?? $response['result']['state']
+            ?? null;
+
+        return [
+            'success' => empty($response['_error']) && empty($response['error']) && empty($response['code']),
+            'file_guid' => $fileGuid,
+            'status' => $status,
+            'data' => $response,
+        ];
+    }
+    
+    /**
+     * Скачать PDF с этикетками
+     * 
+     * GET /v1/cargoes-label/file/{file_guid}
+     * 
+     * @return string URL для скачивания или содержимое файла
+     */
+    public function downloadCargoLabels(string $fileGuid): string
+    {
+        // Возвращаем URL для прямого скачивания через Ozon API
+        return $this->client->getBaseUrl() . '/v1/cargoes-label/file/' . $fileGuid;
     }
 
     /**
@@ -1226,20 +1382,48 @@ class SuppliesApi implements SuppliesApiInterface
             ?? $result
             ?? [];
         
-        $mapped = array_map(fn($wh) => [
-            'id' => (string) ($wh['warehouse_id'] ?? $wh['id'] ?? null),
-            'name' => $wh['name'] ?? null,
-            'type' => $wh['warehouse_type'] ?? $wh['type'] ?? null,
-            'address' => is_array($wh['address'] ?? null)
-                ? ($wh['address']['address'] ?? null)
-                : ($wh['address'] ?? null),
-            'city' => $wh['city'] ?? ($wh['address']['city'] ?? null),
-            'region' => $wh['region'] ?? ($wh['address']['region'] ?? null),
-            'cluster_id' => $wh['macrolocal_cluster_id'] ?? ($wh['address']['macrolocal_cluster_id'] ?? null),
-            'cluster_name' => $wh['cluster_name'] ?? null,
-            'coordinates' => $wh['coordinates'] ?? ($wh['address']['coordinates'] ?? null),
-            'is_active' => $wh['is_active'] ?? true,
-        ], $warehouses);
+        $mapped = array_map(function($wh) {
+            // Normalize coordinates from Ozon API format
+            $rawCoords = $wh['coordinates'] ?? ($wh['address']['coordinates'] ?? null);
+            $coordinates = null;
+            
+            if (is_array($rawCoords)) {
+                // Ozon returns { latitude: number, longitude: number }
+                $lat = $rawCoords['latitude'] ?? $rawCoords['lat'] ?? null;
+                $lng = $rawCoords['longitude'] ?? $rawCoords['lng'] ?? $rawCoords['lon'] ?? null;
+                if ($lat !== null && $lng !== null) {
+                    $coordinates = [
+                        'lat' => (float) $lat,
+                        'lng' => (float) $lng,
+                    ];
+                }
+            }
+            
+            // Determine point type for frontend (sc = sorting center, pvz = pickup point)
+            $warehouseType = $wh['warehouse_type'] ?? $wh['type'] ?? '';
+            $pointType = 'sc'; // default
+            if (str_contains(strtolower($warehouseType), 'delivery') || 
+                str_contains(strtolower($warehouseType), 'point') ||
+                str_contains(strtolower($warehouseType), 'pvz')) {
+                $pointType = 'pvz';
+            }
+            
+            return [
+                'id' => (string) ($wh['warehouse_id'] ?? $wh['id'] ?? null),
+                'name' => $wh['name'] ?? null,
+                'type' => $pointType,
+                'warehouse_type' => $warehouseType,
+                'address' => is_array($wh['address'] ?? null)
+                    ? ($wh['address']['address'] ?? null)
+                    : ($wh['address'] ?? null),
+                'city' => $wh['city'] ?? ($wh['address']['city'] ?? null),
+                'region' => $wh['region'] ?? ($wh['address']['region'] ?? null),
+                'cluster_id' => $wh['macrolocal_cluster_id'] ?? ($wh['address']['macrolocal_cluster_id'] ?? null),
+                'cluster_name' => $wh['cluster_name'] ?? null,
+                'coordinates' => $coordinates,
+                'is_active' => $wh['is_active'] ?? true,
+            ];
+        }, $warehouses);
 
         $hasClusterInfo = collect($mapped)->contains(function ($wh) {
             return !empty($wh['cluster_id']) || !empty($wh['address']);
@@ -1305,6 +1489,58 @@ class SuppliesApi implements SuppliesApiInterface
                 'Не удалось создать пропуск: ' .
                 ($response['error']['message'] ?? 'Unknown error')
             );
+        }
+
+        return $response['result'] ?? $response;
+    }
+
+    /**
+     * Получить таймслоты для прямой поставки (FBP)
+     *
+     * POST /v1/fbp/order/direct/timeslot/list
+     */
+    public function getFbpOrderDirectTimeslotList(string $supplyOrderId, array $payload = []): array
+    {
+        $body = [
+            'supply_order_id' => (int) $supplyOrderId,
+        ];
+
+        if (!empty($payload['date_from'])) {
+            $body['date_from'] = $payload['date_from'];
+        }
+        if (!empty($payload['date_to'])) {
+            $body['date_to'] = $payload['date_to'];
+        }
+
+        \Illuminate\Support\Facades\Log::info('Ozon fbp/order/direct/timeslot/list request', ['body' => $body]);
+
+        $maxAttempts = 1;
+        $response = null;
+
+        for ($attempt = 1; $attempt <= $maxAttempts; $attempt++) {
+            if ($attempt > 1) {
+                $delay = 2 * $attempt;
+                \Illuminate\Support\Facades\Log::warning("Ozon timeslot/list rate limit, waiting {$delay}s before attempt {$attempt}");
+                sleep($delay);
+            }
+
+            $response = $this->client->post('/v1/fbp/order/direct/timeslot/list', $body);
+
+            $httpStatus = $response['_http_status'] ?? null;
+            $errorCode = $response['code'] ?? null;
+
+            if ($httpStatus !== 429 && (int) $errorCode !== 8) {
+                break;
+            }
+        }
+
+        \Illuminate\Support\Facades\Log::info('Ozon fbp/order/direct/timeslot/list response', [
+            'order_id' => $supplyOrderId,
+            'response_keys' => $response ? array_keys($response) : [],
+        ]);
+
+        if (!$response || !empty($response['error']) || !empty($response['code'])) {
+            return $response ?? [];
         }
 
         return $response['result'] ?? $response;
