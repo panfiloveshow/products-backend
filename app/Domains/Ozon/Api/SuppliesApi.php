@@ -1411,8 +1411,9 @@ class SuppliesApi implements SuppliesApiInterface
         
         // Ozon returns nested structure: clusters -> logistic_clusters -> warehouses
         // We need to flatten all warehouses from all clusters
+        // clusters can be in result.clusters or response.clusters
         $warehouses = [];
-        $clusters = $result['clusters'] ?? [];
+        $clusters = $result['clusters'] ?? $response['clusters'] ?? [];
         
         if (!empty($clusters)) {
             foreach ($clusters as $cluster) {
