@@ -1214,8 +1214,12 @@ class SuppliesApi implements SuppliesApiInterface
      */
     public function createCrossdockDraft(array $data): array
     {
+        $clusterId = $data['macrolocal_cluster_id'] ?? '';
+        
         $body = [
-            'macrolocal_cluster_id' => $data['macrolocal_cluster_id'] ?? '',
+            'cluster_info' => [
+                'macrolocal_cluster_id' => (string) $clusterId,
+            ],
             'delivery_scheme' => strtoupper($data['delivery_scheme'] ?? 'DROP_OFF'),
         ];
 
