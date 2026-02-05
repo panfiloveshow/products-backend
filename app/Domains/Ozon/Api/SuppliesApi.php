@@ -1408,11 +1408,37 @@ class SuppliesApi implements SuppliesApiInterface
         }
 
         $result = $response['result'] ?? $response;
-        $warehouses = $result['warehouses']
-            ?? $result['search']
-            ?? $result['items']
-            ?? $result
-            ?? [];
+        
+        // Ozon returns nested structure: clusters -> logistic_clusters -> warehouses
+        // We need to flatten all warehouses from all clusters
+        $warehouses = [];
+        $clusters = $result['clusters'] ?? [];
+        
+        if (!empty($clusters)) {
+            foreach ($clusters as $cluster) {
+                $clusterId = $cluster['macrolocal_cluster_id'] ?? $cluster['id'] ?? null;
+                $clusterName = $cluster['name'] ?? null;
+                $logisticClusters = $cluster['logistic_clusters'] ?? [];
+                
+                foreach ($logisticClusters as $lc) {
+                    $lcWarehouses = $lc['warehouses'] ?? [];
+                    foreach ($lcWarehouses as $wh) {
+                        $wh['_cluster_id'] = $clusterId;
+                        $wh['_cluster_name'] = $clusterName;
+                        $warehouses[] = $wh;
+                    }
+                }
+            }
+        }
+        
+        // Fallback to flat structure if no clusters
+        if (empty($warehouses)) {
+            $warehouses = $result['warehouses']
+                ?? $result['search']
+                ?? $result['items']
+                ?? $result
+                ?? [];
+        }
         
         $mapped = array_map(function($wh) {
             // Normalize coordinates from Ozon API format
@@ -1431,27 +1457,39 @@ class SuppliesApi implements SuppliesApiInterface
                 }
             }
             
-            // Determine point type for frontend (sc = sorting center, pvz = pickup point)
+            // Determine point type for frontend based on warehouse_type
             $warehouseType = $wh['warehouse_type'] ?? $wh['type'] ?? '';
-            $pointType = 'sc'; // default
-            if (str_contains(strtolower($warehouseType), 'delivery') || 
-                str_contains(strtolower($warehouseType), 'point') ||
-                str_contains(strtolower($warehouseType), 'pvz')) {
-                $pointType = 'pvz';
+            $pointType = 'sc'; // default = sorting center
+            
+            // Map Ozon warehouse types to frontend types
+            if (str_contains($warehouseType, 'DELIVERY_POINT') || str_contains($warehouseType, 'ORDERS_RECEIVING')) {
+                $pointType = 'pvz'; // ПВЗ
+            } elseif (str_contains($warehouseType, 'SORTING_CENTER')) {
+                $pointType = 'sc'; // СЦ
+            } elseif (str_contains($warehouseType, 'CROSS_DOCK')) {
+                $pointType = 'crossdock'; // Кросс-док
+            } elseif (str_contains($warehouseType, 'FULL_FILLMENT')) {
+                $pointType = 'rfc'; // РФЦ
+            }
+            
+            // Normalize warehouse_type to full Ozon format
+            $fullWarehouseType = $warehouseType;
+            if (!str_starts_with($warehouseType, 'WAREHOUSE_TYPE_')) {
+                $fullWarehouseType = 'WAREHOUSE_TYPE_' . $warehouseType;
             }
             
             return [
                 'id' => (string) ($wh['warehouse_id'] ?? $wh['id'] ?? null),
                 'name' => $wh['name'] ?? null,
                 'type' => $pointType,
-                'warehouse_type' => $warehouseType,
+                'warehouse_type' => $fullWarehouseType,
                 'address' => is_array($wh['address'] ?? null)
                     ? ($wh['address']['address'] ?? null)
                     : ($wh['address'] ?? null),
                 'city' => $wh['city'] ?? ($wh['address']['city'] ?? null),
                 'region' => $wh['region'] ?? ($wh['address']['region'] ?? null),
-                'cluster_id' => $wh['macrolocal_cluster_id'] ?? ($wh['address']['macrolocal_cluster_id'] ?? null),
-                'cluster_name' => $wh['cluster_name'] ?? null,
+                'cluster_id' => $wh['_cluster_id'] ?? $wh['macrolocal_cluster_id'] ?? ($wh['address']['macrolocal_cluster_id'] ?? null),
+                'cluster_name' => $wh['_cluster_name'] ?? $wh['cluster_name'] ?? null,
                 'coordinates' => $coordinates,
                 'is_active' => $wh['is_active'] ?? true,
             ];
