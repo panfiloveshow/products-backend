@@ -446,6 +446,27 @@ class SyncInventoryJob implements ShouldQueue
             // Пересчитываем юнит-экономику для всех товаров интеграции
             $this->recalculateUnitEconomics();
             
+            // Платное хранение Ozon: обновляем ВСЕ записи InventoryWarehouse напрямую
+            // т.к. getDetailedInventory() может не содержать все SKU с начислениями
+            if (!empty($ozonPaidStorageBySku)) {
+                $paidUpdated = 0;
+                foreach ($ozonPaidStorageBySku as $sku => $paidData) {
+                    $affected = InventoryWarehouse::where('sku', $sku)
+                        ->where('integration_id', $this->syncLog->integration_id)
+                        ->update([
+                            'paid_storage_penalty' => $paidData['storage_penalty'] ?? 0,
+                            'paid_storage_fee' => $paidData['storage_fee'] ?? 0,
+                            'paid_storage_from' => $paidDateFrom ?? null,
+                            'paid_storage_to' => $paidDateTo ?? null,
+                        ]);
+                    $paidUpdated += $affected;
+                }
+                Log::info('Ozon paid storage written to InventoryWarehouse', [
+                    'skus_with_data' => count($ozonPaidStorageBySku),
+                    'rows_updated' => $paidUpdated,
+                ]);
+            }
+
             // Запускаем отдельный джоб для синхронизации storage fees WB
             // Выделен в отдельный джоб для изоляции памяти (отчёт реализации WB может быть 80+ MB)
             $this->dispatchStorageFeesSync();
