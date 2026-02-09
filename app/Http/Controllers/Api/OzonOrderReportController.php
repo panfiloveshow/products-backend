@@ -88,6 +88,16 @@ class OzonOrderReportController extends Controller
             $dateTo = $allDates->last();
             $periodDays = $dateFrom && $dateTo ? max(1, (int) $dateFrom->diffInDays($dateTo) + 1) : 14;
 
+            Log::info('OzonReport dates debug', [
+                'total_rows' => count($rows),
+                'dates_found' => $allDates->count(),
+                'date_from' => $dateFrom?->toDateTimeString(),
+                'date_to' => $dateTo?->toDateTimeString(),
+                'period_days' => $periodDays,
+                'sample_dates' => $allDates->take(5)->map(fn($d) => $d->toDateTimeString())->toArray(),
+                'last_dates' => $allDates->slice(-5)->map(fn($d) => $d->toDateTimeString())->values()->toArray(),
+            ]);
+
             // Сохраняем агрегированные данные
             DB::beginTransaction();
 
@@ -495,13 +505,27 @@ class OzonOrderReportController extends Controller
             $dateStr = trim($row[$columnMap['created_date']] ?? '');
         }
         if (!empty($dateStr)) {
-            try {
-                $shipmentDate = \Carbon\Carbon::parse($dateStr);
-            } catch (\Exception $e) {
-                // Пробуем формат DD.MM.YYYY
+            // Логируем первую дату для диагностики
+            static $dateLogCount = 0;
+            if ($dateLogCount < 3) {
+                Log::debug('OzonReport raw date', ['raw' => $dateStr, 'column' => isset($columnMap['shipment_date']) ? 'shipment_date' : 'created_date']);
+                $dateLogCount++;
+            }
+
+            // Пробуем разные форматы
+            // DD.MM.YYYY HH:MM:SS или DD.MM.YYYY HH:MM
+            if (preg_match('/^(\d{2})\.(\d{2})\.(\d{4})/', $dateStr, $m)) {
+                $shipmentDate = \Carbon\Carbon::createFromDate((int)$m[3], (int)$m[2], (int)$m[1]);
+            }
+            // YYYY-MM-DD
+            elseif (preg_match('/^(\d{4})-(\d{2})-(\d{2})/', $dateStr, $m)) {
+                $shipmentDate = \Carbon\Carbon::createFromDate((int)$m[1], (int)$m[2], (int)$m[3]);
+            }
+            // Fallback Carbon::parse
+            else {
                 try {
-                    $shipmentDate = \Carbon\Carbon::createFromFormat('d.m.Y', substr($dateStr, 0, 10));
-                } catch (\Exception $e2) {
+                    $shipmentDate = \Carbon\Carbon::parse($dateStr)->startOfDay();
+                } catch (\Exception $e) {
                     // Игнорируем
                 }
             }
