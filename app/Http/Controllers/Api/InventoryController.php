@@ -404,6 +404,12 @@ class InventoryController extends Controller
             $storageFeeReportFrom = $whRows->min('storage_fee_report_from');
             $storageFeeReportTo = $whRows->max('storage_fee_report_to');
 
+            // Платное хранение Ozon (штраф >120 дней + обычная плата)
+            $paidStoragePenalty = $whRows->sum('paid_storage_penalty') ?? 0;
+            $paidStorageFee = $whRows->sum('paid_storage_fee') ?? 0;
+            $paidStorageFrom = $whRows->min('paid_storage_from');
+            $paidStorageTo = $whRows->max('paid_storage_to');
+
             // Матрица по складам
             $warehouseMatrix = $allWarehouses->map(function ($wh) use ($whByWarehouseId) {
                 $row = $whByWarehouseId->get($wh->warehouse_id);
@@ -461,6 +467,11 @@ class InventoryController extends Controller
                 'storage_fee_last_week' => round($storageFeeLastWeek, 2),
                 'storage_fee_report_from' => $storageFeeReportFrom,
                 'storage_fee_report_to' => $storageFeeReportTo,
+                'paid_storage_penalty' => round($paidStoragePenalty, 2),
+                'paid_storage_fee' => round($paidStorageFee, 2),
+                'paid_storage_total' => round($paidStoragePenalty + $paidStorageFee, 2),
+                'paid_storage_from' => $paidStorageFrom,
+                'paid_storage_to' => $paidStorageTo,
                 'warehouses_with_stock' => $whRows->where('quantity', '>', 0)->count(),
                 'warehouses_total' => $allWarehouses->count(),
                 'warehouse_matrix' => $warehouseMatrix,
@@ -504,6 +515,9 @@ class InventoryController extends Controller
                     'storage_fee_total' => round($items->sum('storage_fee_total') ?? 0, 2),
                     'storage_fee_report_from' => $summaryStorageFeeFrom,
                     'storage_fee_report_to' => $summaryStorageFeeTo,
+                    'paid_storage_penalty' => round($items->sum('paid_storage_penalty') ?? 0, 2),
+                    'paid_storage_fee' => round($items->sum('paid_storage_fee') ?? 0, 2),
+                    'paid_storage_total' => round($items->sum('paid_storage_total') ?? 0, 2),
                 ],
             ],
         ]);
