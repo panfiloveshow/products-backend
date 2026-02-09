@@ -516,6 +516,7 @@ Route::prefix('auto-supply-plans')->middleware('throttle:api')->group(function (
 */
 Route::prefix('seller-stocks')->middleware('throttle:api')->group(function () {
     Route::get('/', [App\Http\Controllers\Api\SellerWarehouseStockController::class, 'index']);
+    Route::get('/catalog', [App\Http\Controllers\Api\SellerWarehouseStockController::class, 'catalog']);
     Route::post('/', [App\Http\Controllers\Api\SellerWarehouseStockController::class, 'upsert']);
     Route::post('/bulk', [App\Http\Controllers\Api\SellerWarehouseStockController::class, 'bulkUpsert']);
     Route::get('/summary', [App\Http\Controllers\Api\SellerWarehouseStockController::class, 'summary']);

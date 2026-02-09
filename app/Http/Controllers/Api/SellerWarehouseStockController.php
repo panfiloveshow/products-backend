@@ -187,6 +187,89 @@ class SellerWarehouseStockController extends Controller
     }
 
     /**
+     * Полный каталог номенклатуры с остатками собственного склада
+     * Возвращает все товары интеграции + их остатки (если заведены)
+     */
+    public function catalog(Request $request): JsonResponse
+    {
+        $validator = Validator::make($request->all(), [
+            'integration_id' => 'required|integer',
+            'search' => 'nullable|string|max:200',
+            'filter' => 'nullable|in:all,in_stock,no_stock',
+            'page' => 'nullable|integer|min:1',
+            'per_page' => 'nullable|integer|min:1|max:200',
+        ]);
+
+        if ($validator->fails()) {
+            return response()->json(['message' => 'Validation error', 'errors' => $validator->errors()], 422);
+        }
+
+        $integrationId = $request->integration_id;
+        $perPage = $request->integer('per_page', 50);
+
+        // Загружаем остатки собственного склада для этой интеграции
+        $sellerStocks = SellerWarehouseStock::where('integration_id', $integrationId)
+            ->get()
+            ->keyBy('sku');
+
+        // Загружаем товары из каталога
+        $query = Product::where('integration_id', $integrationId)
+            ->select('sku', 'name', 'barcode', 'price', 'marketplace', 'category', 'brand')
+            ->orderBy('name');
+
+        if ($request->filled('search')) {
+            $search = $request->search;
+            $query->where(function ($q) use ($search) {
+                $q->where('sku', 'like', "%{$search}%")
+                  ->orWhere('name', 'like', "%{$search}%")
+                  ->orWhere('barcode', 'like', "%{$search}%");
+            });
+        }
+
+        $paginated = $query->paginate($perPage);
+
+        // Мержим данные собственного склада
+        $items = collect($paginated->items())->map(function ($product) use ($sellerStocks) {
+            $stock = $sellerStocks->get($product->sku);
+            return [
+                'sku' => $product->sku,
+                'name' => $product->name,
+                'barcode' => $product->barcode,
+                'price' => $product->price,
+                'category' => $product->category,
+                'brand' => $product->brand,
+                'own_stock_id' => $stock?->id,
+                'own_quantity' => $stock?->quantity ?? 0,
+                'own_reserved' => $stock?->reserved ?? 0,
+                'own_available' => $stock ? max(0, $stock->quantity - $stock->reserved) : 0,
+                'own_cost_price' => $stock?->cost_price,
+                'own_location' => $stock?->location,
+                'own_last_counted_at' => $stock?->last_counted_at,
+                'has_own_stock' => $stock !== null,
+            ];
+        });
+
+        // Фильтрация по наличию на собственном складе
+        if ($request->filter === 'in_stock') {
+            $items = $items->filter(fn($i) => $i['own_quantity'] > 0)->values();
+        } elseif ($request->filter === 'no_stock') {
+            $items = $items->filter(fn($i) => $i['own_quantity'] === 0)->values();
+        }
+
+        return response()->json([
+            'message' => 'OK',
+            'data' => [
+                'items' => $items,
+                'current_page' => $paginated->currentPage(),
+                'last_page' => $paginated->lastPage(),
+                'total' => $paginated->total(),
+                'per_page' => $paginated->perPage(),
+                'total_with_stock' => $sellerStocks->filter(fn($s) => $s->quantity > 0)->count(),
+            ],
+        ]);
+    }
+
+    /**
      * Сводка по собственному складу
      */
     public function summary(Request $request): JsonResponse
