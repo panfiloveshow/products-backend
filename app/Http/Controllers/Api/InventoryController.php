@@ -405,10 +405,9 @@ class InventoryController extends Controller
             $storageFeeReportFrom = $whRows->min('storage_fee_report_from');
             $storageFeeReportTo = $whRows->max('storage_fee_report_to');
 
-            // Хранение за прошлый месяц и за всё время
+            // Хранение за прошлый месяц
             $storageFeePrevMonth = $whRows->max('storage_fee_prev_month') ?? 0;
             $storageFeePrevMonthPeriod = $whRows->pluck('storage_fee_prev_month_period')->filter()->first();
-            $storageFeeAllTime = $whRows->max('storage_fee_all_time') ?? 0;
 
             // Матрица по складам
             $warehouseMatrix = $allWarehouses->map(function ($wh) use ($whByWarehouseId) {
@@ -469,7 +468,6 @@ class InventoryController extends Controller
                 'storage_fee_report_to' => $storageFeeReportTo,
                 'storage_fee_prev_month' => round($storageFeePrevMonth, 2),
                 'storage_fee_prev_month_period' => $storageFeePrevMonthPeriod,
-                'storage_fee_all_time' => round($storageFeeAllTime, 2),
                 'warehouses_with_stock' => $whRows->where('quantity', '>', 0)->count(),
                 'warehouses_total' => $allWarehouses->count(),
                 'warehouse_matrix' => $warehouseMatrix,
