@@ -488,3 +488,17 @@ Route::prefix('suppliers')->middleware('throttle:api')->group(function () {
     Route::get('/by-clusters', [App\Http\Controllers\Api\OzonDeliveryAnalyticsController::class, 'byClusters']);
     Route::get('/by-products', [App\Http\Controllers\Api\OzonDeliveryAnalyticsController::class, 'byProducts']);
 }); */
+
+/*
+|--------------------------------------------------------------------------
+| Auto Supply Plans Module (Автопланирование поставок)
+|--------------------------------------------------------------------------
+*/
+Route::prefix('auto-supply-plans')->middleware('throttle:api')->group(function () {
+    Route::get('/', [App\Http\Controllers\Api\AutoSupplyPlanController::class, 'index']);
+    Route::post('/', [App\Http\Controllers\Api\AutoSupplyPlanController::class, 'store']);
+    Route::get('/{id}', [App\Http\Controllers\Api\AutoSupplyPlanController::class, 'show']);
+    Route::delete('/{id}', [App\Http\Controllers\Api\AutoSupplyPlanController::class, 'destroy']);
+    Route::get('/{id}/export/ozon', [App\Http\Controllers\Api\AutoSupplyPlanController::class, 'exportOzon'])->middleware('throttle:export');
+    Route::get('/{id}/export/wb', [App\Http\Controllers\Api\AutoSupplyPlanController::class, 'exportWb'])->middleware('throttle:export');
+});
