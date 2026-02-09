@@ -657,10 +657,52 @@ class OzonOrderReportController extends Controller
             }
         }
 
+        // Для всех SKU, которые есть в отчёте, но склад не встретился — ставим real_avg=0
+        // Это значит: с этого склада за период не было отгрузок
+        $reportSkus = $sales->pluck('article')->filter()->unique()->toArray();
+        $reportSkusBySku = $sales->pluck('sku')->filter()->unique()->toArray();
+
+        $zeroFilled = 0;
+        foreach ($allWarehouses as $iw) {
+            // Пропускаем уже обновлённые
+            if ($iw->sales_report_id === $report->id) continue;
+
+            // Проверяем, есть ли этот SKU в отчёте (по артикулу или числовому SKU)
+            $normIwSku = $this->normalizeWarehouseName($iw->sku);
+            $skuInReport = false;
+            foreach ($reportSkus as $art) {
+                if ($this->normalizeWarehouseName($art) === $normIwSku) {
+                    $skuInReport = true;
+                    break;
+                }
+            }
+            if (!$skuInReport) {
+                foreach ($reportSkusBySku as $rSku) {
+                    if ($this->normalizeWarehouseName($rSku) === $normIwSku) {
+                        $skuInReport = true;
+                        break;
+                    }
+                }
+            }
+
+            if ($skuInReport) {
+                $periodDays = $sales->first()->period_days ?? 14;
+                $iw->update([
+                    'real_avg_daily_sales' => 0,
+                    'real_sales_period_days' => $periodDays,
+                    'real_turnover_days' => $iw->quantity > 0 ? 999 : 0,
+                    'real_days_of_stock' => $iw->quantity > 0 ? 999 : 0,
+                    'sales_report_id' => $report->id,
+                ]);
+                $zeroFilled++;
+            }
+        }
+
         Log::info('Warehouse turnover recalculated from report', [
             'report_id' => $report->id,
             'sales_count' => $sales->count(),
             'matched' => $matched,
+            'zero_filled' => $zeroFilled,
             'unmatched_count' => count($unmatched),
             'unmatched_sample' => array_slice($unmatched, 0, 10),
         ]);
