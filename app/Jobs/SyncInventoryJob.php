@@ -223,24 +223,40 @@ class SyncInventoryJob implements ShouldQueue
                 ]);
             }
             
-            // ОТКЛЮЧЕНО: API /v3/finance/transaction/list возвращает некорректные данные
-            // Ozon ЛК показывает 0₽ хранения, а API возвращает транзакции
-            // TODO: Использовать отчёт /v1/report/placement/by-products/create вместо транзакций
-            $ozonStorageBySku = [];
-            // if ($this->syncLog->marketplace === 'ozon' && method_exists($marketplace, 'getStorageTransactions')) {
-            //     try {
-            //         $dateTo = now()->format('Y-m-d');
-            //         $dateFrom = now()->subDays(30)->format('Y-m-d');
-            //         $ozonStorageBySku = $marketplace->getStorageTransactions($dateFrom, $dateTo);
-            //         Log::info('Ozon storage transactions loaded', [
-            //             'count' => count($ozonStorageBySku),
-            //         ]);
-            //     } catch (\Exception $e) {
-            //         Log::warning('Failed to load Ozon storage transactions', [
-            //             'error' => $e->getMessage(),
-            //         ]);
-            //     }
-            // }
+            // Платное хранение Ozon: штраф за превышение 120 дней (MarketplaceServiceItemStorageExcess)
+            // и обычная плата за хранение (MarketplaceServiceItemStorageFee)
+            // Данные из /v3/finance/transaction/list — фактические начисления за текущий месяц
+            $ozonPaidStorageBySku = [];
+            if ($this->syncLog->marketplace === 'ozon' && method_exists($marketplace, 'getStorageTransactions')) {
+                try {
+                    $paidDateFrom = now()->startOfMonth()->format('Y-m-d');
+                    $paidDateTo = now()->format('Y-m-d');
+                    $ozonPaidStorageBySku = $marketplace->getStorageTransactions($paidDateFrom, $paidDateTo);
+                    
+                    if (!empty($ozonPaidStorageBySku)) {
+                        // Сбрасываем старые данные о платном хранении для этой интеграции
+                        InventoryWarehouse::where('marketplace', 'ozon')
+                            ->where('integration_id', $this->syncLog->integration_id)
+                            ->update([
+                                'paid_storage_penalty' => null,
+                                'paid_storage_fee' => null,
+                                'paid_storage_from' => null,
+                                'paid_storage_to' => null,
+                            ]);
+                        
+                        Log::info('Ozon paid storage transactions loaded', [
+                            'count' => count($ozonPaidStorageBySku),
+                            'period' => "$paidDateFrom - $paidDateTo",
+                            'total_penalty' => round(array_sum(array_column($ozonPaidStorageBySku, 'storage_penalty')), 2),
+                            'total_fee' => round(array_sum(array_column($ozonPaidStorageBySku, 'storage_fee')), 2),
+                        ]);
+                    }
+                } catch (\Exception $e) {
+                    Log::warning('Failed to load Ozon paid storage transactions', [
+                        'error' => $e->getMessage(),
+                    ]);
+                }
+            }
             
             // Обновляем комиссии Ozon из v3 API (чтобы комиссии всегда были актуальными)
             if ($this->syncLog->marketplace === 'ozon') {
@@ -294,9 +310,12 @@ class SyncInventoryJob implements ShouldQueue
                         $stockData['storage_fee_report_to'] = $storageFeesBySku[$sku]['report_date_to'] ?? null;
                     }
                     
-                    // Добавляем ФАКТИЧЕСКИЕ начисления за хранение для Ozon (из транзакций)
-                    if ($sku && isset($ozonStorageBySku[$sku])) {
-                        $stockData['storage_fee_total'] = $ozonStorageBySku[$sku]['total_storage_cost'] ?? 0;
+                    // Добавляем платное хранение Ozon (штраф >120 дней + обычная плата)
+                    if ($sku && isset($ozonPaidStorageBySku[$sku])) {
+                        $stockData['paid_storage_penalty'] = $ozonPaidStorageBySku[$sku]['storage_penalty'] ?? 0;
+                        $stockData['paid_storage_fee'] = $ozonPaidStorageBySku[$sku]['storage_fee'] ?? 0;
+                        $stockData['paid_storage_from'] = $paidDateFrom ?? null;
+                        $stockData['paid_storage_to'] = $paidDateTo ?? null;
                     }
                     
                     // Добавляем товары в пути к клиенту если есть

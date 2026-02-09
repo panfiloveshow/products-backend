@@ -545,59 +545,97 @@ class StorageApi
      * Получить финансовые транзакции по хранению
      * POST /v3/finance/transaction/list
      * 
+     * Разделяет два типа начислений:
+     * - MarketplaceServiceItemStorageFee — обычная плата за хранение
+     * - MarketplaceServiceItemStorageExcess — штраф за платное хранение (товар >120 дней на складе)
+     * 
      * @param string $dateFrom Начало периода (YYYY-MM-DD)
      * @param string $dateTo Конец периода (YYYY-MM-DD)
-     * @return array Транзакции по хранению, сгруппированные по SKU
+     * @return array Транзакции по хранению, сгруппированные по SKU с разделением fee/penalty
      */
     public function getStorageTransactions(string $dateFrom, string $dateTo, array $productIdToSku = []): array
     {
         try {
-            $response = $this->client->post('/v3/finance/transaction/list', [
-                'filter' => [
-                    'date' => [
-                        'from' => $dateFrom . 'T00:00:00.000Z',
-                        'to' => $dateTo . 'T23:59:59.000Z',
-                    ],
-                    'operation_type' => [
-                        'MarketplaceServiceItemStorageFee',
-                        'MarketplaceServiceItemStorageExcess',
-                    ],
-                    'posting_number' => '',
-                    'transaction_type' => 'all',
-                ],
-                'page' => 1,
-                'page_size' => 1000,
-            ]);
-
             $result = [];
+            $page = 1;
+            $maxPages = 10;
             
-            foreach ($response['result']['operations'] ?? [] as $op) {
-                foreach ($op['items'] ?? [] as $item) {
-                    $productId = (string)($item['sku'] ?? '');
-                    
-                    if (!$productId) continue;
-                    
-                    // Конвертируем product_id в offer_id (SKU продавца)
-                    $sku = $productIdToSku[$productId] ?? $productId;
-                    
-                    if (!isset($result[$sku])) {
-                        $result[$sku] = [
-                            'total_storage_cost' => 0,
-                            'transactions_count' => 0,
-                            'product_name' => $item['name'] ?? '',
-                            'product_id' => $productId,
-                        ];
-                    }
-                    
-                    $result[$sku]['total_storage_cost'] += abs($op['amount'] ?? 0);
-                    $result[$sku]['transactions_count']++;
+            while ($page <= $maxPages) {
+                $response = $this->client->post('/v3/finance/transaction/list', [
+                    'filter' => [
+                        'date' => [
+                            'from' => $dateFrom . 'T00:00:00.000Z',
+                            'to' => $dateTo . 'T23:59:59.000Z',
+                        ],
+                        'operation_type' => [
+                            'MarketplaceServiceItemStorageFee',
+                            'MarketplaceServiceItemStorageExcess',
+                        ],
+                        'posting_number' => '',
+                        'transaction_type' => 'all',
+                    ],
+                    'page' => $page,
+                    'page_size' => 1000,
+                ]);
+
+                $operations = $response['result']['operations'] ?? [];
+                
+                if (empty($operations)) {
+                    break;
                 }
+
+                foreach ($operations as $op) {
+                    $operationType = $op['operation_type'] ?? '';
+                    $amount = abs($op['amount'] ?? 0);
+                    
+                    foreach ($op['items'] ?? [] as $item) {
+                        $productId = (string)($item['sku'] ?? '');
+                        
+                        if (!$productId) continue;
+                        
+                        // Конвертируем ozon_sku в offer_id (SKU продавца)
+                        $sku = $productIdToSku[$productId] ?? $productId;
+                        
+                        if (!isset($result[$sku])) {
+                            $result[$sku] = [
+                                'storage_fee' => 0,
+                                'storage_penalty' => 0,
+                                'total_storage_cost' => 0,
+                                'transactions_count' => 0,
+                                'product_name' => $item['name'] ?? '',
+                                'product_id' => $productId,
+                            ];
+                        }
+                        
+                        // Разделяем обычное хранение и штраф за превышение 120 дней
+                        if ($operationType === 'MarketplaceServiceItemStorageExcess') {
+                            $result[$sku]['storage_penalty'] += $amount;
+                        } else {
+                            $result[$sku]['storage_fee'] += $amount;
+                        }
+                        $result[$sku]['total_storage_cost'] += $amount;
+                        $result[$sku]['transactions_count']++;
+                    }
+                }
+                
+                // Если получили меньше 1000, значит это последняя страница
+                if (count($operations) < 1000) {
+                    break;
+                }
+                
+                $page++;
             }
 
+            $totalPenalty = array_sum(array_column($result, 'storage_penalty'));
+            $totalFee = array_sum(array_column($result, 'storage_fee'));
+            
             Log::info('Ozon storage transactions loaded', [
                 'date_from' => $dateFrom,
                 'date_to' => $dateTo,
                 'skus_count' => count($result),
+                'pages_loaded' => $page,
+                'total_penalty' => round($totalPenalty, 2),
+                'total_fee' => round($totalFee, 2),
             ]);
 
             return $result;

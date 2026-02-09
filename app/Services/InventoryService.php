@@ -86,6 +86,12 @@ class InventoryService
         $totalStorageFeeLastWeek = $warehouses->sum('storage_fee_last_week') ?? 0;
         $storageFeeReportFrom = $warehouses->min('storage_fee_report_from');
         $storageFeeReportTo = $warehouses->max('storage_fee_report_to');
+        
+        // Платное хранение Ozon: штраф за превышение 120 дней + обычная плата
+        $totalPaidStoragePenalty = $warehouses->sum('paid_storage_penalty') ?? 0;
+        $totalPaidStorageFee = $warehouses->sum('paid_storage_fee') ?? 0;
+        $paidStorageFrom = $warehouses->min('paid_storage_from');
+        $paidStorageTo = $warehouses->max('paid_storage_to');
 
         return [
             'id' => $product->id,
@@ -125,6 +131,12 @@ class InventoryService
             'storage_fee_last_week' => round($totalStorageFeeLastWeek, 2),
             'storage_fee_report_from' => $storageFeeReportFrom,
             'storage_fee_report_to' => $storageFeeReportTo,
+            // Платное хранение Ozon (штраф за >120 дней + обычная плата)
+            'paid_storage_penalty' => round($totalPaidStoragePenalty, 2),
+            'paid_storage_fee' => round($totalPaidStorageFee, 2),
+            'paid_storage_total' => round($totalPaidStoragePenalty + $totalPaidStorageFee, 2),
+            'paid_storage_from' => $paidStorageFrom,
+            'paid_storage_to' => $paidStorageTo,
             // Стоимость хранения (расчётная по складам)
             'storage_cost_per_day' => round($totalStorageCostPerDay, 2),
             'storage_cost_per_month' => round($totalStorageCostPerMonth, 2),
@@ -158,6 +170,11 @@ class InventoryService
                 'storage_fee_last_week' => $w->storage_fee_last_week,
                 'storage_fee_report_from' => $w->storage_fee_report_from,
                 'storage_fee_report_to' => $w->storage_fee_report_to,
+                // Платное хранение Ozon
+                'paid_storage_penalty' => $w->paid_storage_penalty,
+                'paid_storage_fee' => $w->paid_storage_fee,
+                'paid_storage_from' => $w->paid_storage_from,
+                'paid_storage_to' => $w->paid_storage_to,
             ])->values(),
             'financials' => $this->calculateFinancials($product, $warehouses),
             'alerts' => $product->alerts()->active()->get(),
@@ -414,6 +431,14 @@ class InventoryService
         }
         $totalStorageCost = $totalStorageCostQuery->sum('storage_cost');
 
+        // Платное хранение Ozon (штраф >120 дней + обычная плата) из InventoryWarehouse
+        $paidStorageQuery = InventoryWarehouse::whereIn('sku', $filteredSkus);
+        if (!empty($marketplace) && $marketplace !== 'all') {
+            $paidStorageQuery->where('marketplace', $marketplace);
+        }
+        $totalPaidStoragePenalty = (clone $paidStorageQuery)->sum('paid_storage_penalty');
+        $totalPaidStorageFee = (clone $paidStorageQuery)->sum('paid_storage_fee');
+
         return [
             'total_products' => $totalProducts,
             'total_internal_stock' => $totalInternalStock,
@@ -421,6 +446,9 @@ class InventoryService
             'low_stock_products' => $lowStockProducts,
             'out_of_stock_products' => $outOfStockProducts,
             'total_storage_cost' => round($totalStorageCost, 2),
+            'total_paid_storage_penalty' => round($totalPaidStoragePenalty, 2),
+            'total_paid_storage_fee' => round($totalPaidStorageFee, 2),
+            'total_paid_storage' => round($totalPaidStoragePenalty + $totalPaidStorageFee, 2),
         ];
     }
 
