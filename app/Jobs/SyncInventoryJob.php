@@ -102,6 +102,9 @@ class SyncInventoryJob implements ShouldQueue
                         'total' => round(array_sum(array_column($currentMonthData, 'placement_cost')), 2),
                     ]);
                     
+                    // Пауза между запросами отчётов (Ozon rate limit)
+                    sleep(5);
+                    
                     // Прошлый месяц
                     $prevMonthData = $marketplace->getPlacementCostByProducts($prevFrom, $prevTo, 120);
                     Log::info('Ozon placement cost prev month', [
