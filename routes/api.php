@@ -501,6 +501,7 @@ Route::prefix('auto-supply-plans')->middleware('throttle:api')->group(function (
     Route::get('/{id}', [App\Http\Controllers\Api\AutoSupplyPlanController::class, 'show']);
     Route::post('/{id}/calculate', [App\Http\Controllers\Api\AutoSupplyPlanController::class, 'calculate']);
     Route::get('/{id}/lines', [App\Http\Controllers\Api\AutoSupplyPlanController::class, 'lines']);
+    Route::get('/{id}/clusters', [App\Http\Controllers\Api\AutoSupplyPlanController::class, 'clusters']);
     Route::get('/{id}/simulate', [App\Http\Controllers\Api\AutoSupplyPlanController::class, 'simulate']);
     Route::delete('/{id}', [App\Http\Controllers\Api\AutoSupplyPlanController::class, 'destroy']);
     Route::patch('/{planId}/lines/{lineId}', [App\Http\Controllers\Api\AutoSupplyPlanController::class, 'updateLine']);

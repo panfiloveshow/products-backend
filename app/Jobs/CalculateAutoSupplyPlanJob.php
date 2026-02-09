@@ -5,6 +5,7 @@ namespace App\Jobs;
 use App\Models\AutoSupplyPlan;
 use App\Models\AutoSupplyPlanLine;
 use App\Models\InventoryWarehouse;
+use App\Models\OzonWarehouseCluster;
 use App\Models\Product;
 use App\Services\AutoSupplyPlanService;
 use Carbon\Carbon;
@@ -86,6 +87,9 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
             ->get()
             ->keyBy('sku');
 
+        // Load warehouse-to-cluster mapping for geo-distribution
+        $clusterMapping = ($marketplace === 'ozon') ? OzonWarehouseCluster::getAllMapping() : [];
+
         $totalLines = 0;
         $totalQty = 0;
         $lines = [];
@@ -138,6 +142,19 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
             // --- 3.5 Destination ---
             $destinationId = $wh->warehouse_id ?? null;
             $destinationType = $destinationId ? 'warehouse' : 'all';
+
+            // --- 3.5b Geo-distribution: resolve cluster ---
+            $clusterId = null;
+            $clusterName = null;
+            $clusterRegion = null;
+            if (!empty($clusterMapping) && $wh->warehouse_name) {
+                $normalizedName = OzonWarehouseCluster::normalizeWarehouseName($wh->warehouse_name);
+                if (isset($clusterMapping[$normalizedName])) {
+                    $clusterId = $clusterMapping[$normalizedName]['cluster_id'];
+                    $clusterName = $clusterMapping[$normalizedName]['cluster_name'];
+                    $clusterRegion = $clusterMapping[$normalizedName]['region'];
+                }
+            }
 
             // --- 3.6 Округление qty ---
             $packMultiple = 1;
@@ -315,6 +332,9 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
                 'cost_price' => $costPrice > 0 ? round($costPrice, 2) : null,
                 'warehouse_id' => $wh->warehouse_id,
                 'warehouse_name' => $wh->warehouse_name,
+                'cluster_id' => $clusterId,
+                'cluster_name' => $clusterName,
+                'region' => $clusterRegion,
                 'destination' => $wh->warehouse_name,
                 'destination_id' => $destinationId,
                 'destination_type' => $destinationType,

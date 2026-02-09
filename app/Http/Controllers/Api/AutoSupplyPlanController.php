@@ -244,6 +244,79 @@ class AutoSupplyPlanController extends Controller
     }
 
     /**
+     * GET /api/auto-supply-plans/{id}/clusters
+     * Агрегация строк плана по кластерам доставки (гео-распределение)
+     */
+    public function clusters(string $id): JsonResponse
+    {
+        $plan = AutoSupplyPlan::findOrFail($id);
+
+        $lines = $plan->lines()->get();
+
+        $clusters = [];
+        $unclustered = ['cluster_id' => null, 'cluster_name' => 'Без кластера', 'region' => null, 'warehouses' => [], 'total_qty' => 0, 'total_skus' => 0, 'total_supply_cost' => 0, 'skus' => []];
+
+        foreach ($lines as $line) {
+            $cid = $line->cluster_id;
+            if ($cid) {
+                if (!isset($clusters[$cid])) {
+                    $clusters[$cid] = [
+                        'cluster_id' => $cid,
+                        'cluster_name' => $line->cluster_name,
+                        'region' => $line->region,
+                        'warehouses' => [],
+                        'total_qty' => 0,
+                        'total_skus' => 0,
+                        'total_supply_cost' => 0,
+                        'skus' => [],
+                    ];
+                }
+                $clusters[$cid]['total_qty'] += $line->qty_rounded;
+                $clusters[$cid]['total_supply_cost'] += (float) ($line->supply_cost_estimate ?? 0);
+                $clusters[$cid]['skus'][$line->sku] = true;
+                if ($line->warehouse_name && !in_array($line->warehouse_name, $clusters[$cid]['warehouses'])) {
+                    $clusters[$cid]['warehouses'][] = $line->warehouse_name;
+                }
+            } else {
+                $unclustered['total_qty'] += $line->qty_rounded;
+                $unclustered['total_supply_cost'] += (float) ($line->supply_cost_estimate ?? 0);
+                $unclustered['skus'][$line->sku] = true;
+                if ($line->warehouse_name && !in_array($line->warehouse_name, $unclustered['warehouses'])) {
+                    $unclustered['warehouses'][] = $line->warehouse_name;
+                }
+            }
+        }
+
+        // Finalize SKU counts
+        foreach ($clusters as &$c) {
+            $c['total_skus'] = count($c['skus']);
+            $c['total_supply_cost'] = round($c['total_supply_cost'], 2);
+            unset($c['skus']);
+        }
+        $unclustered['total_skus'] = count($unclustered['skus']);
+        $unclustered['total_supply_cost'] = round($unclustered['total_supply_cost'], 2);
+        unset($unclustered['skus']);
+
+        // Sort by total_qty desc
+        $result = array_values($clusters);
+        usort($result, fn($a, $b) => $b['total_qty'] <=> $a['total_qty']);
+
+        if ($unclustered['total_qty'] > 0) {
+            $result[] = $unclustered;
+        }
+
+        return response()->json([
+            'message' => 'OK',
+            'data' => [
+                'plan_id' => $plan->id,
+                'marketplace' => $plan->marketplace,
+                'clusters' => $result,
+                'total_clusters' => count($clusters),
+            ],
+        ]);
+    }
+
+    /**
      * DELETE /api/auto-supply-plans/{id}
      */
     public function destroy(string $id): JsonResponse
