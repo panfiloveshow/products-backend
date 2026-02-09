@@ -598,26 +598,44 @@ class OzonOrderReportController extends Controller
     {
         $sales = OzonWarehouseSale::where('report_id', $report->id)->get();
 
-        foreach ($sales as $sale) {
-            // Ищем запись склада по SKU + warehouse_name
-            $warehouse = InventoryWarehouse::where('integration_id', $report->integration_id)
-                ->where('sku', $sale->sku)
-                ->where(function ($q) use ($sale) {
-                    $q->where('warehouse_name', $sale->warehouse_name)
-                      ->orWhere('warehouse_name', 'LIKE', '%' . $this->normalizeWarehouseName($sale->warehouse_name) . '%');
-                })
-                ->first();
+        // Загружаем все inventory_warehouses для этой интеграции и строим lookup по нормализованному имени
+        $allWarehouses = InventoryWarehouse::where('integration_id', $report->integration_id)->get();
 
+        // Строим карту: normalized(sku + warehouse_name) => InventoryWarehouse
+        $whLookup = [];
+        foreach ($allWarehouses as $iw) {
+            $normKey = $this->normalizeWarehouseName($iw->sku) . '||' . $this->normalizeWarehouseName($iw->warehouse_name);
+            $whLookup[$normKey] = $iw;
+        }
+
+        $matched = 0;
+        $unmatched = [];
+
+        foreach ($sales as $sale) {
+            $normSaleWh = $this->normalizeWarehouseName($sale->warehouse_name);
+
+            // Пробуем по SKU
+            $normKey = $this->normalizeWarehouseName($sale->sku) . '||' . $normSaleWh;
+            $warehouse = $whLookup[$normKey] ?? null;
+
+            // Пробуем по артикулу
+            if (!$warehouse && $sale->article) {
+                $normKey2 = $this->normalizeWarehouseName($sale->article) . '||' . $normSaleWh;
+                $warehouse = $whLookup[$normKey2] ?? null;
+            }
+
+            // Fuzzy: ищем по частичному совпадению warehouse_name
             if (!$warehouse) {
-                // Пробуем найти по артикулу
-                if ($sale->article) {
-                    $warehouse = InventoryWarehouse::where('integration_id', $report->integration_id)
-                        ->where('sku', $sale->article)
-                        ->where(function ($q) use ($sale) {
-                            $q->where('warehouse_name', $sale->warehouse_name)
-                              ->orWhere('warehouse_name', 'LIKE', '%' . $this->normalizeWarehouseName($sale->warehouse_name) . '%');
-                        })
-                        ->first();
+                foreach ($allWarehouses as $iw) {
+                    $normIwSku = $this->normalizeWarehouseName($iw->sku);
+                    $normIwWh = $this->normalizeWarehouseName($iw->warehouse_name);
+                    $normSaleSku = $this->normalizeWarehouseName($sale->sku);
+
+                    if (($normIwSku === $normSaleSku || ($sale->article && $normIwSku === $this->normalizeWarehouseName($sale->article)))
+                        && (str_contains($normIwWh, $normSaleWh) || str_contains($normSaleWh, $normIwWh))) {
+                        $warehouse = $iw;
+                        break;
+                    }
                 }
             }
 
@@ -633,12 +651,18 @@ class OzonOrderReportController extends Controller
                     'real_days_of_stock' => $realDaysOfStock,
                     'sales_report_id' => $report->id,
                 ]);
+                $matched++;
+            } else {
+                $unmatched[] = $sale->sku . ' @ ' . $sale->warehouse_name;
             }
         }
 
         Log::info('Warehouse turnover recalculated from report', [
             'report_id' => $report->id,
             'sales_count' => $sales->count(),
+            'matched' => $matched,
+            'unmatched_count' => count($unmatched),
+            'unmatched_sample' => array_slice($unmatched, 0, 10),
         ]);
     }
 
@@ -647,10 +671,10 @@ class OzonOrderReportController extends Controller
      */
     private function normalizeWarehouseName(string $name): string
     {
-        // Убираем суффиксы типа _РФЦ, _МПСЦ и т.д.
-        $name = preg_replace('/[_\s]+(РФЦ|МПСЦ|ФФЦ|СЦ)$/ui', '', $name);
-        // Убираем лишние пробелы
-        $name = trim($name);
+        // Приводим к нижнему регистру
+        $name = mb_strtolower(trim($name));
+        // Заменяем дефисы, подчёркивания и пробелы на единый разделитель
+        $name = preg_replace('/[\-_\s]+/u', '_', $name);
         return $name;
     }
 }
