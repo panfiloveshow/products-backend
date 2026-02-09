@@ -398,6 +398,12 @@ class InventoryController extends Controller
             $storageCostDaily = $whRows->sum('storage_cost_per_day') ?? 0;
             $storageCostMonthly = $whRows->sum('storage_cost_per_month') ?? 0;
 
+            // Фактические начисления за хранение (отчёты Ozon/WB)
+            $storageFeeTotal = $whRows->sum('storage_fee_total') ?? 0;
+            $storageFeeLastWeek = $whRows->sum('storage_fee_last_week') ?? 0;
+            $storageFeeReportFrom = $whRows->min('storage_fee_report_from');
+            $storageFeeReportTo = $whRows->max('storage_fee_report_to');
+
             // Матрица по складам
             $warehouseMatrix = $allWarehouses->map(function ($wh) use ($whByWarehouseId) {
                 $row = $whByWarehouseId->get($wh->warehouse_id);
@@ -451,6 +457,10 @@ class InventoryController extends Controller
                 'real_turnover_days' => $realTurnoverDays,
                 'real_days_of_stock' => $realDaysOfStock,
                 'real_sales_period_days' => $realSalesPeriodDays,
+                'storage_fee_total' => round($storageFeeTotal, 2),
+                'storage_fee_last_week' => round($storageFeeLastWeek, 2),
+                'storage_fee_report_from' => $storageFeeReportFrom,
+                'storage_fee_report_to' => $storageFeeReportTo,
                 'warehouses_with_stock' => $whRows->where('quantity', '>', 0)->count(),
                 'warehouses_total' => $allWarehouses->count(),
                 'warehouse_matrix' => $warehouseMatrix,
@@ -467,6 +477,9 @@ class InventoryController extends Controller
         if (in_array($sortField, ['total_stock', 'avg_daily_sales', 'turnover_days', 'days_of_stock'])) {
             $items = $items->sortBy($sortField, SORT_REGULAR, $sortOrder === 'desc')->values();
         }
+
+        $summaryStorageFeeFrom = $items->pluck('storage_fee_report_from')->filter()->min();
+        $summaryStorageFeeTo = $items->pluck('storage_fee_report_to')->filter()->max();
 
         return response()->json([
             'message' => 'OK',
@@ -488,6 +501,9 @@ class InventoryController extends Controller
                     'out_of_stock_count' => $items->where('stock_status', 'out_of_stock')->count(),
                     'critical_count' => $items->where('stock_status', 'critical')->count(),
                     'low_count' => $items->where('stock_status', 'low')->count(),
+                    'storage_fee_total' => round($items->sum('storage_fee_total') ?? 0, 2),
+                    'storage_fee_report_from' => $summaryStorageFeeFrom,
+                    'storage_fee_report_to' => $summaryStorageFeeTo,
                 ],
             ],
         ]);
