@@ -241,6 +241,9 @@ class AutoSupplyPlanController extends Controller
         $grouped = [];
         foreach ($lines as $line) {
             $offerId = $line->offer_id ?? $line->sku;
+            if (empty($offerId) || $line->qty_rounded <= 0) {
+                continue;
+            }
             if (!isset($grouped[$offerId])) {
                 $grouped[$offerId] = [
                     'offer_id' => $offerId,
@@ -250,6 +253,9 @@ class AutoSupplyPlanController extends Controller
             }
             $grouped[$offerId]['qty'] += $line->qty_rounded;
         }
+
+        // Убираем строки с итоговым qty < 1
+        $grouped = array_filter($grouped, fn($item) => $item['qty'] >= 1);
 
         $spreadsheet = new Spreadsheet();
         $sheet = $spreadsheet->getActiveSheet();
@@ -301,7 +307,21 @@ class AutoSupplyPlanController extends Controller
         $grouped = [];
         $errors = [];
 
+        // Проверяем однозначность offer_id → barcode
+        $skuToBarcodes = [];
         foreach ($lines as $line) {
+            $product = $products->get($line->sku);
+            $barcode = $product?->barcode ?? $line->barcode;
+            if ($barcode) {
+                $skuToBarcodes[$line->sku][$barcode] = true;
+            }
+        }
+
+        foreach ($lines as $line) {
+            if ($line->qty_rounded <= 0) {
+                continue;
+            }
+
             $product = $products->get($line->sku);
             $barcode = $product?->barcode ?? $line->barcode;
 
@@ -310,6 +330,17 @@ class AutoSupplyPlanController extends Controller
                     'sku' => $line->sku,
                     'product_name' => $line->product_name,
                     'error' => 'Баркод не найден',
+                ];
+                continue;
+            }
+
+            // Один offer_id → несколько баркодов (размеры)
+            if (isset($skuToBarcodes[$line->sku]) && count($skuToBarcodes[$line->sku]) > 1) {
+                $errors[] = [
+                    'sku' => $line->sku,
+                    'product_name' => $line->product_name,
+                    'barcodes' => array_keys($skuToBarcodes[$line->sku]),
+                    'error' => 'Несколько баркодов для одного SKU, нужна детализация',
                 ];
                 continue;
             }
@@ -323,27 +354,8 @@ class AutoSupplyPlanController extends Controller
             $grouped[$barcode]['qty'] += $line->qty_rounded;
         }
 
-        // Проверяем дубли barcode (разные SKU → один barcode)
-        $barcodeToSkus = [];
-        foreach ($lines as $line) {
-            $product = $products->get($line->sku);
-            $barcode = $product?->barcode ?? $line->barcode;
-            if ($barcode) {
-                $barcodeToSkus[$barcode][] = $line->sku;
-            }
-        }
-
-        foreach ($barcodeToSkus as $barcode => $skuList) {
-            $uniqueSkus = array_unique($skuList);
-            if (count($uniqueSkus) > 1) {
-                $errors[] = [
-                    'barcode' => $barcode,
-                    'skus' => $uniqueSkus,
-                    'error' => 'Несколько разных SKU с одним баркодом',
-                ];
-                unset($grouped[$barcode]);
-            }
-        }
+        // Убираем строки с итоговым qty < 1
+        $grouped = array_filter($grouped, fn($item) => $item['qty'] >= 1);
 
         // Сохраняем ошибки в план
         if (!empty($errors)) {

@@ -64,13 +64,8 @@ class AutoSupplyPlanLine extends Model
         return $this->belongsTo(Product::class, 'sku', 'sku');
     }
 
-    public function isCritical(): bool
-    {
-        return $this->risk_level === 'critical';
-    }
-
     public function isHighRisk(): bool
     {
-        return in_array($this->risk_level, ['critical', 'high']);
+        return $this->risk_level === 'high';
     }
 }

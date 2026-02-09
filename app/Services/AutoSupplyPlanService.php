@@ -163,13 +163,18 @@ class AutoSupplyPlanService
         $supplyArrived  = false;
 
         for ($day = 1; $day <= $horizonDays; $day++) {
+            $transitToday = 0;
+            $supplyToday  = 0;
+
             if (!$transitArrived && $day === self::LEAD_TIME_DEFAULT && $inTransit > 0) {
                 $stock += $inTransit;
+                $transitToday = $inTransit;
                 $transitArrived = true;
             }
 
             if (!$supplyArrived && $day === self::LEAD_TIME_DEFAULT + 3 && $supplyQty > 0) {
                 $stock += $supplyQty;
+                $supplyToday = $supplyQty;
                 $supplyArrived = true;
             }
 
@@ -179,8 +184,8 @@ class AutoSupplyPlanService
                 'day'             => $day,
                 'stock'           => round($stock, 1),
                 'sales_forecast'  => round($dailyDemand, 2),
-                'transit_arrived' => (!$transitArrived && $day === self::LEAD_TIME_DEFAULT) ? $inTransit : 0,
-                'supply_arrived'  => (!$supplyArrived && $day === self::LEAD_TIME_DEFAULT + 3) ? $supplyQty : 0,
+                'transit_arrived' => $transitToday,
+                'supply_arrived'  => $supplyToday,
             ];
         }
 

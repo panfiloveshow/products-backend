@@ -84,13 +84,14 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
         $totalQty = 0;
         $lines = [];
 
-        // Data quality counters
+        // Data quality counters (per unique SKU)
         $qStocksCoverage = 0;
         $qSalesHistory = 0;
         $qInTransit = 0;
         $qDestination = 0;
         $qBarcode = 0;
-        $totalSkus = $warehouses->count();
+        $qualitySeenSkus = [];
+        $totalSkus = $warehouses->pluck('sku')->unique()->count();
 
         foreach ($warehouses as $wh) {
             $product = $products->get($wh->sku);
@@ -195,12 +196,15 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
             $offerId = $wh->sku;
             $barcode = $product?->barcode;
 
-            // --- 4. Data quality counters ---
-            if ($currentStock > 0 || $inTransit > 0) $qStocksCoverage++;
-            if ($sales30 > 0) $qSalesHistory++;
-            if ($inTransit > 0) $qInTransit++;
-            if ($destinationId) $qDestination++;
-            if ($marketplace === 'wildberries' && !empty($barcode)) $qBarcode++;
+            // --- 4. Data quality counters (once per unique SKU) ---
+            if (!isset($qualitySeenSkus[$wh->sku])) {
+                $qualitySeenSkus[$wh->sku] = true;
+                if ($currentStock > 0 || $inTransit > 0) $qStocksCoverage++;
+                if ($sales30 > 0) $qSalesHistory++;
+                if ($inTransit > 0) $qInTransit++;
+                if ($destinationId) $qDestination++;
+                if ($marketplace === 'wildberries' && !empty($barcode)) $qBarcode++;
+            }
 
             // Пропускаем строки с нулевым количеством
             if ($qtyRounded <= 0) {
