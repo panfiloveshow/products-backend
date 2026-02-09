@@ -363,6 +363,13 @@ class InventoryController extends Controller
             $turnoverDays = $avgDailySales > 0 ? round($totalStock / $avgDailySales, 1) : null;
             $daysOfStock = $avgDailySales > 0 ? (int) round($totalStock / $avgDailySales) : ($totalStock > 0 ? 999 : 0);
 
+            // Реальные данные из отчёта Ozon (агрегированные по SKU)
+            $realAvgDaily = $whRows->whereNotNull('real_avg_daily_sales')->sum('real_avg_daily_sales');
+            $hasRealData = $realAvgDaily > 0;
+            $realTurnoverDays = $hasRealData ? round($totalStock / $realAvgDaily, 1) : null;
+            $realDaysOfStock = $hasRealData ? (int) ceil($totalStock / $realAvgDaily) : null;
+            $realSalesPeriodDays = $whRows->whereNotNull('real_sales_period_days')->max('real_sales_period_days');
+
             $costPrice = $ue?->cost_price ?? $product->cost_price ?? 0;
             $price = $product->price ?? $ue?->price ?? 0;
             $stockValue = $totalStock * $costPrice;
@@ -439,6 +446,10 @@ class InventoryController extends Controller
                 'stock_status' => $stockStatus,
                 'storage_cost_daily' => round($storageCostDaily, 2),
                 'storage_cost_monthly' => round($storageCostMonthly, 2),
+                'real_avg_daily_sales' => $hasRealData ? round($realAvgDaily, 2) : null,
+                'real_turnover_days' => $realTurnoverDays,
+                'real_days_of_stock' => $realDaysOfStock,
+                'real_sales_period_days' => $realSalesPeriodDays,
                 'warehouses_with_stock' => $whRows->where('quantity', '>', 0)->count(),
                 'warehouses_total' => $allWarehouses->count(),
                 'warehouse_matrix' => $warehouseMatrix,
