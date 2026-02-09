@@ -69,23 +69,15 @@ class SyncInventoryJob implements ShouldQueue
                 $salesBySku = $marketplace->getSalesBySku();
             }
             
-            // Получаем стоимость хранения по SKU
-            // Для Ozon используем отчёт о размещении (getPlacementCostByProducts)
-            // Для WB используем getStorageCostBySku
+            // Получаем стоимость хранения по SKU из отчёта о размещении Ozon
+            // Загружаем за текущий месяц, прошлый месяц. За всё время = сумма обоих.
             $storageCostBySku = [];
             $storageFeeReportFrom = null;
             $storageFeeReportTo = null;
             
             if ($this->syncLog->marketplace === 'ozon' && method_exists($marketplace, 'getPlacementCostByProducts')) {
                 try {
-                    // Получаем данные за текущий месяц (фактически начисленная сумма)
-                    $dateFrom = now()->startOfMonth()->format('Y-m-d');
-                    $dateTo = now()->format('Y-m-d');
-                    $storageFeeReportFrom = $dateFrom;
-                    $storageFeeReportTo = $dateTo;
-                    
-                    // Удаляем старые агрегированные записи (Ozon FBO Fbo, Ozon FBS) - они больше не нужны
-                    // Теперь используем детальные данные по каждому складу из getDetailedInventory()
+                    // Удаляем старые агрегированные записи
                     InventoryWarehouse::where('marketplace', 'ozon')
                         ->where('integration_id', $this->syncLog->integration_id)
                         ->where(function($q) {
@@ -95,87 +87,64 @@ class SyncInventoryJob implements ShouldQueue
                         })
                         ->delete();
                     
-                    $placementData = $marketplace->getPlacementCostByProducts($dateFrom, $dateTo, 120);
+                    $currentFrom = now()->startOfMonth()->format('Y-m-d');
+                    $currentTo = now()->format('Y-m-d');
+                    $prevFrom = now()->subMonth()->startOfMonth()->format('Y-m-d');
+                    $prevTo = now()->subMonth()->endOfMonth()->format('Y-m-d');
+                    $storageFeeReportFrom = $currentFrom;
+                    $storageFeeReportTo = $currentTo;
                     
-                    if (!empty($placementData)) {
-                        // Сбрасываем старые данные о платном хранении для этой интеграции
-                        // чтобы не накапливались суммы за разные периоды
-                        InventoryWarehouse::where('marketplace', 'ozon')
-                            ->where('integration_id', $this->syncLog->integration_id)
-                            ->update([
-                                'storage_fee_total' => null,
-                                'storage_fee_report_from' => null,
-                                'storage_fee_report_to' => null,
-                            ]);
-                        
-                        // Конвертируем в формат storageCostBySku с периодом отчёта
-                        foreach ($placementData as $sku => $data) {
-                            $storageCostBySku[$sku] = [
-                                'storage_fee_total' => $data['placement_cost'] ?? 0,
-                                'storage_fee_report_from' => $dateFrom,
-                                'storage_fee_report_to' => $dateTo,
-                            ];
-                        }
-                        
-                        Log::info('Ozon placement cost loaded', [
-                            'count' => count($storageCostBySku),
-                            'period' => "$dateFrom - $dateTo",
-                        ]);
-                    } else {
-                        // Отчёт не загрузился (лимит API или ошибка) - загружаем предыдущие значения из БД
-                        Log::warning('Ozon placement cost not loaded, loading previous values from DB', [
-                            'period' => "$dateFrom - $dateTo",
-                        ]);
-                        
-                        // Загружаем существующие данные о платном хранении из БД
-                        $existingStorageFees = InventoryWarehouse::where('marketplace', 'ozon')
-                            ->where('integration_id', $this->syncLog->integration_id)
-                            ->whereNotNull('storage_fee_total')
-                            ->where('storage_fee_total', '>', 0)
-                            ->get(['sku', 'storage_fee_total', 'storage_fee_report_from', 'storage_fee_report_to']);
-                        
-                        // Группируем по SKU (берём первую запись с данными)
-                        $seenSkus = [];
-                        foreach ($existingStorageFees as $record) {
-                            if (!isset($seenSkus[$record->sku])) {
-                                $storageCostBySku[$record->sku] = [
-                                    'storage_fee_total' => (float) $record->storage_fee_total,
-                                    'storage_fee_report_from' => $record->storage_fee_report_from,
-                                    'storage_fee_report_to' => $record->storage_fee_report_to,
-                                ];
-                                $seenSkus[$record->sku] = true;
-                            }
-                        }
-                        
-                        Log::info('Loaded previous storage fees from DB', [
-                            'count' => count($storageCostBySku),
-                        ]);
-                    }
-                } catch (\Exception $e) {
-                    Log::warning('Failed to load Ozon placement cost, loading previous values from DB', ['error' => $e->getMessage()]);
-                    
-                    // Загружаем существующие данные о платном хранении из БД
-                    $existingStorageFees = InventoryWarehouse::where('marketplace', 'ozon')
-                        ->where('integration_id', $this->syncLog->integration_id)
-                        ->whereNotNull('storage_fee_total')
-                        ->where('storage_fee_total', '>', 0)
-                        ->get(['sku', 'storage_fee_total', 'storage_fee_report_from', 'storage_fee_report_to']);
-                    
-                    $seenSkus = [];
-                    foreach ($existingStorageFees as $record) {
-                        if (!isset($seenSkus[$record->sku])) {
-                            $storageCostBySku[$record->sku] = [
-                                'storage_fee_total' => (float) $record->storage_fee_total,
-                                'storage_fee_report_from' => $record->storage_fee_report_from,
-                                'storage_fee_report_to' => $record->storage_fee_report_to,
-                            ];
-                            $seenSkus[$record->sku] = true;
-                        }
-                    }
-                    
-                    Log::info('Loaded previous storage fees from DB after error', [
-                        'count' => count($storageCostBySku),
+                    // Текущий месяц
+                    $currentMonthData = $marketplace->getPlacementCostByProducts($currentFrom, $currentTo, 120);
+                    Log::info('Ozon placement cost current month', [
+                        'count' => count($currentMonthData),
+                        'period' => "$currentFrom - $currentTo",
+                        'total' => round(array_sum(array_column($currentMonthData, 'placement_cost')), 2),
                     ]);
+                    
+                    // Прошлый месяц
+                    $prevMonthData = $marketplace->getPlacementCostByProducts($prevFrom, $prevTo, 120);
+                    Log::info('Ozon placement cost prev month', [
+                        'count' => count($prevMonthData),
+                        'period' => "$prevFrom - $prevTo",
+                        'total' => round(array_sum(array_column($prevMonthData, 'placement_cost')), 2),
+                    ]);
+                    
+                    // Сбрасываем старые данные
+                    InventoryWarehouse::where('marketplace', 'ozon')
+                        ->where('integration_id', $this->syncLog->integration_id)
+                        ->update([
+                            'storage_fee_total' => null,
+                            'storage_fee_report_from' => null,
+                            'storage_fee_report_to' => null,
+                            'storage_fee_prev_month' => null,
+                            'storage_fee_prev_month_period' => null,
+                            'storage_fee_all_time' => null,
+                        ]);
+                    
+                    // Собираем все SKU
+                    $allSkus = array_unique(array_merge(array_keys($currentMonthData), array_keys($prevMonthData)));
+                    
+                    foreach ($allSkus as $sku) {
+                        $currentCost = $currentMonthData[$sku]['placement_cost'] ?? 0;
+                        $prevCost = $prevMonthData[$sku]['placement_cost'] ?? 0;
+                        $allTimeCost = $currentCost + $prevCost;
+                        
+                        $storageCostBySku[$sku] = [
+                            'storage_fee_total' => $currentCost,
+                            'storage_fee_report_from' => $currentFrom,
+                            'storage_fee_report_to' => $currentTo,
+                            'storage_fee_prev_month' => $prevCost,
+                            'storage_fee_prev_month_period' => "$prevFrom - $prevTo",
+                            'storage_fee_all_time' => $allTimeCost,
+                        ];
+                    }
+                    
+                    Log::info('Ozon placement cost combined', [
+                        'skus' => count($storageCostBySku),
+                    ]);
+                } catch (\Exception $e) {
+                    Log::warning('Failed to load Ozon placement cost', ['error' => $e->getMessage()]);
                 }
             } elseif (method_exists($marketplace, 'getStorageCostBySku')) {
                 $storageCostBySku = $marketplace->getStorageCostBySku();
@@ -591,19 +560,16 @@ class SyncInventoryJob implements ShouldQueue
             'storage_fee_last_week' => $storageFeeLastWeek,
             'storage_fee_report_from' => $storageFeeReportFrom,
             'storage_fee_report_to' => $storageFeeReportTo,
-            // Платное хранение Ozon (из /v3/finance/transaction/list)
-            'paid_storage_penalty' => array_key_exists('paid_storage_penalty', $stockData)
-                ? $stockData['paid_storage_penalty']
-                : ($existing?->paid_storage_penalty ?? null),
-            'paid_storage_fee' => array_key_exists('paid_storage_fee', $stockData)
-                ? $stockData['paid_storage_fee']
-                : ($existing?->paid_storage_fee ?? null),
-            'paid_storage_from' => array_key_exists('paid_storage_from', $stockData)
-                ? $stockData['paid_storage_from']
-                : ($existing?->paid_storage_from ?? null),
-            'paid_storage_to' => array_key_exists('paid_storage_to', $stockData)
-                ? $stockData['paid_storage_to']
-                : ($existing?->paid_storage_to ?? null),
+            // Хранение за прошлый месяц и за всё время (из отчёта о размещении Ozon)
+            'storage_fee_prev_month' => array_key_exists('storage_fee_prev_month', $stockData)
+                ? $stockData['storage_fee_prev_month']
+                : ($existing?->storage_fee_prev_month ?? null),
+            'storage_fee_prev_month_period' => array_key_exists('storage_fee_prev_month_period', $stockData)
+                ? $stockData['storage_fee_prev_month_period']
+                : ($existing?->storage_fee_prev_month_period ?? null),
+            'storage_fee_all_time' => array_key_exists('storage_fee_all_time', $stockData)
+                ? $stockData['storage_fee_all_time']
+                : ($existing?->storage_fee_all_time ?? null),
             'last_updated' => now(),
         ];
 

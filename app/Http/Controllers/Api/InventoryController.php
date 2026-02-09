@@ -404,11 +404,10 @@ class InventoryController extends Controller
             $storageFeeReportFrom = $whRows->min('storage_fee_report_from');
             $storageFeeReportTo = $whRows->max('storage_fee_report_to');
 
-            // Платное хранение Ozon (штраф >120 дней + обычная плата)
-            $paidStoragePenalty = $whRows->sum('paid_storage_penalty') ?? 0;
-            $paidStorageFee = $whRows->sum('paid_storage_fee') ?? 0;
-            $paidStorageFrom = $whRows->min('paid_storage_from');
-            $paidStorageTo = $whRows->max('paid_storage_to');
+            // Хранение за прошлый месяц и за всё время
+            $storageFeePrevMonth = $whRows->sum('storage_fee_prev_month') ?? 0;
+            $storageFeePrevMonthPeriod = $whRows->pluck('storage_fee_prev_month_period')->filter()->first();
+            $storageFeeAllTime = $whRows->sum('storage_fee_all_time') ?? 0;
 
             // Матрица по складам
             $warehouseMatrix = $allWarehouses->map(function ($wh) use ($whByWarehouseId) {
@@ -467,6 +466,9 @@ class InventoryController extends Controller
                 'storage_fee_last_week' => round($storageFeeLastWeek, 2),
                 'storage_fee_report_from' => $storageFeeReportFrom,
                 'storage_fee_report_to' => $storageFeeReportTo,
+                'storage_fee_prev_month' => round($storageFeePrevMonth, 2),
+                'storage_fee_prev_month_period' => $storageFeePrevMonthPeriod,
+                'storage_fee_all_time' => round($storageFeeAllTime, 2),
                 'warehouses_with_stock' => $whRows->where('quantity', '>', 0)->count(),
                 'warehouses_total' => $allWarehouses->count(),
                 'warehouse_matrix' => $warehouseMatrix,

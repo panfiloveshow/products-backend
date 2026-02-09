@@ -259,30 +259,23 @@ class StorageApi
 
     /**
      * Получить стоимость размещения по товарам за период
-     * Сначала проверяет существующие отчёты, если нет - создаёт новый
+     * Всегда создаёт новый отчёт за указанный период (не использует кэш)
      * 
      * @param string $dateFrom Начало периода (YYYY-MM-DD)
      * @param string $dateTo Конец периода (YYYY-MM-DD)
      * @param int $maxWaitSeconds Максимальное время ожидания отчёта
-     * @return array Данные о стоимости размещения по SKU
+     * @return array Данные о стоимости размещения по SKU ['sku' => ['placement_cost' => float, ...]]
      */
     public function getPlacementCostByProducts(string $dateFrom, string $dateTo, int $maxWaitSeconds = 60): array
     {
-        // Сначала проверяем существующие отчёты за последние 24 часа
-        $existingReport = $this->findExistingPlacementReport('seller_placement_by_products');
-        
-        if ($existingReport) {
-            $fileUrl = $existingReport['file'] ?? null;
-            if ($fileUrl) {
-                Log::info('Using existing placement report', ['report_id' => $existingReport['code'] ?? 'unknown']);
-                return $this->downloadAndParsePlacementReport($fileUrl);
-            }
-        }
-
-        // Если нет существующего отчёта - создаём новый
         $reportId = $this->createPlacementReportByProducts($dateFrom, $dateTo);
         
-        if (!$reportId) {
+        if (!$reportId || is_numeric($reportId)) {
+            Log::warning('Ozon placement report creation failed or returned error', [
+                'report_id' => $reportId,
+                'date_from' => $dateFrom,
+                'date_to' => $dateTo,
+            ]);
             return [];
         }
 
@@ -303,10 +296,9 @@ class StorageApi
                 return [];
             }
             
-            sleep(2); // Ждём 2 секунды перед следующей проверкой
+            sleep(3);
         }
 
-        // Получаем URL файла
         $fileUrl = $reportInfo['file'] ?? null;
         
         if (!$fileUrl) {
@@ -314,7 +306,6 @@ class StorageApi
             return [];
         }
 
-        // Скачиваем и парсим XLSX
         return $this->downloadAndParsePlacementReport($fileUrl);
     }
 
@@ -356,15 +347,18 @@ class StorageApi
 
     /**
      * Скачать и распарсить отчёт о стоимости размещения (XLSX формат)
+     * Использует PhpSpreadsheet для корректного парсинга
+     * 
+     * Структура XLSX:
+     * C1=Дата, C2=SKU, C3=Артикул, ..., C12=Начисленная стоимость размещения
      * 
      * @param string $fileUrl URL файла отчёта
-     * @return array Данные по SKU
+     * @return array Данные по SKU ['sku' => ['placement_cost' => float, ...]]
      */
     private function downloadAndParsePlacementReport(string $fileUrl): array
     {
         try {
-            // Скачиваем файл во временную директорию
-            $tempFile = tempnam(sys_get_temp_dir(), 'ozon_placement_') . '.xlsx';
+            $tempFile = '/tmp/ozon_placement_' . md5($fileUrl) . '.xlsx';
             $content = file_get_contents($fileUrl);
             
             if (!$content) {
@@ -374,171 +368,45 @@ class StorageApi
             
             file_put_contents($tempFile, $content);
             
-            // Парсим XLSX с помощью SimpleXLSX или PhpSpreadsheet
-            $result = $this->parseXlsxFile($tempFile);
+            $reader = new \PhpOffice\PhpSpreadsheet\Reader\Xlsx();
+            $spreadsheet = $reader->load($tempFile);
+            $sheet = $spreadsheet->getActiveSheet();
+            $maxRow = $sheet->getHighestRow();
             
-            // Удаляем временный файл
+            // Колонка 3 = Артикул (offer_id), Колонка 12 = Начисленная стоимость размещения
+            $result = [];
+            $totalCost = 0;
+            
+            for ($r = 2; $r <= $maxRow; $r++) {
+                $sku = $sheet->getCellByColumnAndRow(3, $r)->getValue();
+                $cost = (float)$sheet->getCellByColumnAndRow(12, $r)->getValue();
+                
+                if (!$sku || empty(trim((string)$sku))) continue;
+                
+                $sku = trim((string)$sku);
+                
+                if (!isset($result[$sku])) {
+                    $result[$sku] = ['placement_cost' => 0];
+                }
+                
+                $result[$sku]['placement_cost'] += $cost;
+                $totalCost += $cost;
+            }
+            
             @unlink($tempFile);
             
-            Log::info('Ozon placement report parsed', ['skus_count' => count($result)]);
+            Log::info('Ozon placement report parsed', [
+                'skus_count' => count($result),
+                'total_cost' => round($totalCost, 2),
+                'rows' => $maxRow - 1,
+            ]);
 
             return $result;
         } catch (\Exception $e) {
             Log::error('Ozon downloadAndParsePlacementReport error', ['error' => $e->getMessage()]);
+            @unlink($tempFile ?? '');
             return [];
         }
-    }
-
-    /**
-     * Парсинг XLSX файла отчёта о размещении
-     */
-    private function parseXlsxFile(string $filePath): array
-    {
-        $result = [];
-        
-        // Используем ZipArchive для чтения XLSX
-        $zip = new \ZipArchive();
-        if ($zip->open($filePath) !== true) {
-            Log::warning('Cannot open XLSX file');
-            return [];
-        }
-
-        // Читаем shared strings
-        $sharedStrings = [];
-        $sharedStringsXml = $zip->getFromName('xl/sharedStrings.xml');
-        if ($sharedStringsXml) {
-            $xml = simplexml_load_string($sharedStringsXml);
-            foreach ($xml->si as $si) {
-                $sharedStrings[] = (string)$si->t;
-            }
-        }
-
-        // Читаем данные листа
-        $sheetXml = $zip->getFromName('xl/worksheets/sheet1.xml');
-        $zip->close();
-
-        if (!$sheetXml) {
-            Log::warning('Cannot read sheet1.xml');
-            return [];
-        }
-
-        $xml = simplexml_load_string($sheetXml);
-        $rows = [];
-        
-        foreach ($xml->sheetData->row as $row) {
-            $rowData = [];
-            $colIndex = 0;
-            
-            foreach ($row->c as $cell) {
-                $value = '';
-                $type = (string)$cell['t'];
-                $ref = (string)$cell['r'];
-                
-                // Если есть ссылка на ячейку (A1, B1, ...), используем её
-                // Иначе используем порядковый индекс
-                if (!empty($ref) && preg_match('/^([A-Z]+)/', $ref, $matches)) {
-                    $colIndex = $this->columnLetterToIndex($matches[1]);
-                }
-                
-                if ($type === 's') {
-                    // Shared string
-                    $index = (int)$cell->v;
-                    $value = $sharedStrings[$index] ?? '';
-                } elseif ($type === 'str' || $type === 'inlineStr') {
-                    // Inline string
-                    $value = (string)$cell->v;
-                } else {
-                    // Number or other
-                    $value = (string)$cell->v;
-                }
-                
-                $rowData[$colIndex] = $value;
-                $colIndex++; // Увеличиваем для следующей ячейки
-            }
-            $rows[] = $rowData;
-        }
-
-        if (count($rows) < 2) {
-            return [];
-        }
-
-        // Первая строка - заголовки
-        $headers = array_map('trim', $rows[0]);
-        
-        // Ищем индексы нужных колонок (порядок важен - более специфичные названия первыми)
-        $skuIndex = $this->findColumnIndex($headers, ['Артикул', 'offer_id']); // НЕ SKU - это числовой ID Ozon
-        $costIndex = $this->findColumnIndex($headers, ['Начисленная стоимость размещения', 'Начисленная стоимость']);
-        $volumeIndex = $this->findColumnIndex($headers, ['Платный объем в миллилитрах', 'Платный объем']);
-        $quantityIndex = $this->findColumnIndex($headers, ['Кол-во платных экземпляров', 'Кол-во платных']);
-        
-        Log::info('Ozon placement report columns', [
-            'headers' => $headers,
-            'sku_index' => $skuIndex,
-            'cost_index' => $costIndex,
-        ]);
-
-        if ($skuIndex === null) {
-            Log::warning('SKU column not found in placement report', ['headers' => $headers]);
-            return [];
-        }
-
-        // Парсим данные
-        for ($i = 1; $i < count($rows); $i++) {
-            $row = $rows[$i];
-            $sku = $row[$skuIndex] ?? null;
-            
-            if (!$sku || empty(trim($sku))) continue;
-            
-            $cost = $costIndex !== null ? (float)str_replace([' ', ','], ['', '.'], $row[$costIndex] ?? '0') : 0;
-            $volume = $volumeIndex !== null ? (float)str_replace([' ', ','], ['', '.'], $row[$volumeIndex] ?? '0') : 0;
-            $quantity = $quantityIndex !== null ? (int)($row[$quantityIndex] ?? 0) : 0;
-            
-            // Агрегируем по SKU (может быть несколько строк для одного SKU)
-            if (!isset($result[$sku])) {
-                $result[$sku] = [
-                    'placement_cost' => 0,
-                    'volume_liters' => $volume,
-                    'quantity' => 0,
-                ];
-            }
-            
-            $result[$sku]['placement_cost'] += $cost;
-            $result[$sku]['quantity'] += $quantity;
-        }
-
-        return $result;
-    }
-
-    /**
-     * Найти индекс колонки по возможным названиям
-     */
-    private function findColumnIndex(array $headers, array $possibleNames): ?int
-    {
-        foreach ($headers as $index => $header) {
-            $headerLower = mb_strtolower(trim($header));
-            foreach ($possibleNames as $name) {
-                if (mb_strpos($headerLower, mb_strtolower($name)) !== false) {
-                    return $index;
-                }
-            }
-        }
-        return null;
-    }
-
-    /**
-     * Конвертировать букву колонки Excel в индекс (A=0, B=1, ..., Z=25, AA=26, ...)
-     */
-    private function columnLetterToIndex(string $letters): int
-    {
-        $letters = strtoupper($letters);
-        $index = 0;
-        $length = strlen($letters);
-        
-        for ($i = 0; $i < $length; $i++) {
-            $index = $index * 26 + (ord($letters[$i]) - ord('A') + 1);
-        }
-        
-        return $index - 1; // 0-based index
     }
 
     /**
