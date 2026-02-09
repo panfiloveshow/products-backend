@@ -246,17 +246,23 @@ class SyncInventoryJob implements ShouldQueue
                         
                         // Записываем paid_storage СРАЗУ в InventoryWarehouse
                         // т.к. getDetailedInventory() может вернуть пустой массив (early return)
+                        // ВАЖНО: записываем только в ОДНУ запись склада для каждого SKU,
+                        // чтобы при агрегации (sum) не дублировалась сумма
                         $paidUpdated = 0;
                         foreach ($ozonPaidStorageBySku as $sku => $paidData) {
-                            $affected = InventoryWarehouse::where('sku', $sku)
+                            $firstRow = InventoryWarehouse::where('sku', $sku)
                                 ->where('integration_id', $this->syncLog->integration_id)
-                                ->update([
+                                ->orderBy('quantity', 'desc')
+                                ->first();
+                            if ($firstRow) {
+                                $firstRow->update([
                                     'paid_storage_penalty' => $paidData['storage_penalty'] ?? 0,
                                     'paid_storage_fee' => $paidData['storage_fee'] ?? 0,
                                     'paid_storage_from' => $paidDateFrom,
                                     'paid_storage_to' => $paidDateTo,
                                 ]);
-                            $paidUpdated += $affected;
+                                $paidUpdated++;
+                            }
                         }
 
                         Log::info('Ozon paid storage transactions loaded & written', [
