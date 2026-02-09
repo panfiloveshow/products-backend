@@ -72,10 +72,16 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
             return;
         }
 
-        // Загружаем продукты для метаданных (barcode, name, pack_multiple)
+        // Загружаем продукты для метаданных (barcode, name, pack_multiple, price)
         $skus = $warehouses->pluck('sku')->unique()->toArray();
         $products = Product::where('integration_id', $integrationId)
             ->where('marketplace', $marketplace)
+            ->whereIn('sku', $skus)
+            ->get()
+            ->keyBy('sku');
+
+        // Загружаем UnitEconomics для финансовых метрик (cost_price, storage, delivery)
+        $unitEconomics = \App\Models\UnitEconomics::where('integration_id', $integrationId)
             ->whereIn('sku', $skus)
             ->get()
             ->keyBy('sku');
@@ -196,6 +202,93 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
             $offerId = $wh->sku;
             $barcode = $product?->barcode;
 
+            // --- 3.9 Финансовые метрики + Тренд ---
+            $ue = $unitEconomics->get($wh->sku);
+            $price = $product?->price ?? $ue?->price ?? 0;
+            $costPrice = $ue?->cost_price ?? $wh->cost_price ?? 0;
+            $storageCostDaily = $wh->storage_cost_per_day ?? 0;
+            $storageCostMonthly = $wh->storage_cost_per_month ?? 0;
+
+            // Тренд продаж (улучшенный: 3 периода + учёт OOS)
+            $salesTrend = 'stable';
+            $salesTrendPercent = 0;
+
+            // Используем effective_daily_sales если товар был OOS (корректировка на дни в наличии)
+            $daysInStock30 = $wh->days_in_stock_30 ?? 30;
+            $effectiveDailySales = $wh->effective_daily_sales ?? 0;
+
+            // Среднедневные по периодам
+            $avg7 = $sales7 > 0 ? $sales7 / 7 : 0;
+            $avg14 = $sales14 > 0 ? $sales14 / 14 : 0;
+            // Для 30д: если были OOS-дни, используем effective_daily_sales
+            $avg30 = ($daysInStock30 > 0 && $daysInStock30 < 25 && $effectiveDailySales > 0)
+                ? $effectiveDailySales
+                : ($sales30 > 0 ? $sales30 / 30 : 0);
+
+            if ($avg30 > 0 && $sales14 > 0) {
+                // Краткосрочный тренд: 7д vs 8-14д
+                $avg8_14 = ($sales14 - $sales7) / 7;
+                $shortTrend = $avg8_14 > 0 ? (($avg7 - $avg8_14) / $avg8_14) * 100 : 0;
+
+                // Среднесрочный тренд: 14д vs 15-30д
+                $older16Avg = ($sales30 - $sales14) / 16;
+                $midTrend = $older16Avg > 0 ? (($avg14 - $older16Avg) / $older16Avg) * 100 : 0;
+
+                // Взвешенный тренд: 60% краткосрочный + 40% среднесрочный
+                $salesTrendPercent = round($shortTrend * 0.6 + $midTrend * 0.4, 2);
+
+                if ($salesTrendPercent > 10) $salesTrend = 'growing';
+                elseif ($salesTrendPercent < -10) $salesTrend = 'declining';
+            }
+
+            // Добавляем детали тренда в explain_json
+            $explainJson['trend'] = [
+                'sales_7d' => $sales7,
+                'sales_14d' => $sales14,
+                'sales_30d' => $sales30,
+                'avg_daily_7d' => round($avg7, 4),
+                'avg_daily_14d' => round($avg14, 4),
+                'avg_daily_30d' => round($avg30, 4),
+                'days_in_stock_30' => $daysInStock30,
+                'effective_daily_sales' => round($effectiveDailySales, 4),
+                'oos_adjusted' => ($daysInStock30 < 25 && $effectiveDailySales > 0),
+                'short_trend_pct' => isset($shortTrend) ? round($shortTrend, 2) : null,
+                'mid_trend_pct' => isset($midTrend) ? round($midTrend, 2) : null,
+                'weighted_trend_pct' => $salesTrendPercent,
+                'result' => $salesTrend,
+            ];
+
+            // Потерянная выручка при OOS (если товар закончится)
+            $lostRevenueDaily = $dailyDemand * $price;
+
+            // Стоимость поставки (себестоимость * количество)
+            $supplyCostEstimate = $costPrice > 0 ? $costPrice * $qtyRounded : 0;
+
+            // Ожидаемая выручка за период покрытия
+            $expectedRevenue = $price > 0 ? $dailyDemand * $targetCoverDays * $price : 0;
+
+            // Ожидаемая прибыль
+            $expectedProfit = $expectedRevenue - $supplyCostEstimate - ($storageCostDaily * $targetCoverDays);
+
+            // ROI поставки
+            $roiPercent = $supplyCostEstimate > 0 ? round(($expectedProfit / $supplyCostEstimate) * 100, 2) : 0;
+
+            // Оборачиваемость
+            $turnoverDays = $dailyDemand > 0 ? round(($currentStock + $inTransit + $qtyRounded) / $dailyDemand, 1) : null;
+
+            // Приоритет поставки
+            $priorityScore = 0;
+            if ($oosDate) $priorityScore += 40;
+            if ($coverBefore < $minCoverDays) $priorityScore += 30;
+            if ($riskLevel === 'high') $priorityScore += 20;
+            if ($salesTrend === 'growing') $priorityScore += 10;
+            $priorityScore = min(100, $priorityScore);
+
+            $priority = 'low';
+            if ($priorityScore >= 70) $priority = 'critical';
+            elseif ($priorityScore >= 50) $priority = 'high';
+            elseif ($priorityScore >= 30) $priority = 'medium';
+
             // --- 4. Data quality counters (once per unique SKU) ---
             if (!isset($qualitySeenSkus[$wh->sku])) {
                 $qualitySeenSkus[$wh->sku] = true;
@@ -218,6 +311,8 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
                 'offer_id' => $offerId,
                 'product_name' => $product?->name,
                 'barcode' => $barcode,
+                'price' => $price > 0 ? round($price, 2) : null,
+                'cost_price' => $costPrice > 0 ? round($costPrice, 2) : null,
                 'warehouse_id' => $wh->warehouse_id,
                 'warehouse_name' => $wh->warehouse_name,
                 'destination' => $wh->warehouse_name,
@@ -230,10 +325,22 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
                 'avg_daily_sales' => round($avgDailySales, 4),
                 'ewma_daily_sales' => round($dailyDemand, 4),
                 'demand_daily' => round($dailyDemand, 4),
+                'sales_trend' => $salesTrend,
+                'sales_trend_percent' => $salesTrendPercent,
                 'cover_days_before' => round($coverBefore, 2),
                 'cover_days_after' => round($coverAfter, 2),
                 'oos_date' => $oosDate,
                 'surplus_days' => $surplusDays,
+                'storage_cost_daily' => $storageCostDaily > 0 ? round($storageCostDaily, 2) : null,
+                'storage_cost_monthly' => $storageCostMonthly > 0 ? round($storageCostMonthly, 2) : null,
+                'lost_revenue_daily' => $lostRevenueDaily > 0 ? round($lostRevenueDaily, 2) : null,
+                'supply_cost_estimate' => $supplyCostEstimate > 0 ? round($supplyCostEstimate, 2) : null,
+                'expected_revenue' => $expectedRevenue > 0 ? round($expectedRevenue, 2) : null,
+                'expected_profit' => round($expectedProfit, 2),
+                'roi_percent' => $roiPercent,
+                'priority_score' => $priorityScore,
+                'priority' => $priority,
+                'turnover_days' => $turnoverDays,
                 'explain_json' => json_encode($explainJson),
                 'risk_level' => $riskLevel,
                 'simulation_json' => json_encode($simulation),

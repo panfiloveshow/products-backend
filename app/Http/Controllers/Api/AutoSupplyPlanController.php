@@ -189,6 +189,30 @@ class AutoSupplyPlanController extends Controller
             ->orderByDesc('qty_rounded')
             ->paginate($perPage);
 
+        // Финансовые агрегаты
+        $allLines = $plan->lines();
+        $totalSupplyCost = (float) $allLines->sum('supply_cost_estimate');
+        $totalExpectedRevenue = (float) $plan->lines()->sum('expected_revenue');
+        $totalExpectedProfit = (float) $plan->lines()->sum('expected_profit');
+        $totalLostRevenueDaily = (float) $plan->lines()->sum('lost_revenue_daily');
+        $avgRoi = (float) $plan->lines()->whereNotNull('roi_percent')->avg('roi_percent');
+        $avgTurnover = (float) $plan->lines()->whereNotNull('turnover_days')->avg('turnover_days');
+
+        // Приоритет breakdown
+        $priorityBreakdown = [
+            'critical' => $plan->lines()->where('priority', 'critical')->count(),
+            'high' => $plan->lines()->where('priority', 'high')->count(),
+            'medium' => $plan->lines()->where('priority', 'medium')->count(),
+            'low' => $plan->lines()->where('priority', 'low')->count(),
+        ];
+
+        // Тренд breakdown
+        $trendBreakdown = [
+            'growing' => $plan->lines()->where('sales_trend', 'growing')->count(),
+            'stable' => $plan->lines()->where('sales_trend', 'stable')->count(),
+            'declining' => $plan->lines()->where('sales_trend', 'declining')->count(),
+        ];
+
         return response()->json([
             'message' => 'OK',
             'data' => [
@@ -203,6 +227,16 @@ class AutoSupplyPlanController extends Controller
                         'high' => $plan->lines()->where('risk_level', 'high')->count(),
                         'med' => $plan->lines()->where('risk_level', 'med')->count(),
                         'low' => $plan->lines()->where('risk_level', 'low')->count(),
+                    ],
+                    'priority_breakdown' => $priorityBreakdown,
+                    'trend_breakdown' => $trendBreakdown,
+                    'financials' => [
+                        'total_supply_cost' => round($totalSupplyCost, 2),
+                        'total_expected_revenue' => round($totalExpectedRevenue, 2),
+                        'total_expected_profit' => round($totalExpectedProfit, 2),
+                        'total_lost_revenue_daily' => round($totalLostRevenueDaily, 2),
+                        'avg_roi_percent' => round($avgRoi, 2),
+                        'avg_turnover_days' => round($avgTurnover, 1),
                     ],
                 ],
             ],
@@ -219,6 +253,46 @@ class AutoSupplyPlanController extends Controller
         $plan->delete();
 
         return response()->json(['message' => 'План удалён']);
+    }
+
+    /**
+     * PATCH /api/auto-supply-plans/{planId}/lines/{lineId}
+     * Ручная корректировка количества в строке плана
+     */
+    public function updateLine(Request $request, string $planId, int $lineId): JsonResponse
+    {
+        $plan = AutoSupplyPlan::findOrFail($planId);
+
+        if ($plan->status !== AutoSupplyPlan::STATUS_READY) {
+            abort(422, 'План ещё не рассчитан');
+        }
+
+        $request->validate([
+            'qty_rounded' => 'required|integer|min:0',
+        ]);
+
+        $line = $plan->lines()->findOrFail($lineId);
+        $oldQty = $line->qty_rounded;
+        $newQty = $request->input('qty_rounded');
+
+        $line->update([
+            'qty_rounded' => $newQty,
+        ]);
+
+        // Пересчитать total_qty плана
+        $plan->update([
+            'total_qty' => $plan->lines()->sum('qty_rounded'),
+        ]);
+
+        return response()->json([
+            'message' => 'Количество обновлено',
+            'data' => [
+                'line' => $line->fresh(),
+                'old_qty' => $oldQty,
+                'new_qty' => $newQty,
+                'plan_total_qty' => $plan->fresh()->total_qty,
+            ],
+        ]);
     }
 
     /**

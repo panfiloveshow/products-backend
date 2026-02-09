@@ -281,4 +281,199 @@ class InventoryController extends Controller
             'data' => $stats,
         ]);
     }
+
+    /**
+     * GET /api/inventory/matrix?integration_id=...&search=...&page=...&per_page=...
+     * Матрица: артикулы × склады (все склады, включая где товара нет)
+     */
+    public function matrix(Request $request): JsonResponse
+    {
+        $request->validate([
+            'integration_id' => 'required|integer',
+            'search' => 'nullable|string|max:200',
+            'sort' => 'nullable|string|in:sku,name,total_stock,avg_daily_sales,turnover_days,days_of_stock',
+            'sort_order' => 'nullable|string|in:asc,desc',
+            'stock_status' => 'nullable|string|in:all,critical,low,optimal,excess,out_of_stock',
+            'page' => 'nullable|integer|min:1',
+            'per_page' => 'nullable|integer|min:1|max:200',
+        ]);
+
+        $integrationId = $request->input('integration_id');
+        $perPage = $request->input('per_page', 50);
+
+        // 1. Все уникальные склады для этой интеграции
+        $allWarehouses = InventoryWarehouse::where('integration_id', $integrationId)
+            ->select('warehouse_id', 'warehouse_name', 'marketplace', 'fulfillment_type', 'region')
+            ->distinct()
+            ->orderBy('warehouse_name')
+            ->get()
+            ->unique('warehouse_id')
+            ->values();
+
+        // 2. Все товары интеграции
+        $productsQuery = Product::where('integration_id', $integrationId);
+
+        if ($request->filled('search')) {
+            $search = $request->input('search');
+            $productsQuery->where(function ($q) use ($search) {
+                $q->where('sku', 'like', "%{$search}%")
+                  ->orWhere('name', 'like', "%{$search}%")
+                  ->orWhere('barcode', 'like', "%{$search}%");
+            });
+        }
+
+        // Сортировка
+        $sortField = $request->input('sort', 'sku');
+        $sortOrder = $request->input('sort_order', 'asc');
+        $productsQuery->orderBy($sortField === 'total_stock' ? 'sku' : ($sortField === 'avg_daily_sales' ? 'sku' : ($sortField === 'turnover_days' ? 'sku' : ($sortField === 'days_of_stock' ? 'sku' : $sortField))), $sortOrder);
+
+        $products = $productsQuery->paginate($perPage);
+
+        // 3. Загружаем все остатки для этих SKU
+        $skus = $products->pluck('sku')->toArray();
+        $inventoryRows = InventoryWarehouse::where('integration_id', $integrationId)
+            ->whereIn('sku', $skus)
+            ->get()
+            ->groupBy('sku');
+
+        // 4. UnitEconomics
+        $unitEconomics = \App\Models\UnitEconomics::where('integration_id', $integrationId)
+            ->whereIn('sku', $skus)
+            ->get()
+            ->keyBy('sku');
+
+        // 5. Формируем матрицу
+        $items = $products->getCollection()->map(function ($product) use ($inventoryRows, $allWarehouses, $unitEconomics) {
+            $whRows = $inventoryRows->get($product->sku, collect());
+            $whByWarehouseId = $whRows->keyBy('warehouse_id');
+
+            $ue = $unitEconomics->get($product->sku);
+
+            // Агрегированные данные
+            $totalStock = $whRows->sum('quantity');
+            $totalReserved = $whRows->sum('reserved');
+            $totalInTransit = $whRows->max('in_transit') ?? 0;
+            $sales7 = $whRows->max('sales_7_days') ?? 0;
+            $sales14 = $whRows->max('sales_14_days') ?? 0;
+            $sales30 = $whRows->max('sales_30_days') ?? 0;
+            $avgDailySales = $whRows->max('average_daily_sales') ?? ($product->avg_daily_sales ?? 0);
+            $effectiveDailySales = $whRows->max('effective_daily_sales') ?? 0;
+            $daysInStock30 = $whRows->max('days_in_stock_30') ?? 30;
+
+            $turnoverDays = $avgDailySales > 0 ? round($totalStock / $avgDailySales, 1) : null;
+            $daysOfStock = $avgDailySales > 0 ? (int) round($totalStock / $avgDailySales) : ($totalStock > 0 ? 999 : 0);
+
+            $costPrice = $ue?->cost_price ?? $product->cost_price ?? 0;
+            $price = $product->price ?? $ue?->price ?? 0;
+            $stockValue = $totalStock * $costPrice;
+
+            // Тренд
+            $salesTrend = 'stable';
+            $salesTrendPct = 0;
+            if ($sales30 > 0 && $sales14 > 0) {
+                $avg14 = $sales14 / 14;
+                $older16 = ($sales30 - $sales14) / 16;
+                if ($older16 > 0) {
+                    $salesTrendPct = round((($avg14 - $older16) / $older16) * 100, 1);
+                    if ($salesTrendPct > 10) $salesTrend = 'growing';
+                    elseif ($salesTrendPct < -10) $salesTrend = 'declining';
+                }
+            }
+
+            // Статус
+            $stockStatus = 'optimal';
+            if ($totalStock <= 0) $stockStatus = 'out_of_stock';
+            elseif ($daysOfStock <= 7) $stockStatus = 'critical';
+            elseif ($daysOfStock <= 14) $stockStatus = 'low';
+            elseif ($daysOfStock > 60) $stockStatus = 'excess';
+
+            // Стоимость хранения
+            $storageCostDaily = $whRows->sum('storage_cost_per_day') ?? 0;
+            $storageCostMonthly = $whRows->sum('storage_cost_per_month') ?? 0;
+
+            // Матрица по складам
+            $warehouseMatrix = $allWarehouses->map(function ($wh) use ($whByWarehouseId) {
+                $row = $whByWarehouseId->get($wh->warehouse_id);
+                return [
+                    'warehouse_id' => $wh->warehouse_id,
+                    'quantity' => $row?->quantity ?? 0,
+                    'reserved' => $row?->reserved ?? 0,
+                    'in_transit' => $row?->in_transit ?? 0,
+                    'sales_7_days' => $row?->sales_7_days ?? 0,
+                    'sales_30_days' => $row?->sales_30_days ?? 0,
+                    'average_daily_sales' => $row?->average_daily_sales ?? 0,
+                    'days_of_stock' => $row?->days_of_stock,
+                    'turnover_days' => $row?->turnover_days,
+                    'storage_cost_per_day' => $row?->storage_cost_per_day ?? 0,
+                    'stock_status' => $row ? ($row->stock_status ?? 'optimal') : 'empty',
+                    'has_stock' => ($row?->quantity ?? 0) > 0,
+                ];
+            });
+
+            return [
+                'sku' => $product->sku,
+                'name' => $product->name,
+                'barcode' => $product->barcode,
+                'image_url' => $product->images[0] ?? null,
+                'price' => $price,
+                'cost_price' => $costPrice,
+                'marketplace' => $product->marketplace,
+                'total_stock' => $totalStock,
+                'reserved' => $totalReserved,
+                'in_transit' => $totalInTransit,
+                'stock_value' => round($stockValue, 2),
+                'sales_7_days' => $sales7,
+                'sales_14_days' => $sales14,
+                'sales_30_days' => $sales30,
+                'avg_daily_sales' => $avgDailySales,
+                'effective_daily_sales' => $effectiveDailySales,
+                'days_in_stock_30' => $daysInStock30,
+                'turnover_days' => $turnoverDays,
+                'days_of_stock' => $daysOfStock,
+                'sales_trend' => $salesTrend,
+                'sales_trend_pct' => $salesTrendPct,
+                'stock_status' => $stockStatus,
+                'storage_cost_daily' => round($storageCostDaily, 2),
+                'storage_cost_monthly' => round($storageCostMonthly, 2),
+                'warehouses_with_stock' => $whRows->where('quantity', '>', 0)->count(),
+                'warehouses_total' => $allWarehouses->count(),
+                'warehouse_matrix' => $warehouseMatrix,
+            ];
+        });
+
+        // Фильтр по stock_status (после расчёта)
+        if ($request->filled('stock_status') && $request->input('stock_status') !== 'all') {
+            $statusFilter = $request->input('stock_status');
+            $items = $items->filter(fn($item) => $item['stock_status'] === $statusFilter)->values();
+        }
+
+        // Сортировка по вычисляемым полям
+        if (in_array($sortField, ['total_stock', 'avg_daily_sales', 'turnover_days', 'days_of_stock'])) {
+            $items = $items->sortBy($sortField, SORT_REGULAR, $sortOrder === 'desc')->values();
+        }
+
+        return response()->json([
+            'message' => 'OK',
+            'data' => [
+                'items' => $items->values(),
+                'warehouses' => $allWarehouses,
+                'pagination' => [
+                    'current_page' => $products->currentPage(),
+                    'last_page' => $products->lastPage(),
+                    'per_page' => $products->perPage(),
+                    'total' => $products->total(),
+                ],
+                'summary' => [
+                    'total_products' => $products->total(),
+                    'total_warehouses' => $allWarehouses->count(),
+                    'total_stock' => $inventoryRows->flatten()->sum('quantity'),
+                    'total_stock_value' => round($items->sum('stock_value'), 2),
+                    'avg_turnover_days' => round($items->whereNotNull('turnover_days')->avg('turnover_days') ?? 0, 1),
+                    'out_of_stock_count' => $items->where('stock_status', 'out_of_stock')->count(),
+                    'critical_count' => $items->where('stock_status', 'critical')->count(),
+                    'low_count' => $items->where('stock_status', 'low')->count(),
+                ],
+            ],
+        ]);
+    }
 }

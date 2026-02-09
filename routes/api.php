@@ -73,6 +73,7 @@ Route::prefix('products')->middleware('throttle:api')->group(function () {
 */
 Route::prefix('inventory')->middleware('throttle:api')->group(function () {
     Route::get('/', [InventoryController::class, 'index']);
+    Route::get('/matrix', [InventoryController::class, 'matrix']);
     Route::get('/sync/status', [InventoryController::class, 'syncStatus']);
     Route::get('/alerts', [InventoryController::class, 'alerts']);
     Route::get('/recommendations', [InventoryController::class, 'recommendations']);
@@ -502,6 +503,7 @@ Route::prefix('auto-supply-plans')->middleware('throttle:api')->group(function (
     Route::get('/{id}/lines', [App\Http\Controllers\Api\AutoSupplyPlanController::class, 'lines']);
     Route::get('/{id}/simulate', [App\Http\Controllers\Api\AutoSupplyPlanController::class, 'simulate']);
     Route::delete('/{id}', [App\Http\Controllers\Api\AutoSupplyPlanController::class, 'destroy']);
+    Route::patch('/{planId}/lines/{lineId}', [App\Http\Controllers\Api\AutoSupplyPlanController::class, 'updateLine']);
     Route::get('/{id}/export/ozon', [App\Http\Controllers\Api\AutoSupplyPlanController::class, 'exportOzon'])->middleware('throttle:export');
     Route::get('/{id}/export/wb', [App\Http\Controllers\Api\AutoSupplyPlanController::class, 'exportWb'])->middleware('throttle:export');
 });
