@@ -83,7 +83,7 @@ class OzonOrderReportController extends Controller
             }
 
             // Определяем период отчёта
-            $allDates = collect($rows)->pluck('shipment_date')->filter()->sort();
+            $allDates = collect($rows)->pluck('report_date')->filter()->sort();
             $dateFrom = $allDates->first();
             $dateTo = $allDates->last();
             $periodDays = $dateFrom && $dateTo ? max(1, (int) $dateFrom->diffInDays($dateTo) + 1) : 14;
@@ -498,37 +498,23 @@ class OzonOrderReportController extends Controller
             return null;
         }
 
-        // Парсим дату отгрузки
-        $shipmentDate = null;
-        $dateStr = isset($columnMap['shipment_date']) ? trim($row[$columnMap['shipment_date']] ?? '') : '';
-        if (empty($dateStr) && isset($columnMap['created_date'])) {
-            $dateStr = trim($row[$columnMap['created_date']] ?? '');
-        }
-        if (!empty($dateStr)) {
-            // Логируем первую дату для диагностики
-            static $dateLogCount = 0;
-            if ($dateLogCount < 3) {
-                Log::debug('OzonReport raw date', ['raw' => $dateStr, 'column' => isset($columnMap['shipment_date']) ? 'shipment_date' : 'created_date']);
-                $dateLogCount++;
-            }
+        // Парсим дату отгрузки и дату принятия в обработку
+        $shipmentDateStr = isset($columnMap['shipment_date']) ? trim($row[$columnMap['shipment_date']] ?? '') : '';
+        $createdDateStr = isset($columnMap['created_date']) ? trim($row[$columnMap['created_date']] ?? '') : '';
 
-            // Пробуем разные форматы
-            // DD.MM.YYYY HH:MM:SS или DD.MM.YYYY HH:MM
-            if (preg_match('/^(\d{2})\.(\d{2})\.(\d{4})/', $dateStr, $m)) {
-                $shipmentDate = \Carbon\Carbon::createFromDate((int)$m[3], (int)$m[2], (int)$m[1]);
-            }
-            // YYYY-MM-DD
-            elseif (preg_match('/^(\d{4})-(\d{2})-(\d{2})/', $dateStr, $m)) {
-                $shipmentDate = \Carbon\Carbon::createFromDate((int)$m[1], (int)$m[2], (int)$m[3]);
-            }
-            // Fallback Carbon::parse
-            else {
-                try {
-                    $shipmentDate = \Carbon\Carbon::parse($dateStr)->startOfDay();
-                } catch (\Exception $e) {
-                    // Игнорируем
-                }
-            }
+        // Для периода отчёта используем дату "принят в обработку" (если есть), иначе дату отгрузки
+        $reportDateStr = $createdDateStr ?: $shipmentDateStr;
+        $shipmentDate = $this->parseDateString($shipmentDateStr);
+        $reportDate = $this->parseDateString($reportDateStr);
+
+        static $dateLogCount = 0;
+        if ($dateLogCount < 3) {
+            Log::debug('OzonReport raw report_date', [
+                'shipment_raw' => $shipmentDateStr,
+                'created_raw' => $createdDateStr,
+                'used' => $reportDateStr,
+            ]);
+            $dateLogCount++;
         }
 
         $paidAmount = isset($columnMap['paid_amount']) ? (float) str_replace([' ', ','], ['', '.'], $row[$columnMap['paid_amount']] ?? '0') : 0;
@@ -545,7 +531,28 @@ class OzonOrderReportController extends Controller
             'revenue' => $paidAmount > 0 ? $paidAmount : $price * $quantity,
             'status' => $status,
             'shipment_date' => $shipmentDate,
+            'report_date' => $reportDate,
         ];
+    }
+
+    private function parseDateString(?string $dateStr): ?\Carbon\Carbon
+    {
+        if (!$dateStr) return null;
+        $dateStr = trim($dateStr);
+
+        if (preg_match('/^(\d{2})\.(\d{2})\.(\d{4})/', $dateStr, $m)) {
+            return \Carbon\Carbon::createFromDate((int)$m[3], (int)$m[2], (int)$m[1]);
+        }
+
+        if (preg_match('/^(\d{4})-(\d{2})-(\d{2})/', $dateStr, $m)) {
+            return \Carbon\Carbon::createFromDate((int)$m[1], (int)$m[2], (int)$m[3]);
+        }
+
+        try {
+            return \Carbon\Carbon::parse($dateStr)->startOfDay();
+        } catch (\Exception $e) {
+            return null;
+        }
     }
 
     /**
