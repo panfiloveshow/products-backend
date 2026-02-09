@@ -797,6 +797,14 @@ class OzonMarketplace implements MarketplaceInterface
     }
 
     /**
+     * Получить общую сумму хранения из финансовых транзакций (без привязки к SKU)
+     */
+    public function getStorageTotalFromTransactions(string $dateFrom, string $dateTo): array
+    {
+        return $this->storage->getStorageTotalFromTransactions($dateFrom, $dateTo);
+    }
+
+    /**
      * Получить финансовые транзакции по хранению за период
      * Использует /v3/finance/transaction/list с фильтром по типу операции
      * Автоматически конвертирует product_id в offer_id (SKU продавца)
