@@ -413,6 +413,7 @@ class InventoryController extends Controller
                     'turnover_days' => $row?->turnover_days,
                     'storage_cost_per_day' => $row?->storage_cost_per_day ?? 0,
                     'real_avg_daily_sales' => $row?->real_avg_daily_sales,
+                    'real_items_sold' => ($row?->real_avg_daily_sales && $row?->real_sales_period_days) ? round($row->real_avg_daily_sales * $row->real_sales_period_days) : null,
                     'real_turnover_days' => $row?->real_turnover_days,
                     'real_days_of_stock' => $row?->real_days_of_stock,
                     'real_sales_period_days' => $row?->real_sales_period_days,
