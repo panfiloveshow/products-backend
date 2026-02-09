@@ -542,23 +542,26 @@ class StorageApi
     }
 
     /**
-     * Получить финансовые транзакции по хранению
+     * Получить общую сумму начислений за хранение из финансовых транзакций
      * POST /v3/finance/transaction/list
      * 
-     * Разделяет два типа начислений:
-     * - MarketplaceServiceItemStorageFee — обычная плата за хранение
-     * - MarketplaceServiceItemStorageExcess — штраф за платное хранение (товар >120 дней на складе)
+     * Фильтрует на стороне клиента по типу OperationMarketplaceServiceStorage
+     * (Ozon API игнорирует фильтр operation_type и возвращает все транзакции)
+     * 
+     * Транзакции хранения не содержат привязки к SKU (items пуст),
+     * поэтому возвращается только общая сумма за период.
      * 
      * @param string $dateFrom Начало периода (YYYY-MM-DD)
      * @param string $dateTo Конец периода (YYYY-MM-DD)
-     * @return array Транзакции по хранению, сгруппированные по SKU с разделением fee/penalty
+     * @return array ['total' => float, 'transactions_count' => int]
      */
-    public function getStorageTransactions(string $dateFrom, string $dateTo, array $productIdToSku = []): array
+    public function getStorageTotalFromTransactions(string $dateFrom, string $dateTo): array
     {
         try {
-            $result = [];
+            $total = 0;
+            $count = 0;
             $page = 1;
-            $maxPages = 10;
+            $maxPages = 50;
             
             while ($page <= $maxPages) {
                 $response = $this->client->post('/v3/finance/transaction/list', [
@@ -567,10 +570,7 @@ class StorageApi
                             'from' => $dateFrom . 'T00:00:00.000Z',
                             'to' => $dateTo . 'T23:59:59.000Z',
                         ],
-                        'operation_type' => [
-                            'MarketplaceServiceItemStorageFee',
-                            'MarketplaceServiceItemStorageExcess',
-                        ],
+                        'operation_type' => [],
                         'posting_number' => '',
                         'transaction_type' => 'all',
                     ],
@@ -586,39 +586,14 @@ class StorageApi
 
                 foreach ($operations as $op) {
                     $operationType = $op['operation_type'] ?? '';
-                    $amount = abs($op['amount'] ?? 0);
                     
-                    foreach ($op['items'] ?? [] as $item) {
-                        $productId = (string)($item['sku'] ?? '');
-                        
-                        if (!$productId) continue;
-                        
-                        // Конвертируем ozon_sku в offer_id (SKU продавца)
-                        $sku = $productIdToSku[$productId] ?? $productId;
-                        
-                        if (!isset($result[$sku])) {
-                            $result[$sku] = [
-                                'storage_fee' => 0,
-                                'storage_penalty' => 0,
-                                'total_storage_cost' => 0,
-                                'transactions_count' => 0,
-                                'product_name' => $item['name'] ?? '',
-                                'product_id' => $productId,
-                            ];
-                        }
-                        
-                        // Разделяем обычное хранение и штраф за превышение 120 дней
-                        if ($operationType === 'MarketplaceServiceItemStorageExcess') {
-                            $result[$sku]['storage_penalty'] += $amount;
-                        } else {
-                            $result[$sku]['storage_fee'] += $amount;
-                        }
-                        $result[$sku]['total_storage_cost'] += $amount;
-                        $result[$sku]['transactions_count']++;
+                    // Фильтруем только транзакции хранения на стороне клиента
+                    if ($operationType === 'OperationMarketplaceServiceStorage') {
+                        $total += abs($op['amount'] ?? 0);
+                        $count++;
                     }
                 }
                 
-                // Если получили меньше 1000, значит это последняя страница
                 if (count($operations) < 1000) {
                     break;
                 }
@@ -626,21 +601,20 @@ class StorageApi
                 $page++;
             }
 
-            $totalPenalty = array_sum(array_column($result, 'storage_penalty'));
-            $totalFee = array_sum(array_column($result, 'storage_fee'));
-            
-            Log::info('Ozon storage transactions loaded', [
+            Log::info('Ozon storage total from transactions', [
                 'date_from' => $dateFrom,
                 'date_to' => $dateTo,
-                'skus_count' => count($result),
-                'pages_loaded' => $page,
-                'total_penalty' => round($totalPenalty, 2),
-                'total_fee' => round($totalFee, 2),
+                'total' => round($total, 2),
+                'transactions_count' => $count,
+                'pages_scanned' => $page,
             ]);
 
-            return $result;
+            return [
+                'total' => round($total, 2),
+                'transactions_count' => $count,
+            ];
         } catch (\Exception $e) {
-            Log::error('Ozon getStorageTransactions error', ['error' => $e->getMessage()]);
+            Log::error('Ozon getStorageTotalFromTransactions error', ['error' => $e->getMessage()]);
             return [];
         }
     }

@@ -223,58 +223,36 @@ class SyncInventoryJob implements ShouldQueue
                 ]);
             }
             
-            // Платное хранение Ozon: штраф за превышение 120 дней (MarketplaceServiceItemStorageExcess)
-            // и обычная плата за хранение (MarketplaceServiceItemStorageFee)
-            // Данные из /v3/finance/transaction/list — фактические начисления за текущий месяц
-            $ozonPaidStorageBySku = [];
-            if ($this->syncLog->marketplace === 'ozon' && method_exists($marketplace, 'getStorageTransactions')) {
+            // Общая сумма хранения Ozon из финансовых транзакций (OperationMarketplaceServiceStorage)
+            // Без привязки к SKU — Ozon не предоставляет разбивку в транзакциях
+            // Загружаем за текущий и прошлый месяц для отображения в сводке
+            $ozonStorageTotals = [];
+            if ($this->syncLog->marketplace === 'ozon' && method_exists($marketplace, 'getStorageTotalFromTransactions')) {
                 try {
-                    $paidDateFrom = now()->startOfMonth()->format('Y-m-d');
-                    $paidDateTo = now()->format('Y-m-d');
-                    $ozonPaidStorageBySku = $marketplace->getStorageTransactions($paidDateFrom, $paidDateTo);
+                    $currentMonthFrom = now()->startOfMonth()->format('Y-m-d');
+                    $currentMonthTo = now()->format('Y-m-d');
+                    $prevMonthFrom = now()->subMonth()->startOfMonth()->format('Y-m-d');
+                    $prevMonthTo = now()->subMonth()->endOfMonth()->format('Y-m-d');
                     
-                    if (!empty($ozonPaidStorageBySku)) {
-                        // Сбрасываем старые данные о платном хранении для этой интеграции
-                        InventoryWarehouse::where('marketplace', 'ozon')
-                            ->where('integration_id', $this->syncLog->integration_id)
-                            ->update([
-                                'paid_storage_penalty' => null,
-                                'paid_storage_fee' => null,
-                                'paid_storage_from' => null,
-                                'paid_storage_to' => null,
-                            ]);
-                        
-                        // Записываем paid_storage СРАЗУ в InventoryWarehouse
-                        // т.к. getDetailedInventory() может вернуть пустой массив (early return)
-                        // ВАЖНО: записываем только в ОДНУ запись склада для каждого SKU,
-                        // чтобы при агрегации (sum) не дублировалась сумма
-                        $paidUpdated = 0;
-                        foreach ($ozonPaidStorageBySku as $sku => $paidData) {
-                            $firstRow = InventoryWarehouse::where('sku', $sku)
-                                ->where('integration_id', $this->syncLog->integration_id)
-                                ->orderBy('quantity', 'desc')
-                                ->first();
-                            if ($firstRow) {
-                                $firstRow->update([
-                                    'paid_storage_penalty' => $paidData['storage_penalty'] ?? 0,
-                                    'paid_storage_fee' => $paidData['storage_fee'] ?? 0,
-                                    'paid_storage_from' => $paidDateFrom,
-                                    'paid_storage_to' => $paidDateTo,
-                                ]);
-                                $paidUpdated++;
-                            }
-                        }
-
-                        Log::info('Ozon paid storage transactions loaded & written', [
-                            'count' => count($ozonPaidStorageBySku),
-                            'rows_updated' => $paidUpdated,
-                            'period' => "$paidDateFrom - $paidDateTo",
-                            'total_penalty' => round(array_sum(array_column($ozonPaidStorageBySku, 'storage_penalty')), 2),
-                            'total_fee' => round(array_sum(array_column($ozonPaidStorageBySku, 'storage_fee')), 2),
-                        ]);
-                    }
+                    $currentMonth = $marketplace->getStorageTotalFromTransactions($currentMonthFrom, $currentMonthTo);
+                    $prevMonth = $marketplace->getStorageTotalFromTransactions($prevMonthFrom, $prevMonthTo);
+                    
+                    $ozonStorageTotals = [
+                        'current_month' => [
+                            'total' => $currentMonth['total'] ?? 0,
+                            'from' => $currentMonthFrom,
+                            'to' => $currentMonthTo,
+                        ],
+                        'prev_month' => [
+                            'total' => $prevMonth['total'] ?? 0,
+                            'from' => $prevMonthFrom,
+                            'to' => $prevMonthTo,
+                        ],
+                    ];
+                    
+                    Log::info('Ozon storage totals from transactions', $ozonStorageTotals);
                 } catch (\Exception $e) {
-                    Log::warning('Failed to load Ozon paid storage transactions', [
+                    Log::warning('Failed to load Ozon storage totals', [
                         'error' => $e->getMessage(),
                     ]);
                 }
@@ -332,13 +310,6 @@ class SyncInventoryJob implements ShouldQueue
                         $stockData['storage_fee_report_to'] = $storageFeesBySku[$sku]['report_date_to'] ?? null;
                     }
                     
-                    // Добавляем платное хранение Ozon (штраф >120 дней + обычная плата)
-                    if ($sku && isset($ozonPaidStorageBySku[$sku])) {
-                        $stockData['paid_storage_penalty'] = $ozonPaidStorageBySku[$sku]['storage_penalty'] ?? 0;
-                        $stockData['paid_storage_fee'] = $ozonPaidStorageBySku[$sku]['storage_fee'] ?? 0;
-                        $stockData['paid_storage_from'] = $paidDateFrom ?? null;
-                        $stockData['paid_storage_to'] = $paidDateTo ?? null;
-                    }
                     
                     // Добавляем товары в пути к клиенту если есть
                     if ($sku && isset($inTransitBySku[$sku])) {
@@ -441,14 +412,16 @@ class SyncInventoryJob implements ShouldQueue
             }
             
             // Сохраняем метаданные о синхронизации
-            $this->syncLog->update([
-                'metadata' => [
-                    'total_from_api' => count($inventory),
-                    'created' => $created,
-                    'updated' => $updated,
-                    'unchanged' => $synced - $created - $updated,
-                ],
-            ]);
+            $metadata = [
+                'total_from_api' => count($inventory),
+                'created' => $created,
+                'updated' => $updated,
+                'unchanged' => $synced - $created - $updated,
+            ];
+            if (!empty($ozonStorageTotals)) {
+                $metadata['storage_totals'] = $ozonStorageTotals;
+            }
+            $this->syncLog->update(['metadata' => $metadata]);
             
             $this->syncLog->complete($synced, $failed);
             
@@ -468,27 +441,6 @@ class SyncInventoryJob implements ShouldQueue
             // Пересчитываем юнит-экономику для всех товаров интеграции
             $this->recalculateUnitEconomics();
             
-            // Платное хранение Ozon: обновляем ВСЕ записи InventoryWarehouse напрямую
-            // т.к. getDetailedInventory() может не содержать все SKU с начислениями
-            if (!empty($ozonPaidStorageBySku)) {
-                $paidUpdated = 0;
-                foreach ($ozonPaidStorageBySku as $sku => $paidData) {
-                    $affected = InventoryWarehouse::where('sku', $sku)
-                        ->where('integration_id', $this->syncLog->integration_id)
-                        ->update([
-                            'paid_storage_penalty' => $paidData['storage_penalty'] ?? 0,
-                            'paid_storage_fee' => $paidData['storage_fee'] ?? 0,
-                            'paid_storage_from' => $paidDateFrom ?? null,
-                            'paid_storage_to' => $paidDateTo ?? null,
-                        ]);
-                    $paidUpdated += $affected;
-                }
-                Log::info('Ozon paid storage written to InventoryWarehouse', [
-                    'skus_with_data' => count($ozonPaidStorageBySku),
-                    'rows_updated' => $paidUpdated,
-                ]);
-            }
-
             // Запускаем отдельный джоб для синхронизации storage fees WB
             // Выделен в отдельный джоб для изоляции памяти (отчёт реализации WB может быть 80+ MB)
             $this->dispatchStorageFeesSync();

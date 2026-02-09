@@ -467,11 +467,6 @@ class InventoryController extends Controller
                 'storage_fee_last_week' => round($storageFeeLastWeek, 2),
                 'storage_fee_report_from' => $storageFeeReportFrom,
                 'storage_fee_report_to' => $storageFeeReportTo,
-                'paid_storage_penalty' => round($paidStoragePenalty, 2),
-                'paid_storage_fee' => round($paidStorageFee, 2),
-                'paid_storage_total' => round($paidStoragePenalty + $paidStorageFee, 2),
-                'paid_storage_from' => $paidStorageFrom,
-                'paid_storage_to' => $paidStorageTo,
                 'warehouses_with_stock' => $whRows->where('quantity', '>', 0)->count(),
                 'warehouses_total' => $allWarehouses->count(),
                 'warehouse_matrix' => $warehouseMatrix,
@@ -515,11 +510,33 @@ class InventoryController extends Controller
                     'storage_fee_total' => round($items->sum('storage_fee_total') ?? 0, 2),
                     'storage_fee_report_from' => $summaryStorageFeeFrom,
                     'storage_fee_report_to' => $summaryStorageFeeTo,
-                    'paid_storage_penalty' => round($items->sum('paid_storage_penalty') ?? 0, 2),
-                    'paid_storage_fee' => round($items->sum('paid_storage_fee') ?? 0, 2),
-                    'paid_storage_total' => round($items->sum('paid_storage_total') ?? 0, 2),
+                    'storage_totals' => $this->getStorageTotals($request->input('integration_id')),
                 ],
             ],
         ]);
+    }
+
+    /**
+     * Получить общие суммы хранения из последней синхронизации (metadata.storage_totals)
+     */
+    private function getStorageTotals(?string $integrationId): ?array
+    {
+        if (!$integrationId) return null;
+        
+        $syncLog = \App\Models\SyncLog::where('integration_id', $integrationId)
+            ->where('sync_type', 'inventory')
+            ->where('status', 'completed')
+            ->whereNotNull('metadata')
+            ->orderByDesc('created_at')
+            ->first();
+        
+        if (!$syncLog) return null;
+        
+        $metadata = $syncLog->metadata;
+        if (!is_array($metadata)) {
+            $metadata = json_decode($metadata, true);
+        }
+        
+        return $metadata['storage_totals'] ?? null;
     }
 }
