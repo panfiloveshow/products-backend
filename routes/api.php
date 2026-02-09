@@ -95,10 +95,10 @@ Route::prefix('inventory')->middleware('throttle:api')->group(function () {
 
 /*
 |--------------------------------------------------------------------------
-| Shipments Module (FBO Поставки)
+| Shipments Module (FBO Поставки) — скрыто, отложено на будущие разработки
 |--------------------------------------------------------------------------
 */
-Route::prefix('shipments')->middleware('throttle:api')->group(function () {
+/* Route::prefix('shipments')->middleware('throttle:api')->group(function () {
     // Список и статистика
     Route::get('/', [ShipmentController::class, 'index']);
     Route::get('/statistics', [ShipmentController::class, 'statistics']);
@@ -175,7 +175,7 @@ Route::prefix('shipments')->middleware('throttle:api')->group(function () {
     Route::get('/{id}/labels', [ShipmentController::class, 'generateLabels'])->middleware('throttle:export');
     Route::get('/{id}/export/pdf', [ShipmentController::class, 'exportPdf'])->middleware('throttle:export');
     Route::get('/{id}/export/csv', [ShipmentController::class, 'exportCsv'])->middleware('throttle:export');
-});
+}); */
 
 /*
 |--------------------------------------------------------------------------
@@ -278,10 +278,10 @@ Route::prefix('suppliers')->middleware('throttle:api')->group(function () {
 
 /*
 |--------------------------------------------------------------------------
-| Supply Plans Module
+| Supply Plans Module — скрыто, отложено на будущие разработки
 |--------------------------------------------------------------------------
 */
-Route::prefix('supply-plans')->middleware('throttle:api')->group(function () {
+/* Route::prefix('supply-plans')->middleware('throttle:api')->group(function () {
     Route::get('/', [App\Http\Controllers\Api\SupplyPlanController::class, 'index']);
     Route::post('/', [App\Http\Controllers\Api\SupplyPlanController::class, 'store']);
     Route::get('/{id}', [App\Http\Controllers\Api\SupplyPlanController::class, 'show']);
@@ -290,14 +290,14 @@ Route::prefix('supply-plans')->middleware('throttle:api')->group(function () {
     Route::get('/{id}/calculate', [App\Http\Controllers\Api\SupplyPlanController::class, 'calculate']);
     Route::post('/{id}/approve', [App\Http\Controllers\Api\SupplyPlanController::class, 'approve']);
     Route::post('/{id}/cancel', [App\Http\Controllers\Api\SupplyPlanController::class, 'cancel']);
-});
+}); */
 
 /*
 |--------------------------------------------------------------------------
-| Supply Recommendations Module
+| Supply Recommendations Module — скрыто, отложено на будущие разработки
 |--------------------------------------------------------------------------
 */
-Route::prefix('supply-recommendations')->middleware('throttle:api')->group(function () {
+/* Route::prefix('supply-recommendations')->middleware('throttle:api')->group(function () {
     Route::get('/', [App\Http\Controllers\Api\SupplyRecommendationController::class, 'index']);
     Route::get('/stats', [App\Http\Controllers\Api\SupplyRecommendationController::class, 'stats']);
     Route::get('/by-warehouse', [App\Http\Controllers\Api\SupplyRecommendationController::class, 'byWarehouse']);
@@ -305,28 +305,28 @@ Route::prefix('supply-recommendations')->middleware('throttle:api')->group(funct
     Route::get('/{id}', [App\Http\Controllers\Api\SupplyRecommendationController::class, 'show']);
     Route::post('/{id}/apply', [App\Http\Controllers\Api\SupplyRecommendationController::class, 'apply']);
     Route::post('/{id}/dismiss', [App\Http\Controllers\Api\SupplyRecommendationController::class, 'dismiss']);
-});
+}); */
 
 /*
 |--------------------------------------------------------------------------
-| Warehouse Slots Module
+| Warehouse Slots Module — скрыто, отложено на будущие разработки
 |--------------------------------------------------------------------------
 */
-Route::prefix('warehouse-slots')->middleware('throttle:api')->group(function () {
+/* Route::prefix('warehouse-slots')->middleware('throttle:api')->group(function () {
     Route::get('/', [App\Http\Controllers\Api\WarehouseSlotController::class, 'index']);
     Route::get('/warehouses', [App\Http\Controllers\Api\WarehouseSlotController::class, 'warehouses']);
     Route::get('/for-supply/{supplyId}', [App\Http\Controllers\Api\WarehouseSlotController::class, 'forSupply']);
     Route::post('/sync', [App\Http\Controllers\Api\WarehouseSlotController::class, 'sync'])->middleware('throttle:sync');
     Route::post('/{id}/book', [App\Http\Controllers\Api\WarehouseSlotController::class, 'book']);
     Route::post('/{id}/release', [App\Http\Controllers\Api\WarehouseSlotController::class, 'release']);
-});
+}); */
 
 /*
 |--------------------------------------------------------------------------
-| Ozon Draft/Supply API (Proxy to Ozon Seller API)
+| Ozon Draft/Supply API (Proxy to Ozon Seller API) — скрыто, отложено на будущие разработки
 |--------------------------------------------------------------------------
 */
-Route::prefix('ozon')->middleware('throttle:api')->group(function () {
+/* Route::prefix('ozon')->middleware('throttle:api')->group(function () {
     // Legacy Draft endpoints (черновики - до 16.02.2026)
     Route::post('/draft/create', [App\Http\Controllers\Api\OzonDraftController::class, 'createDraft']);
     Route::post('/draft/info', [App\Http\Controllers\Api\OzonDraftController::class, 'getDraftInfo']);
@@ -399,14 +399,14 @@ Route::prefix('ozon')->middleware('throttle:api')->group(function () {
     Route::post('/clusters', [App\Http\Controllers\Api\OzonSupplyController::class, 'getOzonClusters']);
     Route::post('/warehouses/fbo', [App\Http\Controllers\Api\OzonSupplyController::class, 'getOzonFboWarehouses']);
     Route::post('/warehouses/availability', [App\Http\Controllers\Api\OzonSupplyController::class, 'checkWarehouseAvailability']);
-});
+}); */
 
 /*
 |--------------------------------------------------------------------------
-| Supplies Module (Модуль поставок Ozon FBO)
+| Supplies Module (Модуль поставок Ozon FBO) — скрыто, отложено на будущие разработки
 |--------------------------------------------------------------------------
 */
-Route::prefix('supplies')->middleware('throttle:api')->group(function () {
+/* Route::prefix('supplies')->middleware('throttle:api')->group(function () {
     // Рекомендации
     Route::get('/recommendations', [App\Http\Controllers\Api\SupplyController::class, 'getRecommendations']);
     Route::post('/recommendations/calculate', [App\Http\Controllers\Api\SupplyController::class, 'calculateRecommendations']);
@@ -473,18 +473,18 @@ Route::prefix('supplies')->middleware('throttle:api')->group(function () {
     Route::get('/{supplyId}/documents/{documentId}/download', [App\Http\Controllers\Api\SupplyDocumentController::class, 'download'])->name('api.supplies.documents.download');
     Route::post('/{supplyId}/labels/generate-all', [App\Http\Controllers\Api\SupplyDocumentController::class, 'generateAllLabels']);
     Route::post('/{supplyId}/documents/packing-list', [App\Http\Controllers\Api\SupplyDocumentController::class, 'generatePackingList']);
-});
+}); */
 
 /*
 |--------------------------------------------------------------------------
-| Ozon Delivery Analytics (Clusters, Recommendations)
+| Ozon Delivery Analytics (Clusters, Recommendations) — скрыто, отложено на будущие разработки
 |--------------------------------------------------------------------------
 */
-Route::prefix('ozon/delivery-analytics')->middleware('throttle:api')->group(function () {
+/* Route::prefix('ozon/delivery-analytics')->middleware('throttle:api')->group(function () {
     Route::get('/', [App\Http\Controllers\Api\OzonDeliveryAnalyticsController::class, 'index']);
     Route::get('/details', [App\Http\Controllers\Api\OzonDeliveryAnalyticsController::class, 'details']);
     Route::get('/recommendations', [App\Http\Controllers\Api\OzonDeliveryAnalyticsController::class, 'recommendations']);
     Route::get('/clusters', [App\Http\Controllers\Api\OzonDeliveryAnalyticsController::class, 'clusters']);
     Route::get('/by-clusters', [App\Http\Controllers\Api\OzonDeliveryAnalyticsController::class, 'byClusters']);
     Route::get('/by-products', [App\Http\Controllers\Api\OzonDeliveryAnalyticsController::class, 'byProducts']);
-});
+}); */
