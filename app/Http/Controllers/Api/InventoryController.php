@@ -405,6 +405,10 @@ class InventoryController extends Controller
                     'days_of_stock' => $row?->days_of_stock,
                     'turnover_days' => $row?->turnover_days,
                     'storage_cost_per_day' => $row?->storage_cost_per_day ?? 0,
+                    'real_avg_daily_sales' => $row?->real_avg_daily_sales,
+                    'real_turnover_days' => $row?->real_turnover_days,
+                    'real_days_of_stock' => $row?->real_days_of_stock,
+                    'real_sales_period_days' => $row?->real_sales_period_days,
                     'stock_status' => $row ? ($row->stock_status ?? 'optimal') : 'empty',
                     'has_stock' => ($row?->quantity ?? 0) > 0,
                 ];

@@ -522,3 +522,15 @@ Route::prefix('seller-stocks')->middleware('throttle:api')->group(function () {
     Route::get('/summary', [App\Http\Controllers\Api\SellerWarehouseStockController::class, 'summary']);
     Route::delete('/{id}', [App\Http\Controllers\Api\SellerWarehouseStockController::class, 'destroy']);
 });
+
+/*
+|--------------------------------------------------------------------------
+| Ozon Order Reports (Отчёты заказов — продажи по складам)
+|--------------------------------------------------------------------------
+*/
+Route::prefix('ozon-reports')->middleware('throttle:api')->group(function () {
+    Route::get('/', [App\Http\Controllers\Api\OzonOrderReportController::class, 'index']);
+    Route::post('/upload', [App\Http\Controllers\Api\OzonOrderReportController::class, 'upload']);
+    Route::get('/warehouse-sales', [App\Http\Controllers\Api\OzonOrderReportController::class, 'warehouseSales']);
+    Route::delete('/{id}', [App\Http\Controllers\Api\OzonOrderReportController::class, 'destroy']);
+});
