@@ -797,11 +797,12 @@ class OzonMarketplace implements MarketplaceInterface
     }
 
     /**
-     * Получить общую сумму хранения из финансовых транзакций (без привязки к SKU)
+     * Получить общую сумму хранения из cash-flow-statement (без привязки к SKU)
+     * Использует /v1/finance/cash-flow-statement/list — совпадает с ЛК Ozon
      */
-    public function getStorageTotalFromTransactions(string $dateFrom, string $dateTo): array
+    public function getStorageTotalFromCashFlow(string $dateFrom, string $dateTo): array
     {
-        return $this->storage->getStorageTotalFromTransactions($dateFrom, $dateTo);
+        return $this->storage->getStorageTotalFromCashFlow($dateFrom, $dateTo);
     }
 
     /**

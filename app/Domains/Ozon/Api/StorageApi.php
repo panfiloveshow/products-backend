@@ -542,79 +542,71 @@ class StorageApi
     }
 
     /**
-     * Получить общую сумму начислений за хранение из финансовых транзакций
-     * POST /v3/finance/transaction/list
+     * Получить общую сумму начислений за хранение из cash-flow-statement
+     * POST /v1/finance/cash-flow-statement/list
      * 
-     * Фильтрует на стороне клиента по типу OperationMarketplaceServiceStorage
-     * (Ozon API игнорирует фильтр operation_type и возвращает все транзакции)
-     * 
-     * Транзакции хранения не содержат привязки к SKU (items пуст),
-     * поэтому возвращается только общая сумма за период.
+     * Суммирует MarketplaceServiceStorageItem из services.items за все недели периода.
+     * Это корректный источник данных о хранении (совпадает с ЛК Ozon).
      * 
      * @param string $dateFrom Начало периода (YYYY-MM-DD)
      * @param string $dateTo Конец периода (YYYY-MM-DD)
-     * @return array ['total' => float, 'transactions_count' => int]
+     * @return array ['total' => float, 'weeks' => int]
      */
-    public function getStorageTotalFromTransactions(string $dateFrom, string $dateTo): array
+    public function getStorageTotalFromCashFlow(string $dateFrom, string $dateTo): array
     {
         try {
             $total = 0;
-            $count = 0;
+            $weeks = 0;
             $page = 1;
-            $maxPages = 50;
             
-            while ($page <= $maxPages) {
-                $response = $this->client->post('/v3/finance/transaction/list', [
-                    'filter' => [
-                        'date' => [
-                            'from' => $dateFrom . 'T00:00:00.000Z',
-                            'to' => $dateTo . 'T23:59:59.000Z',
-                        ],
-                        'operation_type' => [],
-                        'posting_number' => '',
-                        'transaction_type' => 'all',
+            while ($page <= 10) {
+                $response = $this->client->post('/v1/finance/cash-flow-statement/list', [
+                    'date' => [
+                        'from' => $dateFrom . 'T00:00:00.000Z',
+                        'to' => $dateTo . 'T23:59:59.000Z',
                     ],
+                    'with_details' => true,
                     'page' => $page,
-                    'page_size' => 1000,
+                    'page_size' => 50,
                 ]);
 
-                $operations = $response['result']['operations'] ?? [];
+                $details = $response['result']['details'] ?? [];
                 
-                if (empty($operations)) {
+                if (empty($details)) {
                     break;
                 }
 
-                foreach ($operations as $op) {
-                    $operationType = $op['operation_type'] ?? '';
-                    
-                    // Фильтруем только транзакции хранения на стороне клиента
-                    if ($operationType === 'OperationMarketplaceServiceStorage') {
-                        $total += abs($op['amount'] ?? 0);
-                        $count++;
+                foreach ($details as $detail) {
+                    $services = $detail['services']['items'] ?? [];
+                    foreach ($services as $service) {
+                        if (stripos($service['name'] ?? '', 'Storage') !== false) {
+                            $total += abs($service['price'] ?? 0);
+                            $weeks++;
+                        }
                     }
                 }
                 
-                if (count($operations) < 1000) {
+                $pageCount = $response['result']['page_count'] ?? 1;
+                if ($page >= $pageCount) {
                     break;
                 }
                 
                 $page++;
             }
 
-            Log::info('Ozon storage total from transactions', [
+            Log::info('Ozon storage total from cash-flow', [
                 'date_from' => $dateFrom,
                 'date_to' => $dateTo,
                 'total' => round($total, 2),
-                'transactions_count' => $count,
-                'pages_scanned' => $page,
+                'weeks' => $weeks,
             ]);
 
             return [
                 'total' => round($total, 2),
-                'transactions_count' => $count,
+                'weeks' => $weeks,
             ];
         } catch (\Exception $e) {
-            Log::error('Ozon getStorageTotalFromTransactions error', ['error' => $e->getMessage()]);
+            Log::error('Ozon getStorageTotalFromCashFlow error', ['error' => $e->getMessage()]);
             return [];
         }
     }

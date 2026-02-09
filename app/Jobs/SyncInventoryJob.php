@@ -223,19 +223,19 @@ class SyncInventoryJob implements ShouldQueue
                 ]);
             }
             
-            // Общая сумма хранения Ozon из финансовых транзакций (OperationMarketplaceServiceStorage)
-            // Без привязки к SKU — Ozon не предоставляет разбивку в транзакциях
+            // Общая сумма хранения Ozon из cash-flow-statement (MarketplaceServiceStorageItem)
+            // Без привязки к SKU — Ozon не предоставляет разбивку
             // Загружаем за текущий и прошлый месяц для отображения в сводке
             $ozonStorageTotals = [];
-            if ($this->syncLog->marketplace === 'ozon' && method_exists($marketplace, 'getStorageTotalFromTransactions')) {
+            if ($this->syncLog->marketplace === 'ozon' && method_exists($marketplace, 'getStorageTotalFromCashFlow')) {
                 try {
                     $currentMonthFrom = now()->startOfMonth()->format('Y-m-d');
                     $currentMonthTo = now()->format('Y-m-d');
                     $prevMonthFrom = now()->subMonth()->startOfMonth()->format('Y-m-d');
                     $prevMonthTo = now()->subMonth()->endOfMonth()->format('Y-m-d');
                     
-                    $currentMonth = $marketplace->getStorageTotalFromTransactions($currentMonthFrom, $currentMonthTo);
-                    $prevMonth = $marketplace->getStorageTotalFromTransactions($prevMonthFrom, $prevMonthTo);
+                    $currentMonth = $marketplace->getStorageTotalFromCashFlow($currentMonthFrom, $currentMonthTo);
+                    $prevMonth = $marketplace->getStorageTotalFromCashFlow($prevMonthFrom, $prevMonthTo);
                     
                     $ozonStorageTotals = [
                         'current_month' => [
@@ -250,7 +250,7 @@ class SyncInventoryJob implements ShouldQueue
                         ],
                     ];
                     
-                    Log::info('Ozon storage totals from transactions', $ozonStorageTotals);
+                    Log::info('Ozon storage totals from cash-flow', $ozonStorageTotals);
                 } catch (\Exception $e) {
                     Log::warning('Failed to load Ozon storage totals', [
                         'error' => $e->getMessage(),
