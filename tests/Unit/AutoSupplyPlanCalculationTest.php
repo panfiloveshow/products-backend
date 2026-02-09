@@ -2,203 +2,124 @@
 
 namespace Tests\Unit;
 
+use App\Services\AutoSupplyPlanService;
 use PHPUnit\Framework\TestCase;
 
 /**
  * Unit tests для алгоритма автопланирования поставок
  * Тестируем: EWMA, caps, rounding, risk, data quality
+ * Все расчёты делегируются AutoSupplyPlanService
  */
 class AutoSupplyPlanCalculationTest extends TestCase
 {
-    private const EPS = 0.1;
+    private AutoSupplyPlanService $service;
+
+    protected function setUp(): void
+    {
+        parent::setUp();
+        $this->service = new AutoSupplyPlanService();
+    }
 
     // === 3.1 EWMA Forecast ===
 
     public function test_ewma_calculation_with_both_windows(): void
     {
-        $alpha = 0.35;
-        $sales7 = 70;  // 10/day
-        $sales30 = 150; // 5/day
-
-        $shortAvg = $sales7 / 7;  // 10
-        $longAvg = $sales30 / 30; // 5
-
-        $ewma = $alpha * $shortAvg + (1 - $alpha) * $longAvg;
-        // 0.35 * 10 + 0.65 * 5 = 3.5 + 3.25 = 6.75
-        $this->assertEqualsWithDelta(6.75, $ewma, 0.01);
+        $result = $this->service->calculateDailyDemand(0.35, 70, 35, 150);
+        // 0.35 * (70/7) + 0.65 * (150/30) = 0.35*10 + 0.65*5 = 6.75
+        $this->assertEqualsWithDelta(6.75, $result['daily_demand'], 0.01);
+        $this->assertFalse($result['needs_manual_review']);
     }
 
     public function test_ewma_with_only_short_window(): void
     {
-        $sales7 = 70;
-        $sales30 = 0;
-
-        $shortAvg = $sales7 / 7;
-        $longAvg = 0;
-
-        // Только short window
-        $dailyDemand = $shortAvg > 0 && $longAvg <= 0 ? $shortAvg : 0;
-        $this->assertEqualsWithDelta(10.0, $dailyDemand, 0.01);
+        $result = $this->service->calculateDailyDemand(0.35, 70, 35, 0);
+        $this->assertEqualsWithDelta(10.0, $result['daily_demand'], 0.01);
+        $this->assertFalse($result['needs_manual_review']);
     }
 
     public function test_ewma_with_only_long_window(): void
     {
-        $sales7 = 0;
-        $sales30 = 150;
-
-        $shortAvg = 0;
-        $longAvg = $sales30 / 30;
-
-        $dailyDemand = $shortAvg <= 0 && $longAvg > 0 ? $longAvg : 0;
-        $this->assertEqualsWithDelta(5.0, $dailyDemand, 0.01);
+        $result = $this->service->calculateDailyDemand(0.35, 0, 35, 150);
+        $this->assertEqualsWithDelta(5.0, $result['daily_demand'], 0.01);
+        $this->assertFalse($result['needs_manual_review']);
     }
 
     public function test_ewma_no_sales_needs_manual_review(): void
     {
-        $sales14 = 0;
-        $sales30 = 0;
-
-        $needsManualReview = ($sales30 <= 0 && $sales14 <= 0);
-        $dailyDemand = $needsManualReview ? 0 : 1;
-
-        $this->assertTrue($needsManualReview);
-        $this->assertEquals(0, $dailyDemand);
+        $result = $this->service->calculateDailyDemand(0.35, 0, 0, 0);
+        $this->assertEquals(0.0, $result['daily_demand']);
+        $this->assertTrue($result['needs_manual_review']);
     }
 
     // === 3.2 Базовые формулы ===
 
     public function test_basic_needed_calculation(): void
     {
-        $dailyDemand = 10.0;
-        $targetCoverDays = 21;
-        $currentStock = 50;
-        $inTransit = 30;
-
-        $targetStock = $dailyDemand * $targetCoverDays; // 210
-        $needed = max(0, $targetStock - ($currentStock + $inTransit)); // 210 - 80 = 130
-
-        $this->assertEquals(210.0, $targetStock);
-        $this->assertEquals(130.0, $needed);
+        $result = $this->service->calculateNeededBeforeCaps(10.0, 21, 50, 30);
+        $this->assertEquals(210.0, $result['target_stock']);
+        $this->assertEquals(130.0, $result['needed_before_caps']);
     }
 
     public function test_needed_zero_when_stock_sufficient(): void
     {
-        $dailyDemand = 5.0;
-        $targetCoverDays = 21;
-        $currentStock = 200;
-        $inTransit = 0;
-
-        $targetStock = $dailyDemand * $targetCoverDays; // 105
-        $needed = max(0, $targetStock - ($currentStock + $inTransit)); // 105 - 200 = -95 → 0
-
-        $this->assertEquals(0.0, $needed);
+        $result = $this->service->calculateNeededBeforeCaps(5.0, 21, 200, 0);
+        $this->assertEquals(0.0, $result['needed_before_caps']);
     }
 
     // === 3.3 Max cover cap ===
 
     public function test_max_cover_cap_limits_needed(): void
     {
-        $dailyDemand = 10.0;
-        $targetCoverDays = 30;
-        $maxCoverDays = 42;
-        $currentStock = 50;
-        $inTransit = 0;
-
-        $targetStock = $dailyDemand * $targetCoverDays; // 300
-        $neededBeforeCaps = max(0, $targetStock - ($currentStock + $inTransit)); // 250
-
-        $capStock = $dailyDemand * $maxCoverDays; // 420
-        $capNeeded = max(0, $capStock - ($currentStock + $inTransit)); // 370
-
-        $needed = min($neededBeforeCaps, $capNeeded); // min(250, 370) = 250
-
-        $this->assertEquals(250.0, $needed);
+        $neededBeforeCaps = 250.0; // target=30d, demand=10, stock=50
+        $result = $this->service->applyMaxCoverCap($neededBeforeCaps, 10.0, 42, 50, 0);
+        // capNeeded = 10*42 - 50 = 370, min(250, 370) = 250
+        $this->assertEquals(250.0, $result['needed']);
+        $this->assertEmpty($result['caps_applied']);
     }
 
     public function test_max_cover_cap_actually_caps(): void
     {
-        $dailyDemand = 10.0;
-        $targetCoverDays = 60; // aggressive target
-        $maxCoverDays = 42;
-        $currentStock = 50;
-        $inTransit = 0;
-
-        $targetStock = $dailyDemand * $targetCoverDays; // 600
-        $neededBeforeCaps = max(0, $targetStock - ($currentStock + $inTransit)); // 550
-
-        $capStock = $dailyDemand * $maxCoverDays; // 420
-        $capNeeded = max(0, $capStock - ($currentStock + $inTransit)); // 370
-
-        $needed = min($neededBeforeCaps, $capNeeded); // min(550, 370) = 370
-
-        $this->assertEquals(370.0, $needed);
-        $this->assertLessThan($neededBeforeCaps, $needed);
+        $neededBeforeCaps = 550.0; // target=60d, demand=10, stock=50
+        $result = $this->service->applyMaxCoverCap($neededBeforeCaps, 10.0, 42, 50, 0);
+        // capNeeded = 420 - 50 = 370, min(550, 370) = 370
+        $this->assertEquals(370.0, $result['needed']);
+        $this->assertContains('max_cover_days', $result['caps_applied']);
     }
 
     // === 3.4 Turnover limit ===
 
     public function test_turnover_limit_reduces_needed(): void
     {
-        $dailyDemand = 10.0;
-        $turnoverLimitDays = 30;
-        $currentStock = 50;
-        $inTransit = 0;
-        $needed = 250.0;
-
-        $turnoverAfter = ($currentStock + $inTransit + $needed) / max($dailyDemand, self::EPS);
-        // (50 + 0 + 250) / 10 = 30 → exactly at limit
-
-        $this->assertEqualsWithDelta(30.0, $turnoverAfter, 0.01);
+        $result = $this->service->applyTurnoverLimit(250.0, 10.0, 30, 50, 0);
+        // turnoverAfter = (50+0+250)/10 = 30 → exactly at limit, no cap
+        $this->assertEquals(250.0, $result['needed']);
+        $this->assertNotContains('turnover_limit', $result['caps_applied']);
     }
 
     public function test_turnover_limit_caps_when_exceeded(): void
     {
-        $dailyDemand = 10.0;
-        $turnoverLimitDays = 25;
-        $currentStock = 50;
-        $inTransit = 0;
-        $needed = 250.0;
-
-        $turnoverAfter = ($currentStock + $inTransit + $needed) / max($dailyDemand, self::EPS);
-        // 300 / 10 = 30 > 25
-
-        if ($turnoverAfter > $turnoverLimitDays) {
-            $maxByTurnover = max(0, $dailyDemand * $turnoverLimitDays - ($currentStock + $inTransit));
-            // 10 * 25 - 50 = 200
-            $needed = min($needed, $maxByTurnover);
-        }
-
-        $this->assertEquals(200.0, $needed);
+        $result = $this->service->applyTurnoverLimit(250.0, 10.0, 25, 50, 0);
+        // turnoverAfter = 300/10 = 30 > 25 → maxByTurnover = 10*25-50 = 200
+        $this->assertEquals(200.0, $result['needed']);
+        $this->assertContains('turnover_limit', $result['caps_applied']);
     }
 
     // === 3.6 Rounding with pack_multiple ===
 
     public function test_rounding_with_pack_multiple_1(): void
     {
-        $needed = 13.7;
-        $packMultiple = 1;
-
-        $qtyRounded = (int) (ceil($needed / max($packMultiple, 1)) * $packMultiple);
-        $this->assertEquals(14, $qtyRounded);
+        $this->assertEquals(14, $this->service->roundToPackMultiple(13.7, 1));
     }
 
     public function test_rounding_with_pack_multiple_6(): void
     {
-        $needed = 13.7;
-        $packMultiple = 6;
-
-        $qtyRounded = (int) (ceil($needed / max($packMultiple, 1)) * $packMultiple);
-        // ceil(13.7 / 6) * 6 = ceil(2.283) * 6 = 3 * 6 = 18
-        $this->assertEquals(18, $qtyRounded);
+        // ceil(13.7 / 6) * 6 = 3 * 6 = 18
+        $this->assertEquals(18, $this->service->roundToPackMultiple(13.7, 6));
     }
 
     public function test_rounding_zero_needed(): void
     {
-        $needed = 0.0;
-        $packMultiple = 5;
-
-        $qtyRounded = max(0, (int) (ceil($needed / max($packMultiple, 1)) * $packMultiple));
-        $this->assertEquals(0, $qtyRounded);
+        $this->assertEquals(0, $this->service->roundToPackMultiple(0.0, 5));
     }
 
     // === 3.7 Risk level ===
@@ -206,97 +127,67 @@ class AutoSupplyPlanCalculationTest extends TestCase
     public function test_risk_high_when_oos_within_7_days(): void
     {
         $oosDate = now()->addDays(5)->toDateString();
-        $coverBefore = 20.0;
-        $minCoverDays = 7;
-
-        $today = now();
-        if ($oosDate !== null && \Carbon\Carbon::parse($oosDate)->lte($today->copy()->addDays(7))) {
-            $riskLevel = 'high';
-        } elseif ($coverBefore < $minCoverDays) {
-            $riskLevel = 'med';
-        } else {
-            $riskLevel = 'low';
-        }
-
-        $this->assertEquals('high', $riskLevel);
+        $this->assertEquals('high', $this->service->determineRiskLevel($oosDate, 20.0, 7));
     }
 
     public function test_risk_med_when_cover_below_min(): void
     {
-        $oosDate = null;
-        $coverBefore = 5.0;
-        $minCoverDays = 7;
-
-        if ($oosDate !== null) {
-            $riskLevel = 'high';
-        } elseif ($coverBefore < $minCoverDays) {
-            $riskLevel = 'med';
-        } else {
-            $riskLevel = 'low';
-        }
-
-        $this->assertEquals('med', $riskLevel);
+        $this->assertEquals('med', $this->service->determineRiskLevel(null, 5.0, 7));
     }
 
     public function test_risk_low_when_sufficient(): void
     {
-        $oosDate = null;
-        $coverBefore = 15.0;
-        $minCoverDays = 7;
+        $this->assertEquals('low', $this->service->determineRiskLevel(null, 15.0, 7));
+    }
 
-        if ($oosDate !== null) {
-            $riskLevel = 'high';
-        } elseif ($coverBefore < $minCoverDays) {
-            $riskLevel = 'med';
-        } else {
-            $riskLevel = 'low';
-        }
+    // === 3.7 Simulation ===
 
-        $this->assertEquals('low', $riskLevel);
+    public function test_simulation_builds_correct_days(): void
+    {
+        $sim = $this->service->buildSimulation(100, 0, 10.0, 0, 14);
+        $this->assertCount(14, $sim);
+        $this->assertEquals(1, $sim[0]['day']);
+        $this->assertEquals(14, $sim[13]['day']);
+    }
+
+    public function test_simulation_finds_oos_date(): void
+    {
+        // stock=20, demand=10/day → OOS on day 2 (20-10=10, 10-10=0)
+        $sim = $this->service->buildSimulation(20, 0, 10.0, 0, 7);
+        $oosDate = $this->service->findOosDate($sim);
+        $this->assertNotNull($oosDate);
+    }
+
+    public function test_simulation_no_oos_with_supply(): void
+    {
+        // stock=20, demand=5/day, supply=100 arrives day 10 → no OOS
+        $sim = $this->service->buildSimulation(20, 0, 5.0, 100, 14);
+        $minStock = $this->service->findMinStock($sim);
+        $this->assertGreaterThanOrEqual(0, $minStock);
     }
 
     // === 4. Data quality ===
 
     public function test_data_quality_perfect_ozon(): void
     {
-        $total = 10;
-        $stocks = 10;
-        $sales = 10;
-        $transit = 10;
-        $destination = 10;
-        $barcode = 0; // Ozon не требует barcode
-
-        $stocksScore = round(($stocks / $total) * 30, 1);   // 30
-        $salesScore = round(($sales / $total) * 25, 1);      // 25
-        $transitScore = round(($transit / $total) * 20, 1);  // 20
-        $destScore = round(($destination / $total) * 15, 1); // 15
-        $barcodeScore = 10.0; // Ozon → always 10
-
-        $totalScore = $stocksScore + $salesScore + $transitScore + $destScore + $barcodeScore;
-
-        $this->assertEquals(100.0, $totalScore);
+        $result = $this->service->calculateDataQuality(10, 10, 10, 10, 10, 0, 'ozon');
+        $this->assertEquals(100.0, $result['total']);
+        $this->assertEquals(10, $result['skus_analyzed']);
     }
 
     public function test_data_quality_partial_wb(): void
     {
-        $total = 10;
-        $stocks = 8;
-        $sales = 5;
-        $transit = 3;
-        $destination = 10;
-        $barcode = 7;
+        $result = $this->service->calculateDataQuality(10, 8, 5, 3, 10, 7, 'wildberries');
+        $this->assertEqualsWithDelta(64.5, $result['total'], 0.1);
+        $this->assertGreaterThan(0, $result['total']);
+        $this->assertLessThanOrEqual(100, $result['total']);
+    }
 
-        $stocksScore = round(($stocks / $total) * 30, 1);   // 24
-        $salesScore = round(($sales / $total) * 25, 1);      // 12.5
-        $transitScore = round(($transit / $total) * 20, 1);  // 6
-        $destScore = round(($destination / $total) * 15, 1); // 15
-        $barcodeScore = round(($barcode / $total) * 10, 1);  // 7
-
-        $totalScore = $stocksScore + $salesScore + $transitScore + $destScore + $barcodeScore;
-
-        $this->assertEqualsWithDelta(64.5, $totalScore, 0.1);
-        $this->assertGreaterThan(0, $totalScore);
-        $this->assertLessThanOrEqual(100, $totalScore);
+    public function test_data_quality_empty(): void
+    {
+        $result = $this->service->emptyQualityJson();
+        $this->assertEquals(0, $result['total']);
+        $this->assertEquals(0, $result['skus_analyzed']);
     }
 
     // === 5. Export validation ===

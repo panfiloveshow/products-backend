@@ -6,13 +6,13 @@ use App\Models\AutoSupplyPlan;
 use App\Models\AutoSupplyPlanLine;
 use App\Models\InventoryWarehouse;
 use App\Models\Product;
+use App\Services\AutoSupplyPlanService;
 use Carbon\Carbon;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
-use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 
 class CalculateAutoSupplyPlanJob implements ShouldQueue
@@ -22,15 +22,11 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
     public int $tries = 2;
     public int $timeout = 300;
 
-    private const EPS = 0.1;
-    private const MIN_SALES_DAYS = 14;
-    private const LEAD_TIME_DEFAULT = 7;
-
     public function __construct(
         private string $planId
     ) {}
 
-    public function handle(): void
+    public function handle(AutoSupplyPlanService $service): void
     {
         $plan = AutoSupplyPlan::find($this->planId);
 
@@ -42,7 +38,7 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
         $plan->markCalculating();
 
         try {
-            $this->calculate($plan);
+            $this->calculate($plan, $service);
         } catch (\Throwable $e) {
             Log::error('CalculateAutoSupplyPlanJob failed', [
                 'plan_id' => $plan->id,
@@ -53,7 +49,7 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
         }
     }
 
-    private function calculate(AutoSupplyPlan $plan): void
+    private function calculate(AutoSupplyPlan $plan, AutoSupplyPlanService $service): void
     {
         $ewmaAlpha = 0.35;
         $targetCoverDays = $plan->target_cover_days ?: 21;
@@ -72,7 +68,7 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
             ->get();
 
         if ($warehouses->isEmpty()) {
-            $plan->markReady(0, 0, 0, $this->emptyQualityJson());
+            $plan->markReady(0, 0, 0, $service->emptyQualityJson());
             return;
         }
 
@@ -99,93 +95,61 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
         foreach ($warehouses as $wh) {
             $product = $products->get($wh->sku);
 
-            // --- 3.1 Forecast (EWMA alpha=0.35 по sales_daily за 28 дней) ---
+            // --- 3.1 Forecast (EWMA) ---
             $sales7 = $wh->sales_7_days ?? 0;
             $sales14 = $wh->sales_14_days ?? 0;
             $sales30 = $wh->sales_30_days ?? 0;
-            $shortAvg = $sales7 > 0 ? $sales7 / 7 : 0;
-            $longAvg = $sales30 > 0 ? $sales30 / 30 : 0;
 
-            $needsManualReview = false;
-            if ($sales30 <= 0 && $sales14 <= 0) {
-                // Менее 14 дней продаж → demand=0, needs_manual_review
-                $dailyDemand = 0;
-                $needsManualReview = true;
-            } elseif ($shortAvg > 0 && $longAvg > 0) {
-                $dailyDemand = $ewmaAlpha * $shortAvg + (1 - $ewmaAlpha) * $longAvg;
-            } elseif ($shortAvg > 0) {
-                $dailyDemand = $shortAvg;
-            } elseif ($longAvg > 0) {
-                $dailyDemand = $longAvg;
-            } else {
-                $dailyDemand = 0;
-            }
+            $demandResult = $service->calculateDailyDemand($ewmaAlpha, $sales7, $sales14, $sales30);
+            $dailyDemand = $demandResult['daily_demand'];
+            $needsManualReview = $demandResult['needs_manual_review'];
 
             $currentStock = $wh->quantity ?? 0;
             $inTransit = $wh->in_transit ?? 0;
             $avgDailySales = $wh->average_daily_sales ?? 0;
 
             // --- 3.2 Базовые формулы ---
-            $coverBefore = ($currentStock + $inTransit) / max($dailyDemand, self::EPS);
+            $coverBefore = ($currentStock + $inTransit) / max($dailyDemand, AutoSupplyPlanService::EPS);
             $safetyStock = $dailyDemand * $safetyStockDays;
-            $targetStock = $dailyDemand * $targetCoverDays;
-            $neededBeforeCaps = max(0, $targetStock - ($currentStock + $inTransit));
+
+            $baseResult = $service->calculateNeededBeforeCaps($dailyDemand, $targetCoverDays, $currentStock, $inTransit);
+            $targetStock = $baseResult['target_stock'];
+            $neededBeforeCaps = $baseResult['needed_before_caps'];
 
             // --- 3.3 Max cover cap ---
-            $capStock = $dailyDemand * $maxCoverDays;
-            $capNeeded = max(0, $capStock - ($currentStock + $inTransit));
-            $needed = min($neededBeforeCaps, $capNeeded);
+            $capResult = $service->applyMaxCoverCap($neededBeforeCaps, $dailyDemand, $maxCoverDays, $currentStock, $inTransit);
+            $needed = $capResult['needed'];
+            $capStock = $capResult['cap_stock'];
+            $capNeeded = $capResult['cap_needed'];
+            $capsApplied = $capResult['caps_applied'];
 
             // --- 3.4 Turnover limit ---
-            $capsApplied = [];
-            if ($needed !== $neededBeforeCaps) {
-                $capsApplied[] = 'max_cover_days';
-            }
-            if ($turnoverLimitDays !== null && $dailyDemand > self::EPS) {
-                $turnoverAfter = ($currentStock + $inTransit + $needed) / max($dailyDemand, self::EPS);
-                if ($turnoverAfter > $turnoverLimitDays) {
-                    $maxByTurnover = max(0, $dailyDemand * $turnoverLimitDays - ($currentStock + $inTransit));
-                    $needed = min($needed, $maxByTurnover);
-                    $capsApplied[] = 'turnover_limit';
-                }
-            }
+            $turnoverResult = $service->applyTurnoverLimit($needed, $dailyDemand, $turnoverLimitDays, $currentStock, $inTransit, $capsApplied);
+            $needed = $turnoverResult['needed'];
+            $capsApplied = $turnoverResult['caps_applied'];
 
             // --- 3.5 Destination ---
             $destinationId = $wh->warehouse_id ?? null;
             $destinationType = $destinationId ? 'warehouse' : 'all';
 
             // --- 3.6 Округление qty ---
-            $packMultiple = 1; // MVP: pack_multiple из sku_meta если доступен
+            $packMultiple = 1;
             if ($product && isset($product->ozon_data['pack_multiple'])) {
                 $packMultiple = max(1, (int) $product->ozon_data['pack_multiple']);
             }
-            $qtyRounded = (int) (ceil($needed / max($packMultiple, 1)) * $packMultiple);
-            $qtyRounded = max(0, $qtyRounded);
+            $qtyRounded = $service->roundToPackMultiple($needed, $packMultiple);
 
             // --- 3.7 Симуляция и риск ---
-            $simulation = $this->buildSimulation(
-                $currentStock,
-                $inTransit,
-                $dailyDemand,
-                $qtyRounded,
-                $horizonDays
-            );
-
-            $oosDate = $this->findOosDate($simulation);
-            $coverAfter = ($currentStock + $inTransit + $qtyRounded) / max($dailyDemand, self::EPS);
+            $simulation = $service->buildSimulation($currentStock, $inTransit, $dailyDemand, $qtyRounded, $horizonDays);
+            $oosDate = $service->findOosDate($simulation);
+            $coverAfter = ($currentStock + $inTransit + $qtyRounded) / max($dailyDemand, AutoSupplyPlanService::EPS);
             $surplusDays = $coverAfter > $targetCoverDays ? (int) ($coverAfter - $targetCoverDays) : null;
-
-            // Risk level по спеке
-            $today = Carbon::today();
-            if ($oosDate !== null && Carbon::parse($oosDate)->lte($today->copy()->addDays(7))) {
-                $riskLevel = 'high';
-            } elseif ($coverBefore < $minCoverDays) {
-                $riskLevel = 'med';
-            } else {
-                $riskLevel = 'low';
-            }
+            $riskLevel = $service->determineRiskLevel($oosDate, $coverBefore, $minCoverDays);
 
             // --- 3.8 Explain ---
+            $shortAvg = $sales7 > 0 ? $sales7 / 7 : 0;
+            $longAvg = $sales30 > 0 ? $sales30 / 30 : 0;
+
             $explainJson = [
                 'inputs' => [
                     'stock_now' => $currentStock,
@@ -218,12 +182,12 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
                 ],
                 'confidence' => [
                     'needs_manual_review' => $needsManualReview,
-                    'missing_sources' => $this->detectMissingSources($wh, $product, $marketplace),
-                    'fallbacks' => $dailyDemand === 0 ? ['no_sales_data'] : [],
+                    'missing_sources' => $service->detectMissingSources($wh, $product, $marketplace),
+                    'fallbacks' => $dailyDemand === 0.0 ? ['no_sales_data'] : [],
                 ],
                 'simulation_summary' => [
                     'oos_date' => $oosDate,
-                    'min_stock' => $this->findMinStock($simulation),
+                    'min_stock' => $service->findMinStock($simulation),
                 ],
             ];
 
@@ -284,8 +248,8 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
             }
         }
 
-        // --- 4. Data quality score (фиксированная шкала) ---
-        $qualityJson = $this->calculateDataQuality(
+        // --- 4. Data quality score ---
+        $qualityJson = $service->calculateDataQuality(
             $totalSkus, $qStocksCoverage, $qSalesHistory,
             $qInTransit, $qDestination, $qBarcode, $marketplace
         );
@@ -299,127 +263,6 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
             'total_qty' => $totalQty,
             'quality_score' => $qualityScore,
         ]);
-    }
-
-    /**
-     * Симуляция остатков по дням на horizon_days
-     * in_transit считаем доступным через lead_time_default=7 (MVP упрощение)
-     */
-    private function buildSimulation(
-        int $currentStock,
-        int $inTransit,
-        float $dailyDemand,
-        int $supplyQty,
-        int $horizonDays
-    ): array {
-        $simulation = [];
-        $stock = (float) $currentStock;
-        $transitArrived = false;
-        $supplyArrived = false;
-
-        for ($day = 1; $day <= $horizonDays; $day++) {
-            // in_transit приходит через lead_time_default
-            if (!$transitArrived && $day === self::LEAD_TIME_DEFAULT && $inTransit > 0) {
-                $stock += $inTransit;
-                $transitArrived = true;
-            }
-
-            // Рекомендованная поставка приходит через lead_time_default + 3 (время на сборку)
-            if (!$supplyArrived && $day === self::LEAD_TIME_DEFAULT + 3 && $supplyQty > 0) {
-                $stock += $supplyQty;
-                $supplyArrived = true;
-            }
-
-            $stock = max(0, $stock - $dailyDemand);
-
-            $simulation[] = [
-                'day' => $day,
-                'stock' => round($stock, 1),
-                'sales_forecast' => round($dailyDemand, 2),
-                'transit_arrived' => (!$transitArrived && $day === self::LEAD_TIME_DEFAULT) ? $inTransit : 0,
-                'supply_arrived' => (!$supplyArrived && $day === self::LEAD_TIME_DEFAULT + 3) ? $supplyQty : 0,
-            ];
-        }
-
-        return $simulation;
-    }
-
-    private function findOosDate(array $simulation): ?string
-    {
-        $today = Carbon::today();
-        foreach ($simulation as $point) {
-            if ($point['stock'] <= 0) {
-                return $today->copy()->addDays($point['day'])->toDateString();
-            }
-        }
-        return null;
-    }
-
-    private function findMinStock(array $simulation): float
-    {
-        $min = PHP_FLOAT_MAX;
-        foreach ($simulation as $point) {
-            if ($point['stock'] < $min) {
-                $min = $point['stock'];
-            }
-        }
-        return $min === PHP_FLOAT_MAX ? 0 : $min;
-    }
-
-    private function detectMissingSources($wh, $product, string $marketplace): array
-    {
-        $missing = [];
-        if (($wh->sales_30_days ?? 0) <= 0) $missing[] = 'sales_daily';
-        if (($wh->in_transit ?? 0) <= 0 && ($wh->quantity ?? 0) <= 0) $missing[] = 'stocks';
-        if ($marketplace === 'wildberries' && empty($product?->barcode)) $missing[] = 'wb_barcode_map';
-        return $missing;
-    }
-
-    /**
-     * Data quality score по фиксированной шкале (0..100)
-     */
-    private function calculateDataQuality(
-        int $total, int $stocks, int $sales, int $transit,
-        int $destination, int $barcode, string $marketplace
-    ): array {
-        if ($total === 0) return $this->emptyQualityJson();
-
-        $stocksScore = round(($stocks / $total) * 30, 1);       // 0..30
-        $salesScore = round(($sales / $total) * 25, 1);          // 0..25
-        $transitScore = round(($transit / $total) * 20, 1);      // 0..20
-        $destScore = round(($destination / $total) * 15, 1);     // 0..15
-        $barcodeScore = $marketplace === 'wildberries'
-            ? round(($barcode / $total) * 10, 1)                 // 0..10
-            : 10.0; // Ozon не требует barcode
-
-        $totalScore = round($stocksScore + $salesScore + $transitScore + $destScore + $barcodeScore, 2);
-
-        return [
-            'total' => min(100, $totalScore),
-            'breakdown' => [
-                'stocks_coverage' => $stocksScore,
-                'sales_history' => $salesScore,
-                'in_transit_availability' => $transitScore,
-                'destination_granularity' => $destScore,
-                'wb_barcode_availability' => $barcodeScore,
-            ],
-            'skus_analyzed' => $total,
-        ];
-    }
-
-    private function emptyQualityJson(): array
-    {
-        return [
-            'total' => 0,
-            'breakdown' => [
-                'stocks_coverage' => 0,
-                'sales_history' => 0,
-                'in_transit_availability' => 0,
-                'destination_granularity' => 0,
-                'wb_barcode_availability' => 0,
-            ],
-            'skus_analyzed' => 0,
-        ];
     }
 
     public function failed(\Throwable $exception): void
