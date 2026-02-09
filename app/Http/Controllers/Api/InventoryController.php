@@ -399,15 +399,16 @@ class InventoryController extends Controller
             $storageCostMonthly = $whRows->sum('storage_cost_per_month') ?? 0;
 
             // Фактические начисления за хранение (отчёты Ozon/WB)
-            $storageFeeTotal = $whRows->sum('storage_fee_total') ?? 0;
-            $storageFeeLastWeek = $whRows->sum('storage_fee_last_week') ?? 0;
+            // Используем max — данные записаны в одну запись на SKU, чтобы не дублировать при sum
+            $storageFeeTotal = $whRows->max('storage_fee_total') ?? 0;
+            $storageFeeLastWeek = $whRows->max('storage_fee_last_week') ?? 0;
             $storageFeeReportFrom = $whRows->min('storage_fee_report_from');
             $storageFeeReportTo = $whRows->max('storage_fee_report_to');
 
             // Хранение за прошлый месяц и за всё время
-            $storageFeePrevMonth = $whRows->sum('storage_fee_prev_month') ?? 0;
+            $storageFeePrevMonth = $whRows->max('storage_fee_prev_month') ?? 0;
             $storageFeePrevMonthPeriod = $whRows->pluck('storage_fee_prev_month_period')->filter()->first();
-            $storageFeeAllTime = $whRows->sum('storage_fee_all_time') ?? 0;
+            $storageFeeAllTime = $whRows->max('storage_fee_all_time') ?? 0;
 
             // Матрица по складам
             $warehouseMatrix = $allWarehouses->map(function ($wh) use ($whByWarehouseId) {
