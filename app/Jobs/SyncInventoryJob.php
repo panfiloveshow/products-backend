@@ -596,6 +596,19 @@ class SyncInventoryJob implements ShouldQueue
             'storage_fee_last_week' => $storageFeeLastWeek,
             'storage_fee_report_from' => $storageFeeReportFrom,
             'storage_fee_report_to' => $storageFeeReportTo,
+            // Платное хранение Ozon (из /v3/finance/transaction/list)
+            'paid_storage_penalty' => array_key_exists('paid_storage_penalty', $stockData)
+                ? $stockData['paid_storage_penalty']
+                : ($existing?->paid_storage_penalty ?? null),
+            'paid_storage_fee' => array_key_exists('paid_storage_fee', $stockData)
+                ? $stockData['paid_storage_fee']
+                : ($existing?->paid_storage_fee ?? null),
+            'paid_storage_from' => array_key_exists('paid_storage_from', $stockData)
+                ? $stockData['paid_storage_from']
+                : ($existing?->paid_storage_from ?? null),
+            'paid_storage_to' => array_key_exists('paid_storage_to', $stockData)
+                ? $stockData['paid_storage_to']
+                : ($existing?->paid_storage_to ?? null),
             'last_updated' => now(),
         ];
 
@@ -616,12 +629,14 @@ class SyncInventoryJob implements ShouldQueue
         // Проверяем есть ли изменения
         $newCoef = $stockData['warehouse_coefficient'] ?? null;
         $newStorageFee = $stockData['storage_fee_total'] ?? null;
+        $newPaidStorageFee = $stockData['paid_storage_fee'] ?? null;
         $hasChanges = $existing->quantity !== $quantity
             || $existing->warehouse_name !== ($stockData['warehouse_name'] ?? $warehouseId)
             || $existing->fulfillment_type !== ($stockData['fulfillment_type'] ?? null)
             || $existing->warehouse_coefficient != $newCoef // != для сравнения float/null
             || $existing->sales_30_days !== $sales30
-            || $existing->storage_fee_total != $newStorageFee; // Обновляем если изменилось платное хранение
+            || $existing->storage_fee_total != $newStorageFee // Обновляем если изменилось платное хранение
+            || $existing->paid_storage_fee != $newPaidStorageFee; // Обновляем если изменилось платное хранение Ozon
 
         if ($hasChanges) {
             $existing->update($newData);
