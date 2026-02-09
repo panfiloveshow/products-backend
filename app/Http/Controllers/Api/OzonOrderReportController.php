@@ -158,6 +158,64 @@ class OzonOrderReportController extends Controller
     }
 
     /**
+     * Сводка по отчёту: склады, сопоставление, топ товаров
+     */
+    public function reportSummary(Request $request): JsonResponse
+    {
+        $validator = Validator::make($request->all(), [
+            'report_id' => 'required|uuid',
+        ]);
+
+        if ($validator->fails()) {
+            return response()->json(['message' => 'Validation error', 'errors' => $validator->errors()], 422);
+        }
+
+        $report = OzonOrderReport::find($request->report_id);
+        if (!$report) {
+            return response()->json(['message' => 'Не найдено'], 404);
+        }
+
+        $sales = OzonWarehouseSale::where('report_id', $report->id)->get();
+
+        // Сводка по складам
+        $warehouseSummary = $sales->groupBy('warehouse_name')->map(function ($group, $whName) {
+            return [
+                'warehouse_name' => $whName,
+                'skus' => $group->count(),
+                'items_sold' => $group->sum('items_sold'),
+                'orders' => $group->sum('orders_count'),
+                'revenue' => round($group->sum('revenue'), 2),
+                'avg_daily_sales' => round($group->sum('avg_daily_sales'), 2),
+                'shipment_cluster' => $group->first()->shipment_cluster,
+            ];
+        })->sortByDesc('items_sold')->values();
+
+        // Сколько записей inventory_warehouses обновлено
+        $matchedCount = InventoryWarehouse::where('sales_report_id', $report->id)->count();
+
+        // Топ-10 товаров по продажам
+        $topSkus = $sales->groupBy('sku')->map(function ($group, $sku) {
+            return [
+                'sku' => $sku,
+                'product_name' => $group->first()->product_name,
+                'total_sold' => $group->sum('items_sold'),
+                'warehouses' => $group->count(),
+                'revenue' => round($group->sum('revenue'), 2),
+            ];
+        })->sortByDesc('total_sold')->take(10)->values();
+
+        return response()->json([
+            'message' => 'OK',
+            'data' => [
+                'report' => $report,
+                'warehouses' => $warehouseSummary,
+                'matched_inventory_records' => $matchedCount,
+                'top_skus' => $topSkus,
+            ],
+        ]);
+    }
+
+    /**
      * Данные продаж по складам из последнего отчёта
      */
     public function warehouseSales(Request $request): JsonResponse

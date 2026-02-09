@@ -531,6 +531,7 @@ Route::prefix('seller-stocks')->middleware('throttle:api')->group(function () {
 Route::prefix('ozon-reports')->middleware('throttle:api')->group(function () {
     Route::get('/', [App\Http\Controllers\Api\OzonOrderReportController::class, 'index']);
     Route::post('/upload', [App\Http\Controllers\Api\OzonOrderReportController::class, 'upload']);
+    Route::get('/summary', [App\Http\Controllers\Api\OzonOrderReportController::class, 'reportSummary']);
     Route::get('/warehouse-sales', [App\Http\Controllers\Api\OzonOrderReportController::class, 'warehouseSales']);
     Route::delete('/{id}', [App\Http\Controllers\Api\OzonOrderReportController::class, 'destroy']);
 });
