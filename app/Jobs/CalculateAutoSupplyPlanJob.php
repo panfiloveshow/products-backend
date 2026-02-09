@@ -7,6 +7,7 @@ use App\Models\AutoSupplyPlanLine;
 use App\Models\InventoryWarehouse;
 use App\Models\OzonWarehouseCluster;
 use App\Models\Product;
+use App\Models\SellerWarehouseStock;
 use App\Services\AutoSupplyPlanService;
 use Carbon\Carbon;
 use Illuminate\Bus\Queueable;
@@ -90,6 +91,12 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
         // Load warehouse-to-cluster mapping for geo-distribution
         $clusterMapping = ($marketplace === 'ozon') ? OzonWarehouseCluster::getAllMapping() : [];
 
+        // Load seller warehouse stocks (optional — if available, limits recommendations)
+        $sellerStockMap = SellerWarehouseStock::getStockMap($integrationId);
+        $hasSellerStocks = !empty($sellerStockMap);
+        // Track consumed own stock per SKU across warehouses
+        $sellerStockConsumed = [];
+
         $totalLines = 0;
         $totalQty = 0;
         $lines = [];
@@ -162,6 +169,30 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
                 $packMultiple = max(1, (int) $product->ozon_data['pack_multiple']);
             }
             $qtyRounded = $service->roundToPackMultiple($needed, $packMultiple);
+
+            // --- 3.6b Own stock accounting (optional) ---
+            $ownStock = null;
+            $ownStockReserved = null;
+            $deficit = null;
+
+            if ($hasSellerStocks && isset($sellerStockMap[$wh->sku])) {
+                $sellerInfo = $sellerStockMap[$wh->sku];
+                $ownStock = $sellerInfo['quantity'];
+                $ownStockReserved = $sellerInfo['reserved'];
+                $alreadyConsumed = $sellerStockConsumed[$wh->sku] ?? 0;
+                $availableOwn = max(0, $sellerInfo['available'] - $alreadyConsumed);
+
+                if ($qtyRounded > $availableOwn) {
+                    $deficit = $qtyRounded - $availableOwn;
+                    $qtyRounded = $availableOwn;
+                    // Re-round down to pack multiple
+                    if ($packMultiple > 1 && $qtyRounded > 0) {
+                        $qtyRounded = (int) floor($qtyRounded / $packMultiple) * $packMultiple;
+                    }
+                }
+
+                $sellerStockConsumed[$wh->sku] = $alreadyConsumed + $qtyRounded;
+            }
 
             // --- 3.7 Симуляция и риск ---
             $simulation = $service->buildSimulation($currentStock, $inTransit, $dailyDemand, $qtyRounded, $horizonDays);
@@ -335,6 +366,9 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
                 'cluster_id' => $clusterId,
                 'cluster_name' => $clusterName,
                 'region' => $clusterRegion,
+                'own_stock' => $ownStock,
+                'own_stock_reserved' => $ownStockReserved,
+                'deficit' => $deficit,
                 'destination' => $wh->warehouse_name,
                 'destination_id' => $destinationId,
                 'destination_type' => $destinationType,

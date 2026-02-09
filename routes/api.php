@@ -508,3 +508,16 @@ Route::prefix('auto-supply-plans')->middleware('throttle:api')->group(function (
     Route::get('/{id}/export/ozon', [App\Http\Controllers\Api\AutoSupplyPlanController::class, 'exportOzon'])->middleware('throttle:export');
     Route::get('/{id}/export/wb', [App\Http\Controllers\Api\AutoSupplyPlanController::class, 'exportWb'])->middleware('throttle:export');
 });
+
+/*
+|--------------------------------------------------------------------------
+| Seller Warehouse Stocks (Остатки собственного склада)
+|--------------------------------------------------------------------------
+*/
+Route::prefix('seller-stocks')->middleware('throttle:api')->group(function () {
+    Route::get('/', [App\Http\Controllers\Api\SellerWarehouseStockController::class, 'index']);
+    Route::post('/', [App\Http\Controllers\Api\SellerWarehouseStockController::class, 'upsert']);
+    Route::post('/bulk', [App\Http\Controllers\Api\SellerWarehouseStockController::class, 'bulkUpsert']);
+    Route::get('/summary', [App\Http\Controllers\Api\SellerWarehouseStockController::class, 'summary']);
+    Route::delete('/{id}', [App\Http\Controllers\Api\SellerWarehouseStockController::class, 'destroy']);
+});
