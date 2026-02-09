@@ -20,12 +20,29 @@ class AutoSupplyPlan extends Model
     public const STATUS_READY = 'ready';
     public const STATUS_ERROR = 'error';
 
+    public const MODE_ANTI_OOS = 'anti_oos';
+    public const MODE_BALANCED = 'balanced';
+    public const MODE_CASH_SAFE = 'cash_safe';
+
     protected $fillable = [
+        'tenant_id',
         'integration_id',
+        'mp_account_id',
         'marketplace',
         'status',
+        'mode',
+        'horizon_days',
+        'min_cover_days',
+        'target_cover_days',
+        'max_cover_days',
+        'safety_stock_days',
+        'turnover_limit_days',
+        'budget_limit',
+        'forecast_model',
+        'algorithm_version',
         'params',
         'data_quality_score',
+        'data_quality_json',
         'total_lines',
         'total_qty',
         'error_message',
@@ -34,10 +51,18 @@ class AutoSupplyPlan extends Model
 
     protected $casts = [
         'params' => 'array',
+        'data_quality_json' => 'array',
         'export_errors' => 'array',
         'data_quality_score' => 'decimal:2',
+        'budget_limit' => 'decimal:2',
         'total_lines' => 'integer',
         'total_qty' => 'integer',
+        'horizon_days' => 'integer',
+        'min_cover_days' => 'integer',
+        'target_cover_days' => 'integer',
+        'max_cover_days' => 'integer',
+        'safety_stock_days' => 'integer',
+        'turnover_limit_days' => 'integer',
     ];
 
     public function integration(): BelongsTo
@@ -65,11 +90,12 @@ class AutoSupplyPlan extends Model
         $this->update(['status' => self::STATUS_CALCULATING]);
     }
 
-    public function markReady(float $qualityScore, int $totalLines, int $totalQty): void
+    public function markReady(float $qualityScore, int $totalLines, int $totalQty, ?array $qualityJson = null): void
     {
         $this->update([
             'status' => self::STATUS_READY,
             'data_quality_score' => $qualityScore,
+            'data_quality_json' => $qualityJson,
             'total_lines' => $totalLines,
             'total_qty' => $totalQty,
         ]);

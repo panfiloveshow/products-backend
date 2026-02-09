@@ -498,6 +498,9 @@ Route::prefix('auto-supply-plans')->middleware('throttle:api')->group(function (
     Route::get('/', [App\Http\Controllers\Api\AutoSupplyPlanController::class, 'index']);
     Route::post('/', [App\Http\Controllers\Api\AutoSupplyPlanController::class, 'store']);
     Route::get('/{id}', [App\Http\Controllers\Api\AutoSupplyPlanController::class, 'show']);
+    Route::post('/{id}/calculate', [App\Http\Controllers\Api\AutoSupplyPlanController::class, 'calculate']);
+    Route::get('/{id}/lines', [App\Http\Controllers\Api\AutoSupplyPlanController::class, 'lines']);
+    Route::get('/{id}/simulate', [App\Http\Controllers\Api\AutoSupplyPlanController::class, 'simulate']);
     Route::delete('/{id}', [App\Http\Controllers\Api\AutoSupplyPlanController::class, 'destroy']);
     Route::get('/{id}/export/ozon', [App\Http\Controllers\Api\AutoSupplyPlanController::class, 'exportOzon'])->middleware('throttle:export');
     Route::get('/{id}/export/wb', [App\Http\Controllers\Api\AutoSupplyPlanController::class, 'exportWb'])->middleware('throttle:export');

@@ -58,13 +58,24 @@ class AutoSupplyPlanController extends Controller
 
         $plan = AutoSupplyPlan::create([
             'integration_id' => $integration->id,
+            'mp_account_id' => $integration->id,
             'marketplace' => $integration->marketplace,
             'status' => AutoSupplyPlan::STATUS_PENDING,
+            'mode' => $request->input('mode', 'balanced'),
+            'horizon_days' => $request->input('horizon_days', 28),
+            'min_cover_days' => $request->input('min_cover_days', 7),
+            'target_cover_days' => $request->input('target_cover_days', 21),
+            'max_cover_days' => $request->input('max_cover_days', 42),
+            'safety_stock_days' => $request->input('safety_stock_days', 5),
+            'turnover_limit_days' => $request->input('turnover_limit_days'),
+            'budget_limit' => $request->input('budget_limit'),
+            'forecast_model' => 'EWMA_0.35',
+            'algorithm_version' => 'asp-1.0.0',
             'params' => [
-                'target_days' => $request->input('target_days', 30),
-                'safety_days' => $request->input('safety_days', 7),
-                'lead_time_days' => $request->input('lead_time_days', 5),
-                'ewma_alpha' => $request->input('ewma_alpha', 0.35),
+                'target_days' => $request->input('target_cover_days', 21),
+                'safety_days' => $request->input('safety_stock_days', 5),
+                'lead_time_days' => $request->input('lead_time_days', 7),
+                'ewma_alpha' => 0.35,
             ],
         ]);
 
@@ -77,6 +88,95 @@ class AutoSupplyPlanController extends Controller
     }
 
     /**
+     * POST /api/auto-supply-plans/{id}/calculate
+     */
+    public function calculate(string $id): JsonResponse
+    {
+        $plan = AutoSupplyPlan::findOrFail($id);
+
+        // Удаляем старые строки
+        $plan->lines()->delete();
+        $plan->update([
+            'status' => AutoSupplyPlan::STATUS_PENDING,
+            'error_message' => null,
+            'data_quality_score' => null,
+            'data_quality_json' => null,
+            'total_lines' => 0,
+            'total_qty' => 0,
+        ]);
+
+        CalculateAutoSupplyPlanJob::dispatch($plan->id);
+
+        return response()->json([
+            'message' => 'Пересчёт запущен',
+            'data' => $plan->fresh()->load('integration'),
+        ]);
+    }
+
+    /**
+     * GET /api/auto-supply-plans/{id}/lines
+     */
+    public function lines(Request $request, string $id): JsonResponse
+    {
+        $plan = AutoSupplyPlan::findOrFail($id);
+
+        $query = $plan->lines();
+
+        if ($request->filled('risk_level')) {
+            $query->where('risk_level', $request->input('risk_level'));
+        }
+
+        if ($request->filled('offer_id')) {
+            $query->where('offer_id', $request->input('offer_id'));
+        }
+
+        $query->orderByRaw("CASE risk_level WHEN 'high' THEN 0 WHEN 'med' THEN 1 ELSE 2 END")
+            ->orderByDesc('qty_rounded');
+
+        $perPage = $request->input('per_page', 50);
+        $lines = $query->paginate($perPage);
+
+        return response()->json([
+            'message' => 'OK',
+            'data' => $lines,
+        ]);
+    }
+
+    /**
+     * GET /api/auto-supply-plans/{id}/simulate?offer_id=...&destination_id=...
+     */
+    public function simulate(Request $request, string $id): JsonResponse
+    {
+        $plan = AutoSupplyPlan::findOrFail($id);
+
+        $request->validate([
+            'offer_id' => 'required|string',
+            'destination_id' => 'nullable|string',
+        ]);
+
+        $query = $plan->lines()->where('offer_id', $request->input('offer_id'));
+
+        if ($request->filled('destination_id')) {
+            $query->where('destination_id', $request->input('destination_id'));
+        }
+
+        $line = $query->first();
+
+        if (!$line) {
+            return response()->json(['message' => 'Строка не найдена'], 404);
+        }
+
+        return response()->json([
+            'message' => 'OK',
+            'data' => [
+                'line' => $line,
+                'simulation' => $line->simulation_json,
+                'explain' => $line->explain_json,
+            ],
+        ]);
+    }
+
+    /**
      * GET /api/auto-supply-plans/{id}
      */
     public function show(Request $request, string $id): JsonResponse
@@ -85,7 +185,7 @@ class AutoSupplyPlanController extends Controller
 
         $perPage = $request->input('per_page', 50);
         $lines = $plan->lines()
-            ->orderByRaw("CASE risk_level WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END")
+            ->orderByRaw("CASE risk_level WHEN 'high' THEN 0 WHEN 'med' THEN 1 ELSE 2 END")
             ->orderByDesc('qty_rounded')
             ->paginate($perPage);
 
@@ -98,10 +198,10 @@ class AutoSupplyPlanController extends Controller
                     'total_lines' => $plan->total_lines,
                     'total_qty' => $plan->total_qty,
                     'data_quality_score' => $plan->data_quality_score,
+                    'data_quality_json' => $plan->data_quality_json,
                     'risk_breakdown' => [
-                        'critical' => $plan->lines()->where('risk_level', 'critical')->count(),
                         'high' => $plan->lines()->where('risk_level', 'high')->count(),
-                        'medium' => $plan->lines()->where('risk_level', 'medium')->count(),
+                        'med' => $plan->lines()->where('risk_level', 'med')->count(),
                         'low' => $plan->lines()->where('risk_level', 'low')->count(),
                     ],
                 ],

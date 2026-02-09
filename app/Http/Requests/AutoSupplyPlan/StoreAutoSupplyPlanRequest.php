@@ -15,8 +15,14 @@ class StoreAutoSupplyPlanRequest extends FormRequest
     {
         return [
             'integration_id' => 'required|integer|exists:integrations,id',
-            'target_days' => 'nullable|integer|min:7|max:90',
-            'safety_days' => 'nullable|integer|min:0|max:30',
+            'mode' => 'nullable|string|in:anti_oos,balanced,cash_safe',
+            'horizon_days' => 'nullable|integer|in:7,14,28,56',
+            'min_cover_days' => 'nullable|integer|min:1|max:90',
+            'target_cover_days' => 'nullable|integer|min:1|max:120',
+            'max_cover_days' => 'nullable|integer|min:1|max:180',
+            'safety_stock_days' => 'nullable|integer|min:0|max:30',
+            'turnover_limit_days' => 'nullable|integer|min:1|max:365',
+            'budget_limit' => 'nullable|numeric|min:0',
             'lead_time_days' => 'nullable|integer|min:0|max:30',
             'ewma_alpha' => 'nullable|numeric|min:0.1|max:0.9',
         ];
