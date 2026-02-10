@@ -71,10 +71,16 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
         $minSafetyDays = $settings->safety_stock_days ?? ($plan->safety_stock_days ?: 3);
         $planDefaultTargetDays = $plan->target_cover_days ?: 21;
 
-        // Получаем все записи остатков для интеграции
-        $warehouses = InventoryWarehouse::where('integration_id', $integrationId)
-            ->where('marketplace', $marketplace)
-            ->get();
+        // Получаем все записи остатков для интеграции (с фильтром по складам если указан)
+        $warehouseQuery = InventoryWarehouse::where('integration_id', $integrationId)
+            ->where('marketplace', $marketplace);
+
+        $selectedWarehouseIds = $plan->params['warehouse_ids'] ?? null;
+        if (!empty($selectedWarehouseIds) && is_array($selectedWarehouseIds)) {
+            $warehouseQuery->whereIn('warehouse_id', $selectedWarehouseIds);
+        }
+
+        $warehouses = $warehouseQuery->get();
 
         if ($warehouses->isEmpty()) {
             $plan->markReady(0, 0, 0, $service->emptyQualityJson());

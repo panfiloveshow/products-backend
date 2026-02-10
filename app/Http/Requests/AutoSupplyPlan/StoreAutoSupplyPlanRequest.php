@@ -25,6 +25,8 @@ class StoreAutoSupplyPlanRequest extends FormRequest
             'budget_limit' => 'nullable|numeric|min:0',
             'lead_time_days' => 'nullable|integer|min:0|max:30',
             'ewma_alpha' => 'nullable|numeric|min:0.1|max:0.9',
+            'warehouse_ids' => 'nullable|array',
+            'warehouse_ids.*' => 'string',
         ];
     }
 }

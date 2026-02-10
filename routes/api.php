@@ -498,6 +498,7 @@ Route::prefix('suppliers')->middleware('throttle:api')->group(function () {
 Route::prefix('auto-supply-plans')->middleware('throttle:api')->group(function () {
     Route::get('/', [App\Http\Controllers\Api\AutoSupplyPlanController::class, 'index']);
     Route::post('/', [App\Http\Controllers\Api\AutoSupplyPlanController::class, 'store']);
+    Route::get('/warehouses', [App\Http\Controllers\Api\AutoSupplyPlanController::class, 'warehouses']);
     Route::get('/{id}', [App\Http\Controllers\Api\AutoSupplyPlanController::class, 'show']);
     Route::post('/{id}/calculate', [App\Http\Controllers\Api\AutoSupplyPlanController::class, 'calculate']);
     Route::get('/{id}/lines', [App\Http\Controllers\Api\AutoSupplyPlanController::class, 'lines']);

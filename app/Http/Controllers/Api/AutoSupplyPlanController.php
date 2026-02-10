@@ -8,6 +8,7 @@ use App\Jobs\CalculateAutoSupplyPlanJob;
 use App\Models\AutoSupplyPlan;
 use App\Models\AutoSupplyPlanLine;
 use App\Models\Integration;
+use App\Models\OzonWarehouseCluster;
 use App\Models\Product;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
@@ -71,12 +72,13 @@ class AutoSupplyPlanController extends Controller
             'budget_limit' => $request->input('budget_limit'),
             'forecast_model' => 'EWMA_0.35',
             'algorithm_version' => 'asp-1.0.0',
-            'params' => [
+            'params' => array_filter([
                 'target_days' => $request->input('target_cover_days', 21),
                 'safety_days' => $request->input('safety_stock_days', 5),
                 'lead_time_days' => $request->input('lead_time_days', 7),
                 'ewma_alpha' => 0.35,
-            ],
+                'warehouse_ids' => $request->input('warehouse_ids'),
+            ]),
         ]);
 
         CalculateAutoSupplyPlanJob::dispatch($plan->id);
@@ -313,6 +315,61 @@ class AutoSupplyPlanController extends Controller
                 'clusters' => $result,
                 'total_clusters' => count($clusters),
             ],
+        ]);
+    }
+
+    /**
+     * GET /api/auto-supply-plans/warehouses?integration_id=X
+     * Список складов интеграции с количеством SKU и остатками
+     */
+    public function warehouses(Request $request): JsonResponse
+    {
+        $request->validate([
+            'integration_id' => 'required|integer|exists:integrations,id',
+        ]);
+
+        $integrationId = $request->input('integration_id');
+        $integration = Integration::findOrFail($integrationId);
+
+        $warehouses = \App\Models\InventoryWarehouse::where('integration_id', $integrationId)
+            ->where('marketplace', $integration->marketplace)
+            ->selectRaw('warehouse_id, warehouse_name, COUNT(DISTINCT sku) as sku_count, SUM(quantity) as total_stock, SUM(sales_30_days) as total_sales_30d')
+            ->groupBy('warehouse_id', 'warehouse_name')
+            ->orderByDesc(\DB::raw('SUM(quantity)'))
+            ->get();
+
+        // Добавляем кластер для Ozon
+        $clusterMapping = ($integration->marketplace === 'ozon') ? OzonWarehouseCluster::getAllMapping() : [];
+
+        $result = $warehouses->map(function ($wh) use ($clusterMapping) {
+            $clusterId = null;
+            $clusterName = null;
+            $region = null;
+
+            if (!empty($clusterMapping) && $wh->warehouse_name) {
+                $normalizedName = OzonWarehouseCluster::normalizeWarehouseName($wh->warehouse_name);
+                if (isset($clusterMapping[$normalizedName])) {
+                    $clusterId = $clusterMapping[$normalizedName]['cluster_id'];
+                    $clusterName = $clusterMapping[$normalizedName]['cluster_name'];
+                    $region = $clusterMapping[$normalizedName]['region'];
+                }
+            }
+
+            return [
+                'warehouse_id' => $wh->warehouse_id,
+                'warehouse_name' => $wh->warehouse_name,
+                'cluster_id' => $clusterId,
+                'cluster_name' => $clusterName,
+                'region' => $region,
+                'sku_count' => (int) $wh->sku_count,
+                'total_stock' => (int) $wh->total_stock,
+                'total_sales_30d' => (int) ($wh->total_sales_30d ?? 0),
+            ];
+        });
+
+        return response()->json([
+            'message' => 'OK',
+            'data' => $result->values(),
         ]);
     }
 
