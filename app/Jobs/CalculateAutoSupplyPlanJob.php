@@ -18,6 +18,7 @@ use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
+use App\Models\OzonOrderReport;
 use Illuminate\Support\Facades\Log;
 
 class CalculateAutoSupplyPlanJob implements ShouldQueue
@@ -114,6 +115,9 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
 
         // v2: Загружаем in-transit из активных заявок на поставку
         $supplyInTransit = $service->getInTransitFromSupplies($integrationId);
+
+        // v3: Проверяем, загружен ли CSV-отчёт заказов для этой интеграции
+        $hasOzonReport = ($marketplace === 'ozon') && OzonOrderReport::where('integration_id', $integrationId)->exists();
 
         // v2: Загружаем рекомендации Ozon по поставкам (delivery analytics)
         $ozonAnalytics = [];
@@ -460,7 +464,7 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
                 ],
                 'confidence' => [
                     'needs_manual_review' => $needsManualReview,
-                    'missing_sources' => $service->detectMissingSources($wh, $product, $marketplace, $ue),
+                    'missing_sources' => $service->detectMissingSources($wh, $product, $marketplace, $ue, $hasOzonReport),
                     'fallbacks' => $dailyDemand === 0.0 ? ['no_sales_data'] : [],
                 ],
                 'trend' => [

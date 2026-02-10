@@ -253,14 +253,14 @@ class AutoSupplyPlanService
     /**
      * Определить недостающие источники данных.
      */
-    public function detectMissingSources($wh, $product, string $marketplace, $ue = null): array
+    public function detectMissingSources($wh, $product, string $marketplace, $ue = null, bool $hasOzonReport = false): array
     {
         $missing = [];
         if (($wh->sales_30_days ?? 0) <= 0 && ($wh->sales_14_days ?? 0) <= 0) $missing[] = 'sales_history';
-        if (($wh->in_transit ?? 0) <= 0 && ($wh->quantity ?? 0) <= 0) $missing[] = 'stocks';
         if ($marketplace === 'wildberries' && empty($product?->barcode)) $missing[] = 'wb_barcode_map';
         if (($ue?->cost_price ?? $wh->cost_price ?? 0) <= 0) $missing[] = 'cost_price';
-        if (($wh->real_avg_daily_sales ?? 0) <= 0) $missing[] = 'ozon_order_report';
+        // Показываем предупреждение только если CSV-отчёт НЕ загружен для интеграции
+        if (!$hasOzonReport && $marketplace === 'ozon' && ($wh->real_avg_daily_sales ?? 0) <= 0) $missing[] = 'ozon_order_report';
         return $missing;
     }
 
