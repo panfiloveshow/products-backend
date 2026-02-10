@@ -190,11 +190,12 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
                 elseif ($salesTrendPercent < -10) $salesTrend = 'declining';
             }
 
-            // --- v2: Улучшенный прогноз спроса (real > effective > EWMA + % выкупа + тренд) ---
+            // --- v2: Улучшенный прогноз спроса (real > effective > EWMA > API avg > 7d fallback) ---
             $demandResult = $service->calculateDailyDemandV2(
                 $ewmaAlpha, $sales7, $sales14, $sales30,
                 $realAvgDailySales, $effectiveDailySales, $daysInStock30,
-                $redemptionRate, $salesTrend, $salesTrendPercent
+                $redemptionRate, $salesTrend, $salesTrendPercent,
+                $avgDailySales
             );
             $dailyDemand = $demandResult['daily_demand'];
             $demandSource = $demandResult['source'];
@@ -365,7 +366,7 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
                 ],
                 'confidence' => [
                     'needs_manual_review' => $needsManualReview,
-                    'missing_sources' => $service->detectMissingSources($wh, $product, $marketplace),
+                    'missing_sources' => $service->detectMissingSources($wh, $product, $marketplace, $ue),
                     'fallbacks' => $dailyDemand === 0.0 ? ['no_sales_data'] : [],
                 ],
                 'trend' => [

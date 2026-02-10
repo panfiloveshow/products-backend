@@ -253,12 +253,14 @@ class AutoSupplyPlanService
     /**
      * Определить недостающие источники данных.
      */
-    public function detectMissingSources($wh, $product, string $marketplace): array
+    public function detectMissingSources($wh, $product, string $marketplace, $ue = null): array
     {
         $missing = [];
-        if (($wh->sales_30_days ?? 0) <= 0) $missing[] = 'sales_daily';
+        if (($wh->sales_30_days ?? 0) <= 0 && ($wh->sales_14_days ?? 0) <= 0) $missing[] = 'sales_history';
         if (($wh->in_transit ?? 0) <= 0 && ($wh->quantity ?? 0) <= 0) $missing[] = 'stocks';
         if ($marketplace === 'wildberries' && empty($product?->barcode)) $missing[] = 'wb_barcode_map';
+        if (($ue?->cost_price ?? $wh->cost_price ?? 0) <= 0) $missing[] = 'cost_price';
+        if (($wh->real_avg_daily_sales ?? 0) <= 0) $missing[] = 'ozon_order_report';
         return $missing;
     }
 
@@ -377,7 +379,8 @@ class AutoSupplyPlanService
         int    $daysInStock30 = 30,
         float  $redemptionRate = 100,
         string $salesTrend = 'stable',
-        float  $salesTrendPercent = 0
+        float  $salesTrendPercent = 0,
+        float  $avgDailySalesApi = 0
     ): array {
         $source = 'ewma';
         $needsManualReview = false;
@@ -387,16 +390,40 @@ class AutoSupplyPlanService
             $baseDemand = $realAvgDailySales;
             $source = 'ozon_order_report';
         }
-        // Приоритет 2: effective_daily_sales (с учётом OOS)
-        elseif ($effectiveDailySales > 0 && $daysInStock30 > 0 && $daysInStock30 < 25) {
+        // Приоритет 2: effective_daily_sales (с учётом OOS-дней)
+        elseif ($effectiveDailySales > 0 && $daysInStock30 > 0 && $daysInStock30 < 28) {
             $baseDemand = $effectiveDailySales;
             $source = 'effective_oos_adjusted';
         }
-        // Приоритет 3: EWMA
-        else {
+        // Приоритет 3: EWMA (если есть хотя бы 14д или 30д продаж)
+        elseif ($sales30 > 0 || $sales14 > 0) {
             $ewma = $this->calculateDailyDemand($alpha, $sales7, $sales14, $sales30);
             $baseDemand = $ewma['daily_demand'];
             $needsManualReview = $ewma['needs_manual_review'];
+
+            if ($sales30 <= 0 && $sales7 > 0) {
+                $source = 'fallback_short';
+            } elseif ($sales7 <= 0 && $sales30 > 0) {
+                $source = 'fallback_long';
+            }
+        }
+        // Приоритет 4: average_daily_sales из API маркетплейса (когда нет 14д/30д продаж)
+        elseif ($avgDailySalesApi > 0) {
+            $baseDemand = $avgDailySalesApi;
+            $source = 'marketplace_api';
+            $needsManualReview = true;
+        }
+        // Приоритет 5: только 7д продажи (нет 14д и 30д)
+        elseif ($sales7 > 0) {
+            $baseDemand = $sales7 / 7;
+            $source = 'fallback_short';
+            $needsManualReview = true;
+        }
+        // Нет данных вообще
+        else {
+            $baseDemand = 0.0;
+            $source = 'no_data';
+            $needsManualReview = true;
         }
 
         // Корректировка на % выкупа (только для Ozon FBO)
