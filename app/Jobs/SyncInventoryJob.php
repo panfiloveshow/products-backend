@@ -75,6 +75,27 @@ class SyncInventoryJob implements ShouldQueue
             $storageFeeReportFrom = null;
             $storageFeeReportTo = null;
             
+            // Сохраняем real_* данные (из отчёта заказов) перед удалением/обновлением записей
+            // Ключ: sku||warehouse_name — чтобы восстановить на правильный склад
+            $savedRealData = [];
+            $allRealRows = InventoryWarehouse::where('integration_id', $this->syncLog->integration_id)
+                ->whereNotNull('sales_report_id')
+                ->get(['sku', 'warehouse_name', 'real_avg_daily_sales', 'real_sales_period_days', 'real_turnover_days', 'real_days_of_stock', 'sales_report_id']);
+            foreach ($allRealRows as $row) {
+                $key = $row->sku . '||' . $row->warehouse_name;
+                $savedRealData[$key] = [
+                    'real_avg_daily_sales' => $row->real_avg_daily_sales,
+                    'real_sales_period_days' => $row->real_sales_period_days,
+                    'real_turnover_days' => $row->real_turnover_days,
+                    'real_days_of_stock' => $row->real_days_of_stock,
+                    'sales_report_id' => $row->sales_report_id,
+                ];
+                // Также сохраняем по SKU (для случая когда warehouse_name меняется)
+                if (!isset($savedRealData[$row->sku])) {
+                    $savedRealData[$row->sku] = $savedRealData[$key];
+                }
+            }
+            
             if ($this->syncLog->marketplace === 'ozon' && method_exists($marketplace, 'getPlacementCostByProducts')) {
                 try {
                     // Удаляем старые агрегированные записи
@@ -381,6 +402,43 @@ class SyncInventoryJob implements ShouldQueue
             // Включаем обратно foreign key checks для SQLite
             if (DB::getDriverName() === 'sqlite') {
                 DB::statement('PRAGMA foreign_keys = ON');
+            }
+            
+            // Восстанавливаем real_* данные из отчёта заказов (могли потеряться при delete+create)
+            if (!empty($savedRealData)) {
+                $restored = 0;
+                $newRows = InventoryWarehouse::where('integration_id', $this->syncLog->integration_id)
+                    ->whereNull('sales_report_id')
+                    ->get();
+                
+                foreach ($newRows as $row) {
+                    // Ищем сохранённые данные: сначала по sku||warehouse, потом по sku
+                    $key = $row->sku . '||' . $row->warehouse_name;
+                    $realData = $savedRealData[$key] ?? $savedRealData[$row->sku] ?? null;
+                    
+                    if ($realData) {
+                        // Пересчитываем turnover и days_of_stock с новым quantity
+                        $avgDaily = $realData['real_avg_daily_sales'] ?? 0;
+                        if ($avgDaily > 0) {
+                            $realData['real_turnover_days'] = round($row->quantity / $avgDaily, 1);
+                            $realData['real_days_of_stock'] = (int) ceil($row->quantity / $avgDaily);
+                        } else {
+                            $realData['real_turnover_days'] = $row->quantity > 0 ? 999 : 0;
+                            $realData['real_days_of_stock'] = $row->quantity > 0 ? 999 : 0;
+                        }
+                        
+                        $row->update($realData);
+                        $restored++;
+                    }
+                }
+                
+                if ($restored > 0) {
+                    Log::info('Restored real_* data from Ozon order report after sync', [
+                        'integration_id' => $this->syncLog->integration_id,
+                        'saved_skus' => count($savedRealData),
+                        'restored_rows' => $restored,
+                    ]);
+                }
             }
             
             // Сохраняем метаданные о синхронизации
