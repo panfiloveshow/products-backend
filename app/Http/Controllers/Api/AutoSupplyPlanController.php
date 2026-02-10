@@ -719,6 +719,119 @@ class AutoSupplyPlanController extends Controller
     }
 
     /**
+     * GET /api/auto-supply-plans/{id}/export/ozon-by-warehouse
+     *
+     * ZIP-архив с отдельными XLSX шаблонами по каждому складу (городу)
+     * Каждый файл — шаблон Ozon FBO: "артикул", "имя (необязательно)", "количество"
+     */
+    public function exportOzonByWarehouse(string $id): StreamedResponse|JsonResponse
+    {
+        $plan = AutoSupplyPlan::findOrFail($id);
+
+        if ($plan->status !== AutoSupplyPlan::STATUS_READY) {
+            abort(422, 'План ещё не рассчитан');
+        }
+
+        $lines = $plan->lines()
+            ->where('qty_rounded', '>', 0)
+            ->get();
+
+        if ($lines->isEmpty()) {
+            return response()->json(['message' => 'Нет данных для экспорта'], 422);
+        }
+
+        // Группируем по складам
+        $byWarehouse = [];
+        foreach ($lines as $line) {
+            $whName = $line->warehouse_name ?: $line->warehouse_id ?: 'Неизвестный';
+            if (!isset($byWarehouse[$whName])) {
+                $byWarehouse[$whName] = [];
+            }
+            $offerId = $line->offer_id ?? $line->sku;
+            if (!isset($byWarehouse[$whName][$offerId])) {
+                $byWarehouse[$whName][$offerId] = [
+                    'offer_id' => $offerId,
+                    'name' => $line->product_name,
+                    'qty' => 0,
+                ];
+            }
+            $byWarehouse[$whName][$offerId]['qty'] += $line->qty_rounded;
+        }
+
+        ksort($byWarehouse);
+
+        // Создаём ZIP
+        $tempFile = tempnam(sys_get_temp_dir(), 'supply_zip_');
+        $zip = new \ZipArchive();
+        $zip->open($tempFile, \ZipArchive::CREATE | \ZipArchive::OVERWRITE);
+
+        foreach ($byWarehouse as $whName => $items) {
+            // Убираем строки с qty < 1
+            $items = array_filter($items, fn($item) => $item['qty'] >= 1);
+            if (empty($items)) continue;
+
+            $spreadsheet = new Spreadsheet();
+            $sheet = $spreadsheet->getActiveSheet();
+            $sheet->setTitle('Поставка');
+
+            $sheet->setCellValue('A1', 'артикул');
+            $sheet->setCellValue('B1', 'имя (необязательно)');
+            $sheet->setCellValue('C1', 'количество');
+
+            // Стиль заголовков
+            $sheet->getStyle('A1:C1')->applyFromArray([
+                'font' => ['bold' => true, 'size' => 10],
+                'fill' => [
+                    'fillType' => \PhpOffice\PhpSpreadsheet\Style\Fill::FILL_SOLID,
+                    'startColor' => ['rgb' => 'E8F5E9'],
+                ],
+            ]);
+            $sheet->getColumnDimension('A')->setAutoSize(true);
+            $sheet->getColumnDimension('B')->setAutoSize(true);
+
+            $row = 2;
+            foreach ($items as $item) {
+                $sheet->setCellValue("A{$row}", $item['offer_id']);
+                $sheet->setCellValue("B{$row}", $item['name'] ?? '');
+                $sheet->setCellValue("C{$row}", $item['qty']);
+                $row++;
+            }
+
+            // Записываем XLSX во временный файл
+            $tmpXlsx = tempnam(sys_get_temp_dir(), 'xlsx_');
+            $writer = new Xlsx($spreadsheet);
+            $writer->save($tmpXlsx);
+            $spreadsheet->disconnectWorksheets();
+
+            // Безопасное имя файла
+            $safeName = preg_replace('/[^\p{L}\p{N}_\-\s]/u', '', $whName);
+            $safeName = trim($safeName) ?: 'warehouse';
+            $zip->addFile($tmpXlsx, "{$safeName}.xlsx");
+        }
+
+        $zip->close();
+
+        $zipContent = file_get_contents($tempFile);
+        @unlink($tempFile);
+
+        // Удаляем временные xlsx файлы
+        foreach (glob(sys_get_temp_dir() . '/xlsx_*') as $f) {
+            @unlink($f);
+        }
+
+        $filename = "ozon_supply_by_warehouse_{$plan->id}.zip";
+
+        return new StreamedResponse(function () use ($zipContent) {
+            echo $zipContent;
+        }, 200, [
+            'Content-Type' => 'application/zip',
+            'Content-Disposition' => "attachment; filename=\"{$filename}\"",
+            'Content-Length' => strlen($zipContent),
+            'Cache-Control' => 'max-age=0',
+        ]);
+    }
+
+    /**
      * Стрим XLSX файла
      */
     private function streamXlsx(Spreadsheet $spreadsheet, string $filename): StreamedResponse

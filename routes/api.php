@@ -509,6 +509,7 @@ Route::prefix('auto-supply-plans')->middleware('throttle:api')->group(function (
     Route::get('/{id}/export/ozon', [App\Http\Controllers\Api\AutoSupplyPlanController::class, 'exportOzon'])->middleware('throttle:export');
     Route::get('/{id}/export/ozon-matrix', [App\Http\Controllers\Api\AutoSupplyPlanController::class, 'exportOzonMatrix'])->middleware('throttle:export');
     Route::get('/{id}/export/wb', [App\Http\Controllers\Api\AutoSupplyPlanController::class, 'exportWb'])->middleware('throttle:export');
+    Route::get('/{id}/export/ozon-by-warehouse', [App\Http\Controllers\Api\AutoSupplyPlanController::class, 'exportOzonByWarehouse'])->middleware('throttle:export');
 });
 
 /*
