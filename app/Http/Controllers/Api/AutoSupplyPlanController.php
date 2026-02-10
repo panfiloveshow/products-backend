@@ -333,7 +333,7 @@ class AutoSupplyPlanController extends Controller
 
         $warehouses = \App\Models\InventoryWarehouse::where('integration_id', $integrationId)
             ->where('marketplace', $integration->marketplace)
-            ->selectRaw('warehouse_id, warehouse_name, COUNT(DISTINCT sku) as sku_count, SUM(quantity) as total_stock, SUM(sales_30_days) as total_sales_30d, SUM(sales_7_days) as total_sales_7d, AVG(storage_cost_daily) as avg_storage_cost_daily, SUM(storage_fee_total) as total_storage_fee')
+            ->selectRaw('warehouse_id, warehouse_name, COUNT(DISTINCT sku) as sku_count, SUM(quantity) as total_stock, SUM(sales_30_days) as total_sales_30d, SUM(sales_7_days) as total_sales_7d, AVG(storage_cost_per_day) as avg_storage_cost_daily, SUM(storage_fee_total) as total_storage_fee')
             ->groupBy('warehouse_id', 'warehouse_name')
             ->orderByDesc(\DB::raw('SUM(quantity)'))
             ->get();
