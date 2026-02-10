@@ -573,11 +573,12 @@ class UnitEconomicsService
                 $expectedReturnCost = $fboData['expected_return_cost'];
                 
                 // Хранение (зависит от оборачиваемости) — ЗА ЕДИНИЦУ
-                $storageCost = $this->calculateFboStorage($volumeLiters, $turnoverDays);
+                // Бесплатный период: 120 дней (большинство), 365 дней (одежда/обувь/аксессуары)
+                $freeStorageDays = (int) ($data['free_storage_days'] ?? 120);
+                $storageCost = $this->calculateFboStorage($volumeLiters, $turnoverDays, $freeStorageDays);
                 
-                // Литробонусы (компенсация за хранение)
+                // Литробонусы отменены с 01.10.2024, поле сохраняется для обратной совместимости
                 $litrobonus = $data['litrobonus'] ?? 0;
-                $storageCost = max(0, $storageCost - $litrobonus);
                 break;
 
             case 'FBS':
@@ -591,12 +592,12 @@ class UnitEconomicsService
                 $baseLogisticsCost = $this->calculateFbsLogistics($volumeLiters, $price);
                 $logisticsCost = $baseLogisticsCost;
                 
-                // Доставка до места выдачи (с 10.12.2025): 10₽ — ЗА ЕДИНИЦУ
-                $lastMileCost = 10.00;
+                // Доставка до места выдачи: не более 25₽ (одинаково для FBO и FBS)
+                $lastMileCost = 25.00;
                 
                 // Возвраты по FBS — продавец платит за обратную логистику
                 // % выкупа влияет на ожидаемые расходы на возвраты — ЗА ЕДИНИЦУ
-                $returnProcessingCost = 20.00; // Обработка возврата
+                $returnProcessingCost = 15.00; // Обработка возврата (15₽ в агентском ПВЗ)
                 $returnLogisticsCost = $baseLogisticsCost + $returnProcessingCost;
                 $expectedReturnCost = $returnLogisticsCost * $returnRate;
                 break;
@@ -934,22 +935,28 @@ class UnitEconomicsService
     }
 
     /**
-     * Расчёт стоимости хранения FBO по оборачиваемости
-     * - До 160 дней: бесплатно
-     * - 161-180 дней: 0.75₽/л
-     * - Более 180 дней: 1.5₽/л
+     * Расчёт стоимости хранения FBO (актуально с 01.10.2024)
+     * 
+     * Бесплатный период зависит от категории:
+     * - Одежда, обувь, аксессуары, ювелирные: 365 дней
+     * - Сезонные товары: 150 дней (или фиксированный период)
+     * - Большинство остальных категорий: 120 дней
+     * 
+     * После окончания бесплатного периода: 2.5₽/л/день
+     * 
+     * @param float $volumeLiters Объём товара в литрах
+     * @param int $turnoverDays Оборачиваемость (дни на складе)
+     * @param int $freeStorageDays Бесплатный период хранения (по умолчанию 120 дней)
      */
-    private function calculateFboStorage(float $volumeLiters, int $turnoverDays): float
+    private function calculateFboStorage(float $volumeLiters, int $turnoverDays, int $freeStorageDays = 120): float
     {
-        if ($turnoverDays <= 160) {
+        if ($turnoverDays <= $freeStorageDays) {
             return 0;
         }
         
-        if ($turnoverDays <= 180) {
-            return $volumeLiters * 0.75;
-        }
-        
-        return $volumeLiters * 1.5;
+        // После бесплатного периода: 2.5₽/л/день за каждый платный день
+        $paidDays = $turnoverDays - $freeStorageDays;
+        return $volumeLiters * 2.5 * $paidDays;
     }
 
     private function calculateYandex(array $data): array

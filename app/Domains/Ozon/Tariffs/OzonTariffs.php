@@ -7,7 +7,7 @@ use App\Domains\Marketplace\Contracts\TariffsProviderInterface;
 /**
  * Тарифы логистики Ozon
  * 
- * Актуальные тарифы с декабря 2024
+ * Актуальные тарифы с 10 декабря 2025
  * 
  * Схемы работы:
  * - FBO: Склад Ozon, логистика Ozon
@@ -18,21 +18,22 @@ use App\Domains\Marketplace\Contracts\TariffsProviderInterface;
 class OzonTariffs implements TariffsProviderInterface
 {
     /**
-     * FBO тарифы логистики по объёму (литры) для товаров от 301₽
+     * FBO тарифы логистики — прогрессивная шкала (с 10.12.2025)
+     * Для товаров от 301₽:
+     * - 0-1л: 46.77₽ (первый литр)
+     * - 1-3л: +10.17₽ за каждый доп. литр
+     * - 3-190л: +15.25₽ за каждый доп. литр
+     * - 190-1000л: +6.10₽ за каждый доп. литр
+     * - >1000л: 7859.86₽ фиксировано
+     * 
+     * Для товаров до 300₽: 17.28₽/л
      */
-    private const FBO_VOLUME_TARIFFS = [
-        ['max_volume' => 0.1, 'rate' => 46.77],
-        ['max_volume' => 0.2, 'rate' => 50.50],
-        ['max_volume' => 0.5, 'rate' => 55.00],
-        ['max_volume' => 1.0, 'rate' => 60.00],
-        ['max_volume' => 2.0, 'rate' => 70.00],
-        ['max_volume' => 3.0, 'rate' => 80.00],
-        ['max_volume' => 5.0, 'rate' => 95.00],
-        ['max_volume' => 10.0, 'rate' => 120.00],
-        ['max_volume' => 15.0, 'rate' => 145.00],
-        ['max_volume' => 20.0, 'rate' => 175.00],
-        ['max_volume' => PHP_FLOAT_MAX, 'rate' => 175.00, 'per_liter_above' => 10.00],
-    ];
+    private const FBO_FIRST_LITER = 46.77;
+    private const FBO_PER_LITER_1_3 = 10.17;
+    private const FBO_PER_LITER_3_190 = 15.25;
+    private const FBO_PER_LITER_190_1000 = 6.10;
+    private const FBO_FIXED_OVER_1000 = 7859.86;
+    private const FBO_CHEAP_RATE_PER_LITER = 17.28; // Для товаров до 300₽
 
     /**
      * FBS тарифы логистики по объёму (литры) для товаров от 301₽
@@ -94,7 +95,12 @@ class OzonTariffs implements TariffsProviderInterface
         return match (strtoupper($scheme)) {
             'FBO' => [
                 'scheme' => 'FBO',
-                'volume_tariffs' => self::FBO_VOLUME_TARIFFS,
+                'first_liter' => self::FBO_FIRST_LITER,
+                'per_liter_1_3' => self::FBO_PER_LITER_1_3,
+                'per_liter_3_190' => self::FBO_PER_LITER_3_190,
+                'per_liter_190_1000' => self::FBO_PER_LITER_190_1000,
+                'fixed_over_1000' => self::FBO_FIXED_OVER_1000,
+                'cheap_rate_per_liter' => self::FBO_CHEAP_RATE_PER_LITER,
                 'last_mile_max' => self::LAST_MILE_MAX,
                 'acquiring_rate' => self::ACQUIRING_RATE,
                 'has_coefficient' => true,
@@ -141,7 +147,7 @@ class OzonTariffs implements TariffsProviderInterface
     }
 
     /**
-     * Рассчитать FBO логистику
+     * Рассчитать FBO логистику (прогрессивная шкала с 10.12.2025)
      */
     private function calculateFboLogistics(float $volume, array $options = []): float
     {
@@ -149,8 +155,8 @@ class OzonTariffs implements TariffsProviderInterface
         $additionalPercent = $options['additional_percent'] ?? 0;
         $price = $options['price'] ?? 0;
 
-        // Базовый тариф
-        $baseCost = $this->getVolumeCost(self::FBO_VOLUME_TARIFFS, $volume);
+        // Базовый тариф по прогрессивной шкале
+        $baseCost = $this->calculateFboBaseCost(ceil($volume), $price);
         
         // Применяем коэффициент времени доставки
         $logisticsCost = $baseCost * $coefficient;
@@ -162,6 +168,45 @@ class OzonTariffs implements TariffsProviderInterface
         $lastMile = min($options['last_mile'] ?? self::LAST_MILE_MAX, self::LAST_MILE_MAX);
 
         return $logisticsCost + $additionalCost + $lastMile;
+    }
+
+    /**
+     * Базовый тариф FBO по прогрессивной шкале (с 10.12.2025)
+     */
+    private function calculateFboBaseCost(float $volume, float $price = 0): float
+    {
+        if ($volume <= 0) {
+            return 0;
+        }
+
+        // Для товаров до 300₽ — фиксированный тариф за литр
+        if ($price > 0 && $price <= 300) {
+            return $volume * self::FBO_CHEAP_RATE_PER_LITER;
+        }
+
+        // Свыше 1000л — фиксированная ставка
+        if ($volume > 1000) {
+            return self::FBO_FIXED_OVER_1000;
+        }
+
+        $cost = self::FBO_FIRST_LITER; // Первый литр
+
+        if ($volume > 1) {
+            $liters_1_3 = min($volume - 1, 2);
+            $cost += $liters_1_3 * self::FBO_PER_LITER_1_3;
+        }
+
+        if ($volume > 3) {
+            $liters_3_190 = min($volume - 3, 187);
+            $cost += $liters_3_190 * self::FBO_PER_LITER_3_190;
+        }
+
+        if ($volume > 190) {
+            $liters_190_1000 = $volume - 190;
+            $cost += $liters_190_1000 * self::FBO_PER_LITER_190_1000;
+        }
+
+        return round($cost, 2);
     }
 
     /**
@@ -244,7 +289,7 @@ class OzonTariffs implements TariffsProviderInterface
     public function calculateReturnLogisticsCost(string $scheme, float $volume): float
     {
         $baseCost = match (strtoupper($scheme)) {
-            'FBO' => $this->getVolumeCost(self::FBO_VOLUME_TARIFFS, $volume),
+            'FBO' => $this->calculateFboBaseCost(ceil($volume)),
             'FBS' => $this->getVolumeCost(self::FBS_VOLUME_TARIFFS, $volume),
             default => 0,
         };

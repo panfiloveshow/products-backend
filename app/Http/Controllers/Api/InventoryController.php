@@ -518,26 +518,77 @@ class InventoryController extends Controller
     }
 
     /**
-     * Получить общие суммы хранения из последней синхронизации (metadata.storage_totals)
+     * Получить общие суммы хранения — вычисляем напрямую из InventoryWarehouse.
+     * Fallback на SyncLog.metadata если прямой расчёт не дал результата.
      */
     private function getStorageTotals(?string $integrationId): ?array
     {
         if (!$integrationId) return null;
-        
+
+        $rows = InventoryWarehouse::where('integration_id', $integrationId)->get();
+
+        if ($rows->isEmpty()) return null;
+
+        // Текущий месяц — суммируем storage_fee_total по уникальным SKU (берём max по SKU)
+        $currentMonthTotal = $rows->groupBy('sku')->sum(function ($group) {
+            return $group->max('storage_fee_total') ?? 0;
+        });
+        $currentFrom = $rows->pluck('storage_fee_report_from')->filter()->min();
+        $currentTo = $rows->pluck('storage_fee_report_to')->filter()->max();
+
+        // Прошлый месяц — суммируем storage_fee_prev_month по уникальным SKU
+        $prevMonthTotal = $rows->groupBy('sku')->sum(function ($group) {
+            return $group->max('storage_fee_prev_month') ?? 0;
+        });
+        $prevPeriod = $rows->pluck('storage_fee_prev_month_period')->filter()->first();
+
+        // Если есть данные — возвращаем
+        if ($currentMonthTotal > 0 || $prevMonthTotal > 0) {
+            $result = [];
+
+            $result['current_month'] = [
+                'total' => round($currentMonthTotal, 2),
+                'from' => $currentFrom,
+                'to' => $currentTo,
+            ];
+
+            // Парсим период прошлого месяца (формат "2026-01-01 – 2026-01-31")
+            $prevFrom = null;
+            $prevTo = null;
+            if ($prevPeriod && str_contains($prevPeriod, '–')) {
+                $parts = array_map('trim', explode('–', $prevPeriod));
+                $prevFrom = $parts[0] ?? null;
+                $prevTo = $parts[1] ?? null;
+            } elseif ($prevPeriod && str_contains($prevPeriod, ' - ')) {
+                $parts = array_map('trim', explode(' - ', $prevPeriod));
+                $prevFrom = $parts[0] ?? null;
+                $prevTo = $parts[1] ?? null;
+            }
+
+            $result['prev_month'] = [
+                'total' => round($prevMonthTotal, 2),
+                'from' => $prevFrom,
+                'to' => $prevTo,
+            ];
+
+            return $result;
+        }
+
+        // Fallback: SyncLog.metadata
         $syncLog = \App\Models\SyncLog::where('integration_id', $integrationId)
             ->where('sync_type', 'inventory')
             ->where('status', 'completed')
             ->whereNotNull('metadata')
             ->orderByDesc('created_at')
             ->first();
-        
+
         if (!$syncLog) return null;
-        
+
         $metadata = $syncLog->metadata;
         if (!is_array($metadata)) {
             $metadata = json_decode($metadata, true);
         }
-        
+
         return $metadata['storage_totals'] ?? null;
     }
 }
