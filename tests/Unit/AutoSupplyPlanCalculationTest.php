@@ -267,4 +267,220 @@ class AutoSupplyPlanCalculationTest extends TestCase
         $this->assertCount(1, $errors);
         $this->assertEquals('4600000000001', $errors[0]['barcode']);
     }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // v2: Тесты для улучшенного расчёта автопополнения
+    // ═══════════════════════════════════════════════════════════════════
+
+    // === ABC-приоритет ===
+
+    public function test_abc_priority_a_for_high_revenue(): void
+    {
+        $this->assertEquals('A', $this->service->calculateAbcPriority(150000));
+    }
+
+    public function test_abc_priority_b_for_medium_revenue(): void
+    {
+        $this->assertEquals('B', $this->service->calculateAbcPriority(50000));
+    }
+
+    public function test_abc_priority_c_for_low_revenue(): void
+    {
+        $this->assertEquals('C', $this->service->calculateAbcPriority(10000));
+    }
+
+    public function test_abc_target_days_without_settings(): void
+    {
+        $this->assertEquals(21, $this->service->getTargetDaysByAbc('A', null, 14));
+        $this->assertEquals(14, $this->service->getTargetDaysByAbc('B', null, 14));
+        $this->assertEquals(14, $this->service->getTargetDaysByAbc('C', null, 14));
+    }
+
+    // === Улучшенный прогноз спроса (v2) ===
+
+    public function test_demand_v2_prefers_real_avg_daily_sales(): void
+    {
+        $result = $this->service->calculateDailyDemandV2(
+            0.35, 70, 35, 150,
+            realAvgDailySales: 8.5
+        );
+        $this->assertEqualsWithDelta(8.5, $result['daily_demand'], 0.01);
+        $this->assertEquals('ozon_order_report', $result['source']);
+    }
+
+    public function test_demand_v2_uses_effective_when_oos(): void
+    {
+        $result = $this->service->calculateDailyDemandV2(
+            0.35, 70, 35, 150,
+            realAvgDailySales: 0,
+            effectiveDailySales: 7.0,
+            daysInStock30: 20
+        );
+        $this->assertEqualsWithDelta(7.0, $result['daily_demand'], 0.01);
+        $this->assertEquals('effective_oos_adjusted', $result['source']);
+    }
+
+    public function test_demand_v2_falls_back_to_ewma(): void
+    {
+        $result = $this->service->calculateDailyDemandV2(
+            0.35, 70, 35, 150,
+            realAvgDailySales: 0,
+            effectiveDailySales: 0,
+            daysInStock30: 30
+        );
+        $this->assertEqualsWithDelta(6.75, $result['daily_demand'], 0.01);
+        $this->assertEquals('ewma', $result['source']);
+    }
+
+    public function test_demand_v2_applies_redemption_rate(): void
+    {
+        $result = $this->service->calculateDailyDemandV2(
+            0.35, 70, 35, 150,
+            realAvgDailySales: 10.0,
+            redemptionRate: 80
+        );
+        // 10.0 * 0.8 = 8.0
+        $this->assertEqualsWithDelta(8.0, $result['daily_demand'], 0.01);
+    }
+
+    public function test_demand_v2_applies_trend_adjustment(): void
+    {
+        $result = $this->service->calculateDailyDemandV2(
+            0.35, 70, 35, 150,
+            realAvgDailySales: 10.0,
+            salesTrend: 'growing',
+            salesTrendPercent: 20
+        );
+        // 10.0 * (1 + 0.20 * 0.5) = 10.0 * 1.10 = 11.0
+        $this->assertEqualsWithDelta(11.0, $result['daily_demand'], 0.01);
+    }
+
+    // === Корректировка на тренд ===
+
+    public function test_trend_adjustment_growing(): void
+    {
+        // 20% тренд → +10% к demand (50% сглаживание)
+        $result = $this->service->adjustDemandByTrend(10.0, 'growing', 20);
+        $this->assertEqualsWithDelta(11.0, $result, 0.01);
+    }
+
+    public function test_trend_adjustment_declining(): void
+    {
+        // -15% тренд → -7.5% к demand
+        $result = $this->service->adjustDemandByTrend(10.0, 'declining', -15);
+        $this->assertEqualsWithDelta(9.25, $result, 0.01);
+    }
+
+    public function test_trend_adjustment_stable_no_change(): void
+    {
+        $result = $this->service->adjustDemandByTrend(10.0, 'stable', 15);
+        $this->assertEquals(10.0, $result);
+    }
+
+    public function test_trend_adjustment_capped_at_20_percent(): void
+    {
+        // 50% тренд → capped to 20% → +10%
+        $result = $this->service->adjustDemandByTrend(10.0, 'growing', 50);
+        $this->assertEqualsWithDelta(11.0, $result, 0.01);
+    }
+
+    // === Волатильность ===
+
+    public function test_volatility_calculation(): void
+    {
+        // avg7=10, avg14=8, avg30=6 → mean=8, variance=((2²+0²+2²)/3)=2.67, std=1.63, cv=0.2041
+        $result = $this->service->calculateVolatility(10, 8, 6);
+        $this->assertGreaterThan(0, $result);
+        $this->assertLessThan(1, $result);
+    }
+
+    public function test_volatility_zero_with_single_value(): void
+    {
+        $result = $this->service->calculateVolatility(10, 0, 0);
+        $this->assertEquals(0, $result);
+    }
+
+    public function test_volatility_zero_with_equal_values(): void
+    {
+        $result = $this->service->calculateVolatility(5, 5, 5);
+        $this->assertEquals(0, $result);
+    }
+
+    // === Динамический safety stock ===
+
+    public function test_dynamic_safety_stock(): void
+    {
+        // demand=10, volatility=0.3, lead_time=5, minSafety=3
+        // dynamic = 10 * 5 * (1 + 0.3 * 1.5) = 50 * 1.45 = 72.5
+        // min = 10 * 3 = 30
+        // max(72.5, 30) = 72.5
+        $result = $this->service->calculateDynamicSafetyStock(10.0, 0.3, 5, 3);
+        $this->assertEqualsWithDelta(72.5, $result, 0.01);
+    }
+
+    public function test_dynamic_safety_stock_uses_min_when_low_volatility(): void
+    {
+        // demand=10, volatility=0, lead_time=1, minSafety=5
+        // dynamic = 10 * 1 * (1 + 0) = 10
+        // min = 10 * 5 = 50
+        // max(10, 50) = 50
+        $result = $this->service->calculateDynamicSafetyStock(10.0, 0.0, 1, 5);
+        $this->assertEqualsWithDelta(50.0, $result, 0.01);
+    }
+
+    // === Needed с safety stock ===
+
+    public function test_needed_with_safety_stock(): void
+    {
+        // demand=10, target=21, safety=30, stock=50, transit=20
+        // target_stock = 10*21 + 30 = 240
+        // needed = max(0, 240 - 70) = 170
+        $result = $this->service->calculateNeededWithSafety(10.0, 21, 30.0, 50, 20);
+        $this->assertEqualsWithDelta(240.0, $result['target_stock'], 0.01);
+        $this->assertEqualsWithDelta(170.0, $result['needed_before_caps'], 0.01);
+        $this->assertEqualsWithDelta(30.0, $result['safety_stock'], 0.01);
+    }
+
+    // === Приоритет v2 ===
+
+    public function test_priority_v2_critical_for_a_with_oos(): void
+    {
+        $oosDate = now()->addDays(2)->toDateString();
+        $result = $this->service->calculatePriorityScoreV2(
+            'A', $oosDate, 3.0, 7, 'growing', 35, 10000, 50000
+        );
+        $this->assertEquals('critical', $result['priority']);
+        $this->assertGreaterThanOrEqual(70, $result['score']);
+    }
+
+    public function test_priority_v2_low_for_c_stable_no_oos(): void
+    {
+        $result = $this->service->calculatePriorityScoreV2(
+            'C', null, 20.0, 7, 'stable', 5, 0, 1000
+        );
+        $this->assertEquals('low', $result['priority']);
+        $this->assertLessThan(30, $result['score']);
+    }
+
+    public function test_priority_v2_medium_for_b_with_low_cover(): void
+    {
+        $result = $this->service->calculatePriorityScoreV2(
+            'B', null, 5.0, 7, 'stable', 20, 0, 5000
+        );
+        $this->assertEquals('medium', $result['priority']);
+    }
+
+    public function test_priority_v2_margin_bonus(): void
+    {
+        $resultHigh = $this->service->calculatePriorityScoreV2('B', null, 10.0, 7, 'stable', 35);
+        $resultLow = $this->service->calculatePriorityScoreV2('B', null, 10.0, 7, 'stable', 5);
+        $this->assertGreaterThan($resultLow['score'], $resultHigh['score']);
+    }
+
+    public function test_priority_v2_ozon_lost_profit_bonus(): void
+    {
+        $resultWith = $this->service->calculatePriorityScoreV2('B', null, 10.0, 7, 'stable', 0, 15000);
+        $resultWithout = $this->service->calculatePriorityScoreV2('B', null, 10.0, 7, 'stable', 0, 0);
+        $this->assertGreaterThan($resultWithout['score'], $resultWith['score']);
+    }
 }

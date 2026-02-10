@@ -4,10 +4,13 @@ namespace App\Jobs;
 
 use App\Models\AutoSupplyPlan;
 use App\Models\AutoSupplyPlanLine;
+use App\Models\Integration;
 use App\Models\InventoryWarehouse;
 use App\Models\OzonWarehouseCluster;
 use App\Models\Product;
 use App\Models\SellerWarehouseStock;
+use App\Models\SupplySettings;
+use App\Models\UnitEconomics;
 use App\Services\AutoSupplyPlanService;
 use Carbon\Carbon;
 use Illuminate\Bus\Queueable;
@@ -54,15 +57,19 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
     private function calculate(AutoSupplyPlan $plan, AutoSupplyPlanService $service): void
     {
         $ewmaAlpha = 0.35;
-        $targetCoverDays = $plan->target_cover_days ?: 21;
         $minCoverDays = $plan->min_cover_days ?: 7;
         $maxCoverDays = $plan->max_cover_days ?: 42;
-        $safetyStockDays = $plan->safety_stock_days ?: 5;
         $turnoverLimitDays = $plan->turnover_limit_days;
         $horizonDays = $plan->horizon_days ?: 28;
 
         $integrationId = $plan->integration_id;
         $marketplace = $plan->marketplace;
+
+        // v2: Загружаем SupplySettings для интеграции (ABC target days, lead time, safety stock mode)
+        $settings = SupplySettings::where('integration_id', $integrationId)->first();
+        $leadTimeDays = $settings->default_lead_time_days ?? AutoSupplyPlanService::LEAD_TIME_DEFAULT;
+        $minSafetyDays = $settings->safety_stock_days ?? ($plan->safety_stock_days ?: 3);
+        $planDefaultTargetDays = $plan->target_cover_days ?: 21;
 
         // Получаем все записи остатков для интеграции
         $warehouses = InventoryWarehouse::where('integration_id', $integrationId)
@@ -82,8 +89,8 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
             ->get()
             ->keyBy('sku');
 
-        // Загружаем UnitEconomics для финансовых метрик (cost_price, storage, delivery)
-        $unitEconomics = \App\Models\UnitEconomics::where('integration_id', $integrationId)
+        // Загружаем UnitEconomics для финансовых метрик
+        $unitEconomics = UnitEconomics::where('integration_id', $integrationId)
             ->whereIn('sku', $skus)
             ->get()
             ->keyBy('sku');
@@ -94,8 +101,33 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
         // Load seller warehouse stocks (optional — if available, limits recommendations)
         $sellerStockMap = SellerWarehouseStock::getStockMap($integrationId);
         $hasSellerStocks = !empty($sellerStockMap);
-        // Track consumed own stock per SKU across warehouses
         $sellerStockConsumed = [];
+
+        // v2: Загружаем in-transit из активных заявок на поставку
+        $supplyInTransit = $service->getInTransitFromSupplies($integrationId);
+
+        // v2: Загружаем рекомендации Ozon по поставкам (delivery analytics)
+        $ozonAnalytics = [];
+        if ($marketplace === 'ozon') {
+            $integration = Integration::find($integrationId);
+            if ($integration) {
+                $ozonAnalytics = $service->loadOzonDeliveryAnalytics($integration);
+            }
+        }
+
+        // v2: Предварительный расчёт выручки за 30д для ABC-приоритета
+        $revenueBySkuMap = [];
+        foreach ($warehouses as $wh) {
+            $product = $products->get($wh->sku);
+            $ue = $unitEconomics->get($wh->sku);
+            $price = $product?->price ?? $ue?->price ?? 0;
+            $sales30 = $wh->sales_30_days ?? 0;
+            $revenue30d = $price * $sales30;
+            // Берём максимальную выручку по SKU (если несколько складов)
+            if (!isset($revenueBySkuMap[$wh->sku]) || $revenue30d > $revenueBySkuMap[$wh->sku]) {
+                $revenueBySkuMap[$wh->sku] = $revenue30d;
+            }
+        }
 
         $totalLines = 0;
         $totalQty = 0;
@@ -112,45 +144,95 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
 
         foreach ($warehouses as $wh) {
             $product = $products->get($wh->sku);
+            $ue = $unitEconomics->get($wh->sku);
 
-            // --- 3.1 Forecast (EWMA) ---
+            // --- Исключённые SKU ---
+            if ($settings && $settings->isSkuExcluded($wh->sku)) {
+                continue;
+            }
+
+            // --- Базовые данные ---
             $sales7 = $wh->sales_7_days ?? 0;
             $sales14 = $wh->sales_14_days ?? 0;
             $sales30 = $wh->sales_30_days ?? 0;
-
-            $demandResult = $service->calculateDailyDemand($ewmaAlpha, $sales7, $sales14, $sales30);
-            $dailyDemand = $demandResult['daily_demand'];
-            $needsManualReview = $demandResult['needs_manual_review'];
-
             $currentStock = $wh->quantity ?? 0;
-            $inTransit = $wh->in_transit ?? 0;
             $avgDailySales = $wh->average_daily_sales ?? 0;
 
-            // --- 3.2 Базовые формулы ---
-            $coverBefore = ($currentStock + $inTransit) / max($dailyDemand, AutoSupplyPlanService::EPS);
-            $safetyStock = $dailyDemand * $safetyStockDays;
+            // v2: In-transit = API + заявки на поставку
+            $inTransitApi = $wh->in_transit ?? 0;
+            $inTransitSupplies = $supplyInTransit[$wh->sku] ?? 0;
+            $inTransit = $inTransitApi + $inTransitSupplies;
 
-            $baseResult = $service->calculateNeededBeforeCaps($dailyDemand, $targetCoverDays, $currentStock, $inTransit);
+            // v2: Данные для улучшенного прогноза
+            $realAvgDailySales = $wh->real_avg_daily_sales ?? 0;
+            $effectiveDailySales = $wh->effective_daily_sales ?? 0;
+            $daysInStock30 = $wh->days_in_stock_30 ?? 30;
+            $redemptionRate = $ue?->redemption_rate ?? 100;
+
+            // --- Тренд продаж (улучшенный: 3 периода + учёт OOS) ---
+            $salesTrend = 'stable';
+            $salesTrendPercent = 0;
+
+            $avg7 = $sales7 > 0 ? $sales7 / 7 : 0;
+            $avg14 = $sales14 > 0 ? $sales14 / 14 : 0;
+            $avg30 = ($daysInStock30 > 0 && $daysInStock30 < 25 && $effectiveDailySales > 0)
+                ? $effectiveDailySales
+                : ($sales30 > 0 ? $sales30 / 30 : 0);
+
+            if ($avg30 > 0 && $sales14 > 0) {
+                $avg8_14 = ($sales14 - $sales7) / 7;
+                $shortTrend = $avg8_14 > 0 ? (($avg7 - $avg8_14) / $avg8_14) * 100 : 0;
+                $older16Avg = ($sales30 - $sales14) / 16;
+                $midTrend = $older16Avg > 0 ? (($avg14 - $older16Avg) / $older16Avg) * 100 : 0;
+                $salesTrendPercent = round($shortTrend * 0.6 + $midTrend * 0.4, 2);
+
+                if ($salesTrendPercent > 10) $salesTrend = 'growing';
+                elseif ($salesTrendPercent < -10) $salesTrend = 'declining';
+            }
+
+            // --- v2: Улучшенный прогноз спроса (real > effective > EWMA + % выкупа + тренд) ---
+            $demandResult = $service->calculateDailyDemandV2(
+                $ewmaAlpha, $sales7, $sales14, $sales30,
+                $realAvgDailySales, $effectiveDailySales, $daysInStock30,
+                $redemptionRate, $salesTrend, $salesTrendPercent
+            );
+            $dailyDemand = $demandResult['daily_demand'];
+            $demandSource = $demandResult['source'];
+            $needsManualReview = $demandResult['needs_manual_review'];
+
+            // --- v2: ABC-приоритет ---
+            $revenue30d = $revenueBySkuMap[$wh->sku] ?? 0;
+            $abcPriority = $service->calculateAbcPriority($revenue30d);
+            $targetCoverDays = $service->getTargetDaysByAbc($abcPriority, $settings, $planDefaultTargetDays);
+
+            // --- v2: Динамический safety stock ---
+            $volatility = $service->calculateVolatility($avg7, $avg14, $avg30);
+            $safetyStock = $service->calculateDynamicSafetyStock($dailyDemand, $volatility, $leadTimeDays, $minSafetyDays);
+
+            // --- v2: Needed с учётом safety stock ---
+            $coverBefore = ($currentStock + $inTransit) / max($dailyDemand, AutoSupplyPlanService::EPS);
+
+            $baseResult = $service->calculateNeededWithSafety($dailyDemand, $targetCoverDays, $safetyStock, $currentStock, $inTransit);
             $targetStock = $baseResult['target_stock'];
             $neededBeforeCaps = $baseResult['needed_before_caps'];
 
-            // --- 3.3 Max cover cap ---
+            // --- Max cover cap ---
             $capResult = $service->applyMaxCoverCap($neededBeforeCaps, $dailyDemand, $maxCoverDays, $currentStock, $inTransit);
             $needed = $capResult['needed'];
             $capStock = $capResult['cap_stock'];
             $capNeeded = $capResult['cap_needed'];
             $capsApplied = $capResult['caps_applied'];
 
-            // --- 3.4 Turnover limit ---
+            // --- Turnover limit ---
             $turnoverResult = $service->applyTurnoverLimit($needed, $dailyDemand, $turnoverLimitDays, $currentStock, $inTransit, $capsApplied);
             $needed = $turnoverResult['needed'];
             $capsApplied = $turnoverResult['caps_applied'];
 
-            // --- 3.5 Destination ---
+            // --- Destination ---
             $destinationId = $wh->warehouse_id ?? null;
             $destinationType = $destinationId ? 'warehouse' : 'all';
 
-            // --- 3.5b Geo-distribution: resolve cluster ---
+            // --- Geo-distribution: resolve cluster ---
             $clusterId = null;
             $clusterName = null;
             $clusterRegion = null;
@@ -163,14 +245,14 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
                 }
             }
 
-            // --- 3.6 Округление qty ---
-            $packMultiple = 1;
+            // --- Округление qty ---
+            $packMultiple = $settings->default_pack_multiple ?? 1;
             if ($product && isset($product->ozon_data['pack_multiple'])) {
                 $packMultiple = max(1, (int) $product->ozon_data['pack_multiple']);
             }
             $qtyRounded = $service->roundToPackMultiple($needed, $packMultiple);
 
-            // --- 3.6b Own stock accounting (optional) ---
+            // --- Own stock accounting (optional) ---
             $ownStock = null;
             $ownStockReserved = null;
             $deficit = null;
@@ -185,7 +267,6 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
                 if ($qtyRounded > $availableOwn) {
                     $deficit = $qtyRounded - $availableOwn;
                     $qtyRounded = $availableOwn;
-                    // Re-round down to pack multiple
                     if ($packMultiple > 1 && $qtyRounded > 0) {
                         $qtyRounded = (int) floor($qtyRounded / $packMultiple) * $packMultiple;
                     }
@@ -194,38 +275,85 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
                 $sellerStockConsumed[$wh->sku] = $alreadyConsumed + $qtyRounded;
             }
 
-            // --- 3.7 Симуляция и риск ---
+            // --- Симуляция и риск ---
             $simulation = $service->buildSimulation($currentStock, $inTransit, $dailyDemand, $qtyRounded, $horizonDays);
             $oosDate = $service->findOosDate($simulation);
             $coverAfter = ($currentStock + $inTransit + $qtyRounded) / max($dailyDemand, AutoSupplyPlanService::EPS);
             $surplusDays = $coverAfter > $targetCoverDays ? (int) ($coverAfter - $targetCoverDays) : null;
             $riskLevel = $service->determineRiskLevel($oosDate, $coverBefore, $minCoverDays);
 
-            // --- 3.8 Explain ---
+            // --- Финансовые метрики ---
+            $offerId = $wh->sku;
+            $barcode = $product?->barcode;
+            $price = $product?->price ?? $ue?->price ?? 0;
+            $costPrice = $ue?->cost_price ?? $wh->cost_price ?? 0;
+            $storageCostDaily = $wh->storage_cost_per_day ?? 0;
+            $storageCostMonthly = $wh->storage_cost_per_month ?? 0;
+            $marginPercent = $ue?->margin_percent ?? 0;
+            $commissionPercent = $ue?->commission_percent ?? 0;
+            $logisticsCost = $ue?->logistics_cost ?? 0;
+
+            $lostRevenueDaily = $dailyDemand * $price;
+            $supplyCostEstimate = $costPrice > 0 ? $costPrice * $qtyRounded : 0;
+            $expectedRevenue = $price > 0 ? $dailyDemand * $targetCoverDays * $price : 0;
+
+            // v2: Улучшенный расчёт прибыли (с учётом комиссии и логистики)
+            $commissionCost = $expectedRevenue * ($commissionPercent / 100);
+            $totalLogisticsCost = $logisticsCost * $qtyRounded;
+            $expectedProfit = $expectedRevenue - $supplyCostEstimate - $commissionCost - $totalLogisticsCost - ($storageCostDaily * $targetCoverDays);
+            $roiPercent = $supplyCostEstimate > 0 ? round(($expectedProfit / $supplyCostEstimate) * 100, 2) : 0;
+            $turnoverDays = $dailyDemand > 0 ? round(($currentStock + $inTransit + $qtyRounded) / $dailyDemand, 1) : null;
+
+            // --- v2: Ozon рекомендации для этого SKU ---
+            $ozonSkuData = $ozonAnalytics[$wh->sku] ?? null;
+            $ozonRecommendedSupply = $ozonSkuData['total_recommended_supply'] ?? null;
+            $ozonLostProfit = $ozonSkuData['total_lost_profit'] ?? 0;
+            $ozonAvgDeliveryTime = $ozonSkuData['max_delivery_time'] ?? null;
+            $ozonAttentionLevel = $ozonSkuData['max_attention_level'] ?? null;
+
+            // --- v2: Улучшенный приоритет (ABC + маржа + Ozon lost profit) ---
+            $priorityResult = $service->calculatePriorityScoreV2(
+                $abcPriority, $oosDate, $coverBefore, $minCoverDays,
+                $salesTrend, $marginPercent, $ozonLostProfit, $lostRevenueDaily
+            );
+            $priorityScore = $priorityResult['score'];
+            $priority = $priorityResult['priority'];
+
+            // --- Explain JSON (v2: расширенный) ---
             $shortAvg = $sales7 > 0 ? $sales7 / 7 : 0;
             $longAvg = $sales30 > 0 ? $sales30 / 30 : 0;
 
             $explainJson = [
+                'version' => 2,
                 'inputs' => [
                     'stock_now' => $currentStock,
-                    'in_transit' => $inTransit,
+                    'in_transit_api' => $inTransitApi,
+                    'in_transit_supplies' => $inTransitSupplies,
+                    'in_transit_total' => $inTransit,
                     'daily_demand' => round($dailyDemand, 4),
+                    'demand_source' => $demandSource,
                     'ewma_alpha' => $ewmaAlpha,
                     'sales_7d' => $sales7,
                     'sales_14d' => $sales14,
                     'sales_30d' => $sales30,
                     'short_avg' => round($shortAvg, 4),
                     'long_avg' => round($longAvg, 4),
+                    'real_avg_daily_sales' => round($realAvgDailySales, 4),
+                    'effective_daily_sales' => round($effectiveDailySales, 4),
+                    'redemption_rate' => $redemptionRate,
                     'target_cover_days' => $targetCoverDays,
                     'min_cover_days' => $minCoverDays,
                     'max_cover_days' => $maxCoverDays,
-                    'safety_stock_days' => $safetyStockDays,
-                    'turnover_limit_days' => $turnoverLimitDays,
+                    'lead_time_days' => $leadTimeDays,
                     'pack_multiple' => $packMultiple,
+                    'abc_priority' => $abcPriority,
+                    'revenue_30d' => round($revenue30d, 2),
                 ],
                 'math' => [
                     'target_stock' => round($targetStock, 2),
                     'safety_stock' => round($safetyStock, 2),
+                    'safety_stock_type' => 'dynamic',
+                    'volatility' => $volatility,
                     'needed_before_caps' => round($neededBeforeCaps, 2),
                     'cap_stock' => round($capStock, 2),
                     'cap_needed' => round($capNeeded, 2),
@@ -240,104 +368,41 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
                     'missing_sources' => $service->detectMissingSources($wh, $product, $marketplace),
                     'fallbacks' => $dailyDemand === 0.0 ? ['no_sales_data'] : [],
                 ],
+                'trend' => [
+                    'sales_7d' => $sales7,
+                    'sales_14d' => $sales14,
+                    'sales_30d' => $sales30,
+                    'avg_daily_7d' => round($avg7, 4),
+                    'avg_daily_14d' => round($avg14, 4),
+                    'avg_daily_30d' => round($avg30, 4),
+                    'days_in_stock_30' => $daysInStock30,
+                    'oos_adjusted' => ($daysInStock30 < 25 && $effectiveDailySales > 0),
+                    'short_trend_pct' => isset($shortTrend) ? round($shortTrend, 2) : null,
+                    'mid_trend_pct' => isset($midTrend) ? round($midTrend, 2) : null,
+                    'weighted_trend_pct' => $salesTrendPercent,
+                    'result' => $salesTrend,
+                ],
+                'ozon_analytics' => [
+                    'recommended_supply' => $ozonRecommendedSupply,
+                    'lost_profit' => $ozonLostProfit,
+                    'avg_delivery_time' => $ozonAvgDeliveryTime,
+                    'attention_level' => $ozonAttentionLevel,
+                    'our_vs_ozon_diff' => $ozonRecommendedSupply !== null ? $qtyRounded - $ozonRecommendedSupply : null,
+                ],
+                'unit_economics' => [
+                    'margin_percent' => $marginPercent,
+                    'commission_percent' => $commissionPercent,
+                    'logistics_cost' => $logisticsCost,
+                    'redemption_rate' => $redemptionRate,
+                    'roi_percent' => $roiPercent,
+                ],
                 'simulation_summary' => [
                     'oos_date' => $oosDate,
                     'min_stock' => $service->findMinStock($simulation),
                 ],
             ];
 
-            // Определяем offer_id и barcode
-            $offerId = $wh->sku;
-            $barcode = $product?->barcode;
-
-            // --- 3.9 Финансовые метрики + Тренд ---
-            $ue = $unitEconomics->get($wh->sku);
-            $price = $product?->price ?? $ue?->price ?? 0;
-            $costPrice = $ue?->cost_price ?? $wh->cost_price ?? 0;
-            $storageCostDaily = $wh->storage_cost_per_day ?? 0;
-            $storageCostMonthly = $wh->storage_cost_per_month ?? 0;
-
-            // Тренд продаж (улучшенный: 3 периода + учёт OOS)
-            $salesTrend = 'stable';
-            $salesTrendPercent = 0;
-
-            // Используем effective_daily_sales если товар был OOS (корректировка на дни в наличии)
-            $daysInStock30 = $wh->days_in_stock_30 ?? 30;
-            $effectiveDailySales = $wh->effective_daily_sales ?? 0;
-
-            // Среднедневные по периодам
-            $avg7 = $sales7 > 0 ? $sales7 / 7 : 0;
-            $avg14 = $sales14 > 0 ? $sales14 / 14 : 0;
-            // Для 30д: если были OOS-дни, используем effective_daily_sales
-            $avg30 = ($daysInStock30 > 0 && $daysInStock30 < 25 && $effectiveDailySales > 0)
-                ? $effectiveDailySales
-                : ($sales30 > 0 ? $sales30 / 30 : 0);
-
-            if ($avg30 > 0 && $sales14 > 0) {
-                // Краткосрочный тренд: 7д vs 8-14д
-                $avg8_14 = ($sales14 - $sales7) / 7;
-                $shortTrend = $avg8_14 > 0 ? (($avg7 - $avg8_14) / $avg8_14) * 100 : 0;
-
-                // Среднесрочный тренд: 14д vs 15-30д
-                $older16Avg = ($sales30 - $sales14) / 16;
-                $midTrend = $older16Avg > 0 ? (($avg14 - $older16Avg) / $older16Avg) * 100 : 0;
-
-                // Взвешенный тренд: 60% краткосрочный + 40% среднесрочный
-                $salesTrendPercent = round($shortTrend * 0.6 + $midTrend * 0.4, 2);
-
-                if ($salesTrendPercent > 10) $salesTrend = 'growing';
-                elseif ($salesTrendPercent < -10) $salesTrend = 'declining';
-            }
-
-            // Добавляем детали тренда в explain_json
-            $explainJson['trend'] = [
-                'sales_7d' => $sales7,
-                'sales_14d' => $sales14,
-                'sales_30d' => $sales30,
-                'avg_daily_7d' => round($avg7, 4),
-                'avg_daily_14d' => round($avg14, 4),
-                'avg_daily_30d' => round($avg30, 4),
-                'days_in_stock_30' => $daysInStock30,
-                'effective_daily_sales' => round($effectiveDailySales, 4),
-                'oos_adjusted' => ($daysInStock30 < 25 && $effectiveDailySales > 0),
-                'short_trend_pct' => isset($shortTrend) ? round($shortTrend, 2) : null,
-                'mid_trend_pct' => isset($midTrend) ? round($midTrend, 2) : null,
-                'weighted_trend_pct' => $salesTrendPercent,
-                'result' => $salesTrend,
-            ];
-
-            // Потерянная выручка при OOS (если товар закончится)
-            $lostRevenueDaily = $dailyDemand * $price;
-
-            // Стоимость поставки (себестоимость * количество)
-            $supplyCostEstimate = $costPrice > 0 ? $costPrice * $qtyRounded : 0;
-
-            // Ожидаемая выручка за период покрытия
-            $expectedRevenue = $price > 0 ? $dailyDemand * $targetCoverDays * $price : 0;
-
-            // Ожидаемая прибыль
-            $expectedProfit = $expectedRevenue - $supplyCostEstimate - ($storageCostDaily * $targetCoverDays);
-
-            // ROI поставки
-            $roiPercent = $supplyCostEstimate > 0 ? round(($expectedProfit / $supplyCostEstimate) * 100, 2) : 0;
-
-            // Оборачиваемость
-            $turnoverDays = $dailyDemand > 0 ? round(($currentStock + $inTransit + $qtyRounded) / $dailyDemand, 1) : null;
-
-            // Приоритет поставки
-            $priorityScore = 0;
-            if ($oosDate) $priorityScore += 40;
-            if ($coverBefore < $minCoverDays) $priorityScore += 30;
-            if ($riskLevel === 'high') $priorityScore += 20;
-            if ($salesTrend === 'growing') $priorityScore += 10;
-            $priorityScore = min(100, $priorityScore);
-
-            $priority = 'low';
-            if ($priorityScore >= 70) $priority = 'critical';
-            elseif ($priorityScore >= 50) $priority = 'high';
-            elseif ($priorityScore >= 30) $priority = 'medium';
-
-            // --- 4. Data quality counters (once per unique SKU) ---
+            // --- Data quality counters (once per unique SKU) ---
             if (!isset($qualitySeenSkus[$wh->sku])) {
                 $qualitySeenSkus[$wh->sku] = true;
                 if ($currentStock > 0 || $inTransit > 0) $qStocksCoverage++;
@@ -413,7 +478,7 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
             }
         }
 
-        // --- 4. Data quality score ---
+        // --- Data quality score ---
         $qualityJson = $service->calculateDataQuality(
             $totalSkus, $qStocksCoverage, $qSalesHistory,
             $qInTransit, $qDestination, $qBarcode, $marketplace
@@ -422,11 +487,14 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
 
         $plan->markReady($qualityScore, $totalLines, $totalQty, $qualityJson);
 
-        Log::info('CalculateAutoSupplyPlanJob completed', [
+        Log::info('CalculateAutoSupplyPlanJob v2 completed', [
             'plan_id' => $plan->id,
             'total_lines' => $totalLines,
             'total_qty' => $totalQty,
             'quality_score' => $qualityScore,
+            'ozon_analytics_skus' => count($ozonAnalytics),
+            'supply_in_transit_skus' => count($supplyInTransit),
+            'settings_used' => $settings ? true : false,
         ]);
     }
 

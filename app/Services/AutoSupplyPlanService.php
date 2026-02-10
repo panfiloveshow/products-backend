@@ -2,6 +2,8 @@
 
 namespace App\Services;
 
+use App\Models\SupplySettings;
+use App\Models\UnitEconomics;
 use Carbon\Carbon;
 
 /**
@@ -9,6 +11,9 @@ use Carbon\Carbon;
  *
  * Вся бизнес-логика EWMA-прогноза, caps, rounding, simulation, risk, data quality
  * вынесена из Job сюда для тестируемости и переиспользования.
+ *
+ * v2: ABC-приоритет, динамический safety stock, % выкупа, корректировка на тренд,
+ *     effective_daily_sales, real_avg_daily_sales, Ozon DeliveryAnalytics.
  */
 class AutoSupplyPlanService
 {
@@ -312,5 +317,398 @@ class AutoSupplyPlanService
             ],
             'skus_analyzed' => 0,
         ];
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // v2: Улучшенный расчёт автопополнения
+    // ═══════════════════════════════════════════════════════════════════
+
+    // ─── ABC-приоритет ────────────────────────────────────────────────
+
+    /**
+     * Определить ABC-приоритет товара по выручке за 30 дней.
+     *
+     * A — топ-товары (выручка ≥ 100к), target_days = 21
+     * B — средние (выручка ≥ 30к), target_days = 14
+     * C — остальные, target_days = 7
+     */
+    public function calculateAbcPriority(float $revenue30d): string
+    {
+        if ($revenue30d >= 100000) return 'A';
+        if ($revenue30d >= 30000) return 'B';
+        return 'C';
+    }
+
+    /**
+     * Получить target_cover_days по ABC-приоритету из SupplySettings.
+     * Если настроек нет — используем дефолты из плана.
+     */
+    public function getTargetDaysByAbc(string $abcPriority, ?SupplySettings $settings, int $planDefault): int
+    {
+        if ($settings) {
+            return $settings->getTargetDays($abcPriority);
+        }
+
+        return match ($abcPriority) {
+            'A' => max($planDefault, 21),
+            'B' => $planDefault,
+            'C' => min($planDefault, 14),
+            default => $planDefault,
+        };
+    }
+
+    // ─── Улучшенный прогноз спроса ───────────────────────────────────
+
+    /**
+     * Выбрать лучший источник дневного спроса (приоритет):
+     *   1) real_avg_daily_sales (из отчёта заказов Ozon — по конкретному складу)
+     *   2) effective_daily_sales (с учётом OOS-дней)
+     *   3) EWMA (стандартный расчёт)
+     *
+     * @return array{daily_demand: float, source: string, needs_manual_review: bool}
+     */
+    public function calculateDailyDemandV2(
+        float  $alpha,
+        float  $sales7,
+        float  $sales14,
+        float  $sales30,
+        float  $realAvgDailySales = 0,
+        float  $effectiveDailySales = 0,
+        int    $daysInStock30 = 30,
+        float  $redemptionRate = 100,
+        string $salesTrend = 'stable',
+        float  $salesTrendPercent = 0
+    ): array {
+        $source = 'ewma';
+        $needsManualReview = false;
+
+        // Приоритет 1: real_avg_daily_sales из отчёта заказов (по складам)
+        if ($realAvgDailySales > 0) {
+            $baseDemand = $realAvgDailySales;
+            $source = 'ozon_order_report';
+        }
+        // Приоритет 2: effective_daily_sales (с учётом OOS)
+        elseif ($effectiveDailySales > 0 && $daysInStock30 > 0 && $daysInStock30 < 25) {
+            $baseDemand = $effectiveDailySales;
+            $source = 'effective_oos_adjusted';
+        }
+        // Приоритет 3: EWMA
+        else {
+            $ewma = $this->calculateDailyDemand($alpha, $sales7, $sales14, $sales30);
+            $baseDemand = $ewma['daily_demand'];
+            $needsManualReview = $ewma['needs_manual_review'];
+        }
+
+        // Корректировка на % выкупа (только для Ozon FBO)
+        if ($redemptionRate > 0 && $redemptionRate < 100) {
+            $baseDemand = $baseDemand * ($redemptionRate / 100);
+        }
+
+        // Корректировка на тренд (±20% макс)
+        $baseDemand = $this->adjustDemandByTrend($baseDemand, $salesTrend, $salesTrendPercent);
+
+        return [
+            'daily_demand' => max(0, $baseDemand),
+            'source' => $source,
+            'needs_manual_review' => $needsManualReview,
+        ];
+    }
+
+    /**
+     * Скорректировать спрос по тренду продаж.
+     * Рост → увеличиваем прогноз (макс +20%).
+     * Падение → уменьшаем (макс -15%).
+     */
+    public function adjustDemandByTrend(float $demand, string $trend, float $trendPercent): float
+    {
+        if ($demand <= 0 || $trend === 'stable') {
+            return $demand;
+        }
+
+        // Ограничиваем корректировку: -15% до +20%
+        $adjustment = max(-15, min(20, $trendPercent)) / 100;
+
+        // Применяем 50% от тренда (сглаживание)
+        return $demand * (1 + $adjustment * 0.5);
+    }
+
+    // ─── Динамический safety stock ───────────────────────────────────
+
+    /**
+     * Рассчитать волатильность продаж (коэффициент вариации).
+     */
+    public function calculateVolatility(float $avg7d, float $avg14d, float $avg30d): float
+    {
+        $values = array_filter([$avg7d, $avg14d, $avg30d], fn($v) => $v > 0);
+
+        if (count($values) < 2) {
+            return 0;
+        }
+
+        $mean = array_sum($values) / count($values);
+        if ($mean <= 0) {
+            return 0;
+        }
+
+        $variance = array_sum(array_map(fn($v) => pow($v - $mean, 2), $values)) / count($values);
+        return round(sqrt($variance) / $mean, 4);
+    }
+
+    /**
+     * Рассчитать динамический страховой запас.
+     *
+     * Формула: SS = avg_sales × lead_time × (1 + volatility × k)
+     * где k = 1.5 (коэффициент запаса)
+     *
+     * Минимум: safetyStockDays × avg_sales (из настроек плана)
+     */
+    public function calculateDynamicSafetyStock(
+        float $dailyDemand,
+        float $volatility,
+        int   $leadTimeDays,
+        int   $minSafetyDays = 3
+    ): float {
+        $safetyCoef = 1.5;
+        $dynamicSafety = $dailyDemand * $leadTimeDays * (1 + $volatility * $safetyCoef);
+        $minSafety = $dailyDemand * $minSafetyDays;
+
+        return max($dynamicSafety, $minSafety);
+    }
+
+    // ─── Нужно с учётом safety stock ─────────────────────────────────
+
+    /**
+     * Рассчитать needed с учётом safety stock (v2).
+     */
+    public function calculateNeededWithSafety(
+        float $dailyDemand,
+        int   $targetCoverDays,
+        float $safetyStock,
+        int   $currentStock,
+        int   $inTransit
+    ): array {
+        $targetStock = $dailyDemand * $targetCoverDays + $safetyStock;
+        $neededBeforeCaps = max(0, $targetStock - ($currentStock + $inTransit));
+
+        return [
+            'target_stock' => $targetStock,
+            'safety_stock' => $safetyStock,
+            'needed_before_caps' => $neededBeforeCaps,
+        ];
+    }
+
+    // ─── Приоритет поставки (v2) ─────────────────────────────────────
+
+    /**
+     * Рассчитать приоритетный скор (v2).
+     *
+     * Учитывает: ABC, OOS-риск, маржинальность, тренд, упущенную прибыль Ozon.
+     */
+    public function calculatePriorityScoreV2(
+        string $abcPriority,
+        ?string $oosDate,
+        float  $coverBefore,
+        int    $minCoverDays,
+        string $salesTrend,
+        float  $marginPercent = 0,
+        float  $ozonLostProfit = 0,
+        float  $lostRevenueDaily = 0
+    ): array {
+        $score = 0;
+
+        // ABC базовый скор
+        $score += match ($abcPriority) {
+            'A' => 30,
+            'B' => 15,
+            'C' => 5,
+            default => 0,
+        };
+
+        // OOS-риск
+        if ($oosDate !== null) {
+            $daysUntilOos = max(0, Carbon::parse($oosDate)->diffInDays(Carbon::today()));
+            if ($daysUntilOos <= 3) $score += 40;
+            elseif ($daysUntilOos <= 7) $score += 25;
+            else $score += 10;
+        }
+
+        // Низкое покрытие
+        if ($coverBefore < $minCoverDays) $score += 20;
+
+        // Растущие продажи
+        if ($salesTrend === 'growing') $score += 10;
+        elseif ($salesTrend === 'declining') $score -= 5;
+
+        // Высокая маржинальность (бонус)
+        if ($marginPercent > 30) $score += 10;
+        elseif ($marginPercent > 15) $score += 5;
+
+        // Упущенная прибыль Ozon (каждые 5000₽ = +3 балла, макс +15)
+        if ($ozonLostProfit > 0) {
+            $score += min(15, (int) floor($ozonLostProfit / 5000) * 3);
+        }
+
+        // Упущенная выручка в день (каждые 10000₽ = +5 баллов, макс +15)
+        if ($lostRevenueDaily > 0) {
+            $score += min(15, (int) floor($lostRevenueDaily / 10000) * 5);
+        }
+
+        $score = max(0, min(100, $score));
+
+        $priority = 'low';
+        if ($score >= 70) $priority = 'critical';
+        elseif ($score >= 50) $priority = 'high';
+        elseif ($score >= 30) $priority = 'medium';
+
+        return [
+            'score' => $score,
+            'priority' => $priority,
+        ];
+    }
+
+    // ─── In-transit из заявок ─────────────────────────────────────────
+
+    /**
+     * Получить товары в пути из активных заявок на поставку.
+     *
+     * @return array<string, int> [sku => qty]
+     */
+    public function getInTransitFromSupplies(int $integrationId): array
+    {
+        return \Illuminate\Support\Facades\DB::table('supply_items')
+            ->join('supplies', 'supply_items.supply_id', '=', 'supplies.id')
+            ->where('supplies.integration_id', $integrationId)
+            ->whereIn('supplies.status', [
+                'draft_ozon',
+                'slot_booked',
+                'preparing',
+                'ready_to_ship',
+                'shipped',
+                'in_transit',
+            ])
+            ->select('supply_items.sku', \Illuminate\Support\Facades\DB::raw('SUM(supply_items.planned_qty) as qty'))
+            ->groupBy('supply_items.sku')
+            ->pluck('qty', 'sku')
+            ->map(fn($v) => (int) $v)
+            ->toArray();
+    }
+
+    // ─── Ozon DeliveryAnalytics ──────────────────────────────────────
+
+    /**
+     * Загрузить рекомендации Ozon по поставкам через Ozon API напрямую.
+     * Подход скопирован из SupplyRecommendationService.getOzonDeliveryAnalytics().
+     *
+     * @return array<string, array{total_recommended_supply: int, total_lost_profit: float, max_delivery_time: int, max_attention_level: string, clusters: array}>
+     */
+    public function loadOzonDeliveryAnalytics(\App\Models\Integration $integration): array
+    {
+        if ($integration->marketplace !== 'ozon') {
+            return [];
+        }
+
+        try {
+            $marketplace = \App\Domains\Marketplace\MarketplaceFactory::create(
+                $integration->marketplace,
+                $integration->getDecryptedCredentials(),
+                $integration
+            );
+            $client = $marketplace->api();
+
+            // Получаем список кластеров
+            $clusterList = $client->post('/v1/cluster/list', ['cluster_type' => 'CLUSTER_TYPE_OZON']);
+            $clusterNames = [];
+            foreach ($clusterList['clusters'] ?? [] as $c) {
+                $clusterNames[$c['id']] = $c['name'] ?? "Кластер {$c['id']}";
+            }
+
+            // Получаем общую аналитику для списка кластеров
+            $overallResponse = $client->post('/v1/analytics/average-delivery-time', [
+                'filters' => [
+                    'delivery_schema' => 'FBO',
+                    'supply_period' => 'EIGHT_WEEKS',
+                ]
+            ]);
+
+            $deliveryClusterIds = [];
+            foreach ($overallResponse['data'] ?? [] as $item) {
+                $clusterId = $item['delivery_cluster_id'] ?? null;
+                if ($clusterId) {
+                    $deliveryClusterIds[] = $clusterId;
+                }
+            }
+            $deliveryClusterIds = array_unique($deliveryClusterIds);
+
+            // Собираем данные по товарам из всех кластеров
+            $result = [];
+
+            foreach ($deliveryClusterIds as $clusterId) {
+                $detailsResponse = $client->post('/v1/analytics/average-delivery-time/details', [
+                    'cluster_id' => $clusterId,
+                    'limit' => 1000,
+                    'offset' => 0,
+                    'filters' => [
+                        'delivery_schema' => 'FBO',
+                        'supply_period' => 'EIGHT_WEEKS',
+                    ],
+                ]);
+
+                foreach ($detailsResponse['data'] ?? [] as $item) {
+                    $itemData = $item['item'] ?? [];
+                    $metrics = $item['metrics'] ?? [];
+
+                    $sku = $itemData['offer_id'] ?? null;
+                    if (!$sku) continue;
+
+                    $avgTime = $metrics['average_delivery_time'] ?? 0;
+                    $attentionLevel = $metrics['attention_level'] ?? 'LOW';
+                    $recSupply = $metrics['recommended_supply'] ?? 0;
+                    $lostProfit = $metrics['lost_profit'] ?? 0;
+
+                    if (!isset($result[$sku])) {
+                        $result[$sku] = [
+                            'clusters' => [],
+                            'total_recommended_supply' => 0,
+                            'total_lost_profit' => 0,
+                            'max_delivery_time' => 0,
+                            'max_attention_level' => 'LOW',
+                        ];
+                    }
+
+                    $result[$sku]['total_recommended_supply'] += $recSupply;
+                    $result[$sku]['total_lost_profit'] += $lostProfit;
+                    if ($avgTime > $result[$sku]['max_delivery_time']) {
+                        $result[$sku]['max_delivery_time'] = $avgTime;
+                    }
+                    $attentionOrder = ['LOW' => 0, 'ATTENTION_MEDIUM' => 1, 'ATTENTION_HI' => 2];
+                    if (($attentionOrder[$attentionLevel] ?? 0) > ($attentionOrder[$result[$sku]['max_attention_level']] ?? 0)) {
+                        $result[$sku]['max_attention_level'] = $attentionLevel;
+                    }
+
+                    $result[$sku]['clusters'][$clusterId] = [
+                        'cluster_id' => $clusterId,
+                        'cluster_name' => $clusterNames[$clusterId] ?? "Кластер {$clusterId}",
+                        'recommended_supply' => $recSupply,
+                        'lost_profit' => $lostProfit,
+                        'average_delivery_time' => $avgTime,
+                        'attention_level' => $attentionLevel,
+                    ];
+                }
+            }
+
+            \Illuminate\Support\Facades\Log::info('AutoSupplyPlanService: Ozon delivery analytics loaded', [
+                'integration_id' => $integration->id,
+                'skus' => count($result),
+                'clusters' => count($deliveryClusterIds),
+            ]);
+
+            return $result;
+        } catch (\Exception $e) {
+            \Illuminate\Support\Facades\Log::warning('AutoSupplyPlanService: Ozon delivery analytics failed', [
+                'integration_id' => $integration->id,
+                'error' => $e->getMessage(),
+            ]);
+            return [];
+        }
     }
 }
