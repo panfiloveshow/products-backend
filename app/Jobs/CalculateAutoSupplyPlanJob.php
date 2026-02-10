@@ -114,10 +114,18 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
 
         // v2: Загружаем рекомендации Ozon по поставкам (delivery analytics)
         $ozonAnalytics = [];
+        // v3: Аналитика остатков и оборачиваемости по SKU×склад (ads_cluster, idc_cluster, turnover_grade_cluster)
+        $ozonStockAnalytics = [];
+        $ozonTurnover = [];
         if ($marketplace === 'ozon') {
             $integration = Integration::find($integrationId);
             if ($integration) {
                 $ozonAnalytics = $service->loadOzonDeliveryAnalytics($integration);
+
+                // v3: Загружаем аналитику остатков из /v1/analytics/stocks и /v1/analytics/turnover/stocks
+                $stockAnalyticsData = $service->loadOzonStockAnalytics($integration, $products);
+                $ozonStockAnalytics = $stockAnalyticsData['stock_analytics']; // [offer_id => [wh_name => data]]
+                $ozonTurnover = $stockAnalyticsData['turnover']; // [offer_id => data]
             }
         }
 
@@ -163,6 +171,35 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
             $sales30 = $wh->sales_30_days ?? 0;
             $currentStock = $wh->quantity ?? 0;
             $avgDailySales = $wh->average_daily_sales ?? 0;
+
+            // v3: Получаем аналитику Ozon для этого SKU × склад
+            $ozonStockData = null;
+            $ozonTurnoverData = $ozonTurnover[$wh->sku] ?? null;
+            $ozonAdsCluster = null;
+            $ozonIdcCluster = null;
+            $ozonTurnoverGradeCluster = null;
+            $ozonDaysWithoutSalesCluster = null;
+            if (!empty($ozonStockAnalytics[$wh->sku])) {
+                // Ищем данные для конкретного склада
+                $whName = $wh->warehouse_name ?? '';
+                $ozonStockData = $ozonStockAnalytics[$wh->sku][$whName] ?? null;
+                // Если нет точного совпадения по имени склада, берём первый доступный
+                if (!$ozonStockData && !empty($ozonStockAnalytics[$wh->sku])) {
+                    $ozonStockData = reset($ozonStockAnalytics[$wh->sku]);
+                }
+                if ($ozonStockData) {
+                    $ozonAdsCluster = $ozonStockData['ads_cluster'] ?? null;
+                    $ozonIdcCluster = $ozonStockData['idc_cluster'] ?? null;
+                    $ozonTurnoverGradeCluster = $ozonStockData['turnover_grade_cluster'] ?? null;
+                    $ozonDaysWithoutSalesCluster = $ozonStockData['days_without_sales_cluster'] ?? null;
+                }
+            }
+
+            // v3: Если Ozon даёт ads_cluster (ср. продажи/день по кластеру), используем как доп. источник
+            // ads_cluster > 0 означает что Ozon видит реальные продажи на этом складе
+            if ($ozonAdsCluster !== null && $ozonAdsCluster > 0) {
+                $avgDailySales = max($avgDailySales, $ozonAdsCluster);
+            }
 
             // v2: In-transit = API + заявки на поставку
             $inTransitApi = $wh->in_transit ?? 0;
@@ -396,6 +433,22 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
                     'attention_level' => $ozonAttentionLevel,
                     'our_vs_ozon_diff' => $ozonRecommendedSupply !== null ? $qtyRounded - $ozonRecommendedSupply : null,
                 ],
+                'ozon_stock_analytics' => [
+                    'ads_cluster' => $ozonAdsCluster,
+                    'idc_cluster' => $ozonIdcCluster,
+                    'turnover_grade_cluster' => $ozonTurnoverGradeCluster,
+                    'days_without_sales_cluster' => $ozonDaysWithoutSalesCluster,
+                    'ads_all' => $ozonStockData['ads'] ?? null,
+                    'idc_all' => $ozonStockData['idc'] ?? null,
+                    'turnover_grade_all' => $ozonStockData['turnover_grade'] ?? null,
+                    'warehouse_name_matched' => $ozonStockData['warehouse_name'] ?? null,
+                    // Оборачиваемость (из /v1/analytics/turnover/stocks)
+                    'turnover_60d_ads' => $ozonTurnoverData['ads'] ?? null,
+                    'turnover_days' => $ozonTurnoverData['turnover'] ?? null,
+                    'turnover_idc' => $ozonTurnoverData['idc'] ?? null,
+                    'turnover_idc_grade' => $ozonTurnoverData['idc_grade'] ?? null,
+                    'turnover_grade' => $ozonTurnoverData['turnover_grade'] ?? null,
+                ],
                 'unit_economics' => [
                     'margin_percent' => $marginPercent,
                     'commission_percent' => $commissionPercent,
@@ -494,12 +547,14 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
 
         $plan->markReady($qualityScore, $totalLines, $totalQty, $qualityJson);
 
-        Log::info('CalculateAutoSupplyPlanJob v2 completed', [
+        Log::info('CalculateAutoSupplyPlanJob v3 completed', [
             'plan_id' => $plan->id,
             'total_lines' => $totalLines,
             'total_qty' => $totalQty,
             'quality_score' => $qualityScore,
             'ozon_analytics_skus' => count($ozonAnalytics),
+            'ozon_stock_analytics_skus' => count($ozonStockAnalytics),
+            'ozon_turnover_skus' => count($ozonTurnover),
             'supply_in_transit_skus' => count($supplyInTransit),
             'settings_used' => $settings ? true : false,
         ]);

@@ -738,4 +738,62 @@ class AutoSupplyPlanService
             return [];
         }
     }
+
+    /**
+     * Загрузить аналитику остатков и оборачиваемости из Ozon API
+     *
+     * Использует:
+     * - GET /v1/analytics/stocks — ads_cluster, idc_cluster, turnover_grade_cluster по SKU×склад
+     * - POST /v1/analytics/turnover/stocks — ads за 60д, turnover, idc_grade по SKU
+     *
+     * @param \App\Models\Integration $integration
+     * @param \Illuminate\Support\Collection $products Коллекция Product моделей (keyBy sku)
+     * @return array ['stock_analytics' => [offer_id => [wh_name => data]], 'turnover' => [offer_id => data]]
+     */
+    public function loadOzonStockAnalytics(\App\Models\Integration $integration, $products): array
+    {
+        try {
+            $client = \App\Domains\Ozon\Api\OzonClient::fromIntegration($integration);
+            $api = new \App\Domains\Ozon\Api\StockAnalyticsApi($client);
+
+            // Собираем числовые Ozon SKU из ozon_data
+            $ozonSkus = [];
+            foreach ($products as $product) {
+                $ozonData = $product->ozon_data ?? [];
+                $ozonSku = $ozonData['sku'] ?? null;
+                if ($ozonSku) {
+                    $ozonSkus[] = (int) $ozonSku;
+                }
+            }
+
+            if (empty($ozonSkus)) {
+                \Illuminate\Support\Facades\Log::info('AutoSupplyPlanService: нет Ozon SKU для аналитики');
+                return ['stock_analytics' => [], 'turnover' => []];
+            }
+
+            // 1. Аналитика остатков по SKU × склад (ads_cluster, idc_cluster, turnover_grade_cluster)
+            $stockAnalytics = $api->getStockAnalyticsByOfferWarehouse($ozonSkus);
+
+            // 2. Оборачиваемость по SKU (ads за 60д, turnover, idc_grade)
+            $turnover = $api->getTurnoverByOfferId($ozonSkus);
+
+            \Illuminate\Support\Facades\Log::info('AutoSupplyPlanService: Ozon stock analytics loaded', [
+                'integration_id' => $integration->id,
+                'ozon_skus_count' => count($ozonSkus),
+                'stock_analytics_skus' => count($stockAnalytics),
+                'turnover_skus' => count($turnover),
+            ]);
+
+            return [
+                'stock_analytics' => $stockAnalytics,
+                'turnover' => $turnover,
+            ];
+        } catch (\Exception $e) {
+            \Illuminate\Support\Facades\Log::warning('AutoSupplyPlanService: Ozon stock analytics failed', [
+                'integration_id' => $integration->id,
+                'error' => $e->getMessage(),
+            ]);
+            return ['stock_analytics' => [], 'turnover' => []];
+        }
+    }
 }
