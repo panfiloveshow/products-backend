@@ -58,9 +58,12 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
     {
         $ewmaAlpha = 0.35;
         $minCoverDays = $plan->min_cover_days ?: 7;
-        $maxCoverDays = $plan->max_cover_days ?: 42;
         $turnoverLimitDays = $plan->turnover_limit_days;
-        $horizonDays = $plan->horizon_days ?: 28;
+        $horizonDays = $plan->horizon_days ?: 30;
+
+        // v3: horizon_days ограничивает max_cover_days и target_cover_days
+        $maxCoverDays = $plan->max_cover_days ?: min($horizonDays, 90);
+        $maxCoverDays = min($maxCoverDays, $horizonDays);
 
         $integrationId = $plan->integration_id;
         $marketplace = $plan->marketplace;
@@ -69,7 +72,7 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
         $settings = SupplySettings::where('integration_id', $integrationId)->first();
         $leadTimeDays = $settings->default_lead_time_days ?? AutoSupplyPlanService::LEAD_TIME_DEFAULT;
         $minSafetyDays = $settings->safety_stock_days ?? ($plan->safety_stock_days ?: 3);
-        $planDefaultTargetDays = $plan->target_cover_days ?: 21;
+        $planDefaultTargetDays = min($plan->target_cover_days ?: 21, $horizonDays);
 
         // Получаем все записи остатков для интеграции (с фильтром по складам если указан)
         $warehouseQuery = InventoryWarehouse::where('integration_id', $integrationId)
@@ -432,6 +435,7 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
                     'real_avg_daily_sales' => round($realAvgDailySales, 4),
                     'effective_daily_sales' => round($effectiveDailySales, 4),
                     'redemption_rate' => $redemptionRate,
+                    'horizon_days' => $horizonDays,
                     'target_cover_days' => $targetCoverDays,
                     'min_cover_days' => $minCoverDays,
                     'max_cover_days' => $maxCoverDays,
