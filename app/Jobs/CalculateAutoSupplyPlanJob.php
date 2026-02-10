@@ -233,6 +233,34 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
                 elseif ($salesTrendPercent < -10) $salesTrend = 'declining';
             }
 
+            // --- v3: Определяем тип поставки (подпитка / новый склад / мёртвый сток) ---
+            $hasWarehouseSales = ($sales7 > 0 || $sales14 > 0 || $sales30 > 0
+                || $realAvgDailySales > 0 || $effectiveDailySales > 0
+                || ($ozonAdsCluster !== null && $ozonAdsCluster > 0));
+            $hasCurrentStock = ($currentStock > 0 || $inTransitApi > 0);
+
+            // Мёртвый сток: Ozon говорит "нет продаж" на этом складе
+            $isDeadStock = false;
+            if ($ozonTurnoverGradeCluster === 'NO_SALES' || $ozonTurnoverGradeCluster === 'RESTRICTED_NO_SALES') {
+                $isDeadStock = true;
+            }
+            if ($ozonDaysWithoutSalesCluster !== null && $ozonDaysWithoutSalesCluster > 60 && !$hasCurrentStock) {
+                $isDeadStock = true;
+            }
+
+            // Определяем supply_type
+            $supplyType = 'replenishment'; // подпитка (по умолчанию)
+            if ($isDeadStock && !$hasCurrentStock && !$hasWarehouseSales) {
+                $supplyType = 'dead_stock';
+            } elseif (!$hasWarehouseSales && !$hasCurrentStock) {
+                $supplyType = 'new_warehouse';
+            }
+
+            // Мёртвый сток — пропускаем (не рекомендуем отгрузку)
+            if ($supplyType === 'dead_stock') {
+                continue;
+            }
+
             // --- v2: Улучшенный прогноз спроса (real > effective > EWMA > API avg > 7d fallback) ---
             $demandResult = $service->calculateDailyDemandV2(
                 $ewmaAlpha, $sales7, $sales14, $sales30,
@@ -244,14 +272,32 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
             $demandSource = $demandResult['source'];
             $needsManualReview = $demandResult['needs_manual_review'];
 
+            // v3: Для нового склада — сниженный спрос (пробная партия)
+            // Берём 30% от общего avg_daily_sales как тестовый объём
+            if ($supplyType === 'new_warehouse' && $dailyDemand > 0) {
+                $dailyDemand = $dailyDemand * 0.3;
+                $demandSource = 'new_warehouse_trial';
+                $needsManualReview = true;
+            }
+
             // --- v2: ABC-приоритет ---
             $revenue30d = $revenueBySkuMap[$wh->sku] ?? 0;
             $abcPriority = $service->calculateAbcPriority($revenue30d);
             $targetCoverDays = $service->getTargetDaysByAbc($abcPriority, $settings, $planDefaultTargetDays);
 
+            // v3: Для нового склада — короткий горизонт покрытия (макс 14 дней)
+            if ($supplyType === 'new_warehouse') {
+                $targetCoverDays = min(14, $targetCoverDays);
+            }
+
             // --- v2: Динамический safety stock ---
             $volatility = $service->calculateVolatility($avg7, $avg14, $avg30);
             $safetyStock = $service->calculateDynamicSafetyStock($dailyDemand, $volatility, $leadTimeDays, $minSafetyDays);
+
+            // v3: Для нового склада — минимальный safety stock
+            if ($supplyType === 'new_warehouse') {
+                $safetyStock = min($safetyStock, $dailyDemand * 3);
+            }
 
             // --- v2: Needed с учётом safety stock ---
             $coverBefore = ($currentStock + $inTransit) / max($dailyDemand, AutoSupplyPlanService::EPS);
@@ -368,8 +414,9 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
             $longAvg = $sales30 > 0 ? $sales30 / 30 : 0;
 
             $explainJson = [
-                'version' => 2,
+                'version' => 3,
                 'inputs' => [
+                    'supply_type' => $supplyType,
                     'stock_now' => $currentStock,
                     'in_transit_api' => $inTransitApi,
                     'in_transit_supplies' => $inTransitSupplies,
