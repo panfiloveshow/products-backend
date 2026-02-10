@@ -333,13 +333,20 @@ class AutoSupplyPlanController extends Controller
 
         $warehouses = \App\Models\InventoryWarehouse::where('integration_id', $integrationId)
             ->where('marketplace', $integration->marketplace)
-            ->selectRaw('warehouse_id, warehouse_name, COUNT(DISTINCT sku) as sku_count, SUM(quantity) as total_stock, SUM(sales_30_days) as total_sales_30d')
+            ->selectRaw('warehouse_id, warehouse_name, COUNT(DISTINCT sku) as sku_count, SUM(quantity) as total_stock, SUM(sales_30_days) as total_sales_30d, SUM(sales_7_days) as total_sales_7d, AVG(storage_cost_daily) as avg_storage_cost_daily, SUM(storage_fee_total) as total_storage_fee')
             ->groupBy('warehouse_id', 'warehouse_name')
             ->orderByDesc(\DB::raw('SUM(quantity)'))
             ->get();
 
-        // Добавляем кластер для Ozon
-        $clusterMapping = ($integration->marketplace === 'ozon') ? OzonWarehouseCluster::getAllMapping() : [];
+        // Добавляем кластер для Ozon (безопасно — таблица может не существовать)
+        $clusterMapping = [];
+        if ($integration->marketplace === 'ozon') {
+            try {
+                $clusterMapping = OzonWarehouseCluster::getAllMapping();
+            } catch (\Exception $e) {
+                // Таблица ozon_warehouse_clusters может не существовать — не критично
+            }
+        }
 
         $result = $warehouses->map(function ($wh) use ($clusterMapping) {
             $clusterId = null;
@@ -347,13 +354,20 @@ class AutoSupplyPlanController extends Controller
             $region = null;
 
             if (!empty($clusterMapping) && $wh->warehouse_name) {
-                $normalizedName = OzonWarehouseCluster::normalizeWarehouseName($wh->warehouse_name);
-                if (isset($clusterMapping[$normalizedName])) {
-                    $clusterId = $clusterMapping[$normalizedName]['cluster_id'];
-                    $clusterName = $clusterMapping[$normalizedName]['cluster_name'];
-                    $region = $clusterMapping[$normalizedName]['region'];
-                }
+                try {
+                    $normalizedName = OzonWarehouseCluster::normalizeWarehouseName($wh->warehouse_name);
+                    if (isset($clusterMapping[$normalizedName])) {
+                        $clusterId = $clusterMapping[$normalizedName]['cluster_id'];
+                        $clusterName = $clusterMapping[$normalizedName]['cluster_name'];
+                        $region = $clusterMapping[$normalizedName]['region'];
+                    }
+                } catch (\Exception $e) {}
             }
+
+            // Рассчитываем оборачиваемость
+            $avgDailySales = ($wh->total_sales_30d ?? 0) / 30;
+            $turnoverDays = $avgDailySales > 0 ? round(($wh->total_stock ?? 0) / $avgDailySales, 1) : null;
+            $storageCostDaily = round((float) ($wh->avg_storage_cost_daily ?? 0), 2);
 
             return [
                 'warehouse_id' => $wh->warehouse_id,
@@ -364,6 +378,11 @@ class AutoSupplyPlanController extends Controller
                 'sku_count' => (int) $wh->sku_count,
                 'total_stock' => (int) $wh->total_stock,
                 'total_sales_30d' => (int) ($wh->total_sales_30d ?? 0),
+                'total_sales_7d' => (int) ($wh->total_sales_7d ?? 0),
+                'avg_daily_sales' => round($avgDailySales, 1),
+                'turnover_days' => $turnoverDays,
+                'storage_cost_daily' => $storageCostDaily,
+                'total_storage_fee' => round((float) ($wh->total_storage_fee ?? 0), 2),
             ];
         });
 
