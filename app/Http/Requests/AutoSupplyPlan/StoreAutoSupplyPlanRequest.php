@@ -16,7 +16,7 @@ class StoreAutoSupplyPlanRequest extends FormRequest
         return [
             'integration_id' => 'required|integer|exists:integrations,id',
             'mode' => 'nullable|string|in:anti_oos,balanced,cash_safe',
-            'horizon_days' => 'nullable|integer|in:7,14,28,56',
+            'horizon_days' => 'nullable|integer|in:14,30,60,90',
             'min_cover_days' => 'nullable|integer|min:1|max:90',
             'target_cover_days' => 'nullable|integer|min:1|max:120',
             'max_cover_days' => 'nullable|integer|min:1|max:180',
