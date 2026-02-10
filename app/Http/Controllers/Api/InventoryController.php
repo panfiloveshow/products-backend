@@ -518,77 +518,169 @@ class InventoryController extends Controller
     }
 
     /**
-     * Получить общие суммы хранения — вычисляем напрямую из InventoryWarehouse.
-     * Fallback на SyncLog.metadata если прямой расчёт не дал результата.
+     * Получить общие суммы хранения за текущий и прошлый месяц.
+     * 
+     * Ozon: cash-flow-statement API (MarketplaceServiceStorageItem) — единственный
+     *       корректный источник (совпадает с ЛК Ozon). Кэшируется на 2 часа.
+     * WB:   суммируем storage_fee_total / storage_fee_prev_month из InventoryWarehouse.
      */
     private function getStorageTotals(?string $integrationId): ?array
     {
         if (!$integrationId) return null;
 
-        $rows = InventoryWarehouse::where('integration_id', $integrationId)->get();
+        $integration = \App\Models\Integration::find($integrationId);
+        if (!$integration) return null;
 
-        if ($rows->isEmpty()) return null;
+        $marketplace = $integration->marketplace ?? '';
 
-        // Текущий месяц — суммируем storage_fee_total по уникальным SKU (берём max по SKU)
-        $currentMonthTotal = $rows->groupBy('sku')->sum(function ($group) {
-            return $group->max('storage_fee_total') ?? 0;
-        });
-        $currentFrom = $rows->pluck('storage_fee_report_from')->filter()->min();
-        $currentTo = $rows->pluck('storage_fee_report_to')->filter()->max();
-
-        // Прошлый месяц — суммируем storage_fee_prev_month по уникальным SKU
-        $prevMonthTotal = $rows->groupBy('sku')->sum(function ($group) {
-            return $group->max('storage_fee_prev_month') ?? 0;
-        });
-        $prevPeriod = $rows->pluck('storage_fee_prev_month_period')->filter()->first();
-
-        // Если есть данные — возвращаем
-        if ($currentMonthTotal > 0 || $prevMonthTotal > 0) {
-            $result = [];
-
-            $result['current_month'] = [
-                'total' => round($currentMonthTotal, 2),
-                'from' => $currentFrom,
-                'to' => $currentTo,
-            ];
-
-            // Парсим период прошлого месяца (формат "2026-01-01 – 2026-01-31")
-            $prevFrom = null;
-            $prevTo = null;
-            if ($prevPeriod && str_contains($prevPeriod, '–')) {
-                $parts = array_map('trim', explode('–', $prevPeriod));
-                $prevFrom = $parts[0] ?? null;
-                $prevTo = $parts[1] ?? null;
-            } elseif ($prevPeriod && str_contains($prevPeriod, ' - ')) {
-                $parts = array_map('trim', explode(' - ', $prevPeriod));
-                $prevFrom = $parts[0] ?? null;
-                $prevTo = $parts[1] ?? null;
+        // Хелпер: привести дату к формату YYYY-MM-DD
+        $fmtDate = function ($d): ?string {
+            if (!$d) return null;
+            try {
+                return \Carbon\Carbon::parse($d)->format('Y-m-d');
+            } catch (\Throwable) {
+                return is_string($d) ? substr($d, 0, 10) : null;
             }
+        };
 
-            $result['prev_month'] = [
-                'total' => round($prevMonthTotal, 2),
-                'from' => $prevFrom,
-                'to' => $prevTo,
-            ];
-
-            return $result;
+        // === Ozon: cash-flow API ===
+        if ($marketplace === 'ozon') {
+            return $this->getOzonStorageTotals($integration, $fmtDate);
         }
 
-        // Fallback: SyncLog.metadata
-        $syncLog = \App\Models\SyncLog::where('integration_id', $integrationId)
+        // === WB и остальные: из InventoryWarehouse ===
+        return $this->getWbStorageTotals($integrationId, $fmtDate);
+    }
+
+    /**
+     * Ozon: получить суммы хранения из cash-flow-statement API.
+     * Кэшируется на 2 часа чтобы не нагружать API на каждый запрос.
+     */
+    private function getOzonStorageTotals(\App\Models\Integration $integration, callable $fmtDate): ?array
+    {
+        $cacheKey = "ozon_storage_totals_{$integration->id}";
+        $cached = \Illuminate\Support\Facades\Cache::get($cacheKey);
+        if ($cached !== null) {
+            return $cached ?: null;
+        }
+
+        // Сначала пробуем SyncLog.metadata (данные от последней синхронизации)
+        $syncLog = \App\Models\SyncLog::where('integration_id', $integration->id)
             ->where('sync_type', 'inventory')
             ->where('status', 'completed')
             ->whereNotNull('metadata')
             ->orderByDesc('created_at')
             ->first();
 
-        if (!$syncLog) return null;
-
-        $metadata = $syncLog->metadata;
-        if (!is_array($metadata)) {
-            $metadata = json_decode($metadata, true);
+        if ($syncLog) {
+            $metadata = $syncLog->metadata;
+            if (!is_array($metadata)) {
+                $metadata = json_decode($metadata, true);
+            }
+            $storageTotals = $metadata['storage_totals'] ?? null;
+            if ($storageTotals && (($storageTotals['current_month']['total'] ?? 0) > 0 || ($storageTotals['prev_month']['total'] ?? 0) > 0)) {
+                // Форматируем даты
+                $storageTotals['current_month']['from'] = $fmtDate($storageTotals['current_month']['from'] ?? null);
+                $storageTotals['current_month']['to'] = $fmtDate($storageTotals['current_month']['to'] ?? null);
+                $storageTotals['prev_month']['from'] = $fmtDate($storageTotals['prev_month']['from'] ?? null);
+                $storageTotals['prev_month']['to'] = $fmtDate($storageTotals['prev_month']['to'] ?? null);
+                \Illuminate\Support\Facades\Cache::put($cacheKey, $storageTotals, 7200);
+                return $storageTotals;
+            }
         }
 
-        return $metadata['storage_totals'] ?? null;
+        // Если SyncLog не помог — вызываем Ozon cash-flow API напрямую
+        try {
+            $credentials = $integration->getDecryptedCredentials();
+            if (empty($credentials)) {
+                \Illuminate\Support\Facades\Cache::put($cacheKey, false, 3600);
+                return null;
+            }
+
+            $mp = \App\Domains\Marketplace\MarketplaceFactory::create('ozon', $credentials, $integration);
+
+            if (!method_exists($mp, 'getStorageTotalFromCashFlow')) {
+                \Illuminate\Support\Facades\Cache::put($cacheKey, false, 3600);
+                return null;
+            }
+
+            $currentMonthFrom = now()->startOfMonth()->format('Y-m-d');
+            $currentMonthTo = now()->format('Y-m-d');
+            $prevMonthFrom = now()->subMonth()->startOfMonth()->format('Y-m-d');
+            $prevMonthTo = now()->subMonth()->endOfMonth()->format('Y-m-d');
+
+            $currentMonth = $mp->getStorageTotalFromCashFlow($currentMonthFrom, $currentMonthTo);
+            $prevMonth = $mp->getStorageTotalFromCashFlow($prevMonthFrom, $prevMonthTo);
+
+            $result = [
+                'current_month' => [
+                    'total' => round($currentMonth['total'] ?? 0, 2),
+                    'from' => $currentMonthFrom,
+                    'to' => $currentMonthTo,
+                ],
+                'prev_month' => [
+                    'total' => round($prevMonth['total'] ?? 0, 2),
+                    'from' => $prevMonthFrom,
+                    'to' => $prevMonthTo,
+                ],
+            ];
+
+            \Illuminate\Support\Facades\Cache::put($cacheKey, $result, 7200);
+            return $result;
+        } catch (\Throwable $e) {
+            \Illuminate\Support\Facades\Log::warning('getOzonStorageTotals: API call failed', [
+                'integration_id' => $integration->id,
+                'error' => $e->getMessage(),
+            ]);
+            \Illuminate\Support\Facades\Cache::put($cacheKey, false, 1800);
+            return null;
+        }
+    }
+
+    /**
+     * WB: получить суммы хранения из InventoryWarehouse.
+     */
+    private function getWbStorageTotals(string $integrationId, callable $fmtDate): ?array
+    {
+        $rows = InventoryWarehouse::where('integration_id', $integrationId)->get();
+        if ($rows->isEmpty()) return null;
+
+        $currentMonthTotal = $rows->groupBy('sku')->sum(function ($group) {
+            return $group->max('storage_fee_total') ?? 0;
+        });
+        $currentFrom = $rows->pluck('storage_fee_report_from')->filter()->min();
+        $currentTo = $rows->pluck('storage_fee_report_to')->filter()->max();
+
+        $prevMonthTotal = $rows->groupBy('sku')->sum(function ($group) {
+            return $group->max('storage_fee_prev_month') ?? 0;
+        });
+        $prevPeriod = $rows->pluck('storage_fee_prev_month_period')->filter()->first();
+
+        if ($currentMonthTotal <= 0 && $prevMonthTotal <= 0) return null;
+
+        $prevFrom = null;
+        $prevTo = null;
+        if ($prevPeriod && str_contains($prevPeriod, '–')) {
+            $parts = array_map('trim', explode('–', $prevPeriod));
+            $prevFrom = $parts[0] ?? null;
+            $prevTo = $parts[1] ?? null;
+        } elseif ($prevPeriod && str_contains($prevPeriod, ' - ')) {
+            $parts = array_map('trim', explode(' - ', $prevPeriod));
+            $prevFrom = $parts[0] ?? null;
+            $prevTo = $parts[1] ?? null;
+        }
+
+        return [
+            'current_month' => [
+                'total' => round($currentMonthTotal, 2),
+                'from' => $fmtDate($currentFrom),
+                'to' => $fmtDate($currentTo),
+            ],
+            'prev_month' => [
+                'total' => round($prevMonthTotal, 2),
+                'from' => $fmtDate($prevFrom),
+                'to' => $fmtDate($prevTo),
+            ],
+        ];
     }
 }
