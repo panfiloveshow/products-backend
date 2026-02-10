@@ -594,6 +594,112 @@ class AutoSupplyPlanController extends Controller
     }
 
     /**
+     * GET /api/auto-supply-plans/{id}/export/ozon-matrix
+     *
+     * Формат матрицы Ozon FBO: строки = артикулы, столбцы = склады
+     * Шаблон для загрузки в ЛК Ozon (Поставки → Создать поставку)
+     */
+    public function exportOzonMatrix(string $id): StreamedResponse
+    {
+        $plan = AutoSupplyPlan::findOrFail($id);
+
+        if ($plan->status !== AutoSupplyPlan::STATUS_READY) {
+            abort(422, 'План ещё не рассчитан');
+        }
+
+        $lines = $plan->lines()
+            ->where('qty_rounded', '>', 0)
+            ->get();
+
+        if ($lines->isEmpty()) {
+            abort(422, 'Нет данных для экспорта');
+        }
+
+        // Собираем уникальные склады (сортируем по имени)
+        $warehouseMap = [];
+        foreach ($lines as $line) {
+            $whName = $line->warehouse_name ?: $line->warehouse_id ?: 'Неизвестный';
+            if (!isset($warehouseMap[$whName])) {
+                $warehouseMap[$whName] = $whName;
+            }
+        }
+        ksort($warehouseMap);
+        $warehouseNames = array_values($warehouseMap);
+
+        // Собираем матрицу: offer_id → warehouse_name → qty
+        $matrix = [];
+        $offerMeta = [];
+        foreach ($lines as $line) {
+            $offerId = $line->offer_id ?? $line->sku;
+            $whName = $line->warehouse_name ?: $line->warehouse_id ?: 'Неизвестный';
+
+            if (!isset($matrix[$offerId])) {
+                $matrix[$offerId] = [];
+                $offerMeta[$offerId] = $line->product_name;
+            }
+            $matrix[$offerId][$whName] = ($matrix[$offerId][$whName] ?? 0) + $line->qty_rounded;
+        }
+
+        // Сортируем артикулы
+        ksort($matrix);
+
+        $spreadsheet = new Spreadsheet();
+        $sheet = $spreadsheet->getActiveSheet();
+        $sheet->setTitle('Поставка Ozon');
+
+        // === Заголовки ===
+        $sheet->setCellValue('A1', 'артикул');
+
+        $colIndex = 2; // B = 2
+        foreach ($warehouseNames as $whName) {
+            $colLetter = \PhpOffice\PhpSpreadsheet\Cell\Coordinate::stringFromColumnIndex($colIndex);
+            $sheet->setCellValue("{$colLetter}1", $whName);
+            // Автоширина
+            $sheet->getColumnDimension($colLetter)->setAutoSize(true);
+            $colIndex++;
+        }
+
+        // Стиль заголовков
+        $lastColLetter = \PhpOffice\PhpSpreadsheet\Cell\Coordinate::stringFromColumnIndex($colIndex - 1);
+        $headerRange = "A1:{$lastColLetter}1";
+        $sheet->getStyle($headerRange)->applyFromArray([
+            'font' => ['bold' => true, 'size' => 10],
+            'fill' => [
+                'fillType' => \PhpOffice\PhpSpreadsheet\Style\Fill::FILL_SOLID,
+                'startColor' => ['rgb' => 'E8F5E9'],
+            ],
+            'borders' => [
+                'bottom' => ['borderStyle' => \PhpOffice\PhpSpreadsheet\Style\Border::BORDER_THIN],
+            ],
+        ]);
+        $sheet->getColumnDimension('A')->setAutoSize(true);
+
+        // === Данные ===
+        $row = 2;
+        foreach ($matrix as $offerId => $warehouseQty) {
+            $sheet->setCellValue("A{$row}", $offerId);
+
+            $colIndex = 2;
+            foreach ($warehouseNames as $whName) {
+                $qty = $warehouseQty[$whName] ?? 0;
+                if ($qty > 0) {
+                    $colLetter = \PhpOffice\PhpSpreadsheet\Cell\Coordinate::stringFromColumnIndex($colIndex);
+                    $sheet->setCellValue("{$colLetter}{$row}", $qty);
+                }
+                $colIndex++;
+            }
+            $row++;
+        }
+
+        // Freeze header
+        $sheet->freezePane('B2');
+
+        $filename = "ozon_supply_matrix_{$plan->id}.xlsx";
+
+        return $this->streamXlsx($spreadsheet, $filename);
+    }
+
+    /**
      * Стрим XLSX файла
      */
     private function streamXlsx(Spreadsheet $spreadsheet, string $filename): StreamedResponse
