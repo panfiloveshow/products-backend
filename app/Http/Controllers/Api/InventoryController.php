@@ -488,6 +488,9 @@ class InventoryController extends Controller
         $summaryStorageFeeFrom = $items->pluck('storage_fee_report_from')->filter()->min();
         $summaryStorageFeeTo = $items->pluck('storage_fee_report_to')->filter()->max();
 
+        // === Summary по ВСЕМ товарам интеграции (не только текущая страница) ===
+        $globalSummary = $this->calculateGlobalSummary($integrationId);
+
         return response()->json([
             'message' => 'OK',
             'data' => [
@@ -502,19 +505,120 @@ class InventoryController extends Controller
                 'summary' => [
                     'total_products' => $products->total(),
                     'total_warehouses' => $allWarehouses->count(),
-                    'total_stock' => $inventoryRows->flatten()->sum('quantity'),
-                    'total_stock_value' => round($items->sum('stock_value'), 2),
-                    'avg_turnover_days' => round($items->whereNotNull('turnover_days')->avg('turnover_days') ?? 0, 1),
-                    'out_of_stock_count' => $items->where('stock_status', 'out_of_stock')->count(),
-                    'critical_count' => $items->where('stock_status', 'critical')->count(),
-                    'low_count' => $items->where('stock_status', 'low')->count(),
-                    'storage_fee_total' => round($items->sum('storage_fee_total') ?? 0, 2),
-                    'storage_fee_report_from' => $summaryStorageFeeFrom,
-                    'storage_fee_report_to' => $summaryStorageFeeTo,
+                    'total_stock' => $globalSummary['total_stock'],
+                    'total_stock_value' => $globalSummary['total_stock_value'],
+                    'avg_turnover_days' => $globalSummary['avg_turnover_days'],
+                    'out_of_stock_count' => $globalSummary['out_of_stock_count'],
+                    'critical_count' => $globalSummary['critical_count'],
+                    'low_count' => $globalSummary['low_count'],
+                    'storage_fee_total' => $globalSummary['storage_fee_total'],
+                    'storage_fee_report_from' => $globalSummary['storage_fee_report_from'],
+                    'storage_fee_report_to' => $globalSummary['storage_fee_report_to'],
                     'storage_totals' => $this->getStorageTotals($request->input('integration_id')),
                 ],
             ],
         ]);
+    }
+
+    /**
+     * Рассчитать summary по ВСЕМ товарам интеграции (не только текущая страница).
+     * Использует агрегатные SQL-запросы для производительности.
+     */
+    private function calculateGlobalSummary(int $integrationId): array
+    {
+        // Агрегаты по InventoryWarehouse: total_stock, avg_daily_sales по SKU
+        $skuAggregates = \Illuminate\Support\Facades\DB::table('inventory_warehouses')
+            ->where('integration_id', $integrationId)
+            ->select(
+                'sku',
+                \Illuminate\Support\Facades\DB::raw('SUM(quantity) as total_qty'),
+                \Illuminate\Support\Facades\DB::raw('MAX(average_daily_sales) as max_avg_daily'),
+                \Illuminate\Support\Facades\DB::raw('MAX(storage_fee_total) as max_storage_fee'),
+                \Illuminate\Support\Facades\DB::raw('MIN(storage_fee_report_from) as min_report_from'),
+                \Illuminate\Support\Facades\DB::raw('MAX(storage_fee_report_to) as max_report_to')
+            )
+            ->groupBy('sku')
+            ->get();
+
+        $totalStock = 0;
+        $totalStockValue = 0;
+        $totalStorageFee = 0;
+        $criticalCount = 0;
+        $lowCount = 0;
+        $turnoverSum = 0;
+        $turnoverCount = 0;
+        $globalReportFrom = null;
+        $globalReportTo = null;
+
+        // Загружаем cost_price для расчёта stock_value
+        $costPrices = \Illuminate\Support\Facades\DB::table('unit_economics')
+            ->where('integration_id', $integrationId)
+            ->pluck('cost_price', 'sku');
+
+        $productCostPrices = \Illuminate\Support\Facades\DB::table('products')
+            ->where('integration_id', $integrationId)
+            ->whereNotNull('cost_price')
+            ->pluck('cost_price', 'sku');
+
+        // Товары без записей в inventory_warehouses тоже считаются out_of_stock
+        $totalProductsCount = \Illuminate\Support\Facades\DB::table('products')
+            ->where('integration_id', $integrationId)
+            ->count();
+        $skusWithInventory = $skuAggregates->count();
+        $productsWithoutInventory = max(0, $totalProductsCount - $skusWithInventory);
+        $outOfStockCount = $productsWithoutInventory; // начинаем с товаров без остатков
+
+        foreach ($skuAggregates as $row) {
+            $qty = (int) $row->total_qty;
+            $avgDaily = (float) ($row->max_avg_daily ?? 0);
+            $storageFee = (float) ($row->max_storage_fee ?? 0);
+
+            $totalStock += $qty;
+
+            // Cost price: UnitEconomics → Product fallback
+            $costPrice = (float) ($costPrices[$row->sku] ?? $productCostPrices[$row->sku] ?? 0);
+            $totalStockValue += $qty * $costPrice;
+
+            $totalStorageFee += $storageFee;
+
+            // Days of stock
+            $daysOfStock = $avgDaily > 0 ? (int) round($qty / $avgDaily) : ($qty > 0 ? 999 : 0);
+
+            // Turnover
+            if ($avgDaily > 0) {
+                $turnoverSum += round($qty / $avgDaily, 1);
+                $turnoverCount++;
+            }
+
+            // Stock status
+            if ($qty <= 0) $outOfStockCount++;
+            elseif ($daysOfStock <= 7) $criticalCount++;
+            elseif ($daysOfStock <= 14) $lowCount++;
+
+            // Report dates
+            if ($row->min_report_from) {
+                if ($globalReportFrom === null || $row->min_report_from < $globalReportFrom) {
+                    $globalReportFrom = $row->min_report_from;
+                }
+            }
+            if ($row->max_report_to) {
+                if ($globalReportTo === null || $row->max_report_to > $globalReportTo) {
+                    $globalReportTo = $row->max_report_to;
+                }
+            }
+        }
+
+        return [
+            'total_stock' => $totalStock,
+            'total_stock_value' => round($totalStockValue, 2),
+            'avg_turnover_days' => $turnoverCount > 0 ? round($turnoverSum / $turnoverCount, 1) : 0,
+            'out_of_stock_count' => $outOfStockCount,
+            'critical_count' => $criticalCount,
+            'low_count' => $lowCount,
+            'storage_fee_total' => round($totalStorageFee, 2),
+            'storage_fee_report_from' => $globalReportFrom,
+            'storage_fee_report_to' => $globalReportTo,
+        ];
     }
 
     /**

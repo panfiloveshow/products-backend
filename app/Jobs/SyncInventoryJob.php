@@ -261,10 +261,6 @@ class SyncInventoryJob implements ShouldQueue
             $updated = 0;
             $created = 0;
             
-            // Для Ozon: отслеживаем SKU, которым уже записали storage_fee_total
-            // чтобы не дублировать на все записи складов одного SKU
-            $skusWithStorageFeeWritten = [];
-
             // Отключаем foreign key checks для SQLite (товары могут быть из разных интеграций)
             if (DB::getDriverName() === 'sqlite') {
                 DB::statement('PRAGMA foreign_keys = OFF');
@@ -281,18 +277,10 @@ class SyncInventoryJob implements ShouldQueue
                     }
                     
                     // Добавляем стоимость хранения если есть (расчётная)
-                    // Для Ozon: записываем storage_fee_total только в первую запись склада для SKU
-                    if ($sku && isset($storageCostBySku[$sku])) {
-                        if ($this->syncLog->marketplace === 'ozon') {
-                            // Для Ozon: записываем storage_fee только если ещё не записали для этого SKU
-                            if (!isset($skusWithStorageFeeWritten[$sku])) {
-                                $stockData = array_merge($stockData, $storageCostBySku[$sku]);
-                                $skusWithStorageFeeWritten[$sku] = true;
-                            }
-                            // Иначе не добавляем storage_fee_total (останется null)
-                        } else {
-                            $stockData = array_merge($stockData, $storageCostBySku[$sku]);
-                        }
+                    // Для Ozon: НЕ записываем здесь — запишем после основного цикла напрямую в БД,
+                    // чтобы избежать обнуления из-за fulfillment_type проверки
+                    if ($sku && isset($storageCostBySku[$sku]) && $this->syncLog->marketplace !== 'ozon') {
+                        $stockData = array_merge($stockData, $storageCostBySku[$sku]);
                     }
                     
                     // Добавляем ФАКТИЧЕСКИЕ начисления за хранение из отчётов реализации WB
@@ -439,6 +427,46 @@ class SyncInventoryJob implements ShouldQueue
                         'restored_rows' => $restored,
                     ]);
                 }
+            }
+            
+            // Для Ozon: записываем storage_fee из placement report напрямую в БД
+            // Делаем это ПОСЛЕ основного цикла, чтобы избежать обнуления из-за fulfillment_type проверки
+            if ($this->syncLog->marketplace === 'ozon' && !empty($storageCostBySku)) {
+                $storageFeeUpdated = 0;
+                foreach ($storageCostBySku as $sku => $feeData) {
+                    // Находим первую FBO запись для SKU (приоритет FBO складам)
+                    $targetRow = InventoryWarehouse::where('integration_id', $this->syncLog->integration_id)
+                        ->where('sku', $sku)
+                        ->where('marketplace', 'ozon')
+                        ->whereIn('fulfillment_type', ['FBO', 'FBY'])
+                        ->first();
+                    
+                    // Если нет FBO записей — берём любую запись для этого SKU
+                    if (!$targetRow) {
+                        $targetRow = InventoryWarehouse::where('integration_id', $this->syncLog->integration_id)
+                            ->where('sku', $sku)
+                            ->where('marketplace', 'ozon')
+                            ->first();
+                    }
+                    
+                    if ($targetRow) {
+                        $targetRow->update([
+                            'storage_fee_total' => $feeData['storage_fee_total'] ?? null,
+                            'storage_fee_report_from' => $feeData['storage_fee_report_from'] ?? null,
+                            'storage_fee_report_to' => $feeData['storage_fee_report_to'] ?? null,
+                            'storage_fee_prev_month' => $feeData['storage_fee_prev_month'] ?? null,
+                            'storage_fee_prev_month_period' => $feeData['storage_fee_prev_month_period'] ?? null,
+                            'storage_fee_all_time' => $feeData['storage_fee_all_time'] ?? null,
+                        ]);
+                        $storageFeeUpdated++;
+                    }
+                }
+                
+                Log::info('Ozon storage fees written to InventoryWarehouse', [
+                    'integration_id' => $this->syncLog->integration_id,
+                    'skus_with_fees' => count($storageCostBySku),
+                    'rows_updated' => $storageFeeUpdated,
+                ]);
             }
             
             // Сохраняем метаданные о синхронизации
