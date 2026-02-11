@@ -455,9 +455,10 @@ class SyncInventoryJob implements ShouldQueue
             
             $this->syncLog->complete($synced, $failed);
             
-            // Инвалидируем кэш статистики
+            // Инвалидируем кэш статистики (товары + остатки + хранение Ozon)
             \App\Services\ProductService::invalidateStatsCache($this->syncLog->integration_id, $this->syncLog->marketplace);
             \App\Services\InventoryService::invalidateStatsCache($this->syncLog->integration_id, $this->syncLog->marketplace);
+            \Illuminate\Support\Facades\Cache::forget("ozon_storage_totals_{$this->syncLog->integration_id}");
             
             // Синхронизируем Product.stock с суммой остатков на складах
             $this->syncProductStocks();
