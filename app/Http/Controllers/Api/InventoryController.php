@@ -550,14 +550,9 @@ class InventoryController extends Controller
         $globalReportFrom = null;
         $globalReportTo = null;
 
-        // Загружаем cost_price для расчёта stock_value
+        // Загружаем cost_price для расчёта stock_value (из unit_economics)
         $costPrices = \Illuminate\Support\Facades\DB::table('unit_economics')
             ->where('integration_id', $integrationId)
-            ->pluck('cost_price', 'sku');
-
-        $productCostPrices = \Illuminate\Support\Facades\DB::table('products')
-            ->where('integration_id', $integrationId)
-            ->whereNotNull('cost_price')
             ->pluck('cost_price', 'sku');
 
         // Товары без записей в inventory_warehouses тоже считаются out_of_stock
@@ -575,8 +570,8 @@ class InventoryController extends Controller
 
             $totalStock += $qty;
 
-            // Cost price: UnitEconomics → Product fallback
-            $costPrice = (float) ($costPrices[$row->sku] ?? $productCostPrices[$row->sku] ?? 0);
+            // Cost price из UnitEconomics
+            $costPrice = (float) ($costPrices[$row->sku] ?? 0);
             $totalStockValue += $qty * $costPrice;
 
             $totalStorageFee += $storageFee;
