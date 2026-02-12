@@ -77,13 +77,24 @@ class ProductController extends Controller
         // Select только нужных полей для оптимизации (тяжёлые поля исключаются ниже)
         $products = $query->paginate($limit, ['*'], 'page', $page);
 
-        // Добавляем cost_price из unitEconomics к каждому товару
+        // Добавляем cost_price из UnitEconomicsSettings (приоритет) или UnitEconomics
         // Исключаем тяжёлые поля для оптимизации размера ответа (ozon_data, characteristics и т.д. могут занимать ~100KB на товар)
         $heavyFields = ['ozon_data', 'wb_data', 'yandex_data', 'characteristics', 'characteristics_list', 'description'];
         
-        $productsWithCostPrice = collect($products->items())->map(function ($product) use ($heavyFields) {
+        // Загружаем настройки пользователя (себестоимость) для всех SKU на странице
+        $skus = collect($products->items())->pluck('sku')->filter()->unique()->values()->toArray();
+        $settingsMap = \App\Models\UnitEconomicsSettings::whereIn('sku', $skus)
+            ->when($integrationId, fn($q) => $q->where('integration_id', $integrationId))
+            ->get()
+            ->keyBy('sku');
+        
+        $productsWithCostPrice = collect($products->items())->map(function ($product) use ($heavyFields, $settingsMap) {
             $productArray = $product->toArray();
-            $productArray['cost_price'] = $product->unitEconomics->first()?->cost_price ?? null;
+            // Приоритет: settings (ручной ввод/файл) > unitEconomics
+            $settings = $settingsMap->get($product->sku);
+            $settingsCostPrice = ($settings && $settings->cost_price > 0) ? (float) $settings->cost_price : null;
+            $ueCostPrice = $product->unitEconomics->first()?->cost_price;
+            $productArray['cost_price'] = $settingsCostPrice ?? $ueCostPrice ?? null;
             unset($productArray['unit_economics']); // Убираем лишние данные
             
             // Убираем тяжёлые поля из списка товаров (они доступны через show endpoint)
