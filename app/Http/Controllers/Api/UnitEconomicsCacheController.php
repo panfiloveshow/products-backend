@@ -669,6 +669,12 @@ class UnitEconomicsCacheController extends Controller
         $data['own_delivery_cost'] = 0;
         $data['ozon_compensation'] = 0;
         
+        // === Себестоимость: приоритет settings > cache (для ВСЕХ маркетплейсов) ===
+        $settingsCostPrice = ($settings?->cost_price && $settings->cost_price > 0) ? (float) $settings->cost_price : null;
+        if ($settingsCostPrice !== null) {
+            $data['cost_price'] = $settingsCostPrice;
+        }
+        
         // === Настройки пользователя (приоритет: settings > cache) ===
         $data['drr_percent'] = (float) ($settings?->drr_percent ?? $cache->drr_percent ?? 0);
         $data['our_share_percent'] = (float) ($settings?->our_share_percent ?? $cache->our_share_percent ?? 0);
