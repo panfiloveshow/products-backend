@@ -32,7 +32,7 @@ class ProductController extends Controller
             if ($integrationId) {
                 $q->where('integration_id', $integrationId);
             }
-            $q->latest()->limit(1);
+            $q->latest();
         }]);
 
         if (!empty($validated['search'])) {
@@ -294,6 +294,7 @@ class ProductController extends Controller
         $success = 0;
         $failed = 0;
         $notFound = [];
+        $updatedSkus = [];
 
         foreach ($items as $item) {
             $vendorCode = $item['sku']; // Артикул продавца
@@ -313,28 +314,32 @@ class ProductController extends Controller
             }
 
             try {
-                // Обновляем или создаём запись UnitEconomics
-                // Уникальный ключ: sku + integration_id (себестоимость привязана к магазину)
-                $unitEconomics = \App\Models\UnitEconomics::updateOrCreate(
-                    [
-                        'sku' => $product->sku,
-                        'integration_id' => $integrationId,
-                    ],
-                    [
-                        'product_id' => $product->id,
-                        'product_name' => $product->name,
-                        'marketplace' => $product->marketplace,
-                        'cost_price' => $costPrice,
-                        'price' => $product->price ?? 0,
-                    ]
+                // Сохраняем cost_price в UnitEconomicsSettings (единый источник правды для ручных данных)
+                // Это гарантирует что себестоимость не потеряется при пересчёте кэша и синхронизации
+                \App\Models\UnitEconomicsSettings::updateOrCreate(
+                    ['integration_id' => $integrationId, 'sku' => $product->sku],
+                    ['cost_price' => $costPrice]
                 );
+                
+                // Также обновляем cost_price во ВСЕХ записях UnitEconomics для данного SKU+integration
+                // (могут быть записи с разными fulfillment_type: FBO, FBS и т.д.)
+                $updated = \App\Models\UnitEconomics::where('sku', $product->sku)
+                    ->where('integration_id', $integrationId)
+                    ->update(['cost_price' => $costPrice]);
+                
+                // Также обновляем cost_price во ВСЕХ записях UnitEconomicsCache
+                \App\Models\UnitEconomicsCache::where('sku', $product->sku)
+                    ->where('integration_id', $integrationId)
+                    ->update(['cost_price' => $costPrice]);
+                
+                $updatedSkus[] = $product->sku;
                 
                 \Log::debug('Cost price saved', [
                     'vendor_code' => $vendorCode,
                     'product_sku' => $product->sku,
                     'integration_id' => $integrationId,
                     'cost_price' => $costPrice,
-                    'unit_economics_id' => $unitEconomics->id,
+                    'ue_records_updated' => $updated,
                 ]);
                 
                 $success++;
@@ -345,6 +350,21 @@ class ProductController extends Controller
                     'error' => $e->getMessage(),
                 ]);
                 $failed++;
+            }
+        }
+
+        // Пересчитываем кэш юнит-экономики чтобы cost_price отобразился на странице UE
+        if (!empty($updatedSkus)) {
+            try {
+                \App\Jobs\RecalculateUnitEconomicsCacheJob::dispatch($integrationId);
+                \Log::info('Cost price bulk: triggered cache recalculation', [
+                    'integration_id' => $integrationId,
+                    'updated_skus_count' => count($updatedSkus),
+                ]);
+            } catch (\Exception $e) {
+                \Log::warning('Cost price bulk: failed to trigger cache recalculation', [
+                    'error' => $e->getMessage(),
+                ]);
             }
         }
 
@@ -488,11 +508,21 @@ class ProductController extends Controller
             return $product;
         }
 
+        // Определяем драйвер БД для корректного JSON-синтаксиса
+        // PostgreSQL: column->>'key', MySQL: JSON_UNQUOTE(JSON_EXTRACT(...)), SQLite: json_extract(...)
+        $driver = \DB::getDriverName();
+
         // Ищем по vendorCode в wb_data (Wildberries)
-        // JSON_UNQUOTE нужен чтобы убрать кавычки из JSON значения
         $product = (clone $query)
             ->where('marketplace', 'wildberries')
-            ->whereRaw("JSON_UNQUOTE(JSON_EXTRACT(wb_data, '$.vendorCode')) = ?", [$vendorCode])
+            ->whereRaw(
+                match ($driver) {
+                    'mysql' => "JSON_UNQUOTE(JSON_EXTRACT(wb_data, '$.vendorCode')) = ?",
+                    'pgsql' => "wb_data->>'vendorCode' = ?",
+                    default => "json_extract(wb_data, '$.vendorCode') = ?",
+                },
+                [$vendorCode]
+            )
             ->first();
         if ($product) {
             return $product;
@@ -501,7 +531,14 @@ class ProductController extends Controller
         // Ищем по offer_id в ozon_data (Ozon)
         $product = (clone $query)
             ->where('marketplace', 'ozon')
-            ->whereRaw("JSON_UNQUOTE(JSON_EXTRACT(ozon_data, '$.offer_id')) = ?", [$vendorCode])
+            ->whereRaw(
+                match ($driver) {
+                    'mysql' => "JSON_UNQUOTE(JSON_EXTRACT(ozon_data, '$.offer_id')) = ?",
+                    'pgsql' => "ozon_data->>'offer_id' = ?",
+                    default => "json_extract(ozon_data, '$.offer_id') = ?",
+                },
+                [$vendorCode]
+            )
             ->first();
         if ($product) {
             return $product;
@@ -510,7 +547,14 @@ class ProductController extends Controller
         // Ищем по shopSku в yandex_data (Yandex)
         $product = (clone $query)
             ->where('marketplace', 'yandex')
-            ->whereRaw("JSON_UNQUOTE(JSON_EXTRACT(yandex_data, '$.shopSku')) = ?", [$vendorCode])
+            ->whereRaw(
+                match ($driver) {
+                    'mysql' => "JSON_UNQUOTE(JSON_EXTRACT(yandex_data, '$.shopSku')) = ?",
+                    'pgsql' => "yandex_data->>'shopSku' = ?",
+                    default => "json_extract(yandex_data, '$.shopSku') = ?",
+                },
+                [$vendorCode]
+            )
             ->first();
         if ($product) {
             return $product;

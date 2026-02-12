@@ -1197,15 +1197,22 @@ class UnitEconomicsService
             ->get()
             ->keyBy('sku');
         
+        // Загружаем ручные настройки пользователя (себестоимость и др.) из UnitEconomicsSettings
+        $settingsMap = \App\Models\UnitEconomicsSettings::where('integration_id', $integrationId)
+            ->whereIn('sku', $products->pluck('sku'))
+            ->get()
+            ->keyBy('sku');
+        
         $synced = 0;
         $errors = 0;
         
         foreach ($products as $product) {
             try {
                 $inventory = $inventoryData->get($product->sku);
+                $settings = $settingsMap->get($product->sku);
                 
                 // Собираем данные для расчета
-                $data = $this->buildCalculationData($product, $inventory, $marketplace);
+                $data = $this->buildCalculationData($product, $inventory, $marketplace, $settings);
                 
                 if ($data['price'] <= 0) {
                     continue;
@@ -1323,12 +1330,24 @@ class UnitEconomicsService
     /**
      * Собирает данные для расчета юнит-экономики из Product и InventoryWarehouse
      */
-    private function buildCalculationData(Product $product, ?InventoryWarehouse $inventory, string $marketplace): array
+    private function buildCalculationData(Product $product, ?InventoryWarehouse $inventory, string $marketplace, ?\App\Models\UnitEconomicsSettings $settings = null): array
     {
         $price = (float) $product->price;
-        $costPrice = $inventory?->cost_price ?? 0;
         $salesCount = $inventory?->sales_30_days ?? 0;
         $storageCost = $inventory?->storage_cost_per_month ?? 0;
+        
+        // Себестоимость: приоритет settings (ручной ввод) > существующая запись UE > inventory > 0
+        $costPrice = 0;
+        if ($settings && $settings->cost_price > 0) {
+            $costPrice = (float) $settings->cost_price;
+        } else {
+            // Fallback: берём из существующей записи UnitEconomics (если была загружена ранее)
+            $existingUE = UnitEconomics::where('sku', $product->sku)
+                ->where('integration_id', $product->integration_id)
+                ->where('cost_price', '>', 0)
+                ->first();
+            $costPrice = (float) ($existingUE?->cost_price ?? $inventory?->cost_price ?? 0);
+        }
         
         // Базовые данные
         $data = [
@@ -1338,6 +1357,22 @@ class UnitEconomicsService
             'sales_count' => $salesCount,
             'storage_cost' => $storageCost,
         ];
+        
+        // Применяем ручные настройки пользователя
+        if ($settings) {
+            if ($settings->drr_percent !== null) {
+                $data['drr_percent'] = (float) $settings->drr_percent;
+            }
+            if ($settings->our_share_percent !== null) {
+                $data['our_share_percent'] = (float) $settings->our_share_percent;
+            }
+            if ($settings->tax_percent !== null) {
+                $data['tax_percent'] = (float) $settings->tax_percent;
+            }
+            if ($settings->vat_percent !== null) {
+                $data['vat_percent'] = (float) $settings->vat_percent;
+            }
+        }
         
         // Специфичные данные по маркетплейсам
         switch ($marketplace) {
