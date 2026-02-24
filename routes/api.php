@@ -7,6 +7,7 @@ use App\Http\Controllers\Api\ProductController;
 use App\Http\Controllers\Api\InventoryController;
 use App\Http\Controllers\Api\ShipmentController;
 use App\Http\Controllers\Api\UnitEconomicsController;
+use App\Http\Controllers\Api\UnitEconomicsCacheController;
 use App\Http\Controllers\Api\SupplierController;
 use Illuminate\Support\Facades\Route;
 
@@ -105,30 +106,32 @@ Route::prefix('shipments')->group(function () {
 |--------------------------------------------------------------------------
 */
 Route::prefix('unit-economics')->group(function () {
-    Route::get('/', [UnitEconomicsController::class, 'index']);
-    Route::get('/comparison', [UnitEconomicsController::class, 'comparison']);
-    Route::get('/stats', [UnitEconomicsController::class, 'stats']);
-    
-    Route::get('/commissions/{marketplace}', [UnitEconomicsController::class, 'commissions'])
+    Route::get('/comparison', [UnitEconomicsCacheController::class, 'comparison']);
+    Route::get('/stats', [UnitEconomicsCacheController::class, 'stats']);
+
+    Route::get('/commissions/{marketplace}', [UnitEconomicsCacheController::class, 'commissions'])
         ->whereIn('marketplace', ['wildberries', 'ozon', 'yandex_market']);
-    Route::get('/tariffs/{marketplace}', [UnitEconomicsController::class, 'tariffs'])
+    Route::get('/tariffs/{marketplace}', [UnitEconomicsCacheController::class, 'tariffs'])
         ->whereIn('marketplace', ['wildberries', 'ozon', 'yandex_market']);
-    
-    Route::get('/stats/{marketplace}', [UnitEconomicsController::class, 'statsByMarketplace'])
+    Route::get('/stats/{marketplace}', [UnitEconomicsCacheController::class, 'statsByMarketplace'])
         ->whereIn('marketplace', ['wildberries', 'ozon', 'yandex_market']);
-    
-    Route::get('/{marketplace}', [UnitEconomicsController::class, 'byMarketplace'])
+
+    // Settings (PUT) — должны быть до /{marketplace} чтобы не конфликтовать
+    Route::put('/settings/bulk', [UnitEconomicsCacheController::class, 'bulkUpdateSettings']);
+    Route::put('/settings/{sku}', [UnitEconomicsCacheController::class, 'updateSettings']);
+
+    // Recalculate
+    Route::post('/recalculate/{integrationId}', [UnitEconomicsCacheController::class, 'recalculate']);
+    Route::get('/cache-stats/{integrationId}', [UnitEconomicsCacheController::class, 'cacheStats']);
+
+    // Calculate
+    Route::post('/calculate/{marketplace}', [UnitEconomicsCacheController::class, 'calculate'])
         ->whereIn('marketplace', ['wildberries', 'ozon', 'yandex_market']);
-    Route::get('/{marketplace}/{sku}', [UnitEconomicsController::class, 'show'])
+
+    // By marketplace (main listing — использует кеш)
+    Route::get('/{marketplace}', [UnitEconomicsCacheController::class, 'index'])
         ->whereIn('marketplace', ['wildberries', 'ozon', 'yandex_market']);
-    Route::post('/{marketplace}', [UnitEconomicsController::class, 'store'])
-        ->whereIn('marketplace', ['wildberries', 'ozon', 'yandex_market']);
-    Route::put('/{marketplace}/{id}', [UnitEconomicsController::class, 'update'])
-        ->whereIn('marketplace', ['wildberries', 'ozon', 'yandex_market']);
-    Route::delete('/{marketplace}/{id}', [UnitEconomicsController::class, 'destroy'])
-        ->whereIn('marketplace', ['wildberries', 'ozon', 'yandex_market']);
-    
-    Route::post('/calculate/{marketplace}', [UnitEconomicsController::class, 'calculate'])
+    Route::get('/{marketplace}/{sku}', [UnitEconomicsCacheController::class, 'show'])
         ->whereIn('marketplace', ['wildberries', 'ozon', 'yandex_market']);
 });
 
