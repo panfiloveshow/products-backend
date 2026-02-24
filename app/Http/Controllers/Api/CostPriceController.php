@@ -139,6 +139,16 @@ class CostPriceController extends Controller
                 UnitEconomics::where('integration_id', $product->integration_id)
                     ->where('sku', $product->sku)
                     ->update(['cost_price' => $costPrice]);
+
+                // Синхронизируем с financial_dashboard по артикулу продавца
+                try {
+                    \Illuminate\Support\Facades\DB::connection('financial')
+                        ->table('products')
+                        ->where('article', $sku)
+                        ->update(['cost_price' => $costPrice]);
+                } catch (\Exception $e) {
+                    // Не критично если financial_dashboard недоступен
+                }
             }
 
             $updated += $products->count();
