@@ -78,10 +78,39 @@ class UnitEconomicsController extends Controller
         $validated = $request->validated();
         $validated['marketplace'] = $marketplace;
 
-        $query = UnitEconomics::marketplace($marketplace);
+        $integrationId = $validated['integration_id'] ?? null;
+        $fulfillmentType = $validated['fulfillment_type'] ?? null;
 
-        if (!empty($validated['integration_id'])) {
-            $query->where('integration_id', $validated['integration_id']);
+        // Базовый запрос по маркетплейсу и интеграции
+        $baseQuery = UnitEconomics::marketplace($marketplace);
+        if ($integrationId) {
+            $baseQuery->where('integration_id', $integrationId);
+        }
+
+        // Считаем количество товаров по каждой схеме (для переключателей на фронте)
+        $schemeCounts = (clone $baseQuery)
+            ->selectRaw('fulfillment_type, count(*) as cnt')
+            ->groupBy('fulfillment_type')
+            ->pluck('cnt', 'fulfillment_type')
+            ->toArray();
+
+        // Определяем актуальную схему (если не передана явно)
+        $actualScheme = null;
+        if ($integrationId) {
+            $actualScheme = UnitEconomics::where('integration_id', $integrationId)
+                ->where('marketplace', $marketplace)
+                ->where('is_actual_scheme', true)
+                ->value('fulfillment_type');
+        }
+
+        // Фильтруем по fulfillment_type если передан, иначе — только актуальная схема
+        $query = clone $baseQuery;
+        if ($fulfillmentType) {
+            $query->where('fulfillment_type', strtoupper($fulfillmentType));
+        } elseif ($actualScheme) {
+            $query->where('fulfillment_type', $actualScheme);
+        } else {
+            $query->where('is_actual_scheme', true);
         }
 
         if (!empty($validated['search'])) {
@@ -115,12 +144,35 @@ class UnitEconomicsController extends Controller
 
         $items = $query->paginate($limit, ['*'], 'page', $page);
 
-        $stats = $this->unitEconomicsService->getStatsByMarketplace($marketplace);
+        // Считаем статистику по той же выборке (integration_id + fulfillment_type)
+        $statsQuery = UnitEconomics::marketplace($marketplace);
+        if ($integrationId) {
+            $statsQuery->where('integration_id', $integrationId);
+        }
+        $effectiveFulfillmentType = $fulfillmentType ?? $actualScheme;
+        if ($effectiveFulfillmentType) {
+            $statsQuery->where('fulfillment_type', strtoupper($effectiveFulfillmentType));
+        } else {
+            $statsQuery->where('is_actual_scheme', true);
+        }
+
+        $stats = [
+            'total_revenue'        => round($statsQuery->sum('revenue'), 2),
+            'total_costs'          => round($statsQuery->sum('total_costs'), 2),
+            'total_profit'         => round($statsQuery->sum('net_profit'), 2),
+            'average_margin'       => round($statsQuery->avg('margin_percent'), 2),
+            'average_roi'          => round($statsQuery->avg('roi_percent'), 2),
+            'total_sales'          => $statsQuery->sum('sales_count'),
+            'profitable_products'  => (clone $statsQuery)->where('net_profit', '>', 0)->count(),
+            'unprofitable_products'=> (clone $statsQuery)->where('net_profit', '<=', 0)->count(),
+        ];
 
         return response()->json([
             'data' => [
                 'items' => $items->items(),
                 'total' => $items->total(),
+                'scheme_counts' => $schemeCounts,
+                'actual_scheme' => $actualScheme,
             ],
             'stats' => $stats,
         ]);
