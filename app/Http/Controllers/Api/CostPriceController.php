@@ -4,6 +4,7 @@ namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
 use App\Models\Product;
+use App\Models\UnitEconomics;
 use App\Models\UnitEconomicsSettings;
 use App\Services\CostPriceParserService;
 use Illuminate\Http\JsonResponse;
@@ -127,12 +128,17 @@ class CostPriceController extends Controller
                     ['cost_price' => $costPrice]
                 );
 
-                // Также по product.sku (штрихкод) на случай если там тоже есть записи
+                // Также по product.sku (штрихкод) на случай если там тоже есть записи в settings
                 if ($product->sku !== $sku) {
                     UnitEconomicsSettings::where('integration_id', $product->integration_id)
                         ->where('sku', $product->sku)
                         ->update(['cost_price' => $costPrice]);
                 }
+
+                // Обновляем unit_economics таблицу (используется для расчётов и отображения в UE странице)
+                UnitEconomics::where('integration_id', $product->integration_id)
+                    ->where('sku', $product->sku)
+                    ->update(['cost_price' => $costPrice]);
             }
 
             $updated += $products->count();

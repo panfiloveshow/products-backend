@@ -1,6 +1,7 @@
 <?php
 
 use App\Http\Controllers\Api\AuthController;
+use App\Http\Controllers\Api\AutoSupplyPlanController;
 use App\Http\Controllers\Api\CostPriceController;
 use App\Http\Controllers\Api\ProductController;
 use App\Http\Controllers\Api\InventoryController;
@@ -50,6 +51,7 @@ Route::prefix('inventory')->group(function () {
     Route::get('/', [InventoryController::class, 'index']);
     Route::get('/sync/status', [InventoryController::class, 'syncStatus']);
     Route::get('/alerts', [InventoryController::class, 'alerts']);
+    Route::get('/matrix', [InventoryController::class, 'matrix']);
     Route::get('/recommendations', [InventoryController::class, 'recommendations']);
     Route::get('/redistribution', [InventoryController::class, 'redistribution']);
     Route::get('/stats', [InventoryController::class, 'stats']);
@@ -128,6 +130,27 @@ Route::prefix('unit-economics')->group(function () {
     
     Route::post('/calculate/{marketplace}', [UnitEconomicsController::class, 'calculate'])
         ->whereIn('marketplace', ['wildberries', 'ozon', 'yandex_market']);
+});
+
+/*
+|--------------------------------------------------------------------------
+| Auto Supply Plans Module
+|--------------------------------------------------------------------------
+*/
+Route::prefix('auto-supply-plans')->group(function () {
+    Route::get('/warehouses', [AutoSupplyPlanController::class, 'warehouses']);
+    Route::get('/', [AutoSupplyPlanController::class, 'index']);
+    Route::post('/', [AutoSupplyPlanController::class, 'store']);
+    Route::get('/{id}', [AutoSupplyPlanController::class, 'show']);
+    Route::delete('/{id}', [AutoSupplyPlanController::class, 'destroy']);
+    Route::post('/{id}/calculate', [AutoSupplyPlanController::class, 'calculate']);
+    Route::get('/{id}/lines', [AutoSupplyPlanController::class, 'lines']);
+    Route::put('/{id}/lines/{lineId}', [AutoSupplyPlanController::class, 'updateLine']);
+    Route::get('/{id}/simulate', [AutoSupplyPlanController::class, 'simulate']);
+    Route::get('/{id}/export/ozon', [AutoSupplyPlanController::class, 'exportOzon']);
+    Route::get('/{id}/export/ozon-matrix', [AutoSupplyPlanController::class, 'exportOzonMatrix']);
+    Route::get('/{id}/export/ozon-by-warehouse', [AutoSupplyPlanController::class, 'exportOzonByWarehouse']);
+    Route::get('/{id}/export/wb', [AutoSupplyPlanController::class, 'exportWb']);
 });
 
 /*
