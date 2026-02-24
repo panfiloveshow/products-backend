@@ -129,6 +129,7 @@ class UnitEconomicsCacheController extends Controller
                 'default_scheme' => $defaultScheme,
                 'stats' => $stats,
             ],
+            'stats' => $stats,
         ]);
     }
 
