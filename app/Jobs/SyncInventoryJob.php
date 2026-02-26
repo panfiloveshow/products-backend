@@ -237,20 +237,6 @@ class SyncInventoryJob implements ShouldQueue
                     $sales30 = (int) round($avgDailySales * 30);
                 }
 
-                static $debugSkus = 0;
-                if ($debugSkus < 2 && (string)$sku === '8904071300019') {
-                    $debugSkus++;
-                    Log::debug('WB sales debug for 8904071300019', [
-                        'sku'           => $sku,
-                        'warehouseId'   => $warehouseId,
-                        'totalAvg'      => $totalAvg,
-                        'avgDailySales' => $avgDailySales,
-                        'sales30'       => $sales30,
-                        'warehouseData' => $warehouseData,
-                        'allWidsCount'  => count($allWarehouses),
-                        'allWids'       => array_keys($allWarehouses),
-                    ]);
-                }
             }
         }
 
@@ -278,16 +264,6 @@ class SyncInventoryJob implements ShouldQueue
         if ($sales14 !== null) $newData['sales_14_days'] = $sales14;
         if ($sales30 !== null) $newData['sales_30_days'] = $sales30;
 
-        static $debugNewData = 0;
-        if ($debugNewData < 2 && ($stockData['sku'] ?? '') === '8904071300019') {
-            $debugNewData++;
-            Log::debug('WB newData for 8904071300019', [
-                'sales7'  => $sales7,
-                'sales30' => $sales30,
-                'newData_sales30' => $newData['sales_30_days'] ?? 'NOT SET',
-                'hasChanges_preview' => ($sales30 !== null && (int)($existing->sales_30_days ?? 0) !== (int)$sales30),
-            ]);
-        }
 
         if (!$existing) {
             // Создаём новую запись
