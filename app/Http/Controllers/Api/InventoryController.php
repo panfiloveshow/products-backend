@@ -239,6 +239,8 @@ class InventoryController extends Controller
             ]);
 
         // Агрегируем по SKU
+        // average_daily_sales суммируется (продажи по каждому складу независимы)
+        // days_of_stock/turnover_days вычисляется как total_stock / sum_daily_sales
         $skuQuery = \App\Models\InventoryWarehouse::query()
             ->select('sku')
             ->selectRaw('SUM(quantity) as total_stock')
@@ -247,15 +249,15 @@ class InventoryController extends Controller
             ->selectRaw('SUM(sales_7_days) as sales_7_days')
             ->selectRaw('SUM(sales_14_days) as sales_14_days')
             ->selectRaw('SUM(sales_30_days) as sales_30_days')
-            ->selectRaw('AVG(average_daily_sales) as avg_daily_sales')
-            ->selectRaw('AVG(effective_daily_sales) as effective_daily_sales')
+            ->selectRaw('SUM(average_daily_sales) as avg_daily_sales')
+            ->selectRaw('SUM(effective_daily_sales) as effective_daily_sales')
             ->selectRaw('AVG(days_in_stock_30) as days_in_stock_30')
-            ->selectRaw('AVG(turnover_days) as turnover_days')
-            ->selectRaw('AVG(days_of_stock) as days_of_stock')
+            ->selectRaw('CASE WHEN SUM(average_daily_sales) > 0 THEN ROUND(SUM(quantity)::numeric / SUM(average_daily_sales), 1) ELSE NULL END as turnover_days')
+            ->selectRaw('CASE WHEN SUM(average_daily_sales) > 0 THEN ROUND(SUM(quantity)::numeric / SUM(average_daily_sales)) ELSE NULL END as days_of_stock')
             ->selectRaw('MAX(stock_status) as stock_status')
             ->selectRaw('SUM(storage_cost_per_day) as storage_cost_daily')
             ->selectRaw('SUM(storage_cost_per_month) as storage_cost_monthly')
-            ->selectRaw('AVG(real_avg_daily_sales) as real_avg_daily_sales')
+            ->selectRaw('SUM(real_avg_daily_sales) as real_avg_daily_sales')
             ->selectRaw('AVG(real_turnover_days) as real_turnover_days')
             ->selectRaw('AVG(real_days_of_stock) as real_days_of_stock')
             ->selectRaw('AVG(real_sales_period_days) as real_sales_period_days')
