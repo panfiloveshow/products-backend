@@ -226,7 +226,7 @@ class SyncInventoryJob implements ShouldQueue
                 // sales_7/14/30 — только по конкретному складу
                 $warehouseData = $allWarehouses[$warehouseId] ?? null;
                 if ($warehouseData) {
-                    $wAvg  = (float)($warehouseData['avg_daily_sales'] ?? 0);
+                    $wAvg    = (float)($warehouseData['avg_daily_sales'] ?? 0);
                     $sales7  = (int) round($wAvg * 7);
                     $sales14 = (int) round($wAvg * 14);
                     $sales30 = (int) round($wAvg * 30);
@@ -235,6 +235,21 @@ class SyncInventoryJob implements ShouldQueue
                     $sales7  = (int) round($avgDailySales * 7);
                     $sales14 = (int) round($avgDailySales * 14);
                     $sales30 = (int) round($avgDailySales * 30);
+                }
+
+                static $debugSkus = 0;
+                if ($debugSkus < 2 && (string)$sku === '8904071300019') {
+                    $debugSkus++;
+                    Log::debug('WB sales debug for 8904071300019', [
+                        'sku'           => $sku,
+                        'warehouseId'   => $warehouseId,
+                        'totalAvg'      => $totalAvg,
+                        'avgDailySales' => $avgDailySales,
+                        'sales30'       => $sales30,
+                        'warehouseData' => $warehouseData,
+                        'allWidsCount'  => count($allWarehouses),
+                        'allWids'       => array_keys($allWarehouses),
+                    ]);
                 }
             }
         }
