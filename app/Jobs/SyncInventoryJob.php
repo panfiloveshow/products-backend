@@ -65,7 +65,28 @@ class SyncInventoryJob implements ShouldQueue
             $updated = 0;
             $created = 0;
 
-            foreach ($inventory as $stockData) {
+            // Разворачиваем вложенный формат {sku, warehouses:[{warehouse_id,...}]} в плоский список
+            $flatInventory = [];
+            foreach ($inventory as $item) {
+                $sku = $item['sku'] ?? null;
+                if (empty($sku)) continue;
+
+                if (!empty($item['warehouses']) && is_array($item['warehouses'])) {
+                    foreach ($item['warehouses'] as $wh) {
+                        $flatInventory[] = array_merge($wh, [
+                            'sku'        => $sku,
+                            'marketplace' => $this->syncLog->marketplace,
+                        ]);
+                    }
+                } elseif (!empty($item['warehouse_id'])) {
+                    // уже плоский формат
+                    $flatInventory[] = array_merge($item, [
+                        'marketplace' => $this->syncLog->marketplace,
+                    ]);
+                }
+            }
+
+            foreach ($flatInventory as $stockData) {
                 // Пропускаем записи без SKU или warehouse_id
                 if (empty($stockData['sku']) || empty($stockData['warehouse_id'])) {
                     continue;
