@@ -234,15 +234,6 @@ class ProductsApi implements ProductsApiInterface
         $maxIterations = 200;
         $iteration = 0;
 
-        // Если нужны конкретные nmIds — строим set со string-ключами
-        $nmIdsSet = null;
-        if (!empty($filterNmIds)) {
-            $nmIdsSet = [];
-            foreach ($filterNmIds as $id) {
-                $nmIdsSet[(string) $id] = true;
-            }
-        }
-
         \Illuminate\Support\Facades\Log::info('WB ProductsApi: Requesting prices from Prices API', [
             'endpoint' => '/api/v2/list/goods/filter',
             'filterNmIds' => count($filterNmIds),
@@ -285,11 +276,6 @@ class ProductsApi implements ProductsApiInterface
 
                 if (!$nmId) continue;
 
-                // Фильтруем если нужны конкретные nmIds (string-сравнение)
-                if ($nmIdsSet !== null && !isset($nmIdsSet[(string) $nmId])) {
-                    continue;
-                }
-
                 // Берём первый размер для базовой цены
                 $sizes       = $item['sizes'] ?? [];
                 $firstSize   = $sizes[0] ?? [];
@@ -328,18 +314,6 @@ class ProductsApi implements ProductsApiInterface
 
             $offset += $limit;
             $iteration++;
-
-            // Если фильтруем и нашли все нужные - выходим раньше
-            // Считаем по string-ключам чтобы не было ложных совпадений
-            if ($nmIdsSet !== null) {
-                $found = 0;
-                foreach ($nmIdsSet as $id => $_) {
-                    if (isset($prices[$id])) $found++;
-                }
-                if ($found >= count($nmIdsSet)) {
-                    break;
-                }
-            }
 
         } while (count($items) === $limit && $iteration < $maxIterations);
         
