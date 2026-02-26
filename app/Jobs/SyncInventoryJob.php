@@ -204,44 +204,24 @@ class SyncInventoryJob implements ShouldQueue
         if (!empty($wbSalesByWarehouse)) {
             $sku             = $stockData['sku'];
             $supplierArticle = $stockData['supplier_article'] ?? $sku;
-            $warehouseId     = (string)($stockData['warehouse_id'] ?? '');
 
-            // 1) Точное совпадение по складу
-            $salesData = $wbSalesByWarehouse[$sku][$warehouseId]
-                      ?? $wbSalesByWarehouse[$supplierArticle][$warehouseId]
-                      ?? null;
+            // Ищем avg_daily_sales по всем складам SKU и суммируем
+            $allWarehouses = $wbSalesByWarehouse[$sku]
+                          ?? $wbSalesByWarehouse[$supplierArticle]
+                          ?? null;
 
-            // 2) Если склад не совпал — суммируем по всем складам для SKU
-            if ($salesData === null) {
-                $allWarehouses = $wbSalesByWarehouse[$sku]
-                              ?? $wbSalesByWarehouse[$supplierArticle]
-                              ?? null;
-                if ($allWarehouses) {
-                    $sumD7 = $sumD14 = $sumD30 = 0;
-                    foreach ($allWarehouses as $wData) {
-                        if (is_array($wData)) {
-                            $sumD7  += (int)($wData['sales_7_days']  ?? 0);
-                            $sumD14 += (int)($wData['sales_14_days'] ?? 0);
-                            $sumD30 += (int)($wData['sales_30_days'] ?? 0);
-                        }
+            if ($allWarehouses) {
+                $totalAvg = 0;
+                foreach ($allWarehouses as $wData) {
+                    if (is_array($wData)) {
+                        $totalAvg += (float)($wData['avg_daily_sales'] ?? 0);
                     }
-                    $salesData = [
-                        'avg_daily_sales' => round($sumD30 / 30, 4),
-                        'sales_7_days'    => $sumD7,
-                        'sales_14_days'   => $sumD14,
-                        'sales_30_days'   => $sumD30,
-                    ];
                 }
-            }
-
-            if ($salesData !== null) {
-                if (is_array($salesData)) {
-                    $avgDailySales = $salesData['avg_daily_sales'] ?? $avgDailySales;
-                    $sales7        = $salesData['sales_7_days']    ?? null;
-                    $sales14       = $salesData['sales_14_days']   ?? null;
-                    $sales30       = $salesData['sales_30_days']   ?? null;
-                } else {
-                    $avgDailySales = $salesData;
+                if ($totalAvg > 0) {
+                    $avgDailySales = round($totalAvg, 4);
+                    $sales7        = (int) round($avgDailySales * 7);
+                    $sales14       = (int) round($avgDailySales * 14);
+                    $sales30       = (int) round($avgDailySales * 30);
                 }
             }
         }
