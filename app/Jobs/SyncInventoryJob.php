@@ -202,9 +202,13 @@ class SyncInventoryJob implements ShouldQueue
         $sales30       = null;
 
         if (!empty($wbSalesByWarehouse)) {
-            $sku         = $stockData['sku'];
-            $warehouseId = (string)($stockData['warehouse_id'] ?? '');
-            $salesData   = $wbSalesByWarehouse[$sku][$warehouseId] ?? null;
+            $sku             = $stockData['sku'];
+            $supplierArticle = $stockData['supplier_article'] ?? $sku;
+            $warehouseId     = (string)($stockData['warehouse_id'] ?? '');
+            // Ищем сначала по sku, затем по supplier_article (barcode до нормализации)
+            $salesData = $wbSalesByWarehouse[$sku][$warehouseId]
+                      ?? $wbSalesByWarehouse[$supplierArticle][$warehouseId]
+                      ?? null;
 
             if ($salesData !== null) {
                 // Новый формат: массив с avg_daily_sales, sales_7_days, sales_14_days, sales_30_days
