@@ -237,12 +237,15 @@ class WildberriesService implements MarketplaceInterface
                 $stocks = $response->json() ?? [];
                 
                 foreach ($stocks as $stock) {
+                    $warehouseName = $stock['warehouseName'] ?? 'WB Склад';
+                    $warehouseId   = $warehouseName !== '' ? 'wb_' . substr(md5($warehouseName), 0, 8) : '0';
+                    $barcode       = $stock['barcode'] ?? null;
                     $inventory[] = [
-                        'sku' => $stock['supplierArticle'] ?? $stock['barcode'],
-                        'warehouse_id' => (string)($stock['warehouseId'] ?? 0),
-                        'warehouse_name' => $stock['warehouseName'] ?? 'WB Склад',
-                        'marketplace' => 'wildberries',
-                        'quantity' => $stock['quantity'] ?? 0,
+                        'sku'            => $barcode ?? $stock['supplierArticle'],
+                        'warehouse_id'   => $warehouseId,
+                        'warehouse_name' => $warehouseName,
+                        'marketplace'    => 'wildberries',
+                        'quantity'       => $stock['quantity'] ?? 0,
                     ];
                 }
             }
