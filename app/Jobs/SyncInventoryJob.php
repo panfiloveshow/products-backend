@@ -128,9 +128,12 @@ class SyncInventoryJob implements ShouldQueue
      */
     private function syncInventoryItem(array $stockData, array $wbSalesByWarehouse = []): string
     {
-        // Ищем существующую запись по sku + warehouse_id
+        $integrationId = $this->syncLog->integration_id;
+
+        // Ищем существующую запись по sku + warehouse_id + integration_id
         $existing = InventoryWarehouse::where('sku', $stockData['sku'])
             ->where('warehouse_id', $stockData['warehouse_id'])
+            ->when($integrationId, fn($q) => $q->where('integration_id', $integrationId))
             ->first();
 
         // Для WB: используем реальные продажи из Statistics API
@@ -149,6 +152,7 @@ class SyncInventoryJob implements ShouldQueue
             'quantity'            => $stockData['quantity'],
             'fulfillment_type'    => $stockData['fulfillment_type'] ?? null,
             'last_updated'        => now(),
+            'integration_id'      => $integrationId,
         ];
 
         if ($avgDailySales !== null) {
@@ -158,8 +162,9 @@ class SyncInventoryJob implements ShouldQueue
         if (!$existing) {
             // Создаём новую запись
             $warehouse = InventoryWarehouse::create(array_merge([
-                'sku' => $stockData['sku'],
-                'warehouse_id' => $stockData['warehouse_id'],
+                'sku'            => $stockData['sku'],
+                'warehouse_id'   => $stockData['warehouse_id'],
+                'integration_id' => $integrationId,
             ], $newData));
             
             $warehouse->stock_status = $warehouse->calculateStockStatus();
@@ -168,9 +173,10 @@ class SyncInventoryJob implements ShouldQueue
             return 'created';
         }
 
-        // Проверяем есть ли изменения (главное - quantity)
+        // Проверяем есть ли изменения (quantity, warehouse_name, integration_id)
         $hasChanges = $existing->quantity !== (int)$stockData['quantity']
-            || $existing->warehouse_name !== $stockData['warehouse_name'];
+            || $existing->warehouse_name !== $stockData['warehouse_name']
+            || (string)$existing->integration_id !== (string)$integrationId;
 
         if ($hasChanges) {
             $existing->update($newData);
