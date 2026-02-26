@@ -205,31 +205,42 @@ class SyncInventoryJob implements ShouldQueue
             $sku             = $stockData['sku'];
             $supplierArticle = $stockData['supplier_article'] ?? $sku;
             $warehouseId     = (string)($stockData['warehouse_id'] ?? '');
-            // Ищем сначала по sku, затем по supplier_article (barcode до нормализации)
+
+            // 1) Точное совпадение по складу
             $salesData = $wbSalesByWarehouse[$sku][$warehouseId]
                       ?? $wbSalesByWarehouse[$supplierArticle][$warehouseId]
                       ?? null;
 
-            static $debugCount = 0;
-            if ($salesData === null && $debugCount < 3 && isset($wbSalesByWarehouse[$sku])) {
-                $debugCount++;
-                Log::debug('WB sales lookup miss', [
-                    'sku'        => $sku,
-                    'supplier'   => $supplierArticle,
-                    'warehouseId'=> $warehouseId,
-                    'salesWids'  => array_keys($wbSalesByWarehouse[$sku] ?? []),
-                ]);
+            // 2) Если склад не совпал — суммируем по всем складам для SKU
+            if ($salesData === null) {
+                $allWarehouses = $wbSalesByWarehouse[$sku]
+                              ?? $wbSalesByWarehouse[$supplierArticle]
+                              ?? null;
+                if ($allWarehouses) {
+                    $sumD7 = $sumD14 = $sumD30 = 0;
+                    foreach ($allWarehouses as $wData) {
+                        if (is_array($wData)) {
+                            $sumD7  += (int)($wData['sales_7_days']  ?? 0);
+                            $sumD14 += (int)($wData['sales_14_days'] ?? 0);
+                            $sumD30 += (int)($wData['sales_30_days'] ?? 0);
+                        }
+                    }
+                    $salesData = [
+                        'avg_daily_sales' => round($sumD30 / 30, 4),
+                        'sales_7_days'    => $sumD7,
+                        'sales_14_days'   => $sumD14,
+                        'sales_30_days'   => $sumD30,
+                    ];
+                }
             }
 
             if ($salesData !== null) {
-                // Новый формат: массив с avg_daily_sales, sales_7_days, sales_14_days, sales_30_days
                 if (is_array($salesData)) {
                     $avgDailySales = $salesData['avg_daily_sales'] ?? $avgDailySales;
                     $sales7        = $salesData['sales_7_days']    ?? null;
                     $sales14       = $salesData['sales_14_days']   ?? null;
                     $sales30       = $salesData['sales_30_days']   ?? null;
                 } else {
-                    // Обратная совместимость: число
                     $avgDailySales = $salesData;
                 }
             }
