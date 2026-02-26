@@ -369,8 +369,9 @@ class WildberriesService implements MarketplaceInterface
             }
 
             Log::info('WB sales by warehouse fetched', [
-                'skus' => count($result),
-                'raw'  => count($sales),
+                'skus'        => count($result),
+                'raw'         => count($sales),
+                'sample_skus' => array_slice(array_keys($result), 0, 5),
             ]);
 
             return $result;
