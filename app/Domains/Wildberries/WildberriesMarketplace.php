@@ -214,19 +214,28 @@ class WildberriesMarketplace implements MarketplaceInterface
         // Получаем остатки из Statistics API (ищем по barcode, nmId, vendorCode)
         $stockData = $stocks[$barcode] ?? $stocks[(string)$nmId] ?? $stocks[$vendorCode] ?? null;
         
+        $price    = null;
+        $oldPrice = null;
         if ($priceData) {
             // Prices API возвращает цены в sizes
-            $price = (float) ($priceData['final_price'] ?? $priceData['discounted_price'] ?? $priceData['price'] ?? 0);
-            $oldPrice = (float) ($priceData['price'] ?? 0);
+            $finalPrice = (float) ($priceData['final_price'] ?? $priceData['discounted_price'] ?? $priceData['price'] ?? 0);
+            $basePrice  = (float) ($priceData['price'] ?? 0);
+            if ($finalPrice > 0) {
+                $price    = $finalPrice;
+                $oldPrice = $basePrice > $finalPrice ? $basePrice : null;
+            }
         } elseif ($stockData && !empty($stockData['price'])) {
             // Fallback: цены из Statistics API
             $oldPrice = (float) ($stockData['price'] ?? 0);
             $discount = (int) ($stockData['discount'] ?? 0);
-            $price = $oldPrice * (1 - $discount / 100);
-        } else {
+            $price    = $oldPrice > 0 ? round($oldPrice * (1 - $discount / 100), 2) : null;
+            $oldPrice = ($oldPrice > 0 && $discount > 0) ? $oldPrice : null;
+        } elseif (!empty($firstSize['discountedPrice']) || !empty($firstSize['price'])) {
             // Fallback: цены из sizes карточки (могут быть устаревшими)
-            $price = (float) ($firstSize['discountedPrice'] ?? $firstSize['price'] ?? 0);
-            $oldPrice = (float) ($firstSize['price'] ?? 0);
+            $fp       = (float) ($firstSize['discountedPrice'] ?? 0);
+            $bp       = (float) ($firstSize['price'] ?? 0);
+            $price    = $fp > 0 ? $fp : ($bp > 0 ? $bp : null);
+            $oldPrice = ($bp > 0 && $fp > 0 && $bp > $fp) ? $bp : null;
         }
         
         // Получаем остатки
@@ -294,7 +303,7 @@ class WildberriesMarketplace implements MarketplaceInterface
             'brand' => $card['brand'] ?? '',
             'category' => $card['subjectName'] ?? '',
             'price' => $price,
-            'old_price' => $oldPrice > $price ? $oldPrice : null,
+            'old_price' => ($oldPrice !== null && $price !== null && $oldPrice > $price) ? $oldPrice : null,
             'stock' => $stock,
             'rating' => $rating,
             'reviews_count' => $reviewsCount,

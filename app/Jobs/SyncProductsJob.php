@@ -133,8 +133,15 @@ class SyncProductsJob implements ShouldQueue
         $hasChanges = $this->hasChanges($existingProduct, $productData);
 
         if ($hasChanges) {
-            // Обновляем только изменившиеся поля
-            $existingProduct->update($productData);
+            // Не перезаписываем цену нулём/null если уже есть реальная цена
+            $updateData = $productData;
+            if (empty($updateData['price']) && !empty($existingProduct->price)) {
+                unset($updateData['price']);
+            }
+            if (empty($updateData['old_price']) && !empty($existingProduct->old_price)) {
+                unset($updateData['old_price']);
+            }
+            $existingProduct->update($updateData);
             return 'updated';
         }
 
