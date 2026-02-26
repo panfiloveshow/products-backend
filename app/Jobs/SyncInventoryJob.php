@@ -78,7 +78,7 @@ class SyncInventoryJob implements ShouldQueue
                             'marketplace' => $this->syncLog->marketplace,
                         ]);
                     }
-                } elseif (!empty($item['warehouse_id'])) {
+                } elseif (isset($item['warehouse_id']) && $item['warehouse_id'] !== null && $item['warehouse_id'] !== '') {
                     // уже плоский формат
                     $flatInventory[] = array_merge($item, [
                         'marketplace' => $this->syncLog->marketplace,
@@ -87,8 +87,12 @@ class SyncInventoryJob implements ShouldQueue
             }
 
             foreach ($flatInventory as $stockData) {
-                // Пропускаем записи без SKU или warehouse_id
-                if (empty($stockData['sku']) || empty($stockData['warehouse_id'])) {
+                // Пропускаем записи без SKU
+                if (empty($stockData['sku'])) {
+                    continue;
+                }
+                // Пропускаем записи без warehouse_id (но не отфильтровываем "0" — это может быть валидный ID)
+                if (!isset($stockData['warehouse_id']) || $stockData['warehouse_id'] === null || $stockData['warehouse_id'] === '') {
                     continue;
                 }
 
