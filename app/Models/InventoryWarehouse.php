@@ -20,6 +20,7 @@ class InventoryWarehouse extends Model
         'warehouse_id',
         'warehouse_name',
         'marketplace',
+        'integration_id',
         'fulfillment_type',
         'region',
         'quantity',
