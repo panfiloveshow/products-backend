@@ -84,6 +84,12 @@ class ProductService
         return $syncLog;
     }
 
+    public static function invalidateStatsCache(?int $integrationId = null, ?string $marketplace = null): void
+    {
+        \Illuminate\Support\Facades\Cache::forget("products_stats_{$integrationId}_{$marketplace}");
+        \Illuminate\Support\Facades\Cache::forget("products_stats_all");
+    }
+
     public function getSyncStatuses(): array
     {
         $marketplaces = ['wildberries', 'ozon', 'yandex'];

@@ -279,6 +279,12 @@ class InventoryService
         return $suggestions;
     }
 
+    public static function invalidateStatsCache(?int $integrationId = null, ?string $marketplace = null): void
+    {
+        \Illuminate\Support\Facades\Cache::forget("inventory_stats_{$integrationId}_{$marketplace}");
+        \Illuminate\Support\Facades\Cache::forget("inventory_stats_all");
+    }
+
     public function getOverallStats(): array
     {
         return [
