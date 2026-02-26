@@ -3,6 +3,7 @@
 namespace App\Jobs;
 
 use App\Models\InventoryWarehouse;
+use App\Models\Product;
 use App\Models\SyncLog;
 use App\Services\Marketplace\MarketplaceFactory;
 use Illuminate\Bus\Queueable;
@@ -86,13 +87,34 @@ class SyncInventoryJob implements ShouldQueue
                 }
             }
 
-            // Для WB: если warehouse_id = "0" или пустой — используем хэш названия склада как уникальный ID
+            // Для WB: нормализуем warehouse_id и маппируем supplierArticle → реальный products.sku (barcode)
             if ($this->syncLog->marketplace === 'wildberries') {
+                // Строим маппинг vendorCode → sku из таблицы products
+                $vendorCodeMap = Product::where('marketplace', 'wildberries')
+                    ->whereNotNull('wb_data')
+                    ->where('integration_id', $this->syncLog->integration_id)
+                    ->get(['sku', 'wb_data'])
+                    ->mapWithKeys(function ($p) {
+                        $vendorCode = data_get($p->wb_data, 'vendorCode');
+                        return $vendorCode ? [$vendorCode => $p->sku] : [];
+                    })
+                    ->toArray();
+
+                Log::info('WB vendorCode map loaded', ['count' => count($vendorCodeMap)]);
+
                 foreach ($flatInventory as &$stockData) {
+                    // warehouse_id: заменяем "0" на хэш от названия склада
                     $wid  = (string) ($stockData['warehouse_id'] ?? '');
                     $name = (string) ($stockData['warehouse_name'] ?? '');
                     if (($wid === '0' || $wid === '') && $name !== '') {
                         $stockData['warehouse_id'] = 'wb_' . substr(md5($name), 0, 8);
+                    }
+
+                    // sku: заменяем supplierArticle на реальный products.sku через vendorCode
+                    $articleKey = $stockData['sku'] ?? '';
+                    if ($articleKey && isset($vendorCodeMap[$articleKey])) {
+                        $stockData['sku']              = $vendorCodeMap[$articleKey];
+                        $stockData['supplier_article'] = $articleKey;
                     }
                 }
                 unset($stockData);

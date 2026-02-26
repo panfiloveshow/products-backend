@@ -240,14 +240,17 @@ class WildberriesService implements MarketplaceInterface
 
             $sales = $response->json() ?? [];
 
-            // Агрегируем количество продаж по [sku][warehouse_id]
+            // Агрегируем количество продаж по [barcode][warehouse_key]
+            // barcode совпадает с products.sku и inventory_warehouses.sku
+            // warehouseName → wb_+md5 совпадает с warehouse_id в inventory_warehouses
             $counts = [];
             foreach ($sales as $sale) {
-                $sku = $sale['supplierArticle'] ?? null;
-                $warehouseId = (string)($sale['warehouseId'] ?? 0);
-                if (!$sku || ($sale['isReturn'] ?? false)) continue;
+                $barcode     = $sale['barcode'] ?? null;
+                $warehouseName = $sale['warehouseName'] ?? '';
+                $warehouseKey  = $warehouseName !== '' ? 'wb_' . substr(md5($warehouseName), 0, 8) : '0';
+                if (!$barcode || ($sale['isReturn'] ?? false)) continue;
 
-                $counts[$sku][$warehouseId] = ($counts[$sku][$warehouseId] ?? 0) + 1;
+                $counts[$barcode][$warehouseKey] = ($counts[$barcode][$warehouseKey] ?? 0) + 1;
             }
 
             // Делим на количество дней — получаем average_daily_sales
