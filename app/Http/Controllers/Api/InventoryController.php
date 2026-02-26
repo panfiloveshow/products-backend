@@ -283,17 +283,21 @@ class InventoryController extends Controller
         }
 
         // Сортировка
-        $sortedSkus = $allSkus->sortBy(function ($row) use ($sort) {
+        $sortCallback = function ($row) use ($sort) {
             return match ($sort) {
-                'total_stock'    => (int)    $row->total_stock,
-                'sales_30_days'  => (int)    $row->sales_30_days,
-                'avg_daily_sales'=> (float)  $row->avg_daily_sales,
+                'total_stock'    => (int)   $row->total_stock,
+                'sales_30_days'  => (int)   $row->sales_30_days,
+                'avg_daily_sales'=> (float) $row->avg_daily_sales,
                 'days_of_stock'  => (float) ($row->days_of_stock ?? 9999),
                 'turnover_days'  => (float) ($row->turnover_days ?? 9999),
-                'stock_value'    => (float)  $row->total_stock,
-                default          => (int)    $row->total_stock,
+                'stock_value'    => (float) $row->total_stock,
+                default          => (int)   $row->total_stock,
             };
-        }, SORT_REGULAR, $sortOrder === 'asc' ? false : true);
+        };
+
+        $sortedSkus = $sortOrder === 'asc'
+            ? $allSkus->sortBy($sortCallback)
+            : $allSkus->sortByDesc($sortCallback);
 
         $total      = $sortedSkus->count();
         $pagedSkus  = $sortedSkus->slice(($page - 1) * $perPage, $perPage)->keys()->toArray();
