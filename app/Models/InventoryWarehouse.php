@@ -30,14 +30,20 @@ class InventoryWarehouse extends Model
         'recommended_quantity',
         'stock_status',
         'last_updated',
+        'sales_7_days',
+        'sales_14_days',
+        'sales_30_days',
     ];
 
     protected $casts = [
-        'quantity' => 'integer',
-        'average_daily_sales' => 'decimal:2',
-        'days_of_stock' => 'integer',
-        'recommended_quantity' => 'integer',
-        'last_updated' => 'datetime',
+        'quantity'            => 'integer',
+        'average_daily_sales' => 'decimal:4',
+        'days_of_stock'       => 'integer',
+        'recommended_quantity'=> 'integer',
+        'last_updated'        => 'datetime',
+        'sales_7_days'        => 'integer',
+        'sales_14_days'       => 'integer',
+        'sales_30_days'       => 'integer',
     ];
 
     public function product(): BelongsTo
