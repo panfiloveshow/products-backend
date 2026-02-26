@@ -205,10 +205,15 @@ class SyncInventoryJob implements ShouldQueue
             }
         }
 
+        $qty          = (int) ($stockData['quantity'] ?? 0);
+        $daysOfStock  = ($avgDailySales !== null && $avgDailySales > 0)
+            ? (int) round($qty / $avgDailySales)
+            : null;
+
         $newData = [
             'warehouse_name'      => $stockData['warehouse_name'],
             'marketplace'         => $stockData['marketplace'],
-            'quantity'            => $stockData['quantity'],
+            'quantity'            => $qty,
             'fulfillment_type'    => $stockData['fulfillment_type'] ?? null,
             'last_updated'        => now(),
             'integration_id'      => $integrationId,
@@ -216,6 +221,8 @@ class SyncInventoryJob implements ShouldQueue
 
         if ($avgDailySales !== null) {
             $newData['average_daily_sales'] = $avgDailySales;
+            $newData['days_of_stock']       = $daysOfStock;
+            $newData['turnover_days']        = $daysOfStock;
         }
 
         if (!$existing) {

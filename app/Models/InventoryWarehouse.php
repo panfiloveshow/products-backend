@@ -26,6 +26,7 @@ class InventoryWarehouse extends Model
         'quantity',
         'average_daily_sales',
         'days_of_stock',
+        'turnover_days',
         'recommended_quantity',
         'stock_status',
         'last_updated',
