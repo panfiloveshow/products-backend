@@ -15,7 +15,6 @@ class Shipment extends Model
     protected $keyType = 'string';
     public $incrementing = false;
 
-    // Базовые статусы
     public const STATUS_DRAFT = 'draft';
     public const STATUS_PENDING_LOGISTICS = 'pending_logistics';
     public const STATUS_APPROVED = 'approved';
@@ -23,111 +22,13 @@ class Shipment extends Model
     public const STATUS_IN_TRANSIT = 'in_transit';
     public const STATUS_DELIVERED = 'delivered';
     public const STATUS_REJECTED = 'rejected';
-    
-    // Расширенные статусы (P2)
-    public const STATUS_SUBMITTED = 'submitted';              // Отправлена в МП
-    public const STATUS_PENDING_CONFIRMATION = 'pending_confirmation'; // Ждём подтверждения от МП
-    public const STATUS_CONFIRMED = 'confirmed';              // МП подтвердил
-    public const STATUS_ARRIVED = 'arrived';                  // Прибыл на склад
-    public const STATUS_PROCESSING = 'processing';            // Идёт приёмка
-    public const STATUS_PARTIALLY_ACCEPTED = 'partially_accepted'; // Частично принят
-    public const STATUS_CANCELLED = 'cancelled';              // Отменён
-
-    /**
-     * Получить все возможные статусы
-     */
-    public static function getStatuses(): array
-    {
-        return [
-            self::STATUS_DRAFT => 'Черновик',
-            self::STATUS_PENDING_LOGISTICS => 'Ожидает согласования',
-            self::STATUS_SUBMITTED => 'Отправлена в МП',
-            self::STATUS_PENDING_CONFIRMATION => 'Ожидает подтверждения МП',
-            self::STATUS_CONFIRMED => 'Подтверждена МП',
-            self::STATUS_APPROVED => 'Согласована',
-            self::STATUS_SENT => 'Отправлена',
-            self::STATUS_IN_TRANSIT => 'В пути',
-            self::STATUS_ARRIVED => 'Прибыла на склад',
-            self::STATUS_PROCESSING => 'Идёт приёмка',
-            self::STATUS_DELIVERED => 'Доставлена',
-            self::STATUS_PARTIALLY_ACCEPTED => 'Частично принята',
-            self::STATUS_REJECTED => 'Отклонена',
-            self::STATUS_CANCELLED => 'Отменена',
-        ];
-    }
-
-    /**
-     * Получить активные статусы (для синхронизации)
-     */
-    public static function getActiveStatuses(): array
-    {
-        return [
-            self::STATUS_SUBMITTED,
-            self::STATUS_PENDING_CONFIRMATION,
-            self::STATUS_CONFIRMED,
-            self::STATUS_APPROVED,
-            self::STATUS_SENT,
-            self::STATUS_IN_TRANSIT,
-            self::STATUS_ARRIVED,
-            self::STATUS_PROCESSING,
-        ];
-    }
-
-    /**
-     * Группировка статусов по разделам (как в Ozon Seller)
-     */
-    public static function getStatusGroups(): array
-    {
-        return [
-            'new' => [
-                'label' => 'Новые',
-                'statuses' => [self::STATUS_DRAFT, self::STATUS_PENDING_LOGISTICS],
-            ],
-            'preparing' => [
-                'label' => 'Подготовка к поставкам',
-                'statuses' => [self::STATUS_SUBMITTED, self::STATUS_PENDING_CONFIRMATION, self::STATUS_CONFIRMED, self::STATUS_APPROVED],
-            ],
-            'in_transit' => [
-                'label' => 'Товары в пути и приёмка',
-                'statuses' => [self::STATUS_SENT, self::STATUS_IN_TRANSIT, self::STATUS_ARRIVED, self::STATUS_PROCESSING],
-            ],
-            'confirmation' => [
-                'label' => 'Подтверждение актов',
-                'statuses' => [self::STATUS_PARTIALLY_ACCEPTED],
-            ],
-            'archive' => [
-                'label' => 'Архив',
-                'statuses' => [self::STATUS_DELIVERED, self::STATUS_REJECTED, self::STATUS_CANCELLED],
-            ],
-        ];
-    }
-
-    /**
-     * Получить группу статуса
-     */
-    public function getStatusGroup(): string
-    {
-        foreach (self::getStatusGroups() as $group => $data) {
-            if (in_array($this->status, $data['statuses'])) {
-                return $group;
-            }
-        }
-        return 'new';
-    }
 
     protected $fillable = [
-        'supply_plan_id',
-        'integration_id',
-        'warehouse_id',
-        'external_supply_id',
-        'external_status',
         'name',
         'status',
         'marketplace',
         'shipment_type',
         'warehouse_name',
-        'meta',
-        'planned_date',
         'supplier_id',
         'supplier_name',
         'supplier_address',
@@ -149,13 +50,10 @@ class Shipment extends Model
         'created_by_name',
         'sent_at',
         'delivered_at',
-        'synced_at',
-        'description',
     ];
 
     protected $casts = [
         'slot' => 'array',
-        'meta' => 'array',
         'marketplace_requirements' => 'array',
         'packaging' => 'array',
         'logistics_approval' => 'array',
@@ -168,20 +66,13 @@ class Shipment extends Model
         'delivery_cost' => 'decimal:2',
         'delivery_cost_percent' => 'decimal:2',
         'utilization_percent' => 'decimal:2',
-        'planned_date' => 'date',
         'sent_at' => 'datetime',
         'delivered_at' => 'datetime',
-        'synced_at' => 'datetime',
     ];
 
     public function supplier(): BelongsTo
     {
         return $this->belongsTo(Supplier::class);
-    }
-
-    public function supplyPlan(): BelongsTo
-    {
-        return $this->belongsTo(SupplyPlan::class);
     }
 
     public function items(): HasMany
@@ -243,7 +134,7 @@ class Shipment extends Model
 
     public function canBeApproved(): bool
     {
-        return in_array($this->status, [self::STATUS_PENDING_LOGISTICS, self::STATUS_SUBMITTED], true);
+        return $this->status === self::STATUS_PENDING_LOGISTICS;
     }
 
     public function canBeSent(): bool

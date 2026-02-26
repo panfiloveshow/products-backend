@@ -170,14 +170,40 @@ class CostPriceController extends Controller
      */
     public function template(Request $request): \Illuminate\Http\Response
     {
-        $marketplace = $request->query('marketplace', '');
+        $marketplace   = $request->query('marketplace', '');
+        $integrationId = $request->query('marketplace_id') ?? $request->query('integration_id');
 
         $headers = ['Артикул продавца', 'Себестоимость'];
-        $rows = [
-            ['АРТИКУЛ-001', '1500.00'],
-            ['АРТИКУЛ-002', '2300.50'],
-            ['АРТИКУЛ-003', '890.00'],
-        ];
+        $rows    = [];
+
+        if ($integrationId) {
+            $query = Product::where('integration_id', $integrationId)
+                ->whereNotNull('sku')
+                ->where('sku', '!=', '')
+                ->select('sku', 'name', 'cost_price');
+
+            if ($marketplace) {
+                $query->where('marketplace', $marketplace);
+            }
+
+            $products = $query->orderBy('sku')->limit(5000)->get();
+
+            foreach ($products as $product) {
+                $costPrice = (float) $product->cost_price;
+                $rows[] = [
+                    $product->sku,
+                    $costPrice > 0 ? number_format($costPrice, 2, '.', '') : '',
+                ];
+            }
+        }
+
+        if (empty($rows)) {
+            $rows = [
+                ['АРТИКУЛ-001', ''],
+                ['АРТИКУЛ-002', ''],
+                ['АРТИКУЛ-003', ''],
+            ];
+        }
 
         $csv = implode(';', $headers) . "\n";
         foreach ($rows as $row) {
@@ -189,7 +215,7 @@ class CostPriceController extends Controller
             : 'шаблон_себестоимость.csv';
 
         return response($csv, 200, [
-            'Content-Type' => 'text/csv; charset=UTF-8',
+            'Content-Type'        => 'text/csv; charset=UTF-8',
             'Content-Disposition' => 'attachment; filename="' . $filename . '"',
         ]);
     }

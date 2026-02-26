@@ -10,6 +10,7 @@ use App\Models\OzonWarehouseCluster;
 use App\Models\Product;
 use App\Models\SellerWarehouseStock;
 use App\Models\SupplySettings;
+use App\Models\WbBarcodeCost;
 use App\Models\UnitEconomics;
 use App\Services\AutoSupplyPlanService;
 use Carbon\Carbon;
@@ -113,6 +114,25 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
         $hasSellerStocks = !empty($sellerStockMap);
         $sellerStockConsumed = [];
 
+        // WB v4: Карта себестоимостей по баркодам [barcode => cost_price]
+        $wbBarcodeCostMap = ($marketplace === 'wildberries')
+            ? WbBarcodeCost::getCostMap($integrationId)
+            : [];
+
+        // WB v5: FBS-остатки на складах продавца [sku => total_fbs_qty]
+        // FBS-остатки снижают потребность в поставке на склад WB (FBO)
+        $wbFbsStockMap = [];
+        if ($marketplace === 'wildberries') {
+            $fbsRows = InventoryWarehouse::where('integration_id', $integrationId)
+                ->where('marketplace', 'wildberries')
+                ->where('fulfillment_type', 'fbs')
+                ->selectRaw('sku, SUM(quantity) as total_qty')
+                ->groupBy('sku')
+                ->pluck('total_qty', 'sku')
+                ->toArray();
+            $wbFbsStockMap = array_map('intval', $fbsRows);
+        }
+
         // v2: Загружаем in-transit из активных заявок на поставку
         $supplyInTransit = $service->getInTransitFromSupplies($integrationId);
 
@@ -153,6 +173,10 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
         $totalLines = 0;
         $totalQty = 0;
         $lines = [];
+
+        // v4: Карты избытка и дефицита для матрицы перераспределения
+        $surplusMap = [];  // [sku => [warehouse_id => surplus_qty]]
+        $deficitMap = [];  // [sku => [warehouse_id => deficit_qty]]
 
         // Data quality counters (per unique SKU)
         $qStocksCoverage = 0;
@@ -213,11 +237,52 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
             $inTransitSupplies = $supplyInTransit[$wh->sku] ?? 0;
             $inTransit = $inTransitApi + $inTransitSupplies;
 
+            // WB v4: Товары на возврате с клиентов — уже едут обратно на склад
+            // in_way_from_client снижает реальную потребность в новой поставке
+            $inWayFromClient = 0;
+            if ($marketplace === 'wildberries') {
+                $inWayFromClient = $wh->in_way_from_client ?? 0;
+                // Возвраты частично восполняют потребность (с коэффициентом 0.8 — часть бракуется)
+                $inTransit = $inTransit + (int) round($inWayFromClient * 0.8);
+            }
+
+            // WB v5: FBS-остатки продавца — товары уже у продавца, можно отгрузить на WB
+            // Учитываем как дополнительный "виртуальный транзит" (товар уже есть, нужна только отгрузка)
+            $wbFbsStock = 0;
+            if ($marketplace === 'wildberries') {
+                $wbFbsStock = $wbFbsStockMap[$wh->sku] ?? 0;
+                if ($wbFbsStock > 0) {
+                    // FBS = уже на складе продавца, учитываем как in-transit с коэффициентом 1.0
+                    $inTransit = $inTransit + $wbFbsStock;
+                }
+            }
+
             // v2: Данные для улучшенного прогноза
             $realAvgDailySales = $wh->real_avg_daily_sales ?? 0;
             $effectiveDailySales = $wh->effective_daily_sales ?? 0;
             $daysInStock30 = $wh->days_in_stock_30 ?? 30;
-            $redemptionRate = $ue?->redemption_rate ?? 100;
+
+            // WB v4: % выкупа — вычисляем из реальных данных unit_economics если есть
+            $redemptionRate = 100;
+            if ($ue) {
+                if ($ue->redemption_rate > 0 && $ue->redemption_rate < 100) {
+                    // Есть явный % выкупа — используем
+                    $redemptionRate = (float) $ue->redemption_rate;
+                } elseif ($marketplace === 'wildberries' && ($ue->orders_count ?? 0) > 0 && ($ue->returns_count ?? 0) >= 0) {
+                    // Вычисляем из заказов/возвратов
+                    $calcRate = (($ue->orders_count - $ue->returns_count) / $ue->orders_count) * 100;
+                    if ($calcRate > 10 && $calcRate <= 100) {
+                        $redemptionRate = round($calcRate, 1);
+                    }
+                }
+                // Если ничего нет — для WB дефолт 85% (реальный средний по рынку)
+                if ($marketplace === 'wildberries' && $redemptionRate === 100 && ($ue->orders_count ?? 0) === 0) {
+                    $redemptionRate = 85.0;
+                }
+            } elseif ($marketplace === 'wildberries') {
+                // Нет UE данных для WB — дефолтный % выкупа 85%
+                $redemptionRate = 85.0;
+            }
 
             // --- Тренд продаж (улучшенный: 3 периода + учёт OOS) ---
             $salesTrend = 'stable';
@@ -379,11 +444,40 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
             $surplusDays = $coverAfter > $targetCoverDays ? (int) ($coverAfter - $targetCoverDays) : null;
             $riskLevel = $service->determineRiskLevel($oosDate, $coverBefore, $minCoverDays);
 
+            // v4: Матрица перераспределения — фиксируем избыток и дефицит по SKU×склад
+            $whKey = $wh->warehouse_id ?? $wh->warehouse_name ?? 'unknown';
+            if ($surplusDays !== null && $surplusDays > 0 && $dailyDemand > 0) {
+                $surplusQty = (int) round($surplusDays * $dailyDemand);
+                if ($surplusQty > 0) {
+                    $surplusMap[$wh->sku][$whKey] = [
+                        'qty'            => $surplusQty,
+                        'warehouse_name' => $wh->warehouse_name,
+                        'daily_demand'   => $dailyDemand,
+                        'current_stock'  => $currentStock,
+                    ];
+                }
+            }
+            if ($qtyRounded > 0 && $dailyDemand > 0) {
+                $deficitMap[$wh->sku][$whKey] = [
+                    'qty'            => $qtyRounded,
+                    'warehouse_name' => $wh->warehouse_name,
+                    'daily_demand'   => $dailyDemand,
+                    'current_stock'  => $currentStock,
+                ];
+            }
+
             // --- Финансовые метрики ---
             $offerId = $wh->sku;
             $barcode = $product?->barcode;
             $price = $product?->price ?? $ue?->price ?? 0;
-            $costPrice = $ue?->cost_price ?? $wh->cost_price ?? 0;
+
+            // WB v4: себестоимость по баркоду (приоритет) > unit_economics > inventory
+            $costPrice = 0;
+            if ($marketplace === 'wildberries' && $barcode && isset($wbBarcodeCostMap[$barcode])) {
+                $costPrice = $wbBarcodeCostMap[$barcode];
+            } else {
+                $costPrice = $ue?->cost_price ?? $wh->cost_price ?? 0;
+            }
             $storageCostDaily = $wh->storage_cost_per_day ?? 0;
             $storageCostMonthly = $wh->storage_cost_per_month ?? 0;
             $marginPercent = $ue?->margin_percent ?? 0;
@@ -427,6 +521,8 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
                     'stock_now' => $currentStock,
                     'in_transit_api' => $inTransitApi,
                     'in_transit_supplies' => $inTransitSupplies,
+                    'in_way_from_client' => $inWayFromClient,
+                    'fbs_stock' => $wbFbsStock,
                     'in_transit_total' => $inTransit,
                     'daily_demand' => round($dailyDemand, 4),
                     'demand_source' => $demandSource,
@@ -592,6 +688,35 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
                 AutoSupplyPlanLine::insert($chunk);
             }
         }
+
+        // v4: Матрица перераспределения — SKU у которых есть и избыток на одном складе и дефицит на другом
+        $redistributionSuggestions = [];
+        foreach ($deficitMap as $sku => $deficitWarehouses) {
+            if (empty($surplusMap[$sku])) continue;
+            foreach ($deficitWarehouses as $defWhKey => $defInfo) {
+                foreach ($surplusMap[$sku] as $surWhKey => $surInfo) {
+                    if ($defWhKey === $surWhKey) continue;
+                    $transferQty = min($defInfo['qty'], $surInfo['qty']);
+                    if ($transferQty <= 0) continue;
+                    $product = $products->get($sku);
+                    $ue = $unitEconomics->get($sku);
+                    $costPrice = $ue?->cost_price ?? 0;
+                    $redistributionSuggestions[] = [
+                        'sku'            => $sku,
+                        'product_name'   => $product?->name,
+                        'from_warehouse' => $surInfo['warehouse_name'],
+                        'to_warehouse'   => $defInfo['warehouse_name'],
+                        'transfer_qty'   => $transferQty,
+                        'saves_cost'     => $costPrice > 0 ? round($transferQty * $costPrice, 2) : null,
+                        'surplus_qty'    => $surInfo['qty'],
+                        'deficit_qty'    => $defInfo['qty'],
+                    ];
+                }
+            }
+        }
+
+        $resultJson = ['redistribution' => $redistributionSuggestions];
+        $plan->result_json = $resultJson;
 
         // --- Data quality score ---
         $qualityJson = $service->calculateDataQuality(

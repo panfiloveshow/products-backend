@@ -1,19 +1,8 @@
-# Logs
 *.log
-storage/logs/*
-!storage/logs/.gitkeep
-
-# OS
 .DS_Store
-Thumbs.db
-
-# Environment
 .env
 .env.backup
 .env.production
-.env.local
-
-# IDE
 .phpactor.json
 .phpunit.result.cache
 /.fleet
@@ -22,8 +11,6 @@ Thumbs.db
 /.phpunit.cache
 /.vscode
 /.zed
-
-# Laravel
 /auth.json
 /node_modules
 /public/build
@@ -31,19 +18,7 @@ Thumbs.db
 /public/storage
 /storage/*.key
 /storage/pail
-/storage/framework/cache/data/*
-/storage/framework/sessions/*
-/storage/framework/views/*
-!storage/framework/cache/.gitkeep
-!storage/framework/sessions/.gitkeep
-!storage/framework/views/.gitkeep
 /vendor
-/bootstrap/cache/*
-!bootstrap/cache/.gitkeep
-
-# Homestead
 Homestead.json
 Homestead.yaml
-
-# Testing
-/coverage
+Thumbs.db

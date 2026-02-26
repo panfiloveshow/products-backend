@@ -313,103 +313,6 @@ class SellicoApiService
     }
 
     /**
-     * Получить credentials интеграции по ID
-     * Sellico API не имеет endpoint для получения интеграции по ID,
-     * поэтому получаем все интеграции всех workspaces и ищем нужную
-     */
-    public function getIntegrationById(int $integrationId): array
-    {
-        $token = $this->getAccessToken();
-        
-        if (!$token) {
-            return [
-                'success' => false,
-                'error' => 'Не авторизован в Sellico API',
-            ];
-        }
-
-        try {
-            // Сначала получаем список workspaces
-            $workspacesResponse = Http::withToken($token)
-                ->get("{$this->baseUrl}/workspaces");
-            
-            if (!$workspacesResponse->successful()) {
-                return [
-                    'success' => false,
-                    'error' => 'Не удалось получить список workspaces',
-                ];
-            }
-            
-            $workspaces = $workspacesResponse->json('data') ?? $workspacesResponse->json();
-            
-            // Ищем интеграцию во всех workspaces
-            foreach ($workspaces as $workspace) {
-                $workspaceId = $workspace['id'] ?? null;
-                if (!$workspaceId) continue;
-                
-                $integrationsResponse = Http::withToken($token)
-                    ->get("{$this->baseUrl}/workspaces/{$workspaceId}/integrations");
-                
-                if (!$integrationsResponse->successful()) continue;
-                
-                $integrations = $integrationsResponse->json('data') ?? $integrationsResponse->json();
-                
-                foreach ($integrations as $integration) {
-                    if (($integration['id'] ?? null) == $integrationId) {
-                        Log::info("Found integration", [
-                            'integration_id' => $integrationId,
-                            'workspace_id' => $workspaceId,
-                            'type' => $integration['type'] ?? 'unknown',
-                        ]);
-                        
-                        return [
-                            'success' => true,
-                            'integration' => $integration,
-                            'credentials' => $this->extractCredentials($integration),
-                        ];
-                    }
-                }
-            }
-
-            return [
-                'success' => false,
-                'error' => "Интеграция с ID {$integrationId} не найдена",
-            ];
-        } catch (\Exception $e) {
-            Log::error("Sellico get integration {$integrationId} error: " . $e->getMessage());
-            return [
-                'success' => false,
-                'error' => $e->getMessage(),
-            ];
-        }
-    }
-
-    /**
-     * Извлечь credentials из данных интеграции
-     */
-    private function extractCredentials(array $integration): array
-    {
-        $type = strtolower($integration['type'] ?? '');
-        
-        return match ($type) {
-            'wildberries' => [
-                'api_key' => $integration['api_key'] ?? null,
-            ],
-            'ozon' => [
-                'client_id' => $integration['client_id'] ?? null,
-                'api_key' => $integration['api_key'] ?? null,
-            ],
-            'yandexmarket', 'yandex_market', 'yandex' => [
-                'token' => $integration['api_key'] ?? $integration['token'] ?? null,
-                // client_id в Sellico для Yandex — это campaign_id
-                'campaign_id' => $integration['campaign_id'] ?? $integration['client_id'] ?? null,
-                'business_id' => $integration['business_id'] ?? null,
-            ],
-            default => $integration,
-        };
-    }
-
-    /**
      * Получить профиль пользователя
      */
     public function getProfile(): array
@@ -425,7 +328,7 @@ class SellicoApiService
 
         try {
             $response = Http::withToken($token)
-                ->get("{$this->baseUrl}/user");
+                ->get("{$this->baseUrl}/me");
 
             if ($response->successful()) {
                 return [

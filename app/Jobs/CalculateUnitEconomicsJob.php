@@ -60,9 +60,8 @@ class CalculateUnitEconomicsJob implements ShouldQueue
 
     private function calculateForProduct(Product $product, UnitEconomicsService $service): void
     {
-        // Ищем существующую запись по sku + integration_id (себестоимость привязана к магазину)
         $existingUE = UnitEconomics::where('sku', $product->sku)
-            ->where('integration_id', $product->integration_id)
+            ->where('marketplace', $this->normalizeMarketplace($product->marketplace))
             ->latest()
             ->first();
 
@@ -74,7 +73,6 @@ class CalculateUnitEconomicsJob implements ShouldQueue
 
         $data = array_merge([
             'sku' => $product->sku,
-            'integration_id' => $product->integration_id,
             'product_name' => $product->name,
             'marketplace' => $this->normalizeMarketplace($product->marketplace),
             'price' => $product->price ?? 0,

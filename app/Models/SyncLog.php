@@ -58,7 +58,7 @@ class SyncLog extends Model
 
     public function scopeRunning($query)
     {
-        return $query->whereIn('status', [self::STATUS_PENDING, self::STATUS_RUNNING]);
+        return $query->where('status', self::STATUS_RUNNING);
     }
 
     public function scopeLatest($query)

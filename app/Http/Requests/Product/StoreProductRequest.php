@@ -25,7 +25,7 @@ class StoreProductRequest extends FormRequest
             'images.*' => 'url',
             'category' => 'nullable|string|max:200',
             'brand' => 'nullable|string|max:200',
-            'rating' => 'nullable|numeric|min:0|max:100',
+            'rating' => 'nullable|numeric|min:0|max:5',
             'reviews_count' => 'nullable|integer|min:0',
             'marketplace' => 'required|in:wildberries,ozon,yandex',
             'marketplace_id' => 'nullable|string|max:100',

@@ -56,7 +56,6 @@ return [
     'yandex_market' => [
         'token' => env('YANDEX_MARKET_TOKEN'),
         'campaign_id' => env('YANDEX_MARKET_CAMPAIGN_ID'),
-        'business_id' => env('YANDEX_MARKET_BUSINESS_ID'),
         'base_url' => env('YANDEX_MARKET_BASE_URL', 'https://api.partner.market.yandex.ru'),
     ],
 

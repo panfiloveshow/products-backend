@@ -240,6 +240,7 @@ class AutoSupplyPlanController extends Controller
                         'avg_roi_percent' => round($avgRoi, 2),
                         'avg_turnover_days' => round($avgTurnover, 1),
                     ],
+                    'redistribution' => $plan->result_json['redistribution'] ?? [],
                 ],
             ],
         ]);

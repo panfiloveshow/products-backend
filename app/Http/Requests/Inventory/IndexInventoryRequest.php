@@ -16,7 +16,6 @@ class IndexInventoryRequest extends FormRequest
         return [
             'search' => 'nullable|string|max:255',
             'marketplace' => 'nullable|string',
-            'integration_id' => 'nullable|integer',
             'low_stock' => 'nullable|boolean',
             'out_of_stock' => 'nullable|boolean',
             'category' => 'nullable|string|max:200',

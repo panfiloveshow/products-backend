@@ -43,6 +43,7 @@ class AutoSupplyPlan extends Model
         'params',
         'data_quality_score',
         'data_quality_json',
+        'result_json',
         'total_lines',
         'total_qty',
         'error_message',
@@ -52,6 +53,7 @@ class AutoSupplyPlan extends Model
     protected $casts = [
         'params' => 'array',
         'data_quality_json' => 'array',
+        'result_json' => 'array',
         'export_errors' => 'array',
         'data_quality_score' => 'decimal:2',
         'budget_limit' => 'decimal:2',
@@ -92,13 +94,17 @@ class AutoSupplyPlan extends Model
 
     public function markReady(float $qualityScore, int $totalLines, int $totalQty, ?array $qualityJson = null): void
     {
-        $this->update([
+        $data = [
             'status' => self::STATUS_READY,
             'data_quality_score' => $qualityScore,
             'data_quality_json' => $qualityJson,
             'total_lines' => $totalLines,
             'total_qty' => $totalQty,
-        ]);
+        ];
+        if ($this->result_json !== null) {
+            $data['result_json'] = $this->result_json;
+        }
+        $this->update($data);
     }
 
     public function markError(string $message): void

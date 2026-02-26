@@ -28,7 +28,7 @@ return new class extends Migration
             $table->index('marketplace');
             $table->index('stock_status');
 
-            // FK убран: sku больше не уникален (теперь sku + marketplace)
+            $table->foreign('sku')->references('sku')->on('products')->onDelete('cascade');
         });
     }
 

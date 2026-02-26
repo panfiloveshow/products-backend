@@ -1,6 +1,7 @@
 <?php
 
 use App\Http\Controllers\Api\AuthController;
+use App\Http\Controllers\Api\IntegrationController;
 use App\Http\Controllers\Api\AutoSupplyPlanController;
 use App\Http\Controllers\Api\CostPriceController;
 use App\Http\Controllers\Api\ProductController;
@@ -8,8 +9,20 @@ use App\Http\Controllers\Api\InventoryController;
 use App\Http\Controllers\Api\ShipmentController;
 use App\Http\Controllers\Api\UnitEconomicsController;
 use App\Http\Controllers\Api\UnitEconomicsCacheController;
+use App\Http\Controllers\Api\SellerStockController;
+use App\Http\Controllers\Api\WbBarcodeCostController;
+use App\Http\Controllers\Api\WbWebhookController;
 use App\Http\Controllers\Api\SupplierController;
 use Illuminate\Support\Facades\Route;
+
+/*
+|--------------------------------------------------------------------------
+| Integrations Module
+|--------------------------------------------------------------------------
+*/
+Route::prefix('integrations')->group(function () {
+    Route::get('/{id}/premium-status', [IntegrationController::class, 'getPremiumStatus']);
+});
 
 /*
 |--------------------------------------------------------------------------
@@ -168,3 +181,39 @@ Route::prefix('suppliers')->group(function () {
     Route::put('/{id}', [SupplierController::class, 'update']);
     Route::delete('/{id}', [SupplierController::class, 'destroy']);
 });
+
+/*
+|--------------------------------------------------------------------------
+| Seller Warehouse Stocks Module
+|--------------------------------------------------------------------------
+*/
+Route::prefix('seller-stocks')->group(function () {
+    Route::get('/summary', [SellerStockController::class, 'summary']);
+    Route::get('/catalog', [SellerStockController::class, 'catalog']);
+    Route::get('/', [SellerStockController::class, 'index']);
+    Route::post('/bulk', [SellerStockController::class, 'bulkUpsert']);
+    Route::post('/', [SellerStockController::class, 'upsert']);
+    Route::delete('/{id}', [SellerStockController::class, 'destroy']);
+});
+
+/*
+|--------------------------------------------------------------------------
+| WB Barcode Costs Module
+|--------------------------------------------------------------------------
+*/
+Route::prefix('wb-barcode-costs')->group(function () {
+    Route::get('/', [WbBarcodeCostController::class, 'index']);
+    Route::post('/bulk', [WbBarcodeCostController::class, 'bulkUpsert']);
+    Route::delete('/', [WbBarcodeCostController::class, 'destroy']);
+});
+
+/*
+|--------------------------------------------------------------------------
+| WB Webhooks Module
+|--------------------------------------------------------------------------
+*/
+Route::get('/wb-webhook/status', [WbWebhookController::class, 'status'])->name('wb-webhook.status');
+Route::post('/wb-webhook/register', [WbWebhookController::class, 'register'])->name('wb-webhook.register');
+Route::post('/wb-webhook/deactivate', [WbWebhookController::class, 'deactivate'])->name('wb-webhook.deactivate');
+// Публичный роут для приёма событий от WB (без авторизации)
+Route::post('/wb-webhook/receive/{integrationId}', [WbWebhookController::class, 'receive'])->name('wb-webhook.receive');
