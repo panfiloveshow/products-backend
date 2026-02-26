@@ -86,13 +86,13 @@ class SyncInventoryJob implements ShouldQueue
                 }
             }
 
-            // Для WB: если warehouse_id = "0" или пустой — используем транслитерацию warehouse_name как уникальный ID
+            // Для WB: если warehouse_id = "0" или пустой — используем хэш названия склада как уникальный ID
             if ($this->syncLog->marketplace === 'wildberries') {
                 foreach ($flatInventory as &$stockData) {
                     $wid  = (string) ($stockData['warehouse_id'] ?? '');
                     $name = (string) ($stockData['warehouse_name'] ?? '');
                     if (($wid === '0' || $wid === '') && $name !== '') {
-                        $stockData['warehouse_id'] = 'wb_' . preg_replace('/[^a-z0-9]+/', '_', mb_strtolower($name));
+                        $stockData['warehouse_id'] = 'wb_' . substr(md5($name), 0, 8);
                     }
                 }
                 unset($stockData);
