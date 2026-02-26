@@ -206,9 +206,9 @@ class SyncInventoryJob implements ShouldQueue
             $supplierArticle = $stockData['supplier_article'] ?? $sku;
             $warehouseId     = (string)($stockData['warehouse_id'] ?? '');
 
-            // Все склады этого SKU
-            $allWarehouses = $wbSalesByWarehouse[$sku]
-                          ?? $wbSalesByWarehouse[$supplierArticle]
+            // Все склады этого SKU (приводим к строке для корректного поиска)
+            $allWarehouses = $wbSalesByWarehouse[(string)$sku]
+                          ?? $wbSalesByWarehouse[(string)$supplierArticle]
                           ?? null;
 
             if ($allWarehouses) {
