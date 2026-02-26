@@ -19,6 +19,7 @@ class WildberriesService implements MarketplaceInterface
     private string $suppliesApiUrl = 'https://supplies-api.wildberries.ru';
     private string $statisticsApiUrl = 'https://statistics-api.wildberries.ru';
     private string $analyticsApiUrl = 'https://seller-analytics-api.wildberries.ru';
+    private string $pricesApiUrl = 'https://discounts-prices-api.wildberries.ru';
 
     public function __construct(?string $apiKey = null)
     {
@@ -33,9 +34,9 @@ class WildberriesService implements MarketplaceInterface
     public function getProducts(): array
     {
         try {
-            $products = [];
+            $allCards = [];
             $cursor = ['limit' => 100];
-            
+
             do {
                 $response = Http::withHeaders([
                     'Authorization' => $this->apiKey,
@@ -60,7 +61,7 @@ class WildberriesService implements MarketplaceInterface
                 $data = $response->json();
                 
                 foreach ($data['cards'] ?? [] as $card) {
-                    $products[] = $this->transformProduct($card);
+                    $allCards[] = $card;
                 }
 
                 // Обновляем cursor для следующей страницы
@@ -75,7 +76,16 @@ class WildberriesService implements MarketplaceInterface
                     $cursor = null;
                 }
                 
-            } while ($cursor && count($products) < 10000);
+            } while ($cursor && count($allCards) < 10000);
+
+            // Загружаем цены из Prices API для всех карточек
+            $prices = $this->loadAllPrices();
+            Log::info('WB getProducts: prices loaded', ['count' => count($prices)]);
+
+            $products = [];
+            foreach ($allCards as $card) {
+                $products[] = $this->transformProduct($card, $prices);
+            }
 
             Log::info('Wildberries products fetched', ['count' => count($products)]);
             return $products;
@@ -87,18 +97,86 @@ class WildberriesService implements MarketplaceInterface
     }
 
     /**
+     * Загрузить все цены аккаунта из Prices API (с пагинацией)
+     */
+    private function loadAllPrices(): array
+    {
+        $prices = [];
+        $offset = 0;
+        $limit  = 1000;
+
+        do {
+            $response = Http::withHeaders(['Authorization' => $this->apiKey])
+                ->get("{$this->pricesApiUrl}/api/v2/list/goods/filter", [
+                    'limit'  => $limit,
+                    'offset' => $offset,
+                ]);
+
+            if (!$response->successful()) {
+                Log::warning('WB Prices API error', ['status' => $response->status()]);
+                break;
+            }
+
+            $items = $response->json()['data']['listGoods'] ?? [];
+
+            foreach ($items as $item) {
+                $nmId       = $item['nmID'] ?? null;
+                $vendorCode = $item['vendorCode'] ?? null;
+                if (!$nmId) continue;
+
+                $firstSize       = $item['sizes'][0] ?? [];
+                $discountedPrice = (float) ($firstSize['discountedPrice'] ?? 0);
+                $basePrice       = (float) ($firstSize['price'] ?? 0);
+
+                $priceData = [
+                    'final_price'      => $discountedPrice > 0 ? $discountedPrice : $basePrice,
+                    'base_price'       => $basePrice,
+                    'discounted_price' => $discountedPrice,
+                    'discount'         => (int) ($item['discount'] ?? 0),
+                ];
+
+                $prices[(string) $nmId] = $priceData;
+                if ($vendorCode) {
+                    $prices[$vendorCode] = $priceData;
+                }
+            }
+
+            $offset += $limit;
+        } while (count($items) === $limit);
+
+        return $prices;
+    }
+
+    /**
      * Трансформация карточки WB в формат Product
      */
-    private function transformProduct(array $card): array
+    private function transformProduct(array $card, array $prices = []): array
     {
         // Получаем первый размер для SKU и баркода
         $firstSize = $card['sizes'][0] ?? [];
-        $sku = $firstSize['skus'][0] ?? $card['vendorCode'] ?? (string)$card['nmID'];
+        $sku     = $firstSize['skus'][0] ?? $card['vendorCode'] ?? (string)$card['nmID'];
         $barcode = $firstSize['skus'][0] ?? null;
-        
-        // Получаем цену из первого размера
-        $price = isset($firstSize['price']) ? $firstSize['price'] / 100 : null;
-        $discountedPrice = isset($firstSize['discountedPrice']) ? $firstSize['discountedPrice'] / 100 : $price;
+        $nmId    = (string) ($card['nmID'] ?? '');
+        $vendorCode = $card['vendorCode'] ?? null;
+
+        // Цена из Prices API (приоритет) или из sizes карточки (устарело)
+        $priceData       = $prices[$vendorCode] ?? $prices[$nmId] ?? null;
+        $finalPrice      = null;
+        $oldPrice        = null;
+        if ($priceData) {
+            $fp = (float) ($priceData['final_price'] ?? 0);
+            $bp = (float) ($priceData['base_price'] ?? 0);
+            $finalPrice = $fp > 0 ? $fp : null;
+            $oldPrice   = ($bp > 0 && $bp > $fp) ? $bp : null;
+        } elseif (!empty($firstSize['discountedPrice']) || !empty($firstSize['price'])) {
+            $fp = (float) ($firstSize['discountedPrice'] ?? 0);
+            $bp = (float) ($firstSize['price'] ?? 0);
+            // sizes из Cards API хранят в копейках
+            if ($fp > 100 || $bp > 100) { $fp /= 100; $bp /= 100; }
+            $finalPrice = $fp > 0 ? $fp : ($bp > 0 ? $bp : null);
+            $oldPrice   = ($bp > 0 && $fp > 0 && $bp > $fp) ? $bp : null;
+        }
+        $discountedPrice = $finalPrice;
         
         // Собираем фото
         $photos = [];
@@ -113,7 +191,7 @@ class WildberriesService implements MarketplaceInterface
             'name' => $card['title'] ?? $card['subjectName'] ?? 'Без названия',
             'barcode' => $barcode,
             'price' => $discountedPrice,
-            'old_price' => $price !== $discountedPrice ? $price : null,
+            'old_price' => $oldPrice,
             'stock' => 0, // Остатки получаем отдельно через getInventory
             'description' => $card['description'] ?? null,
             'images' => $photos,
