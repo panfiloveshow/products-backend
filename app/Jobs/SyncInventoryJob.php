@@ -258,10 +258,14 @@ class SyncInventoryJob implements ShouldQueue
             return 'created';
         }
 
-        // Проверяем есть ли изменения (quantity, warehouse_name, integration_id)
+        // Проверяем есть ли изменения
         $hasChanges = $existing->quantity !== (int)$stockData['quantity']
             || $existing->warehouse_name !== $stockData['warehouse_name']
-            || (string)$existing->integration_id !== (string)$integrationId;
+            || (string)$existing->integration_id !== (string)$integrationId
+            || ($sales7  !== null && (int)$existing->sales_7_days  !== $sales7)
+            || ($sales14 !== null && (int)$existing->sales_14_days !== $sales14)
+            || ($sales30 !== null && (int)$existing->sales_30_days !== $sales30)
+            || ($avgDailySales !== null && (float)$existing->average_daily_sales !== (float)$avgDailySales);
 
         if ($hasChanges) {
             $existing->update($newData);
