@@ -210,6 +210,17 @@ class SyncInventoryJob implements ShouldQueue
                       ?? $wbSalesByWarehouse[$supplierArticle][$warehouseId]
                       ?? null;
 
+            static $debugCount = 0;
+            if ($salesData === null && $debugCount < 3 && isset($wbSalesByWarehouse[$sku])) {
+                $debugCount++;
+                Log::debug('WB sales lookup miss', [
+                    'sku'        => $sku,
+                    'supplier'   => $supplierArticle,
+                    'warehouseId'=> $warehouseId,
+                    'salesWids'  => array_keys($wbSalesByWarehouse[$sku] ?? []),
+                ]);
+            }
+
             if ($salesData !== null) {
                 // Новый формат: массив с avg_daily_sales, sales_7_days, sales_14_days, sales_30_days
                 if (is_array($salesData)) {
