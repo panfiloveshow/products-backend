@@ -197,26 +197,41 @@ class SyncInventoryJob implements ShouldQueue
 
         // Для WB: используем реальные продажи из Statistics API
         $avgDailySales = $stockData['average_daily_sales'] ?? null;
+        $sales7        = null;
+        $sales14       = null;
+        $sales30       = null;
+
         if (!empty($wbSalesByWarehouse)) {
             $sku         = $stockData['sku'];
             $warehouseId = (string)($stockData['warehouse_id'] ?? '');
-            if (isset($wbSalesByWarehouse[$sku][$warehouseId])) {
-                $avgDailySales = $wbSalesByWarehouse[$sku][$warehouseId];
+            $salesData   = $wbSalesByWarehouse[$sku][$warehouseId] ?? null;
+
+            if ($salesData !== null) {
+                // Новый формат: массив с avg_daily_sales, sales_7_days, sales_14_days, sales_30_days
+                if (is_array($salesData)) {
+                    $avgDailySales = $salesData['avg_daily_sales'] ?? $avgDailySales;
+                    $sales7        = $salesData['sales_7_days']    ?? null;
+                    $sales14       = $salesData['sales_14_days']   ?? null;
+                    $sales30       = $salesData['sales_30_days']   ?? null;
+                } else {
+                    // Обратная совместимость: число
+                    $avgDailySales = $salesData;
+                }
             }
         }
 
-        $qty          = (int) ($stockData['quantity'] ?? 0);
-        $daysOfStock  = ($avgDailySales !== null && $avgDailySales > 0)
+        $qty         = (int) ($stockData['quantity'] ?? 0);
+        $daysOfStock = ($avgDailySales !== null && $avgDailySales > 0)
             ? (int) round($qty / $avgDailySales)
             : null;
 
         $newData = [
-            'warehouse_name'      => $stockData['warehouse_name'],
-            'marketplace'         => $stockData['marketplace'],
-            'quantity'            => $qty,
-            'fulfillment_type'    => $stockData['fulfillment_type'] ?? null,
-            'last_updated'        => now(),
-            'integration_id'      => $integrationId,
+            'warehouse_name'   => $stockData['warehouse_name'],
+            'marketplace'      => $stockData['marketplace'],
+            'quantity'         => $qty,
+            'fulfillment_type' => $stockData['fulfillment_type'] ?? null,
+            'last_updated'     => now(),
+            'integration_id'   => $integrationId,
         ];
 
         if ($avgDailySales !== null) {
@@ -224,6 +239,10 @@ class SyncInventoryJob implements ShouldQueue
             $newData['days_of_stock']       = $daysOfStock;
             $newData['turnover_days']        = $daysOfStock;
         }
+
+        if ($sales7 !== null)  $newData['sales_7_days']  = $sales7;
+        if ($sales14 !== null) $newData['sales_14_days'] = $sales14;
+        if ($sales30 !== null) $newData['sales_30_days'] = $sales30;
 
         if (!$existing) {
             // Создаём новую запись

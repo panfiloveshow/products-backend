@@ -231,106 +231,116 @@ class ProductsApi implements ProductsApiInterface
         $prices = [];
         $offset = 0;
         $limit = 1000;
-        $maxIterations = 100;
+        $maxIterations = 200;
         $iteration = 0;
-        
-        // Если нужны конкретные nmIds, создаём set для фильтрации
-        $nmIdsSet = !empty($filterNmIds) ? array_flip($filterNmIds) : null;
-        
+
+        // Если нужны конкретные nmIds — строим set со string-ключами
+        $nmIdsSet = null;
+        if (!empty($filterNmIds)) {
+            $nmIdsSet = [];
+            foreach ($filterNmIds as $id) {
+                $nmIdsSet[(string) $id] = true;
+            }
+        }
+
         \Illuminate\Support\Facades\Log::info('WB ProductsApi: Requesting prices from Prices API', [
             'endpoint' => '/api/v2/list/goods/filter',
             'filterNmIds' => count($filterNmIds),
         ]);
-        
+
         do {
             $response = $this->client->pricesGet('/api/v2/list/goods/filter', [
-                'limit' => $limit,
+                'limit'  => $limit,
                 'offset' => $offset,
             ]);
-            
+
             if (!$response) {
                 \Illuminate\Support\Facades\Log::warning('WB ProductsApi: Prices API returned null', [
                     'offset' => $offset,
                 ]);
                 break;
             }
-            
+
             if (!isset($response['data']['listGoods'])) {
                 \Illuminate\Support\Facades\Log::warning('WB ProductsApi: Prices API response missing listGoods', [
                     'response_keys' => array_keys($response),
-                    'error' => $response['error'] ?? null,
-                    'errorText' => $response['errorText'] ?? null,
+                    'error'         => $response['error'] ?? null,
+                    'errorText'     => $response['errorText'] ?? null,
                 ]);
                 break;
             }
-            
+
             $items = $response['data']['listGoods'];
-            
+
             if ($iteration === 0) {
                 \Illuminate\Support\Facades\Log::info('WB ProductsApi: Prices API first response', [
-                    'count' => count($items),
+                    'count'  => count($items),
                     'sample' => array_slice($items, 0, 2),
                 ]);
             }
-            
+
             foreach ($items as $item) {
-                $nmId = $item['nmID'] ?? null;
+                $nmId       = $item['nmID'] ?? null;
                 $vendorCode = $item['vendorCode'] ?? null;
-                
+
                 if (!$nmId) continue;
-                
-                // Фильтруем если нужны конкретные nmIds
-                if ($nmIdsSet !== null && !isset($nmIdsSet[$nmId])) {
+
+                // Фильтруем если нужны конкретные nmIds (string-сравнение)
+                if ($nmIdsSet !== null && !isset($nmIdsSet[(string) $nmId])) {
                     continue;
                 }
-                
-                // Берём первый размер для базовой цены (или агрегируем)
-                $sizes = $item['sizes'] ?? [];
-                $firstSize = $sizes[0] ?? [];
-                
-                $basePrice = (float) ($firstSize['price'] ?? 0);
+
+                // Берём первый размер для базовой цены
+                $sizes       = $item['sizes'] ?? [];
+                $firstSize   = $sizes[0] ?? [];
+
+                $basePrice       = (float) ($firstSize['price'] ?? 0);
                 $discountedPrice = (float) ($firstSize['discountedPrice'] ?? 0);
-                $clubPrice = (float) ($firstSize['clubDiscountedPrice'] ?? 0);
-                
+                $clubPrice       = (float) ($firstSize['clubDiscountedPrice'] ?? 0);
+
                 $priceData = [
-                    'nmID' => $nmId,
-                    'vendorCode' => $vendorCode,
-                    'price' => $basePrice,
-                    'discount' => (int) ($item['discount'] ?? 0),
-                    'discounted_price' => $discountedPrice,
-                    'club_price' => $clubPrice,
-                    'club_discount' => (int) ($item['clubDiscount'] ?? 0),
-                    'final_price' => $discountedPrice > 0 ? $discountedPrice : $basePrice,
-                    'currency' => $item['currencyIsoCode4217'] ?? 'RUB',
-                    'is_bad_turnover' => $item['isBadTurnover'] ?? false,
-                    'editable_size_price' => $item['editableSizePrice'] ?? false,
-                    'sizes' => array_map(fn($s) => [
-                        'sizeID' => $s['sizeID'] ?? null,
-                        'price' => (float) ($s['price'] ?? 0),
-                        'discountedPrice' => (float) ($s['discountedPrice'] ?? 0),
+                    'nmID'               => $nmId,
+                    'vendorCode'         => $vendorCode,
+                    'price'              => $basePrice,
+                    'discount'           => (int) ($item['discount'] ?? 0),
+                    'discounted_price'   => $discountedPrice,
+                    'club_price'         => $clubPrice,
+                    'club_discount'      => (int) ($item['clubDiscount'] ?? 0),
+                    'final_price'        => $discountedPrice > 0 ? $discountedPrice : $basePrice,
+                    'currency'           => $item['currencyIsoCode4217'] ?? 'RUB',
+                    'is_bad_turnover'    => $item['isBadTurnover'] ?? false,
+                    'editable_size_price'=> $item['editableSizePrice'] ?? false,
+                    'sizes'              => array_map(fn($s) => [
+                        'sizeID'              => $s['sizeID'] ?? null,
+                        'price'               => (float) ($s['price'] ?? 0),
+                        'discountedPrice'     => (float) ($s['discountedPrice'] ?? 0),
                         'clubDiscountedPrice' => (float) ($s['clubDiscountedPrice'] ?? 0),
-                        'techSizeName' => $s['techSizeName'] ?? '',
+                        'techSizeName'        => $s['techSizeName'] ?? '',
                     ], $sizes),
                 ];
-                
-                // Индексируем по nmID и vendorCode для удобства поиска
+
+                // Индексируем по string(nmID) и vendorCode
                 $prices[(string) $nmId] = $priceData;
                 if ($vendorCode) {
                     $prices[$vendorCode] = $priceData;
                 }
             }
-            
+
             $offset += $limit;
             $iteration++;
-            
+
             // Если фильтруем и нашли все нужные - выходим раньше
+            // Считаем по string-ключам чтобы не было ложных совпадений
             if ($nmIdsSet !== null) {
-                $foundCount = count(array_intersect_key($prices, $nmIdsSet));
-                if ($foundCount >= count($nmIdsSet)) {
+                $found = 0;
+                foreach ($nmIdsSet as $id => $_) {
+                    if (isset($prices[$id])) $found++;
+                }
+                if ($found >= count($nmIdsSet)) {
                     break;
                 }
             }
-            
+
         } while (count($items) === $limit && $iteration < $maxIterations);
         
         \Illuminate\Support\Facades\Log::info('WB ProductsApi: Prices loaded', [

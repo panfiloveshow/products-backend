@@ -221,13 +221,14 @@ class WildberriesService implements MarketplaceInterface
     public function getSalesByWarehouse(int $days = 30): array
     {
         try {
-            $dateFrom = now()->subDays($days)->format('Y-m-d');
+            // Один запрос за 30 дней, из него считаем 7/14/30 по полю date
+            $dateFrom = now()->subDays(30)->format('Y-m-d');
 
             $response = Http::withHeaders([
                 'Authorization' => $this->apiKey,
-            ])->get("{$this->statisticsApiUrl}/api/v1/supplier/sales", [
+            ])->timeout(60)->get("{$this->statisticsApiUrl}/api/v1/supplier/sales", [
                 'dateFrom' => $dateFrom,
-                'flag' => 0,
+                'flag'     => 1,
             ]);
 
             if (!$response->successful()) {
@@ -240,31 +241,55 @@ class WildberriesService implements MarketplaceInterface
 
             $sales = $response->json() ?? [];
 
-            // Агрегируем количество продаж по [barcode][warehouse_key]
+            $now     = now();
+            $date7   = $now->copy()->subDays(7);
+            $date14  = $now->copy()->subDays(14);
+            $date30  = $now->copy()->subDays(30);
+
+            // Агрегируем по [barcode][warehouse_key][period]
             // barcode совпадает с products.sku и inventory_warehouses.sku
             // warehouseName → wb_+md5 совпадает с warehouse_id в inventory_warehouses
             $counts = [];
             foreach ($sales as $sale) {
-                $barcode     = $sale['barcode'] ?? null;
+                $barcode       = $sale['barcode'] ?? null;
                 $warehouseName = $sale['warehouseName'] ?? '';
                 $warehouseKey  = $warehouseName !== '' ? 'wb_' . substr(md5($warehouseName), 0, 8) : '0';
-                if (!$barcode || ($sale['isReturn'] ?? false)) continue;
+                $isReturn      = $sale['isReturn'] ?? false;
+                $saleDate      = $sale['date'] ?? null;
 
-                $counts[$barcode][$warehouseKey] = ($counts[$barcode][$warehouseKey] ?? 0) + 1;
+                if (!$barcode || $isReturn || !$saleDate) continue;
+
+                try {
+                    $dt = \Carbon\Carbon::parse($saleDate);
+                } catch (\Exception $e) {
+                    continue;
+                }
+
+                if (!isset($counts[$barcode][$warehouseKey])) {
+                    $counts[$barcode][$warehouseKey] = ['d7' => 0, 'd14' => 0, 'd30' => 0];
+                }
+
+                if ($dt->gte($date30)) $counts[$barcode][$warehouseKey]['d30']++;
+                if ($dt->gte($date14)) $counts[$barcode][$warehouseKey]['d14']++;
+                if ($dt->gte($date7))  $counts[$barcode][$warehouseKey]['d7']++;
             }
 
-            // Делим на количество дней — получаем average_daily_sales
+            // Формируем результат: [barcode][warehouse_key] = [avg_daily, sales_7, sales_14, sales_30]
             $result = [];
-            foreach ($counts as $sku => $warehouses) {
-                foreach ($warehouses as $warehouseId => $totalSold) {
-                    $result[$sku][$warehouseId] = round($totalSold / $days, 4);
+            foreach ($counts as $barcode => $warehouses) {
+                foreach ($warehouses as $warehouseKey => $periods) {
+                    $result[$barcode][$warehouseKey] = [
+                        'avg_daily_sales' => round($periods['d30'] / 30, 4),
+                        'sales_7_days'    => $periods['d7'],
+                        'sales_14_days'   => $periods['d14'],
+                        'sales_30_days'   => $periods['d30'],
+                    ];
                 }
             }
 
             Log::info('WB sales by warehouse fetched', [
-                'days'   => $days,
-                'skus'   => count($result),
-                'raw'    => count($sales),
+                'skus' => count($result),
+                'raw'  => count($sales),
             ]);
 
             return $result;
