@@ -74,16 +74,28 @@ class SyncInventoryJob implements ShouldQueue
                 if (!empty($item['warehouses']) && is_array($item['warehouses'])) {
                     foreach ($item['warehouses'] as $wh) {
                         $flatInventory[] = array_merge($wh, [
-                            'sku'        => $sku,
+                            'sku'         => $sku,
                             'marketplace' => $this->syncLog->marketplace,
                         ]);
                     }
-                } elseif (isset($item['warehouse_id']) && $item['warehouse_id'] !== null && $item['warehouse_id'] !== '') {
+                } elseif (isset($item['warehouse_id']) || isset($item['warehouse_name'])) {
                     // уже плоский формат
                     $flatInventory[] = array_merge($item, [
                         'marketplace' => $this->syncLog->marketplace,
                     ]);
                 }
+            }
+
+            // Для WB: если warehouse_id = "0" или пустой — используем транслитерацию warehouse_name как уникальный ID
+            if ($this->syncLog->marketplace === 'wildberries') {
+                foreach ($flatInventory as &$stockData) {
+                    $wid  = (string) ($stockData['warehouse_id'] ?? '');
+                    $name = (string) ($stockData['warehouse_name'] ?? '');
+                    if (($wid === '0' || $wid === '') && $name !== '') {
+                        $stockData['warehouse_id'] = 'wb_' . preg_replace('/[^a-z0-9]+/', '_', mb_strtolower($name));
+                    }
+                }
+                unset($stockData);
             }
 
             foreach ($flatInventory as $stockData) {
