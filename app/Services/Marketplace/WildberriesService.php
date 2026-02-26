@@ -245,7 +245,7 @@ class WildberriesService implements MarketplaceInterface
             foreach ($sales as $sale) {
                 $sku = $sale['supplierArticle'] ?? null;
                 $warehouseId = (string)($sale['warehouseId'] ?? 0);
-                if (!$sku || $sale['isReturn'] ?? false) continue;
+                if (!$sku || ($sale['isReturn'] ?? false)) continue;
 
                 $counts[$sku][$warehouseId] = ($counts[$sku][$warehouseId] ?? 0) + 1;
             }
