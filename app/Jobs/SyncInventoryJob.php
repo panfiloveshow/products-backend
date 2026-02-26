@@ -68,6 +68,11 @@ class SyncInventoryJob implements ShouldQueue
             DB::beginTransaction();
 
             foreach ($inventory as $stockData) {
+                // Пропускаем записи без SKU или warehouse_id
+                if (empty($stockData['sku']) || empty($stockData['warehouse_id'])) {
+                    continue;
+                }
+
                 try {
                     $result = $this->syncInventoryItem($stockData, $wbSalesByWarehouse);
                     $synced++;
@@ -79,6 +84,12 @@ class SyncInventoryJob implements ShouldQueue
                     }
                 } catch (\Exception $e) {
                     $failed++;
+                    // Сбрасываем транзакцию если она прервана, начинаем новую
+                    try {
+                        DB::rollBack();
+                    } catch (\Throwable $rollbackEx) {
+                    }
+                    DB::beginTransaction();
                     Log::error("Failed to sync inventory", [
                         'marketplace' => $this->syncLog->marketplace,
                         'sku' => $stockData['sku'] ?? 'unknown',
