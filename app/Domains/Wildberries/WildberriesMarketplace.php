@@ -288,6 +288,7 @@ class WildberriesMarketplace implements MarketplaceInterface
             'marketplace_id' => (string) $card['nmID'],
             // В проекте sku используется как штрихкод (EAN) для WB, чтобы совпадало с текущими данными/кэшем
             'sku' => $barcode ?? (string) $card['nmID'],
+            'vendor_code' => $card['vendorCode'] ?? null,
             'name' => $card['title'] ?? $card['subjectName'] ?? '',
             'description' => $description,
             'brand' => $card['brand'] ?? '',

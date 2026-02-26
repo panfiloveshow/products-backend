@@ -503,6 +503,7 @@ class OzonMarketplace implements MarketplaceInterface
         return [
             'marketplace_id' => (string) $productId,
             'sku' => $offerId,
+            'vendor_code' => $offerId,
             'name' => $name,
             'description' => $description,
             'brand' => $brand,
