@@ -278,6 +278,17 @@ class SyncInventoryJob implements ShouldQueue
         if ($sales14 !== null) $newData['sales_14_days'] = $sales14;
         if ($sales30 !== null) $newData['sales_30_days'] = $sales30;
 
+        static $debugNewData = 0;
+        if ($debugNewData < 2 && ($stockData['sku'] ?? '') === '8904071300019') {
+            $debugNewData++;
+            Log::debug('WB newData for 8904071300019', [
+                'sales7'  => $sales7,
+                'sales30' => $sales30,
+                'newData_sales30' => $newData['sales_30_days'] ?? 'NOT SET',
+                'hasChanges_preview' => ($sales30 !== null && (int)($existing->sales_30_days ?? 0) !== (int)$sales30),
+            ]);
+        }
+
         if (!$existing) {
             // Создаём новую запись
             $warehouse = InventoryWarehouse::create(array_merge([
