@@ -78,8 +78,12 @@ class ProductService
             'credentials' => $credentials,
         ]);
 
-        // Запускаем Job в очереди
-        SyncProductsJob::dispatch($syncLog);
+        // Запускаем Job в очереди в зависимости от типа синхронизации
+        if ($syncType === 'inventory') {
+            \App\Jobs\SyncInventoryJob::dispatch($syncLog);
+        } else {
+            SyncProductsJob::dispatch($syncLog);
+        }
 
         return $syncLog;
     }
