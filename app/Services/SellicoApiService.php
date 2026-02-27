@@ -351,6 +351,53 @@ class SellicoApiService
     }
 
     /**
+     * Получить интеграцию по ID
+     */
+    public function getIntegrationById(int $integrationId): array
+    {
+        $token = $this->getAccessToken();
+        
+        if (!$token) {
+            return [
+                'success' => false,
+                'error' => 'Не авторизован в Sellico API',
+            ];
+        }
+
+        try {
+            $response = Http::withToken($token)
+                ->get("{$this->baseUrl}/integrations/{$integrationId}");
+
+            if ($response->successful()) {
+                $data = $response->json('data') ?? $response->json();
+                
+                return [
+                    'success' => true,
+                    'integration' => $data,
+                    'credentials' => $data['credentials'] ?? [
+                        'api_key' => $data['api_key'] ?? null,
+                        'client_id' => $data['client_id'] ?? null,
+                        'token' => $data['token'] ?? null,
+                        'campaign_id' => $data['campaign_id'] ?? null,
+                        'business_id' => $data['business_id'] ?? null,
+                    ],
+                ];
+            }
+
+            return [
+                'success' => false,
+                'error' => $response->json('message', 'Ошибка получения интеграции'),
+            ];
+        } catch (\Exception $e) {
+            Log::error('Sellico get integration by id error: ' . $e->getMessage());
+            return [
+                'success' => false,
+                'error' => $e->getMessage(),
+            ];
+        }
+    }
+
+    /**
      * Получить список товаров (SKU) интеграции из Sellico
      */
     public function getIntegrationProducts(int $integrationId): array
