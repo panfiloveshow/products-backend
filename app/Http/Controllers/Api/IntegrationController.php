@@ -178,6 +178,7 @@ class IntegrationController extends Controller
         
         $integrationData = $result['integration'];
         $credentials = $result['credentials'];
+        $credentials['_sellico_token'] = $token; // Прокидываем токен для фоновых задач
         $marketplace = strtolower($integrationData['type'] ?? '');
         
         // Нормализуем тип маркетплейса
