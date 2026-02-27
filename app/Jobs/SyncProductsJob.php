@@ -47,28 +47,50 @@ class SyncProductsJob implements ShouldQueue
             // Фильтруем товары по integration_id через Sellico API
             $integrationId = $this->syncLog->integration_id;
             if ($integrationId) {
-                $token = request()->bearerToken();
-                if ($token) {
-                    $sellicoApi = app(\App\Services\SellicoApiService::class);
-                    $sellicoApi->setAccessToken($token);
-                    
-                    $result = $sellicoApi->getIntegrationProducts($integrationId);
-                    if ($result['success'] && !empty($result['skus'])) {
-                        $allowedSkus = $result['skus'];
-                        $originalCount = count($products);
-                        
-                        $products = array_filter($products, function ($product) use ($allowedSkus) {
-                            return in_array($product['sku'] ?? '', $allowedSkus);
-                        });
-                        
-                        Log::info("Filtered products by integration SKUs", [
-                            'integration_id' => $integrationId,
-                            'original_count' => $originalCount,
-                            'filtered_count' => count($products),
-                            'allowed_skus_count' => count($allowedSkus),
-                        ]);
-                    }
+                $sellicoApi = app(\App\Services\SellicoApiService::class);
+
+                // В очереди request() недоступен, поэтому токен передаём через credentials
+                $sellicoToken = $credentials['_sellico_token'] ?? null;
+                if (!empty($sellicoToken)) {
+                    $sellicoApi->setAccessToken($sellicoToken);
                 }
+
+                $result = $sellicoApi->getIntegrationProducts($integrationId);
+                if (!$result['success']) {
+                    // Fallback: используем уже привязанные к интеграции SKU из локальной БД.
+                    // Это безопаснее, чем синхронизировать весь аккаунт при проблеме с Sellico API.
+                    $allowedSkus = Product::where('integration_id', $integrationId)
+                        ->where('marketplace', $this->syncLog->marketplace)
+                        ->pluck('sku')
+                        ->map(fn($sku) => (string) $sku)
+                        ->toArray();
+
+                    Log::warning('Sellico integration products unavailable, fallback to local SKUs', [
+                        'integration_id' => $integrationId,
+                        'marketplace' => $this->syncLog->marketplace,
+                        'error' => $result['error'] ?? 'unknown',
+                        'local_skus_count' => count($allowedSkus),
+                    ]);
+                } else {
+                    $allowedSkus = array_map('strval', $result['skus'] ?? []);
+                }
+
+                $allowedSkus = array_values(array_unique(array_filter($allowedSkus)));
+                if (empty($allowedSkus)) {
+                    throw new \RuntimeException('Пустой список SKU интеграции ' . $integrationId . '. Синхронизация остановлена, чтобы не обновить все товары аккаунта.');
+                }
+                $originalCount = count($products);
+
+                $products = array_filter($products, function ($product) use ($allowedSkus) {
+                    return in_array((string) ($product['sku'] ?? ''), $allowedSkus, true);
+                });
+
+                Log::info("Filtered products by integration SKUs", [
+                    'integration_id' => $integrationId,
+                    'original_count' => $originalCount,
+                    'filtered_count' => count($products),
+                    'allowed_skus_count' => count($allowedSkus),
+                ]);
             }
 
             $synced = 0;
