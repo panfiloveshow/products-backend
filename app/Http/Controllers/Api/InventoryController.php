@@ -261,13 +261,14 @@ class InventoryController extends Controller
             ->selectRaw('AVG(real_turnover_days) as real_turnover_days')
             ->selectRaw('AVG(real_days_of_stock) as real_days_of_stock')
             ->selectRaw('AVG(real_sales_period_days) as real_sales_period_days')
+            ->selectRaw('SUM(storage_fee_total) as storage_fee_total')
+            ->selectRaw('SUM(storage_fee_last_week) as storage_fee_last_week')
+            ->selectRaw('MIN(storage_fee_report_from) as storage_fee_report_from')
+            ->selectRaw('MAX(storage_fee_report_to) as storage_fee_report_to')
+            ->selectRaw('SUM(storage_fee_prev_month) as storage_fee_prev_month')
+            ->selectRaw('MAX(storage_fee_prev_month_period) as storage_fee_prev_month_period')
             ->when($integrationId, fn($q) => $q->where('integration_id', $integrationId))
             ->groupBy('sku');
-
-        // Фильтр по статусу остатка
-        if ($stockStatus) {
-            $skuQuery->having(\DB::raw('MAX(stock_status)'), $stockStatus);
-        }
 
         // Получаем полный список для поиска и сортировки с джойном на products
         $allSkus = $skuQuery->get()->keyBy('sku');
@@ -300,6 +301,27 @@ class InventoryController extends Controller
         $sortedSkus = $sortOrder === 'asc'
             ? $allSkus->sortBy($sortCallback)
             : $allSkus->sortByDesc($sortCallback);
+
+        // Фильтр по статусу — применяем на уровне PHP с корректным расчётом
+        if ($stockStatus) {
+            $sortedSkus = $sortedSkus->filter(function ($row) use ($stockStatus) {
+                $qty = (int) ($row->total_stock ?? 0);
+                $avg = (float) ($row->avg_daily_sales ?? 0);
+                $dos = $avg > 0 ? round($qty / $avg) : null;
+                if ($qty <= 0) {
+                    $s = 'out_of_stock';
+                } elseif ($dos !== null && $dos <= 7) {
+                    $s = 'critical';
+                } elseif ($dos !== null && $dos <= 14) {
+                    $s = 'low';
+                } elseif ($dos !== null && $dos > 60) {
+                    $s = 'excess';
+                } else {
+                    $s = 'optimal';
+                }
+                return $s === $stockStatus;
+            });
+        }
 
         $total      = $sortedSkus->count();
         $pagedSkus  = $sortedSkus->slice(($page - 1) * $perPage, $perPage)->keys()->toArray();
@@ -366,7 +388,7 @@ class InventoryController extends Controller
             $trendPct = $s1 > 0 ? round(($s2 - $s1) / $s1 * 100) : 0;
             $trend = $trendPct > 10 ? 'growing' : ($trendPct < -10 ? 'declining' : 'stable');
 
-            $costPrice   = (float) ($agg->cost_price ?? $prod?->cost_price ?? 0);
+            $costPrice   = (float) ($prod?->cost_price ?? 0);
             $price       = (float) ($prod?->price ?? 0);
             $stockValue  = $totalStock * ($price ?: $costPrice);
 
@@ -395,7 +417,7 @@ class InventoryController extends Controller
                 'sku'                  => $sku,
                 'name'                 => $prod?->name,
                 'barcode'              => $prod?->barcode,
-                'image_url'            => $prod?->images[0] ?? null,
+                'image_url'            => ($prod && is_array($prod->images) && !empty($prod->images)) ? $prod->images[0] : null,
                 'price'                => $price,
                 'cost_price'           => $costPrice,
                 'marketplace'          => $prod?->marketplace ?? ($rows->first()?->marketplace ?? ''),
@@ -416,6 +438,12 @@ class InventoryController extends Controller
                 'stock_status'         => $computedStatus,
                 'storage_cost_daily'   => round((float) ($agg->storage_cost_daily   ?? 0), 2),
                 'storage_cost_monthly' => round((float) ($agg->storage_cost_monthly ?? 0), 2),
+                'storage_fee_total'    => $agg->storage_fee_total    ? round((float) $agg->storage_fee_total, 2)    : null,
+                'storage_fee_last_week'=> $agg->storage_fee_last_week ? round((float) $agg->storage_fee_last_week, 2) : null,
+                'storage_fee_report_from'  => $agg->storage_fee_report_from  ? (string) $agg->storage_fee_report_from  : null,
+                'storage_fee_report_to'    => $agg->storage_fee_report_to    ? (string) $agg->storage_fee_report_to    : null,
+                'storage_fee_prev_month'   => $agg->storage_fee_prev_month   ? round((float) $agg->storage_fee_prev_month, 2)   : null,
+                'storage_fee_prev_month_period' => $agg->storage_fee_prev_month_period ? (string) $agg->storage_fee_prev_month_period : null,
                 'real_avg_daily_sales' => $agg->real_avg_daily_sales ? round($agg->real_avg_daily_sales, 2) : null,
                 'real_turnover_days'   => $agg->real_turnover_days   ? round($agg->real_turnover_days, 1)  : null,
                 'real_days_of_stock'   => $agg->real_days_of_stock   ? round($agg->real_days_of_stock)     : null,
@@ -430,15 +458,56 @@ class InventoryController extends Controller
         $summaryQuery = \App\Models\InventoryWarehouse::query()
             ->when($integrationId, fn($q) => $q->where('integration_id', $integrationId));
 
+        // Подсчёт статусов через правильный computedStatus (не MAX(stock_status))
+        $outOfStockCount = 0;
+        $criticalCount   = 0;
+        $lowCount        = 0;
+        foreach ($allSkus as $row) {
+            $qty = (int) ($row->total_stock ?? 0);
+            $avg = (float) ($row->avg_daily_sales ?? 0);
+            $dos = $avg > 0 ? round($qty / $avg) : null;
+            if ($qty <= 0) {
+                $outOfStockCount++;
+            } elseif ($dos !== null && $dos <= 7) {
+                $criticalCount++;
+            } elseif ($dos !== null && $dos <= 14) {
+                $lowCount++;
+            }
+        }
+
+        // Суммы хранения по всем SKU для карточек
+        $storageFeeTotal     = $allSkus->sum(fn($r) => (float) ($r->storage_fee_total ?? 0));
+        $storageFeePrevMonth = $allSkus->sum(fn($r) => (float) ($r->storage_fee_prev_month ?? 0));
+        $storageFeeFromVals  = $allSkus->filter(fn($r) => !empty($r->storage_fee_report_from))->pluck('storage_fee_report_from');
+        $storageFeeToVals    = $allSkus->filter(fn($r) => !empty($r->storage_fee_report_to))->pluck('storage_fee_report_to');
+        $storageFeeFrom      = $storageFeeFromVals->min();
+        $storageFeeTo        = $storageFeeToVals->max();
+        $storagePrevPeriod   = $allSkus->filter(fn($r) => !empty($r->storage_fee_prev_month_period))->first()?->storage_fee_prev_month_period;
+
+        // total_stock_value из уже построенных items
+        $totalStockValue = array_sum(array_column($items, 'stock_value'));
+
         $summary = [
             'total_products'    => $total,
             'total_warehouses'  => (clone $summaryQuery)->distinct('warehouse_id')->count('warehouse_id'),
             'total_stock'       => (int) (clone $summaryQuery)->sum('quantity'),
-            'total_stock_value' => 0,
-            'avg_turnover_days' => round((float) (clone $summaryQuery)->avg('turnover_days') ?? 0, 1),
-            'out_of_stock_count'=> $allSkus->where('total_stock', '<=', 0)->count(),
-            'critical_count'    => $allSkus->filter(fn($r) => in_array($r->stock_status, ['critical']))->count(),
-            'low_count'         => $allSkus->filter(fn($r) => $r->stock_status === 'low')->count(),
+            'total_stock_value' => round($totalStockValue, 2),
+            'avg_turnover_days' => round((float) ((clone $summaryQuery)->avg('turnover_days') ?? 0), 1),
+            'out_of_stock_count'=> $outOfStockCount,
+            'critical_count'    => $criticalCount,
+            'low_count'         => $lowCount,
+            'storage_totals'    => [
+                'current_month' => [
+                    'total' => round($storageFeeTotal, 2),
+                    'from'  => $storageFeeFrom ? (string) $storageFeeFrom : null,
+                    'to'    => $storageFeeTo   ? (string) $storageFeeTo   : null,
+                ],
+                'prev_month' => [
+                    'total' => round($storageFeePrevMonth, 2),
+                    'from'  => $storagePrevPeriod ? substr($storagePrevPeriod, 0, 7) . '-01' : null,
+                    'to'    => $storagePrevPeriod ?? null,
+                ],
+            ],
         ];
 
         return response()->json([

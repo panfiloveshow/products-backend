@@ -13,6 +13,7 @@ use App\Http\Controllers\Api\SellerStockController;
 use App\Http\Controllers\Api\WbBarcodeCostController;
 use App\Http\Controllers\Api\WbWebhookController;
 use App\Http\Controllers\Api\SupplierController;
+use App\Http\Controllers\Api\OzonOrderReportController;
 use Illuminate\Support\Facades\Route;
 
 /*
@@ -21,6 +22,7 @@ use Illuminate\Support\Facades\Route;
 |--------------------------------------------------------------------------
 */
 Route::prefix('integrations')->group(function () {
+    Route::get('/', [IntegrationController::class, 'index']);
     Route::get('/{id}/premium-status', [IntegrationController::class, 'getPremiumStatus']);
 });
 
@@ -205,6 +207,19 @@ Route::prefix('wb-barcode-costs')->group(function () {
     Route::get('/', [WbBarcodeCostController::class, 'index']);
     Route::post('/bulk', [WbBarcodeCostController::class, 'bulkUpsert']);
     Route::delete('/', [WbBarcodeCostController::class, 'destroy']);
+});
+
+/*
+|--------------------------------------------------------------------------
+| Ozon Order Reports Module
+|--------------------------------------------------------------------------
+*/
+Route::prefix('ozon-reports')->group(function () {
+    Route::get('/', [OzonOrderReportController::class, 'index']);
+    Route::post('/upload', [OzonOrderReportController::class, 'upload']);
+    Route::get('/summary', [OzonOrderReportController::class, 'reportSummary']);
+    Route::get('/warehouse-sales', [OzonOrderReportController::class, 'warehouseSales']);
+    Route::delete('/{id}', [OzonOrderReportController::class, 'destroy']);
 });
 
 /*
