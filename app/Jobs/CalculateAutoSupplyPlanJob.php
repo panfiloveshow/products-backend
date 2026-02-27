@@ -101,8 +101,13 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
             ->keyBy('sku');
 
         // Загружаем UnitEconomics для финансовых метрик
-        $unitEconomics = UnitEconomics::where('integration_id', $integrationId)
+        $unitEconomics = UnitEconomics::where(function ($q) use ($integrationId) {
+                $q->where('integration_id', $integrationId)
+                  ->orWhereNull('integration_id');
+            })
+            ->where('marketplace', $marketplace)
             ->whereIn('sku', $skus)
+            ->orderByDesc('integration_id')
             ->get()
             ->keyBy('sku');
 
@@ -476,7 +481,7 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
             if ($marketplace === 'wildberries' && $barcode && isset($wbBarcodeCostMap[$barcode])) {
                 $costPrice = $wbBarcodeCostMap[$barcode];
             } else {
-                $costPrice = $ue?->cost_price ?? $wh->cost_price ?? 0;
+                $costPrice = $ue?->cost_price ?? 0;
             }
             $storageCostDaily = $wh->storage_cost_per_day ?? 0;
             $storageCostMonthly = $wh->storage_cost_per_month ?? 0;

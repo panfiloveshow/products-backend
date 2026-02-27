@@ -179,6 +179,7 @@ class UnitEconomicsService
                 'period_end' => $data['period_end'] ?? now()->endOfMonth()->toDateString(),
             ],
             [
+                'integration_id' => $data['integration_id'] ?? null,
                 'product_name' => $data['product_name'] ?? null,
                 'price' => $data['price'],
                 'cost_price' => $data['cost_price'],
@@ -314,5 +315,52 @@ class UnitEconomicsService
                 default => [],
             };
         });
+    }
+
+    public function bulkSave(array $items): array
+    {
+        $synced = 0;
+        $errors = 0;
+
+        foreach ($items as $item) {
+            try {
+                $this->createOrUpdate($item);
+                $synced++;
+            } catch (\Exception $e) {
+                $errors++;
+            }
+        }
+
+        return ['synced' => $synced, 'errors' => $errors];
+    }
+
+    public function getProductComparison(?int $integrationId = null): array
+    {
+        $query = UnitEconomics::query();
+        if ($integrationId) {
+            $query->where('integration_id', $integrationId);
+        }
+
+        return $query->select('sku', 'marketplace', 'price', 'cost_price', 'margin_percent', 'roi_percent', 'net_profit')
+            ->orderByDesc('roi_percent')
+            ->limit(100)
+            ->get()
+            ->toArray();
+    }
+
+    public function syncFromRealData(
+        \App\Models\Integration $integration,
+        ?string $periodStart = null,
+        ?string $periodEnd = null,
+        ?array $localizationIndex = null
+    ): array {
+        $exitCode = \Illuminate\Support\Facades\Artisan::call('unit-economics:sync', [
+            '--integration' => $integration->id,
+        ]);
+
+        return [
+            'synced' => $exitCode === 0 ? 1 : 0,
+            'errors' => $exitCode !== 0 ? 1 : 0,
+        ];
     }
 }
