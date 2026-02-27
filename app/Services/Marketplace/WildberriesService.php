@@ -128,23 +128,34 @@ class WildberriesService implements MarketplaceInterface
                     'total_collected' => count($allCards) + $cardsCount,
                 ]);
 
+                if ($cardsCount === 0) {
+                    break; // Достигли конца списка
+                }
+
                 foreach ($data['cards'] ?? [] as $card) {
                     $allCards[] = $card;
                 }
 
                 // Обновляем cursor для следующей страницы
                 $cursorData = $data['cursor'] ?? null;
-                if ($cursorData && isset($cursorData['nmID'])) {
+                
+                // Если WB вернул nmID, проверяем что он не сбросился в 0 (что бывает в конце списка)
+                if ($cursorData && isset($cursorData['nmID']) && $cardsCount > 0) {
                     $cursor = [
                         'limit' => 100,
                         'updatedAt' => $cursorData['updatedAt'] ?? null,
                         'nmID' => $cursorData['nmID'],
                     ];
+                    
+                    // Защита от зацикливания: если WB возвращает курсор на начало
+                    if ($cursor['nmID'] === 0 && ($cursorData['updatedAt'] ?? null) === null) {
+                        $cursor = null;
+                    }
                 } else {
                     $cursor = null;
                 }
                 
-            } while ($cursor && count($allCards) < 10000);
+            } while ($cursor && count($allCards) < 50000);
 
             // Загружаем цены из Prices API для всех карточек
             $prices = $this->loadAllPrices();
