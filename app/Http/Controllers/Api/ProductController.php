@@ -191,9 +191,16 @@ class ProductController extends Controller
                     if ($result['success'] && !empty($result['credentials'])) {
                         $credentials = $result['credentials'];
                     } else {
-                        return response()->json(['error' => 'Integration not found locally or in Sellico API'], 404);
+                        \Log::error('ProductController::sync - Sellico API integration fetch failed', [
+                            'integration_id' => $integrationId,
+                            'result' => $result
+                        ]);
+                        return response()->json(['error' => 'Integration not found locally or in Sellico API', 'details' => $result], 404);
                     }
                 } else {
+                    \Log::error('ProductController::sync - No local integration and no token provided', [
+                        'integration_id' => $integrationId
+                    ]);
                     return response()->json(['error' => 'Integration not found locally and no token provided'], 404);
                 }
             }
