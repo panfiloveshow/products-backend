@@ -69,11 +69,25 @@ class ProductController extends Controller
 
         $products = $query->paginate($limit, ['*'], 'page', $page);
 
+        // Подгружаем остатки из inventory_warehouses
+        $productSkus = $products->pluck('sku')->toArray();
+        $inventoryStocks = \DB::table('inventory_warehouses')
+            ->whereIn('sku', $productSkus)
+            ->select('sku', \DB::raw('SUM(quantity) as total_stock'))
+            ->groupBy('sku')
+            ->pluck('total_stock', 'sku');
+
+        // Обновляем stock в товарах
+        $productsWithStock = $products->map(function ($product) use ($inventoryStocks) {
+            $product->stock = $inventoryStocks[$product->sku] ?? 0;
+            return $product;
+        });
+
         $stats = $this->productService->getProductsStats($validated);
 
         return response()->json([
             'data' => [
-                'products' => $products->items(),
+                'products' => $productsWithStock,
                 'total' => $products->total(),
                 'page' => $products->currentPage(),
                 'limit' => $products->perPage(),
