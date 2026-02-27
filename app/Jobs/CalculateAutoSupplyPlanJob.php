@@ -160,15 +160,38 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
         }
 
         // Загружаем UnitEconomics для финансовых метрик
-        $unitEconomics = UnitEconomics::where(function ($q) use ($integrationId) {
+        // Для WB-баркодов размеров строим маппинг barcode → product.sku через $products
+        $skusForUe = $skus;
+        $barcodeToProductSku = []; // barcode_wh -> sku_in_products (для маппинга UE)
+        foreach ($products as $invSku => $prod) {
+            if ($prod->sku !== $invSku) {
+                // invSku это баркод WB, prod->sku — настоящий SKU товара
+                $barcodeToProductSku[$invSku] = $prod->sku;
+                if (!in_array($prod->sku, $skusForUe)) {
+                    $skusForUe[] = $prod->sku;
+                }
+            }
+        }
+
+        $unitEconomicsRaw = UnitEconomics::where(function ($q) use ($integrationId) {
                 $q->where('integration_id', $integrationId)
                   ->orWhereNull('integration_id');
             })
             ->where('marketplace', $marketplace)
-            ->whereIn('sku', $skus)
+            ->whereIn('sku', $skusForUe)
             ->orderByDesc('integration_id')
             ->get()
             ->keyBy('sku');
+
+        // Строим итоговую карту: invSku → UE (через маппинг для WB-баркодов)
+        $unitEconomics = collect();
+        foreach ($skus as $invSku) {
+            if ($unitEconomicsRaw->has($invSku)) {
+                $unitEconomics->put($invSku, $unitEconomicsRaw->get($invSku));
+            } elseif (isset($barcodeToProductSku[$invSku]) && $unitEconomicsRaw->has($barcodeToProductSku[$invSku])) {
+                $unitEconomics->put($invSku, $unitEconomicsRaw->get($barcodeToProductSku[$invSku]));
+            }
+        }
 
         // Load warehouse-to-cluster mapping for geo-distribution
         $clusterMapping = ($marketplace === 'ozon') ? OzonWarehouseCluster::getAllMapping() : [];
