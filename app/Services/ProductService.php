@@ -63,11 +63,17 @@ class ProductService
         ?int $integrationId = null,
         string $syncType = 'products'
     ): SyncLog {
-        // Проверяем нет ли уже запущенной синхронизации для этого маркетплейса
-        $existingSync = SyncLog::where('marketplace', $marketplace)
+        // Проверяем нет ли уже запущенной синхронизации для этого маркетплейса + интеграции
+        $query = SyncLog::where('marketplace', $marketplace)
             ->where('sync_type', $syncType)
-            ->running()
-            ->first();
+            ->running();
+        
+        // Если указан integration_id, проверяем только для этой интеграции
+        if ($integrationId) {
+            $query->where('integration_id', $integrationId);
+        }
+        
+        $existingSync = $query->first();
 
         if ($existingSync) {
             return $existingSync;

@@ -94,6 +94,26 @@ class SyncProductsJob implements ShouldQueue
                 'updated' => $updated,
                 'failed' => $failed,
             ]);
+
+            // Автоматически запускаем синхронизацию остатков после товаров
+            $credentials = $this->syncLog->credentials ?? [];
+            if (!empty($credentials)) {
+                $inventorySyncLog = \App\Models\SyncLog::create([
+                    'marketplace' => $this->syncLog->marketplace,
+                    'integration_id' => $this->syncLog->integration_id,
+                    'sync_type' => 'inventory',
+                    'status' => \App\Models\SyncLog::STATUS_PENDING,
+                    'credentials' => $credentials,
+                ]);
+
+                \App\Jobs\SyncInventoryJob::dispatch($inventorySyncLog)
+                    ->delay(now()->addSeconds(5));
+
+                Log::info("Inventory sync dispatched after products sync", [
+                    'marketplace' => $this->syncLog->marketplace,
+                    'inventory_sync_id' => $inventorySyncLog->id,
+                ]);
+            }
         } catch (\Exception $e) {
             $this->syncLog->fail($e->getMessage());
 
@@ -116,13 +136,21 @@ class SyncProductsJob implements ShouldQueue
     private function syncProduct(array $productData): string
     {
         $marketplace = $this->syncLog->marketplace;
-        
-        // Ищем существующий товар по sku (баркоду) — уникален для каждого размера WB карточки
-        $existingProduct = Product::where('marketplace', $marketplace)
-            ->where('sku', $productData['sku'])
-            ->first();
-
         $integrationId = $this->syncLog->integration_id ?? null;
+        
+        // Ищем существующий товар по sku + integration_id (если указан)
+        // Это предотвращает перезапись товаров из разных аккаунтов одного маркетплейса
+        $query = Product::where('marketplace', $marketplace)
+            ->where('sku', $productData['sku']);
+        
+        if ($integrationId) {
+            $query->where(function ($q) use ($integrationId) {
+                $q->where('integration_id', $integrationId)
+                  ->orWhereNull('integration_id');
+            });
+        }
+        
+        $existingProduct = $query->first();
 
         if (!$existingProduct) {
             // Создаём новый товар
