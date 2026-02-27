@@ -116,9 +116,9 @@ class SyncProductsJob implements ShouldQueue
     {
         $marketplace = $this->syncLog->marketplace;
         
-        // Ищем существующий товар по marketplace + marketplace_id
+        // Ищем существующий товар по sku (баркоду) — уникален для каждого размера WB карточки
         $existingProduct = Product::where('marketplace', $marketplace)
-            ->where('marketplace_id', $productData['marketplace_id'])
+            ->where('sku', $productData['sku'])
             ->first();
 
         if (!$existingProduct) {

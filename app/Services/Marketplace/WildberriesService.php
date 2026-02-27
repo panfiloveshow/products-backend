@@ -84,7 +84,9 @@ class WildberriesService implements MarketplaceInterface
 
             $products = [];
             foreach ($allCards as $card) {
-                $products[] = $this->transformProduct($card, $prices);
+                foreach ($this->transformProduct($card, $prices) as $productData) {
+                    $products[] = $productData;
+                }
             }
 
             Log::info('Wildberries products fetched', ['count' => count($products)]);
@@ -148,36 +150,26 @@ class WildberriesService implements MarketplaceInterface
     }
 
     /**
-     * Трансформация карточки WB в формат Product
+     * Трансформация карточки WB в набор Product-записей (по одной на каждый баркод/размер).
+     * WB Statistics API возвращает остатки по баркодам, поэтому нужна запись на каждый баркод.
+     * Возвращает массив массивов (может быть несколько вариантов одной карточки).
      */
     private function transformProduct(array $card, array $prices = []): array
     {
-        // Получаем первый размер для SKU и баркода
-        $firstSize = $card['sizes'][0] ?? [];
-        $sku     = $firstSize['skus'][0] ?? $card['vendorCode'] ?? (string)$card['nmID'];
-        $barcode = $firstSize['skus'][0] ?? null;
-        $nmId    = (string) ($card['nmID'] ?? '');
+        $nmId       = (string) ($card['nmID'] ?? '');
         $vendorCode = $card['vendorCode'] ?? null;
 
-        // Цена из Prices API (приоритет) или из sizes карточки (устарело)
-        $priceData       = $prices[$vendorCode] ?? $prices[$nmId] ?? null;
-        $finalPrice      = null;
-        $oldPrice        = null;
+        // Цена из Prices API (приоритет)
+        $priceData = $prices[$vendorCode] ?? $prices[$nmId] ?? null;
+        $finalPrice = null;
+        $oldPrice   = null;
         if ($priceData) {
             $fp = (float) ($priceData['final_price'] ?? 0);
             $bp = (float) ($priceData['base_price'] ?? 0);
             $finalPrice = $fp > 0 ? $fp : null;
             $oldPrice   = ($bp > 0 && $bp > $fp) ? $bp : null;
-        } elseif (!empty($firstSize['discountedPrice']) || !empty($firstSize['price'])) {
-            $fp = (float) ($firstSize['discountedPrice'] ?? 0);
-            $bp = (float) ($firstSize['price'] ?? 0);
-            // sizes из Cards API хранят в копейках
-            if ($fp > 100 || $bp > 100) { $fp /= 100; $bp /= 100; }
-            $finalPrice = $fp > 0 ? $fp : ($bp > 0 ? $bp : null);
-            $oldPrice   = ($bp > 0 && $fp > 0 && $bp > $fp) ? $bp : null;
         }
-        $discountedPrice = $finalPrice;
-        
+
         // Собираем фото
         $photos = [];
         foreach ($card['photos'] ?? [] as $photo) {
@@ -186,34 +178,87 @@ class WildberriesService implements MarketplaceInterface
             }
         }
 
-        return [
-            'sku' => $sku,
-            'vendor_code' => $vendorCode,
-            'name' => $card['title'] ?? $card['subjectName'] ?? 'Без названия',
-            'barcode' => $barcode,
-            'price' => $discountedPrice,
-            'old_price' => $oldPrice,
-            'stock' => 0, // Остатки получаем отдельно через getInventory
-            'description' => $card['description'] ?? null,
-            'images' => $photos,
-            'category' => $card['subjectName'] ?? null,
-            'brand' => $card['brand'] ?? null,
-            'rating' => $card['rating'] ?? null,
-            'reviews_count' => $card['feedbackCount'] ?? 0,
-            'marketplace' => 'wildberries',
-            'marketplace_id' => (string)$card['nmID'],
-            'url' => "https://www.wildberries.ru/catalog/{$card['nmID']}/detail.aspx",
-            'wb_data' => [
-                'nmID' => $card['nmID'],
-                'imtID' => $card['imtID'] ?? null,
-                'vendorCode' => $card['vendorCode'] ?? null,
-                'subjectID' => $card['subjectID'] ?? null,
-                'sizes' => $card['sizes'] ?? [],
-                'characteristics' => $card['characteristics'] ?? [],
-                'createdAt' => $card['createdAt'] ?? null,
-                'updatedAt' => $card['updatedAt'] ?? null,
-            ],
-        ];
+        $baseName  = $card['title'] ?? $card['subjectName'] ?? 'Без названия';
+        $sizes     = $card['sizes'] ?? [];
+
+        // Собираем все баркоды из всех размеров
+        $allBarcodes = [];
+        foreach ($sizes as $size) {
+            foreach ($size['skus'] ?? [] as $barcode) {
+                if ($barcode) {
+                    $allBarcodes[] = [
+                        'barcode'   => $barcode,
+                        'size_name' => trim(($size['wbSize'] ?? '') ?: ($size['techSize'] ?? '')),
+                        'chrtID'    => $size['chrtID'] ?? null,
+                    ];
+                }
+            }
+        }
+
+        // Если размеров нет — создаём одну запись с vendorCode как SKU
+        if (empty($allBarcodes)) {
+            $allBarcodes = [[
+                'barcode'   => $vendorCode ?? $nmId,
+                'size_name' => '',
+                'chrtID'    => null,
+            ]];
+        }
+
+        $results = [];
+        foreach ($allBarcodes as $sizeInfo) {
+            $barcode  = $sizeInfo['barcode'];
+            $sizeName = $sizeInfo['size_name'];
+            $name     = $sizeName ? "{$baseName} ({$sizeName})" : $baseName;
+
+            // Если цены из Prices API нет — пробуем из sizes карточки
+            $itemFinalPrice = $finalPrice;
+            $itemOldPrice   = $oldPrice;
+            if ($itemFinalPrice === null) {
+                foreach ($sizes as $size) {
+                    if (in_array($barcode, $size['skus'] ?? [])) {
+                        $fp = (float) ($size['discountedPrice'] ?? 0);
+                        $bp = (float) ($size['price'] ?? 0);
+                        if ($fp > 100 || $bp > 100) { $fp /= 100; $bp /= 100; }
+                        $itemFinalPrice = $fp > 0 ? $fp : ($bp > 0 ? $bp : null);
+                        $itemOldPrice   = ($bp > 0 && $fp > 0 && $bp > $fp) ? $bp : null;
+                        break;
+                    }
+                }
+            }
+
+            $results[] = [
+                'sku'            => $barcode,
+                'vendor_code'    => $vendorCode,
+                'name'           => $name,
+                'barcode'        => $barcode,
+                'price'          => $itemFinalPrice,
+                'old_price'      => $itemOldPrice,
+                'stock'          => 0,
+                'description'    => $card['description'] ?? null,
+                'images'         => $photos,
+                'category'       => $card['subjectName'] ?? null,
+                'brand'          => $card['brand'] ?? null,
+                'rating'         => $card['rating'] ?? null,
+                'reviews_count'  => $card['feedbackCount'] ?? 0,
+                'marketplace'    => 'wildberries',
+                'marketplace_id' => $nmId,
+                'url'            => "https://www.wildberries.ru/catalog/{$nmId}/detail.aspx",
+                'wb_data'        => [
+                    'nmID'            => $card['nmID'],
+                    'imtID'           => $card['imtID'] ?? null,
+                    'vendorCode'      => $vendorCode,
+                    'subjectID'       => $card['subjectID'] ?? null,
+                    'chrtID'          => $sizeInfo['chrtID'],
+                    'size'            => $sizeName,
+                    'sizes'           => $sizes,
+                    'characteristics' => $card['characteristics'] ?? [],
+                    'createdAt'       => $card['createdAt'] ?? null,
+                    'updatedAt'       => $card['updatedAt'] ?? null,
+                ],
+            ];
+        }
+
+        return $results;
     }
 
     /**
