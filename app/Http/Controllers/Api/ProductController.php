@@ -137,31 +137,40 @@ class ProductController extends Controller
      */
     public function sync(Request $request, string $marketplace): JsonResponse
     {
-        // Валидация credentials в зависимости от маркетплейса
-        $rules = match ($marketplace) {
-            'wildberries' => ['api_key' => 'required|string'],
-            'ozon' => ['client_id' => 'required|string', 'api_key' => 'required|string'],
-            'yandex' => ['token' => 'required|string', 'campaign_id' => 'required|string'],
-            default => [],
-        };
-
-        $request->validate($rules);
-
-        // Собираем credentials из запроса
-        $credentials = match ($marketplace) {
-            'wildberries' => ['api_key' => $request->input('api_key')],
-            'ozon' => [
-                'client_id' => $request->input('client_id'),
-                'api_key' => $request->input('api_key'),
-            ],
-            'yandex' => [
-                'token' => $request->input('token'),
-                'campaign_id' => $request->input('campaign_id'),
-            ],
-            default => [],
-        };
-
         $integrationId = $request->input('integration_id');
+        
+        // Если передан integration_id, берём credentials из интеграции
+        if ($integrationId) {
+            $integration = \App\Models\Integration::find($integrationId);
+            if (!$integration) {
+                return response()->json(['error' => 'Integration not found'], 404);
+            }
+            $credentials = $integration->credentials ?? [];
+        } else {
+            // Валидация credentials в зависимости от маркетплейса
+            $rules = match ($marketplace) {
+                'wildberries' => ['api_key' => 'required|string'],
+                'ozon' => ['client_id' => 'required|string', 'api_key' => 'required|string'],
+                'yandex' => ['token' => 'required|string', 'campaign_id' => 'required|string'],
+                default => [],
+            };
+
+            $request->validate($rules);
+
+            // Собираем credentials из запроса
+            $credentials = match ($marketplace) {
+                'wildberries' => ['api_key' => $request->input('api_key')],
+                'ozon' => [
+                    'client_id' => $request->input('client_id'),
+                    'api_key' => $request->input('api_key'),
+                ],
+                'yandex' => [
+                    'token' => $request->input('token'),
+                    'campaign_id' => $request->input('campaign_id'),
+                ],
+                default => [],
+            };
+        }
 
         $syncLog = $this->productService->startSync(
             $marketplace, 
