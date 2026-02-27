@@ -31,6 +31,10 @@ class ProductController extends Controller
             $query->marketplace($validated['marketplace']);
         }
 
+        if (!empty($validated['integration_id'])) {
+            $query->where('integration_id', $validated['integration_id']);
+        }
+
         if (!empty($validated['category'])) {
             $query->where('category', $validated['category']);
         }

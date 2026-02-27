@@ -17,6 +17,10 @@ class ProductService
             $query->marketplace($filters['marketplace']);
         }
 
+        if (!empty($filters['integration_id'])) {
+            $query->where('integration_id', $filters['integration_id']);
+        }
+
         $total = $query->count();
         $inStock = (clone $query)->inStock()->count();
         $outOfStock = (clone $query)->outOfStock()->count();

@@ -16,6 +16,7 @@ class IndexProductRequest extends FormRequest
         return [
             'search' => 'nullable|string|max:255',
             'marketplace' => 'nullable|in:wildberries,ozon,yandex',
+            'integration_id' => 'nullable|integer',
             'category' => 'nullable|string|max:200',
             'brand' => 'nullable|string|max:200',
             'price_from' => 'nullable|numeric|min:0',
