@@ -46,12 +46,17 @@ class UpdateProductsIntegrationId extends Command
                     continue;
                 }
 
-                // Обновляем integration_id
-                DB::table('products')
+                // Обновляем integration_id — игнорируем конфликт уникального индекса
+                $affected = DB::table('products')
                     ->where('id', $product->id)
-                    ->update(['integration_id' => $integration->id]);
-                
-                $updated++;
+                    ->whereNull('integration_id')
+                    ->updateOrIgnore(['integration_id' => $integration->id]);
+
+                if ($affected) {
+                    $updated++;
+                } else {
+                    $skipped++;
+                }
             }
 
             $this->info("Обработано товаров для {$marketplace}: обновлено {$updated}, пропущено {$skipped}");

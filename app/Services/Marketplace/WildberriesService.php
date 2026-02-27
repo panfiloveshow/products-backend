@@ -21,9 +21,70 @@ class WildberriesService implements MarketplaceInterface
     private string $analyticsApiUrl = 'https://seller-analytics-api.wildberries.ru';
     private string $pricesApiUrl = 'https://discounts-prices-api.wildberries.ru';
 
+    // Задержка между запросами (мс) — глобальный лимит WB: 6 рек/мин на эндпоинт
+    private int $requestDelayMs = 500;
+    // Максимум попыток при 429
+    private int $maxRetries = 5;
+
     public function __construct(?string $apiKey = null)
     {
         $this->apiKey = $apiKey ?? config('services.wildberries.api_key', '');
+    }
+
+    /**
+     * Выполняет GET-запрос к WB API с автоматическим retry при 429.
+     * При 429 ждёт Retry-After (или 60с) и повторяет попытку.
+     */
+    private function wbGet(string $url, array $params = [], int $timeout = 60): \Illuminate\Http\Client\Response
+    {
+        usleep($this->requestDelayMs * 1000);
+        $attempt = 0;
+        do {
+            $response = Http::withHeaders(['Authorization' => $this->apiKey])
+                ->timeout($timeout)
+                ->get($url, $params);
+            if ($response->status() !== 429) {
+                return $response;
+            }
+            $retryAfter = (int) ($response->header('Retry-After') ?: 60);
+            $retryAfter = max(1, min($retryAfter, 120));
+            Log::warning('WB API 429 — ожидание перед повтором', [
+                'url'         => $url,
+                'retry_after' => $retryAfter,
+                'attempt'     => $attempt + 1,
+            ]);
+            sleep($retryAfter);
+            $attempt++;
+        } while ($attempt < $this->maxRetries);
+        return $response;
+    }
+
+    /**
+     * Выполняет POST-запрос к WB API с автоматическим retry при 429.
+     */
+    private function wbPost(string $url, array $data = [], int $timeout = 60): \Illuminate\Http\Client\Response
+    {
+        usleep($this->requestDelayMs * 1000);
+        $attempt = 0;
+        do {
+            $response = Http::withHeaders([
+                'Authorization' => $this->apiKey,
+                'Content-Type'  => 'application/json',
+            ])->timeout($timeout)->post($url, $data);
+            if ($response->status() !== 429) {
+                return $response;
+            }
+            $retryAfter = (int) ($response->header('Retry-After') ?: 60);
+            $retryAfter = max(1, min($retryAfter, 120));
+            Log::warning('WB API 429 — ожидание перед повтором', [
+                'url'         => $url,
+                'retry_after' => $retryAfter,
+                'attempt'     => $attempt + 1,
+            ]);
+            sleep($retryAfter);
+            $attempt++;
+        } while ($attempt < $this->maxRetries);
+        return $response;
     }
 
     /**
@@ -38,10 +99,7 @@ class WildberriesService implements MarketplaceInterface
             $cursor = ['limit' => 100];
 
             do {
-                $response = Http::withHeaders([
-                    'Authorization' => $this->apiKey,
-                    'Content-Type' => 'application/json',
-                ])->post("{$this->contentApiUrl}/content/v2/get/cards/list", [
+                $response = $this->wbPost("{$this->contentApiUrl}/content/v2/get/cards/list", [
                     'settings' => [
                         'cursor' => $cursor,
                         'filter' => [
@@ -108,11 +166,10 @@ class WildberriesService implements MarketplaceInterface
         $limit  = 1000;
 
         do {
-            $response = Http::withHeaders(['Authorization' => $this->apiKey])
-                ->get("{$this->pricesApiUrl}/api/v2/list/goods/filter", [
-                    'limit'  => $limit,
-                    'offset' => $offset,
-                ]);
+            $response = $this->wbGet("{$this->pricesApiUrl}/api/v2/list/goods/filter", [
+                'limit'  => $limit,
+                'offset' => $offset,
+            ]);
 
             if (!$response->successful()) {
                 Log::warning('WB Prices API error', ['status' => $response->status()]);
@@ -273,9 +330,7 @@ class WildberriesService implements MarketplaceInterface
             $inventory = [];
 
             // Получаем остатки через Statistics API
-            $response = Http::withHeaders([
-                'Authorization' => $this->apiKey,
-            ])->get("{$this->statisticsApiUrl}/api/v1/supplier/stocks", [
+            $response = $this->wbGet("{$this->statisticsApiUrl}/api/v1/supplier/stocks", [
                 'dateFrom' => now()->subDays(1)->format('Y-m-d'),
             ]);
 
@@ -313,9 +368,7 @@ class WildberriesService implements MarketplaceInterface
     public function getWarehouses(): array
     {
         try {
-            $response = Http::withHeaders([
-                'Authorization' => $this->apiKey,
-            ])->get("{$this->suppliesApiUrl}/api/v1/warehouses");
+            $response = $this->wbGet("{$this->suppliesApiUrl}/api/v1/warehouses");
 
             if (!$response->successful()) {
                 Log::error('WB getWarehouses error', [
@@ -351,12 +404,10 @@ class WildberriesService implements MarketplaceInterface
             // Один запрос за 30 дней, из него считаем 7/14/30 по полю date
             $dateFrom = now()->subDays(30)->format('Y-m-d');
 
-            $response = Http::withHeaders([
-                'Authorization' => $this->apiKey,
-            ])->timeout(60)->get("{$this->statisticsApiUrl}/api/v1/supplier/sales", [
+            $response = $this->wbGet("{$this->statisticsApiUrl}/api/v1/supplier/sales", [
                 'dateFrom' => $dateFrom,
                 'flag'     => 1,
-            ]);
+            ], 120);
 
             if (!$response->successful()) {
                 Log::warning('WB getSalesByWarehouse error', [
@@ -457,9 +508,7 @@ class WildberriesService implements MarketplaceInterface
                         $params['next'] = $cursor;
                     }
 
-                    $response = Http::withHeaders([
-                        'Authorization' => $this->apiKey,
-                    ])->get("https://marketplace-api.wildberries.ru/api/v3/stocks/{$warehouseId}", $params);
+                    $response = $this->wbGet("https://marketplace-api.wildberries.ru/api/v3/stocks/{$warehouseId}", $params);
 
                     if (!$response->successful()) {
                         Log::warning('WB FBS stocks error', [
@@ -507,9 +556,7 @@ class WildberriesService implements MarketplaceInterface
     public function getSellerWarehouses(): array
     {
         try {
-            $response = Http::withHeaders([
-                'Authorization' => $this->apiKey,
-            ])->get('https://marketplace-api.wildberries.ru/api/v3/warehouses');
+            $response = $this->wbGet('https://marketplace-api.wildberries.ru/api/v3/warehouses');
 
             if (!$response->successful()) {
                 Log::error('WB getSellerWarehouses error', [
@@ -540,9 +587,7 @@ class WildberriesService implements MarketplaceInterface
     public function getSalesStats(string $dateFrom, string $dateTo): array
     {
         try {
-            $response = Http::withHeaders([
-                'Authorization' => $this->apiKey,
-            ])->get("{$this->statisticsApiUrl}/api/v1/supplier/sales", [
+            $response = $this->wbGet("{$this->statisticsApiUrl}/api/v1/supplier/sales", [
                 'dateFrom' => $dateFrom,
             ]);
 
@@ -568,9 +613,7 @@ class WildberriesService implements MarketplaceInterface
     public function getCommissions(): array
     {
         try {
-            $response = Http::withHeaders([
-                'Authorization' => $this->apiKey,
-            ])->get("{$this->analyticsApiUrl}/api/v1/tariffs/commission");
+            $response = $this->wbGet("{$this->analyticsApiUrl}/api/v1/tariffs/commission");
 
             if (!$response->successful()) {
                 return [];
