@@ -365,12 +365,13 @@ class SellicoApiService
         }
 
         try {
+            // 1) Пробуем прямой endpoint (может отсутствовать на некоторых версиях Sellico API)
             $response = Http::withToken($token)
                 ->get("{$this->baseUrl}/integrations/{$integrationId}");
 
             if ($response->successful()) {
                 $data = $response->json('data') ?? $response->json();
-                
+
                 return [
                     'success' => true,
                     'integration' => $data,
@@ -384,9 +385,53 @@ class SellicoApiService
                 ];
             }
 
+            // 2) Fallback: ищем интеграцию во всех workspace пользователя
+            $workspacesResponse = Http::withToken($token)
+                ->get("{$this->baseUrl}/workspaces");
+
+            if ($workspacesResponse->successful()) {
+                $workspacesRaw = $workspacesResponse->json('data') ?? $workspacesResponse->json();
+                $workspaces = is_array($workspacesRaw) ? $workspacesRaw : [];
+
+                foreach ($workspaces as $workspace) {
+                    $workspaceId = $workspace['id'] ?? null;
+                    if (!$workspaceId) {
+                        continue;
+                    }
+
+                    $integrationsResponse = Http::withToken($token)
+                        ->get("{$this->baseUrl}/workspaces/{$workspaceId}/integrations");
+
+                    if (!$integrationsResponse->successful()) {
+                        continue;
+                    }
+
+                    $integrationsRaw = $integrationsResponse->json('data') ?? $integrationsResponse->json();
+                    $integrations = is_array($integrationsRaw) ? $integrationsRaw : [];
+
+                    foreach ($integrations as $integration) {
+                        if ((int)($integration['id'] ?? 0) !== $integrationId) {
+                            continue;
+                        }
+
+                        return [
+                            'success' => true,
+                            'integration' => $integration,
+                            'credentials' => $integration['credentials'] ?? [
+                                'api_key' => $integration['api_key'] ?? null,
+                                'client_id' => $integration['client_id'] ?? null,
+                                'token' => $integration['token'] ?? null,
+                                'campaign_id' => $integration['campaign_id'] ?? null,
+                                'business_id' => $integration['business_id'] ?? null,
+                            ],
+                        ];
+                    }
+                }
+            }
+
             return [
                 'success' => false,
-                'error' => $response->json('message', 'Ошибка получения интеграции'),
+                'error' => $response->json('message', 'Интеграция не найдена в Sellico API'),
             ];
         } catch (\Exception $e) {
             Log::error('Sellico get integration by id error: ' . $e->getMessage());
