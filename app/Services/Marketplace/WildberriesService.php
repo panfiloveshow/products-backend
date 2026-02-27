@@ -524,17 +524,16 @@ class WildberriesService implements MarketplaceInterface
                 $cursor = null;
 
                 do {
-                    $params = ['limit' => 1000];
-                    if ($cursor) {
-                        $params['next'] = $cursor;
-                    }
-
-                    $response = $this->wbGet("https://marketplace-api.wildberries.ru/api/v3/stocks/{$warehouseId}", $params);
+                    // Для получения всех остатков передаем пустой массив skus (согласно документации WB API)
+                    $postData = ['skus' => []];
+                    
+                    $response = $this->wbPost("https://marketplace-api.wildberries.ru/api/v3/stocks/{$warehouseId}", $postData);
 
                     if (!$response->successful()) {
                         Log::warning('WB FBS stocks error', [
                             'warehouseId' => $warehouseId,
                             'status' => $response->status(),
+                            'body' => $response->body()
                         ]);
                         break;
                     }
@@ -556,7 +555,8 @@ class WildberriesService implements MarketplaceInterface
                         ];
                     }
 
-                    $cursor = $data['cursor']['next'] ?? null;
+                    // Этот POST эндпоинт не возвращает cursor
+                    $cursor = null;
 
                 } while ($cursor && count($stocks) > 0);
             }
