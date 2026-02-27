@@ -30,6 +30,7 @@ class Product extends Model
         'reviews_count',
         'marketplace',
         'marketplace_id',
+        'integration_id',
         'url',
         'wb_data',
         'ozon_data',
