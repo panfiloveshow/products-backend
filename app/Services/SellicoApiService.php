@@ -349,4 +349,46 @@ class SellicoApiService
             ];
         }
     }
+
+    /**
+     * Получить список товаров (SKU) интеграции из Sellico
+     */
+    public function getIntegrationProducts(int $integrationId): array
+    {
+        $token = $this->getAccessToken();
+        
+        if (!$token) {
+            return [
+                'success' => false,
+                'error' => 'Не авторизован в Sellico API',
+            ];
+        }
+
+        try {
+            $response = Http::withToken($token)
+                ->get("{$this->baseUrl}/integrations/{$integrationId}/products");
+
+            if ($response->successful()) {
+                $products = $response->json('data', []);
+                $skus = array_column($products, 'sku');
+                
+                return [
+                    'success' => true,
+                    'skus' => array_filter($skus),
+                    'count' => count($skus),
+                ];
+            }
+
+            return [
+                'success' => false,
+                'error' => $response->json('message', 'Ошибка получения товаров интеграции'),
+            ];
+        } catch (\Exception $e) {
+            Log::error('Sellico get integration products error: ' . $e->getMessage());
+            return [
+                'success' => false,
+                'error' => $e->getMessage(),
+            ];
+        }
+    }
 }

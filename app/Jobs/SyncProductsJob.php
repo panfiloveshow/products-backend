@@ -44,6 +44,33 @@ class SyncProductsJob implements ShouldQueue
                 return;
             }
 
+            // Фильтруем товары по integration_id через Sellico API
+            $integrationId = $this->syncLog->integration_id;
+            if ($integrationId) {
+                $token = request()->bearerToken();
+                if ($token) {
+                    $sellicoApi = app(\App\Services\SellicoApiService::class);
+                    $sellicoApi->setAccessToken($token);
+                    
+                    $result = $sellicoApi->getIntegrationProducts($integrationId);
+                    if ($result['success'] && !empty($result['skus'])) {
+                        $allowedSkus = $result['skus'];
+                        $originalCount = count($products);
+                        
+                        $products = array_filter($products, function ($product) use ($allowedSkus) {
+                            return in_array($product['sku'] ?? '', $allowedSkus);
+                        });
+                        
+                        Log::info("Filtered products by integration SKUs", [
+                            'integration_id' => $integrationId,
+                            'original_count' => $originalCount,
+                            'filtered_count' => count($products),
+                            'allowed_skus_count' => count($allowedSkus),
+                        ]);
+                    }
+                }
+            }
+
             $synced = 0;
             $failed = 0;
             $updated = 0;
