@@ -136,12 +136,29 @@ class SyncUnitEconomicsCommand extends Command
         $integration = \App\Models\Integration::find($integrationId);
         $integrationSettings = $integration?->settings ?? [];
 
+        // Загружаем себестоимость из UnitEconomicsSettings (приоритет — ввод пользователя)
+        $skus = $products->pluck('sku');
+        $vendorCodes = $products->pluck('vendor_code')->filter();
+        $costPriceSettings = \App\Models\UnitEconomicsSettings::where('integration_id', $integrationId)
+            ->where(function ($q) use ($skus, $vendorCodes) {
+                $q->whereIn('sku', $skus);
+                if ($vendorCodes->isNotEmpty()) {
+                    $q->orWhereIn('sku', $vendorCodes);
+                }
+            })
+            ->where('cost_price', '>', 0)
+            ->get(['sku', 'cost_price'])
+            ->keyBy('sku');
+
+        // Карта vendor_code -> sku для поиска себестоимости по артикулу продавца
+        $vendorToSku = $products->filter(fn($p) => $p->vendor_code)->pluck('sku', 'vendor_code');
+
         // Агрегируем данные по складам для каждого SKU
         $inventoryRaw = InventoryWarehouse::where('marketplace', $marketplace)
-            ->whereIn('sku', $products->pluck('sku'))
+            ->whereIn('sku', $skus)
             ->get();
         
-        $inventoryData = $inventoryRaw->groupBy('sku')->map(function ($items) {
+        $inventoryData = $inventoryRaw->groupBy('sku')->map(function ($items) use ($costPriceSettings, $vendorToSku) {
             // Определяем фактическую схему работы по остаткам (где больше товара)
             $byFulfillment = $items->groupBy('fulfillment_type');
             $maxStock = 0;
@@ -160,9 +177,21 @@ class SyncUnitEconomicsCommand extends Command
                 $actualFulfillmentType = strtoupper($items->first()->fulfillment_type ?? 'FBO');
             }
             
+            $sku = $items->first()->sku;
+            // Приоритет себестоимости: UnitEconomicsSettings > inventory_warehouses
+            $costFromSettings = $costPriceSettings[$sku]->cost_price ?? null;
+            // Также ищем по vendor_code (артикулу продавца)
+            if (!$costFromSettings) {
+                $vendorCode = array_search($sku, $vendorToSku->toArray());
+                if ($vendorCode) {
+                    $costFromSettings = $costPriceSettings[$vendorCode]->cost_price ?? null;
+                }
+            }
+            $costFromInventory = $items->max('cost_price');
+
             return (object) [
-                'sku' => $items->first()->sku,
-                'cost_price' => $items->max('cost_price'), // Берём максимальную себестоимость
+                'sku' => $sku,
+                'cost_price' => $costFromSettings ?? $costFromInventory, // Берём из настроек или из inventory
                 'sales_30_days' => $items->sum('sales_30_days'), // Суммируем продажи по всем складам
                 'storage_cost_per_month' => $items->sum('storage_cost_per_month'), // Суммируем хранение
                 'fulfillment_type' => $actualFulfillmentType, // Схема с наибольшими остатками
