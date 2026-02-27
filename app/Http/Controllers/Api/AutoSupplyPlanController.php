@@ -117,6 +117,7 @@ class AutoSupplyPlanController extends Controller
 
     /**
      * GET /api/auto-supply-plans/{id}/lines
+     * Агрегирует строки по SKU — одна строка на товар, qty суммируется по всем складам
      */
     public function lines(Request $request, string $id): JsonResponse
     {
@@ -132,11 +133,45 @@ class AutoSupplyPlanController extends Controller
             $query->where('offer_id', $request->input('offer_id'));
         }
 
-        $query->orderByRaw("CASE risk_level WHEN 'high' THEN 0 WHEN 'med' THEN 1 ELSE 2 END")
-            ->orderByDesc('qty_rounded');
+        // Агрегируем по SKU: суммируем qty_rounded, берём MAX для финансовых полей
+        $aggregated = $query
+            ->selectRaw('
+                sku,
+                MAX(offer_id) as offer_id,
+                MAX(product_name) as product_name,
+                MAX(barcode) as barcode,
+                SUM(qty_rounded) as qty_rounded,
+                SUM(qty_recommended) as qty_recommended,
+                SUM(current_stock) as current_stock,
+                SUM(in_transit) as in_transit,
+                MAX(avg_daily_sales) as avg_daily_sales,
+                MAX(ewma_daily_sales) as ewma_daily_sales,
+                MAX(demand_daily) as demand_daily,
+                MAX(cover_days_before) as cover_days_before,
+                MAX(cover_days_after) as cover_days_after,
+                MAX(oos_date) as oos_date,
+                MAX(risk_level) as risk_level,
+                MAX(priority) as priority,
+                MAX(priority_score) as priority_score,
+                MAX(sales_trend) as sales_trend,
+                MAX(sales_trend_percent) as sales_trend_percent,
+                MAX(price) as price,
+                MAX(cost_price) as cost_price,
+                SUM(supply_cost_estimate) as supply_cost_estimate,
+                SUM(expected_revenue) as expected_revenue,
+                SUM(expected_profit) as expected_profit,
+                MAX(roi_percent) as roi_percent,
+                MAX(turnover_days) as turnover_days,
+                SUM(storage_cost_daily) as storage_cost_daily,
+                SUM(storage_cost_monthly) as storage_cost_monthly,
+                SUM(lost_revenue_daily) as lost_revenue_daily
+            ')
+            ->groupBy('sku')
+            ->orderByRaw("CASE MAX(risk_level) WHEN 'high' THEN 0 WHEN 'med' THEN 1 ELSE 2 END")
+            ->orderByRaw('SUM(qty_rounded) DESC');
 
         $perPage = $request->input('per_page', 50);
-        $lines = $query->paginate($perPage);
+        $lines = $aggregated->paginate($perPage);
 
         return response()->json([
             'message' => 'OK',
@@ -186,9 +221,42 @@ class AutoSupplyPlanController extends Controller
         $plan = AutoSupplyPlan::with('integration')->findOrFail($id);
 
         $perPage = $request->input('per_page', 50);
+        // Агрегируем по SKU: одна строка на товар, qty суммируется по всем складам
         $lines = $plan->lines()
-            ->orderByRaw("CASE risk_level WHEN 'high' THEN 0 WHEN 'med' THEN 1 ELSE 2 END")
-            ->orderByDesc('qty_rounded')
+            ->selectRaw('
+                sku,
+                MAX(offer_id) as offer_id,
+                MAX(product_name) as product_name,
+                MAX(barcode) as barcode,
+                SUM(qty_rounded) as qty_rounded,
+                SUM(qty_recommended) as qty_recommended,
+                SUM(current_stock) as current_stock,
+                SUM(in_transit) as in_transit,
+                MAX(avg_daily_sales) as avg_daily_sales,
+                MAX(ewma_daily_sales) as ewma_daily_sales,
+                MAX(demand_daily) as demand_daily,
+                MAX(cover_days_before) as cover_days_before,
+                MAX(cover_days_after) as cover_days_after,
+                MAX(oos_date) as oos_date,
+                MAX(risk_level) as risk_level,
+                MAX(priority) as priority,
+                MAX(priority_score) as priority_score,
+                MAX(sales_trend) as sales_trend,
+                MAX(sales_trend_percent) as sales_trend_percent,
+                MAX(price) as price,
+                MAX(cost_price) as cost_price,
+                SUM(supply_cost_estimate) as supply_cost_estimate,
+                SUM(expected_revenue) as expected_revenue,
+                SUM(expected_profit) as expected_profit,
+                MAX(roi_percent) as roi_percent,
+                MAX(turnover_days) as turnover_days,
+                SUM(storage_cost_daily) as storage_cost_daily,
+                SUM(storage_cost_monthly) as storage_cost_monthly,
+                SUM(lost_revenue_daily) as lost_revenue_daily
+            ')
+            ->groupBy('sku')
+            ->orderByRaw("CASE MAX(risk_level) WHEN 'high' THEN 0 WHEN 'med' THEN 1 ELSE 2 END")
+            ->orderByRaw('SUM(qty_rounded) DESC')
             ->paginate($perPage);
 
         // Финансовые агрегаты
