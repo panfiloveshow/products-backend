@@ -18,7 +18,7 @@ class ProductService
         }
 
         if (!empty($filters['integration_id'])) {
-            $query->where('integration_id', $filters['integration_id']);
+            $query->where('integration_id', (int) $filters['integration_id']);
         }
 
         $total = $query->count();

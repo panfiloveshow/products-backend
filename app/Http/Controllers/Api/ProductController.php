@@ -32,7 +32,7 @@ class ProductController extends Controller
         }
 
         if (!empty($validated['integration_id'])) {
-            $query->where('integration_id', $validated['integration_id']);
+            $query->where('integration_id', (int) $validated['integration_id']);
         }
 
         if (!empty($validated['category'])) {
