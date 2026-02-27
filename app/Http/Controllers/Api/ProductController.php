@@ -178,10 +178,25 @@ class ProductController extends Controller
         // Если передан integration_id, берём credentials из интеграции
         if ($integrationId) {
             $integration = \App\Models\Integration::find($integrationId);
-            if (!$integration) {
-                return response()->json(['error' => 'Integration not found'], 404);
+            if ($integration) {
+                $credentials = $integration->credentials ?? [];
+            } else {
+                // Если локально нет, пробуем получить из Sellico API
+                $token = $request->bearerToken();
+                if ($token) {
+                    $sellicoApi = app(\App\Services\SellicoApiService::class);
+                    $sellicoApi->setAccessToken($token);
+                    $result = $sellicoApi->getIntegrationById($integrationId);
+                    
+                    if ($result['success'] && !empty($result['credentials'])) {
+                        $credentials = $result['credentials'];
+                    } else {
+                        return response()->json(['error' => 'Integration not found locally or in Sellico API'], 404);
+                    }
+                } else {
+                    return response()->json(['error' => 'Integration not found locally and no token provided'], 404);
+                }
             }
-            $credentials = $integration->credentials ?? [];
         } else {
             // Валидация credentials в зависимости от маркетплейса
             $rules = match ($marketplace) {
