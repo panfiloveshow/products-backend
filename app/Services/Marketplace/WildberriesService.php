@@ -188,6 +188,7 @@ class WildberriesService implements MarketplaceInterface
 
         return [
             'sku' => $sku,
+            'vendor_code' => $vendorCode,
             'name' => $card['title'] ?? $card['subjectName'] ?? 'Без названия',
             'barcode' => $barcode,
             'price' => $discountedPrice,

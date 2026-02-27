@@ -156,6 +156,7 @@ class SyncProductsJob implements ShouldQueue
         // Поля которые проверяем на изменения
         $fieldsToCompare = [
             'name',
+            'vendor_code',
             'price',
             'old_price',
             'stock',
