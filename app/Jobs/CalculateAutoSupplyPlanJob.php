@@ -483,8 +483,12 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
             } else {
                 $costPrice = $ue?->cost_price ?? 0;
             }
-            $storageCostDaily = $wh->storage_cost_per_day ?? 0;
-            $storageCostMonthly = $wh->storage_cost_per_month ?? 0;
+            $storageCostMonthly = $wh->storage_cost_per_month > 0
+                ? $wh->storage_cost_per_month
+                : ($ue?->storage_cost ?? 0);
+            $storageCostDaily = $wh->storage_cost_per_day > 0
+                ? $wh->storage_cost_per_day
+                : ($storageCostMonthly > 0 ? round($storageCostMonthly / 30, 2) : 0);
             $marginPercent = $ue?->margin_percent ?? 0;
             $commissionPercent = $ue?->commission_percent ?? 0;
             $logisticsCost = $ue?->logistics_cost ?? 0;
