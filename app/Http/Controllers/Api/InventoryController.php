@@ -304,14 +304,28 @@ class InventoryController extends Controller
         $total      = $sortedSkus->count();
         $pagedSkus  = $sortedSkus->slice(($page - 1) * $perPage, $perPage)->keys()->toArray();
 
-        // Загружаем товары (с приоритетом по integration_id если задан)
-        $productsQuery = \App\Models\Product::whereIn('sku', $pagedSkus);
+        // Загружаем товары по sku ИЛИ barcode (WB: инвентарь использует все баркоды размеров)
+        $productsQuery = \App\Models\Product::where(function ($q) use ($pagedSkus) {
+            $q->whereIn('sku', $pagedSkus)->orWhereIn('barcode', $pagedSkus);
+        });
         if ($integrationId) {
             $productsQuery->where(function ($q) use ($integrationId) {
                 $q->where('integration_id', $integrationId)->orWhereNull('integration_id');
             })->orderByRaw('CASE WHEN integration_id = ? THEN 0 ELSE 1 END', [$integrationId]);
         }
-        $products = $productsQuery->get()->keyBy('sku');
+        // Строим карту: invSku -> product (sku совпадение приоритетнее barcode)
+        $productsRaw = $productsQuery->get();
+        $products = collect();
+        foreach ($productsRaw as $prod) {
+            // Если SKU совпадает напрямую — добавляем под этим SKU
+            if (in_array($prod->sku, $pagedSkus)) {
+                $products->put($prod->sku, $prod);
+            }
+            // Если barcode совпадает с одним из SKU инвентаря — добавляем под barcode (не перетираем прямое совпадение)
+            if ($prod->barcode && in_array($prod->barcode, $pagedSkus) && !$products->has($prod->barcode)) {
+                $products->put($prod->barcode, $prod);
+            }
+        }
 
         // Загружаем строки складов для страницы
         $warehouseRows = \App\Models\InventoryWarehouse::whereIn('sku', $pagedSkus)
