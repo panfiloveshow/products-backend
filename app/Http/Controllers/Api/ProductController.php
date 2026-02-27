@@ -208,6 +208,11 @@ class ProductController extends Controller
             };
         }
 
+        // Прокидываем токен авторизации для Sellico API в фоновые очереди
+        if ($request->bearerToken()) {
+            $credentials['_sellico_token'] = $request->bearerToken();
+        }
+
         $syncLog = $this->productService->startSync(
             $marketplace, 
             $credentials,
