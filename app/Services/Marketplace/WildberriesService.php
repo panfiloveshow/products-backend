@@ -99,6 +99,10 @@ class WildberriesService implements MarketplaceInterface
             $cursor = ['limit' => 100];
 
             do {
+                Log::info('WB API Request: /content/v2/get/cards/list', [
+                    'cursor' => $cursor,
+                ]);
+
                 $response = $this->wbPost("{$this->contentApiUrl}/content/v2/get/cards/list", [
                     'settings' => [
                         'cursor' => $cursor,
@@ -118,6 +122,12 @@ class WildberriesService implements MarketplaceInterface
 
                 $data = $response->json();
                 
+                $cardsCount = count($data['cards'] ?? []);
+                Log::info('WB API Response: /content/v2/get/cards/list', [
+                    'cards_returned' => $cardsCount,
+                    'total_collected' => count($allCards) + $cardsCount,
+                ]);
+
                 foreach ($data['cards'] ?? [] as $card) {
                     $allCards[] = $card;
                 }
