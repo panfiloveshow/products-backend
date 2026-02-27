@@ -389,19 +389,9 @@ class SellicoApiService
             $workspacesResponse = Http::withToken($token)
                 ->get("{$this->baseUrl}/workspaces");
 
-            Log::info('getIntegrationById fallback: workspaces response', [
-                'status' => $workspacesResponse->status(),
-                'body_preview' => substr($workspacesResponse->body(), 0, 500),
-            ]);
-
             if ($workspacesResponse->successful()) {
                 $workspacesRaw = $workspacesResponse->json('data') ?? $workspacesResponse->json();
                 $workspaces = is_array($workspacesRaw) ? $workspacesRaw : [];
-
-                Log::info('getIntegrationById fallback: workspaces parsed', [
-                    'count' => count($workspaces),
-                    'first_keys' => !empty($workspaces) ? array_keys((array)($workspaces[0] ?? [])) : [],
-                ]);
 
                 foreach ($workspaces as $workspace) {
                     $workspaceId = $workspace['id'] ?? null;
@@ -412,24 +402,12 @@ class SellicoApiService
                     $integrationsResponse = Http::withToken($token)
                         ->get("{$this->baseUrl}/workspaces/{$workspaceId}/integrations");
 
-                    Log::info('getIntegrationById fallback: workspace integrations', [
-                        'workspace_id' => $workspaceId,
-                        'status' => $integrationsResponse->status(),
-                        'body_preview' => substr($integrationsResponse->body(), 0, 500),
-                    ]);
-
                     if (!$integrationsResponse->successful()) {
                         continue;
                     }
 
                     $integrationsRaw = $integrationsResponse->json('data') ?? $integrationsResponse->json();
                     $integrations = is_array($integrationsRaw) ? $integrationsRaw : [];
-
-                    Log::info('getIntegrationById fallback: integrations parsed', [
-                        'workspace_id' => $workspaceId,
-                        'count' => count($integrations),
-                        'ids' => array_slice(array_column($integrations, 'id'), 0, 10),
-                    ]);
 
                     foreach ($integrations as $integration) {
                         if ((int)($integration['id'] ?? 0) !== $integrationId) {

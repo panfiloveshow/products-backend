@@ -83,12 +83,22 @@ class SyncProductsJob implements ShouldQueue
 
                 $allowedSkus = array_values(array_unique(array_filter($allowedSkus)));
                 if (empty($allowedSkus)) {
-                    Log::warning('Пустой список SKU интеграции, синхронизация пропущена', [
+                    if ($result['success']) {
+                        // Sellico подтвердил: у интеграции нет товаров
+                        Log::warning('Пустой список SKU интеграции (Sellico), синхронизация пропущена', [
+                            'integration_id' => $integrationId,
+                            'marketplace' => $this->syncLog->marketplace,
+                        ]);
+                        $this->syncLog->complete(0, 0);
+                        return;
+                    }
+                    // Sellico API недоступен и локальных SKU нет — первая синхронизация,
+                    // синхронизируем все товары без фильтра по SKU
+                    Log::info('SKU не найдены (первая синхронизация) — синхронизируем все товары', [
                         'integration_id' => $integrationId,
                         'marketplace' => $this->syncLog->marketplace,
                     ]);
-                    $this->syncLog->complete(0, 0);
-                    return;
+                    $allowedSkus = null; // null = без фильтра
                 }
 
                 // Если мы получили свежий список из Sellico API (не fallback), отвязываем лишние товары, 
@@ -109,15 +119,17 @@ class SyncProductsJob implements ShouldQueue
 
                 $originalCount = count($products);
 
-                $products = array_filter($products, function ($product) use ($allowedSkus) {
-                    return in_array((string) ($product['sku'] ?? ''), $allowedSkus, true);
-                });
+                if ($allowedSkus !== null) {
+                    $products = array_filter($products, function ($product) use ($allowedSkus) {
+                        return in_array((string) ($product['sku'] ?? ''), $allowedSkus, true);
+                    });
+                }
 
-                Log::info("Filtered products by integration SKUs", [
+                Log::info('Filtered products by integration SKUs', [
                     'integration_id' => $integrationId,
                     'original_count' => $originalCount,
                     'filtered_count' => count($products),
-                    'allowed_skus_count' => count($allowedSkus),
+                    'allowed_skus_count' => $allowedSkus !== null ? count($allowedSkus) : 'all',
                 ]);
             }
 
