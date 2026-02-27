@@ -85,9 +85,10 @@ class ProductController extends Controller
             ->pluck('total_stock', 'sku');
 
         // Обновляем stock в товарах
-        $productsWithStock = $products->map(function ($product) use ($inventoryStocks) {
-            $product->stock = $inventoryStocks[$product->sku] ?? 0;
-            return $product;
+        $productsWithStock = $products->getCollection()->map(function ($product) use ($inventoryStocks) {
+            $productArray = $product->toArray();
+            $productArray['stock'] = (int) ($inventoryStocks[$product->sku] ?? 0);
+            return $productArray;
         });
 
         $stats = $this->productService->getProductsStats($validated);
