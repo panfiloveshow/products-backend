@@ -107,11 +107,57 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
 
         // Загружаем продукты для метаданных (barcode, name, pack_multiple, price)
         $skus = $warehouses->pluck('sku')->unique()->toArray();
-        $products = Product::where('integration_id', $integrationId)
+        $productsRaw = Product::where('integration_id', $integrationId)
             ->where('marketplace', $marketplace)
-            ->whereIn('sku', $skus)
-            ->get()
-            ->keyBy('sku');
+            ->where(function ($q) use ($skus) {
+                $q->whereIn('sku', $skus)->orWhereIn('barcode', $skus);
+            })
+            ->get();
+
+        $products = collect();
+        foreach ($productsRaw as $prod) {
+            if (in_array($prod->sku, $skus)) {
+                $products->put($prod->sku, $prod);
+            }
+            if ($prod->barcode && in_array($prod->barcode, $skus) && !$products->has($prod->barcode)) {
+                $products->put($prod->barcode, $prod);
+            }
+            // WB: баркоды размеров внутри wb_data.sizes[].skus[]
+            if (!empty($prod->wb_data['sizes'])) {
+                foreach ($prod->wb_data['sizes'] as $size) {
+                    foreach ($size['skus'] ?? [] as $wbBarcode) {
+                        if (in_array($wbBarcode, $skus) && !$products->has($wbBarcode)) {
+                            $products->put($wbBarcode, $prod);
+                        }
+                    }
+                }
+            }
+        }
+
+        // WB: дополнительный JSONB-поиск для баркодов не найденных по sku/barcode
+        $notFoundSkus = array_diff($skus, $products->keys()->toArray());
+        if (!empty($notFoundSkus) && $marketplace === 'wildberries') {
+            $wbExtra = Product::where('integration_id', $integrationId)
+                ->where('marketplace', 'wildberries')
+                ->whereNotNull('wb_data')
+                ->where(function ($q) use ($notFoundSkus) {
+                    foreach ($notFoundSkus as $s) {
+                        $q->orWhereRaw("wb_data::text LIKE ?", ["%{$s}%"]);
+                    }
+                })
+                ->get();
+            foreach ($wbExtra as $prod) {
+                if (!empty($prod->wb_data['sizes'])) {
+                    foreach ($prod->wb_data['sizes'] as $size) {
+                        foreach ($size['skus'] ?? [] as $wbBarcode) {
+                            if (in_array($wbBarcode, $notFoundSkus) && !$products->has($wbBarcode)) {
+                                $products->put($wbBarcode, $prod);
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         // Загружаем UnitEconomics для финансовых метрик
         $unitEconomics = UnitEconomics::where(function ($q) use ($integrationId) {
