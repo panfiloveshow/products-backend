@@ -79,6 +79,23 @@ class SyncProductsJob implements ShouldQueue
                 if (empty($allowedSkus)) {
                     throw new \RuntimeException('Пустой список SKU интеграции ' . $integrationId . '. Синхронизация остановлена, чтобы не обновить все товары аккаунта.');
                 }
+
+                // Если мы получили свежий список из Sellico API (не fallback), отвязываем лишние товары, 
+                // которые могли привязаться по ошибке ранее
+                if ($result['success']) {
+                    $unlinkedCount = \App\Models\Product::where('integration_id', $integrationId)
+                        ->where('marketplace', $this->syncLog->marketplace)
+                        ->whereNotIn('sku', $allowedSkus)
+                        ->update(['integration_id' => null]);
+                        
+                    if ($unlinkedCount > 0) {
+                        Log::info("Unlinked old products from integration", [
+                            'integration_id' => $integrationId,
+                            'unlinked_count' => $unlinkedCount
+                        ]);
+                    }
+                }
+
                 $originalCount = count($products);
 
                 $products = array_filter($products, function ($product) use ($allowedSkus) {
