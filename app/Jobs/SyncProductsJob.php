@@ -171,12 +171,20 @@ class SyncProductsJob implements ShouldQueue
             ->where('sku', $productData['sku']);
         
         if ($integrationId) {
-            // Строго по integration_id, без orWhereNull
-            // Иначе товары без integration_id будут обновляться и перезаписываться
+            // Сначала ищем в рамках выбранной интеграции
             $query->where('integration_id', $integrationId);
         }
         
         $existingProduct = $query->first();
+
+        // Резервный поиск по уникальному ключу (sku + marketplace).
+        // Нужен, чтобы не ловить duplicate key, если запись уже есть
+        // с другим/пустым integration_id.
+        if (!$existingProduct) {
+            $existingProduct = Product::where('marketplace', $marketplace)
+                ->where('sku', $productData['sku'])
+                ->first();
+        }
 
         if (!$existingProduct) {
             // Создаём новый товар
