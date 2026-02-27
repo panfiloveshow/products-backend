@@ -50,9 +50,15 @@ class SyncProductsJob implements ShouldQueue
                 $sellicoApi = app(\App\Services\SellicoApiService::class);
 
                 // В очереди request() недоступен, поэтому токен передаём через credentials
+                // или берём из кеша (если задача запущена через планировщик без токена)
                 $sellicoToken = $credentials['_sellico_token'] ?? null;
                 if (!empty($sellicoToken)) {
                     $sellicoApi->setAccessToken($sellicoToken);
+                } else {
+                    $cachedToken = \Illuminate\Support\Facades\Cache::get('sellico_access_token');
+                    if ($cachedToken) {
+                        $sellicoApi->setAccessToken($cachedToken);
+                    }
                 }
 
                 $result = $sellicoApi->getIntegrationProducts($integrationId);
@@ -77,7 +83,12 @@ class SyncProductsJob implements ShouldQueue
 
                 $allowedSkus = array_values(array_unique(array_filter($allowedSkus)));
                 if (empty($allowedSkus)) {
-                    throw new \RuntimeException('Пустой список SKU интеграции ' . $integrationId . '. Синхронизация остановлена, чтобы не обновить все товары аккаунта.');
+                    Log::warning('Пустой список SKU интеграции, синхронизация пропущена', [
+                        'integration_id' => $integrationId,
+                        'marketplace' => $this->syncLog->marketplace,
+                    ]);
+                    $this->syncLog->complete(0, 0);
+                    return;
                 }
 
                 // Если мы получили свежий список из Sellico API (не fallback), отвязываем лишние товары, 
