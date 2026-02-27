@@ -84,10 +84,24 @@ class ProductController extends Controller
             ->groupBy('sku')
             ->pluck('total_stock', 'sku');
 
+        \Log::info('ProductController: Остатки загружены', [
+            'count' => $inventoryStocks->count(),
+            'sample' => $inventoryStocks->take(3)->toArray(),
+        ]);
+
         // Обновляем stock в товарах
         $productsWithStock = $products->getCollection()->map(function ($product) use ($inventoryStocks) {
             $productArray = $product->toArray();
-            $productArray['stock'] = (int) ($inventoryStocks[$product->sku] ?? 0);
+            $stock = (int) ($inventoryStocks[$product->sku] ?? 0);
+            $productArray['stock'] = $stock;
+            
+            if ($stock > 0) {
+                \Log::info('ProductController: Товар с остатком', [
+                    'sku' => $product->sku,
+                    'stock' => $stock,
+                ]);
+            }
+            
             return $productArray;
         });
 
