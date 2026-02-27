@@ -8,6 +8,8 @@ use App\Models\InventoryAlert;
 use App\Models\InventoryHistory;
 use App\Models\InventoryWarehouse;
 use App\Models\Product;
+use App\Jobs\SyncStorageFeesJob;
+use App\Models\Integration;
 use App\Services\InventoryService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
@@ -160,6 +162,31 @@ class InventoryController extends Controller
                 'status' => $syncLog->status,
                 'message' => "Inventory sync started for {$marketplace}",
             ],
+        ]);
+    }
+
+    public function syncStorageFees(Request $request): JsonResponse
+    {
+        $integrationId = $request->input('integration_id');
+        if (!$integrationId) {
+            return response()->json(['message' => 'integration_id обязателен'], 422);
+        }
+
+        $integration = Integration::find($integrationId);
+        if (!$integration || $integration->marketplace !== 'wildberries') {
+            return response()->json(['message' => 'WB интеграция не найдена'], 404);
+        }
+
+        $credentials = $integration->credentials ?? [];
+        if (empty($credentials)) {
+            return response()->json(['message' => 'Credentials интеграции не заполнены'], 422);
+        }
+
+        SyncStorageFeesJob::dispatch($integrationId, $credentials, 4);
+
+        return response()->json([
+            'message' => 'Синхронизация начислений за хранение запущена',
+            'data' => ['integration_id' => $integrationId],
         ]);
     }
 

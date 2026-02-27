@@ -73,6 +73,7 @@ Route::prefix('inventory')->group(function () {
     Route::get('/stats', [InventoryController::class, 'stats']);
     Route::post('/sync/{marketplace}', [InventoryController::class, 'sync'])
         ->whereIn('marketplace', ['wildberries', 'ozon', 'yandex']);
+    Route::post('/sync-storage-fees', [InventoryController::class, 'syncStorageFees']);
     Route::get('/{sku}', [InventoryController::class, 'show']);
     Route::get('/{sku}/history', [InventoryController::class, 'history']);
     Route::get('/{sku}/forecast', [InventoryController::class, 'forecast']);

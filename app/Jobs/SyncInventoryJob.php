@@ -168,6 +168,18 @@ class SyncInventoryJob implements ShouldQueue
                 'updated' => $updated,
                 'failed' => $failed,
             ]);
+
+            // Для WB: после синхронизации остатков запускаем джоб сбора начислений за хранение
+            if ($this->syncLog->marketplace === 'wildberries') {
+                $credentials = $this->syncLog->credentials ?? [];
+                if (!empty($credentials)) {
+                    SyncStorageFeesJob::dispatch($this->syncLog->integration_id, $credentials, 4)
+                        ->delay(now()->addSeconds(10));
+                    Log::info('SyncStorageFeesJob dispatched after inventory sync', [
+                        'integration_id' => $this->syncLog->integration_id,
+                    ]);
+                }
+            }
         } catch (\Exception $e) {
             $this->syncLog->fail($e->getMessage());
 
