@@ -121,16 +121,23 @@ class SyncProductsJob implements ShouldQueue
             ->where('sku', $productData['sku'])
             ->first();
 
+        $integrationId = $this->syncLog->integration_id ?? null;
+
         if (!$existingProduct) {
             // Создаём новый товар
             Product::create(array_merge($productData, [
-                'marketplace' => $marketplace,
+                'marketplace'    => $marketplace,
+                'integration_id' => $integrationId,
             ]));
             return 'created';
         }
 
+        // Всегда обновляем integration_id если он не проставлен или совпадает
+        $forceUpdate = ($integrationId && $existingProduct->integration_id !== $integrationId
+            && $existingProduct->integration_id === null);
+
         // Проверяем есть ли изменения
-        $hasChanges = $this->hasChanges($existingProduct, $productData);
+        $hasChanges = $forceUpdate || $this->hasChanges($existingProduct, $productData);
 
         if ($hasChanges) {
             // Не перезаписываем цену нулём/null если уже есть реальная цена
@@ -140,6 +147,9 @@ class SyncProductsJob implements ShouldQueue
             }
             if (empty($updateData['old_price']) && !empty($existingProduct->old_price)) {
                 unset($updateData['old_price']);
+            }
+            if ($integrationId) {
+                $updateData['integration_id'] = $integrationId;
             }
             $existingProduct->update($updateData);
             return 'updated';
