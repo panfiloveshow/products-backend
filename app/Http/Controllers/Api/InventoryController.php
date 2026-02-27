@@ -266,28 +266,30 @@ class InventoryController extends Controller
             ]);
 
         // Агрегируем по SKU
-        // average_daily_sales суммируется (продажи по каждому складу независимы)
-        // days_of_stock/turnover_days вычисляется как total_stock / sum_daily_sales
+        // ВАЖНО: SyncSalesJob записывает одинаковые sales_*/average_daily_sales на каждый склад SKU
+        // (данные общие по SKU, не разбиты по складам). Поэтому используем MAX() а не SUM() —
+        // иначе значения умножаются на количество складов.
+        // SUM() применяем только к quantity/reserved/in_transit/storage_cost — они реально разные по складам.
         $skuQuery = \App\Models\InventoryWarehouse::query()
             ->select('sku')
             ->selectRaw('SUM(quantity) as total_stock')
             ->selectRaw('SUM(reserved) as reserved')
             ->selectRaw('SUM(in_transit) as in_transit')
-            ->selectRaw('SUM(sales_7_days) as sales_7_days')
-            ->selectRaw('SUM(sales_14_days) as sales_14_days')
-            ->selectRaw('SUM(sales_30_days) as sales_30_days')
-            ->selectRaw('SUM(average_daily_sales) as avg_daily_sales')
-            ->selectRaw('SUM(effective_daily_sales) as effective_daily_sales')
-            ->selectRaw('AVG(days_in_stock_30) as days_in_stock_30')
-            ->selectRaw('CASE WHEN SUM(average_daily_sales) > 0 THEN ROUND(SUM(quantity)::numeric / SUM(average_daily_sales), 1) ELSE NULL END as turnover_days')
-            ->selectRaw('CASE WHEN SUM(average_daily_sales) > 0 THEN ROUND(SUM(quantity)::numeric / SUM(average_daily_sales)) ELSE NULL END as days_of_stock')
+            ->selectRaw('MAX(sales_7_days) as sales_7_days')
+            ->selectRaw('MAX(sales_14_days) as sales_14_days')
+            ->selectRaw('MAX(sales_30_days) as sales_30_days')
+            ->selectRaw('MAX(average_daily_sales) as avg_daily_sales')
+            ->selectRaw('MAX(effective_daily_sales) as effective_daily_sales')
+            ->selectRaw('MAX(days_in_stock_30) as days_in_stock_30')
+            ->selectRaw('CASE WHEN MAX(average_daily_sales) > 0 THEN ROUND(SUM(quantity)::numeric / MAX(average_daily_sales), 1) ELSE NULL END as turnover_days')
+            ->selectRaw('CASE WHEN MAX(average_daily_sales) > 0 THEN ROUND(SUM(quantity)::numeric / MAX(average_daily_sales)) ELSE NULL END as days_of_stock')
             ->selectRaw('MAX(stock_status) as stock_status')
             ->selectRaw('SUM(storage_cost_per_day) as storage_cost_daily')
             ->selectRaw('SUM(storage_cost_per_month) as storage_cost_monthly')
-            ->selectRaw('SUM(real_avg_daily_sales) as real_avg_daily_sales')
-            ->selectRaw('AVG(real_turnover_days) as real_turnover_days')
-            ->selectRaw('AVG(real_days_of_stock) as real_days_of_stock')
-            ->selectRaw('AVG(real_sales_period_days) as real_sales_period_days')
+            ->selectRaw('MAX(real_avg_daily_sales) as real_avg_daily_sales')
+            ->selectRaw('MAX(real_turnover_days) as real_turnover_days')
+            ->selectRaw('MAX(real_days_of_stock) as real_days_of_stock')
+            ->selectRaw('MAX(real_sales_period_days) as real_sales_period_days')
             ->selectRaw('SUM(storage_fee_total) as storage_fee_total')
             ->selectRaw('SUM(storage_fee_last_week) as storage_fee_last_week')
             ->selectRaw('MIN(storage_fee_report_from) as storage_fee_report_from')
@@ -511,15 +513,42 @@ class InventoryController extends Controller
         $storageFeeTo        = $storageFeeToVals->max();
         $storagePrevPeriod   = $allSkus->filter(fn($r) => !empty($r->storage_fee_prev_month_period))->first()?->storage_fee_prev_month_period;
 
-        // total_stock_value из уже построенных items
-        $totalStockValue = array_sum(array_column($items, 'stock_value'));
+        // total_stock_value считаем по всем SKU через products + allSkus
+        $allProductSkus = $allSkus->keys()->toArray();
+        $allProductsMap = \App\Models\Product::whereIn('sku', $allProductSkus)
+            ->when($integrationId, fn($q) => $q->where(function ($q) use ($integrationId) {
+                $q->where('integration_id', $integrationId)->orWhereNull('integration_id');
+            }))
+            ->get(['sku', 'price', 'cost_price'])
+            ->keyBy('sku');
+        $totalStockValue = 0;
+        foreach ($allSkus as $sku => $row) {
+            $prod = $allProductsMap[$sku] ?? null;
+            $price = (float) ($prod?->price ?? 0);
+            $costPrice = (float) ($prod?->cost_price ?? 0);
+            $qty = (int) ($row->total_stock ?? 0);
+            $totalStockValue += $qty * ($price ?: $costPrice);
+        }
+
+        // avg_turnover_days считаем по всем SKU с корректным MAX(avg_daily_sales)
+        $avgTurnoverDays = 0;
+        $turnoverCount = 0;
+        foreach ($allSkus as $row) {
+            $avg = (float) ($row->avg_daily_sales ?? 0);
+            $qty = (int) ($row->total_stock ?? 0);
+            if ($avg > 0) {
+                $avgTurnoverDays += round($qty / $avg, 1);
+                $turnoverCount++;
+            }
+        }
+        $avgTurnoverDays = $turnoverCount > 0 ? round($avgTurnoverDays / $turnoverCount, 1) : 0;
 
         $summary = [
             'total_products'    => $total,
             'total_warehouses'  => (clone $summaryQuery)->distinct('warehouse_id')->count('warehouse_id'),
             'total_stock'       => (int) (clone $summaryQuery)->sum('quantity'),
             'total_stock_value' => round($totalStockValue, 2),
-            'avg_turnover_days' => round((float) ((clone $summaryQuery)->avg('turnover_days') ?? 0), 1),
+            'avg_turnover_days' => $avgTurnoverDays,
             'out_of_stock_count'=> $outOfStockCount,
             'critical_count'    => $criticalCount,
             'low_count'         => $lowCount,

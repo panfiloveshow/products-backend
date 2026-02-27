@@ -216,7 +216,6 @@ class SyncInventoryJob implements ShouldQueue
         if (!empty($wbSalesByWarehouse)) {
             $sku             = $stockData['sku'];
             $supplierArticle = $stockData['supplier_article'] ?? $sku;
-            $warehouseId     = (string)($stockData['warehouse_id'] ?? '');
 
             // Все склады этого SKU (приводим к строке для корректного поиска)
             $allWarehouses = $wbSalesByWarehouse[(string)$sku]
@@ -224,29 +223,31 @@ class SyncInventoryJob implements ShouldQueue
                           ?? null;
 
             if ($allWarehouses) {
-                // avg_daily_sales — суммарно по всем складам SKU (для days_of_stock)
-                $totalAvg = 0;
+                // avg_daily_sales и sales_* — суммарно по всем складам SKU.
+                // Записываем одинаково на каждый склад, в matrix() используется MAX() для агрегации.
+                $totalAvg   = 0;
+                $totalS7    = 0;
+                $totalS14   = 0;
+                $totalS30   = 0;
                 foreach ($allWarehouses as $wData) {
                     if (is_array($wData)) {
                         $totalAvg += (float)($wData['avg_daily_sales'] ?? 0);
+                        $totalS7  += (int)($wData['sales_7_days']  ?? 0);
+                        $totalS14 += (int)($wData['sales_14_days'] ?? 0);
+                        $totalS30 += (int)($wData['sales_30_days'] ?? 0);
                     }
                 }
                 if ($totalAvg > 0) {
                     $avgDailySales = round($totalAvg, 4);
                 }
-
-                // sales_7/14/30 — только по конкретному складу
-                $warehouseData = $allWarehouses[$warehouseId] ?? null;
-                if ($warehouseData) {
-                    $wAvg    = (float)($warehouseData['avg_daily_sales'] ?? 0);
-                    $sales7  = (int) round($wAvg * 7);
-                    $sales14 = (int) round($wAvg * 14);
-                    $sales30 = (int) round($wAvg * 30);
+                if ($totalS7 > 0 || $totalS14 > 0 || $totalS30 > 0) {
+                    $sales7  = $totalS7;
+                    $sales14 = $totalS14;
+                    $sales30 = $totalS30;
                 } elseif ($totalAvg > 0) {
-                    // Продаж с этого склада нет — считаем от общего среднего
-                    $sales7  = (int) round($avgDailySales * 7);
-                    $sales14 = (int) round($avgDailySales * 14);
-                    $sales30 = (int) round($avgDailySales * 30);
+                    $sales7  = (int) round($totalAvg * 7);
+                    $sales14 = (int) round($totalAvg * 14);
+                    $sales30 = (int) round($totalAvg * 30);
                 }
 
             }

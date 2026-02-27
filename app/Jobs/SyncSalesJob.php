@@ -134,33 +134,37 @@ class SyncSalesJob implements ShouldQueue
             }
 
             // Обновляем InventoryWarehouse
+            // sales_* и average_daily_sales — данные по всему SKU (не по конкретному складу),
+            // поэтому записываем одинаково на все склады. В matrix() используется MAX() для агрегации.
             $warehouses = InventoryWarehouse::where('sku', $sku)
                 ->where('marketplace', $marketplace)
                 ->where('integration_id', $integrationId)
                 ->get();
+
+            // Суммарный остаток по всем складам для корректного расчёта days_of_stock
+            $totalQuantity = $warehouses->sum('quantity');
 
             foreach ($warehouses as $warehouse) {
                 $warehouse->sales_7_days = $sales['sales_7_days'] ?? 0;
                 $warehouse->sales_14_days = $sales['sales_14_days'] ?? 0;
                 $warehouse->sales_28_days = $sales28;
                 $warehouse->average_daily_sales = $avgDailySales;
-                
-                // Рассчитываем дни запаса и оборачиваемость
-                $quantity = $warehouse->quantity ?? 0;
-                
+
+                // days_of_stock/turnover_days считаем от суммарного остатка по SKU
+                // (avg_daily_sales — общий по SKU, не по складу)
                 if ($avgDailySales > 0) {
-                    $warehouse->days_of_stock = (int) round($quantity / $avgDailySales);
-                    $warehouse->turnover_days = round($quantity / $avgDailySales, 1);
+                    $warehouse->days_of_stock = (int) round($totalQuantity / $avgDailySales);
+                    $warehouse->turnover_days = round($totalQuantity / $avgDailySales, 1);
                 } else {
-                    $warehouse->days_of_stock = $quantity > 0 ? 999 : 0;
-                    $warehouse->turnover_days = $quantity > 0 ? 999 : null;
+                    $warehouse->days_of_stock = $totalQuantity > 0 ? 999 : 0;
+                    $warehouse->turnover_days = $totalQuantity > 0 ? 999 : null;
                 }
-                
+
                 // Обновляем статус на основе дней запаса
                 if (method_exists($warehouse, 'calculateStockStatus')) {
                     $warehouse->stock_status = $warehouse->calculateStockStatus();
                 }
-                
+
                 $warehouse->save();
                 $updatedWarehouses++;
             }
