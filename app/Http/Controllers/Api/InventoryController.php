@@ -304,10 +304,14 @@ class InventoryController extends Controller
         $total      = $sortedSkus->count();
         $pagedSkus  = $sortedSkus->slice(($page - 1) * $perPage, $perPage)->keys()->toArray();
 
-        // Загружаем товары
-        $products = \App\Models\Product::whereIn('sku', $pagedSkus)
-            ->get()
-            ->keyBy('sku');
+        // Загружаем товары (с приоритетом по integration_id если задан)
+        $productsQuery = \App\Models\Product::whereIn('sku', $pagedSkus);
+        if ($integrationId) {
+            $productsQuery->where(function ($q) use ($integrationId) {
+                $q->where('integration_id', $integrationId)->orWhereNull('integration_id');
+            })->orderByRaw('CASE WHEN integration_id = ? THEN 0 ELSE 1 END', [$integrationId]);
+        }
+        $products = $productsQuery->get()->keyBy('sku');
 
         // Загружаем строки складов для страницы
         $warehouseRows = \App\Models\InventoryWarehouse::whereIn('sku', $pagedSkus)
