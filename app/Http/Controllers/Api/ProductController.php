@@ -32,7 +32,12 @@ class ProductController extends Controller
         }
 
         if (!empty($validated['integration_id'])) {
-            $query->where('integration_id', (int) $validated['integration_id']);
+            $integrationId = (int) $validated['integration_id'];
+            \Log::info('ProductController: Фильтр по integration_id', [
+                'raw_value' => $validated['integration_id'],
+                'casted_value' => $integrationId,
+            ]);
+            $query->where('integration_id', $integrationId);
         }
 
         if (!empty($validated['category'])) {
