@@ -171,10 +171,9 @@ class SyncProductsJob implements ShouldQueue
             ->where('sku', $productData['sku']);
         
         if ($integrationId) {
-            $query->where(function ($q) use ($integrationId) {
-                $q->where('integration_id', $integrationId)
-                  ->orWhereNull('integration_id');
-            });
+            // Строго по integration_id, без orWhereNull
+            // Иначе товары без integration_id будут обновляться и перезаписываться
+            $query->where('integration_id', $integrationId);
         }
         
         $existingProduct = $query->first();
