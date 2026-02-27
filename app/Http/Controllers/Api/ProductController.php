@@ -223,9 +223,10 @@ class ProductController extends Controller
         ]);
     }
 
-    public function syncStatus(): JsonResponse
+    public function syncStatus(Request $request): JsonResponse
     {
-        $statuses = $this->productService->getSyncStatuses();
+        $integrationId = $request->input('integration_id');
+        $statuses = $this->productService->getSyncStatuses($integrationId ? (int) $integrationId : null);
 
         return response()->json([
             'data' => $statuses,

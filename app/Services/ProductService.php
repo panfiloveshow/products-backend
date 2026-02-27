@@ -27,7 +27,8 @@ class ProductService
         $averagePrice = (clone $query)->avg('price') ?? 0;
         $totalValue = (clone $query)->selectRaw('SUM(price * stock) as total')->value('total') ?? 0;
 
-        $byMarketplace = Product::select('marketplace')
+        $byMarketplace = (clone $query)
+            ->select('marketplace')
             ->selectRaw('COUNT(*) as count')
             ->selectRaw('AVG(price) as average_price')
             ->groupBy('marketplace')
@@ -104,16 +105,21 @@ class ProductService
         \Illuminate\Support\Facades\Cache::forget("products_stats_all");
     }
 
-    public function getSyncStatuses(): array
+    public function getSyncStatuses(?int $integrationId = null): array
     {
         $marketplaces = ['wildberries', 'ozon', 'yandex'];
         $statuses = [];
 
         foreach ($marketplaces as $marketplace) {
-            $lastSync = SyncLog::where('marketplace', $marketplace)
+            $syncQuery = SyncLog::where('marketplace', $marketplace)
                 ->where('sync_type', 'products')
-                ->latest()
-                ->first();
+                ->latest();
+
+            if ($integrationId) {
+                $syncQuery->where('integration_id', $integrationId);
+            }
+
+            $lastSync = $syncQuery->first();
 
             $statuses[$marketplace] = [
                 'last_sync' => $lastSync?->completed_at,
