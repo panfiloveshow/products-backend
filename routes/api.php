@@ -24,6 +24,8 @@ use Illuminate\Support\Facades\Route;
 Route::prefix('integrations')->group(function () {
     Route::get('/', [IntegrationController::class, 'index']);
     Route::get('/{id}/premium-status', [IntegrationController::class, 'getPremiumStatus']);
+    Route::post('/{id}/sync', [IntegrationController::class, 'sync']);
+    Route::get('/{id}/sync-status', [IntegrationController::class, 'syncStatus']);
 });
 
 /*
