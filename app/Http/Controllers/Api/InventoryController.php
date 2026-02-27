@@ -376,6 +376,48 @@ class InventoryController extends Controller
             if ($prod->barcode && in_array($prod->barcode, $pagedSkus) && !$products->has($prod->barcode)) {
                 $products->put($prod->barcode, $prod);
             }
+            // WB: дополнительный поиск по всем баркодам из wb_data.sizes[].skus[]
+            // У WB-товара с несколькими размерами каждый размер имеет свой баркод в инвентаре
+            if (!empty($prod->wb_data['sizes'])) {
+                foreach ($prod->wb_data['sizes'] as $size) {
+                    foreach ($size['skus'] ?? [] as $wbBarcode) {
+                        if (in_array($wbBarcode, $pagedSkus) && !$products->has($wbBarcode)) {
+                            $products->put($wbBarcode, $prod);
+                        }
+                    }
+                }
+            }
+        }
+
+        // WB: дополнительный JSONB-запрос для баркодов которые не нашлись по sku/barcode
+        // но могут быть внутри wb_data->sizes[*]->skus[] других товаров
+        $notFoundSkus = array_diff($pagedSkus, $products->keys()->toArray());
+        if (!empty($notFoundSkus)) {
+            $wbExtraQuery = \App\Models\Product::where('marketplace', 'wildberries')
+                ->whereNotNull('wb_data');
+            if ($integrationId) {
+                $wbExtraQuery->where(function ($q) use ($integrationId) {
+                    $q->where('integration_id', $integrationId)->orWhereNull('integration_id');
+                });
+            }
+            // Ищем через JSONB: баркод присутствует в wb_data::text
+            $wbExtraQuery->where(function ($q) use ($notFoundSkus) {
+                foreach ($notFoundSkus as $notFoundSku) {
+                    $q->orWhereRaw("wb_data::text LIKE ?", ["%{$notFoundSku}%"]);
+                }
+            });
+            $wbExtraProducts = $wbExtraQuery->get();
+            foreach ($wbExtraProducts as $prod) {
+                if (!empty($prod->wb_data['sizes'])) {
+                    foreach ($prod->wb_data['sizes'] as $size) {
+                        foreach ($size['skus'] ?? [] as $wbBarcode) {
+                            if (in_array($wbBarcode, $notFoundSkus) && !$products->has($wbBarcode)) {
+                                $products->put($wbBarcode, $prod);
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         // Загружаем строки складов для страницы
