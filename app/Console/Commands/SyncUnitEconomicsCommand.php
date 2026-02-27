@@ -729,7 +729,7 @@ class SyncUnitEconomicsCommand extends Command
         $salesCount = $wbSalesData['sales_30_days'] ?? $inventory?->sales_30_days ?? 0;
         
         // Хранение: приоритет WB API > inventory
-        $storageCost = $wbStorageData['storage_cost_per_month'] ?? $inventory?->storage_cost_per_month ?? 0;
+        $storageCost = ($wbStorageData['storage_cost_per_month'] ?? null) ?? $inventory?->storage_cost_per_month ?? 0;
 
         $data = [
             'sku' => $product->sku,
