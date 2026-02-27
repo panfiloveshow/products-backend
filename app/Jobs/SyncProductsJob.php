@@ -49,13 +49,17 @@ class SyncProductsJob implements ShouldQueue
             $updated = 0;
             $created = 0;
 
-            DB::beginTransaction();
-
+            // Каждый товар — в своей транзакции.
+            // Одна общая транзакция на весь цикл нельзя использовать в PostgreSQL:
+            // первая ошибка переводит транзакцию в сломанное состояние (25P02),
+            // и все последующие запросы падают с тем же кодом.
             foreach ($products as $productData) {
                 try {
-                    $result = $this->syncProduct($productData);
+                    $result = DB::transaction(function () use ($productData) {
+                        return $this->syncProduct($productData);
+                    });
                     $synced++;
-                    
+
                     if ($result === 'created') {
                         $created++;
                     } elseif ($result === 'updated') {
@@ -71,8 +75,6 @@ class SyncProductsJob implements ShouldQueue
                 }
             }
 
-            DB::commit();
-            
             // Сохраняем метаданные о синхронизации
             $this->syncLog->update([
                 'metadata' => [
@@ -82,7 +84,7 @@ class SyncProductsJob implements ShouldQueue
                     'unchanged' => $synced - $created - $updated,
                 ],
             ]);
-            
+
             $this->syncLog->complete($synced, $failed);
 
             Log::info("Products sync completed", [
@@ -93,7 +95,6 @@ class SyncProductsJob implements ShouldQueue
                 'failed' => $failed,
             ]);
         } catch (\Exception $e) {
-            DB::rollBack();
             $this->syncLog->fail($e->getMessage());
 
             Log::error("Products sync failed", [
