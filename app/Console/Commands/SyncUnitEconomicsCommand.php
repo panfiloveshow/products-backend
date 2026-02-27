@@ -842,7 +842,7 @@ class SyncUnitEconomicsCommand extends Command
                 // Если есть фактическая стоимость хранения из API — используем её
                 if ($wbStorageData && isset($wbStorageData['storage_cost_per_day'])) {
                     $data['storage_cost_per_day'] = $wbStorageData['storage_cost_per_day'];
-                    $data['storage_cost_per_month'] = $wbStorageData['storage_cost_per_month'];
+                    $data['storage_cost_per_month'] = $wbStorageData['storage_cost_per_month'] ?? null;
                 }
                 
                 // === ПРИЁМКА ===
