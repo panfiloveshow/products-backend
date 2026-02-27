@@ -44,94 +44,10 @@ class SyncProductsJob implements ShouldQueue
                 return;
             }
 
-            // Фильтруем товары по integration_id через Sellico API
+            // Все товары аккаунта маркетплейса принадлежат данной интеграции.
+            // Sellico API не предоставляет список SKU продуктов — integration_id
+            // привязывается к каждому товару напрямую через syncProduct().
             $integrationId = $this->syncLog->integration_id;
-            if ($integrationId) {
-                $sellicoApi = app(\App\Services\SellicoApiService::class);
-
-                // В очереди request() недоступен, поэтому токен передаём через credentials
-                // или берём из кеша (если задача запущена через планировщик без токена)
-                $sellicoToken = $credentials['_sellico_token'] ?? null;
-                if (!empty($sellicoToken)) {
-                    $sellicoApi->setAccessToken($sellicoToken);
-                } else {
-                    $cachedToken = \Illuminate\Support\Facades\Cache::get('sellico_access_token');
-                    if ($cachedToken) {
-                        $sellicoApi->setAccessToken($cachedToken);
-                    }
-                }
-
-                $result = $sellicoApi->getIntegrationProducts($integrationId);
-                if (!$result['success']) {
-                    // Fallback: используем уже привязанные к интеграции SKU из локальной БД.
-                    // Это безопаснее, чем синхронизировать весь аккаунт при проблеме с Sellico API.
-                    $allowedSkus = Product::where('integration_id', $integrationId)
-                        ->where('marketplace', $this->syncLog->marketplace)
-                        ->pluck('sku')
-                        ->map(fn($sku) => (string) $sku)
-                        ->toArray();
-
-                    Log::warning('Sellico integration products unavailable, fallback to local SKUs', [
-                        'integration_id' => $integrationId,
-                        'marketplace' => $this->syncLog->marketplace,
-                        'error' => $result['error'] ?? 'unknown',
-                        'local_skus_count' => count($allowedSkus),
-                    ]);
-                } else {
-                    $allowedSkus = array_map('strval', $result['skus'] ?? []);
-                }
-
-                $allowedSkus = array_values(array_unique(array_filter($allowedSkus)));
-                if (empty($allowedSkus)) {
-                    if ($result['success']) {
-                        // Sellico подтвердил: у интеграции нет товаров
-                        Log::warning('Пустой список SKU интеграции (Sellico), синхронизация пропущена', [
-                            'integration_id' => $integrationId,
-                            'marketplace' => $this->syncLog->marketplace,
-                        ]);
-                        $this->syncLog->complete(0, 0);
-                        return;
-                    }
-                    // Sellico API недоступен и локальных SKU нет — первая синхронизация,
-                    // синхронизируем все товары без фильтра по SKU
-                    Log::info('SKU не найдены (первая синхронизация) — синхронизируем все товары', [
-                        'integration_id' => $integrationId,
-                        'marketplace' => $this->syncLog->marketplace,
-                    ]);
-                    $allowedSkus = null; // null = без фильтра
-                }
-
-                // Если мы получили свежий список из Sellico API (не fallback), отвязываем лишние товары, 
-                // которые могли привязаться по ошибке ранее
-                if ($result['success']) {
-                    $unlinkedCount = \App\Models\Product::where('integration_id', $integrationId)
-                        ->where('marketplace', $this->syncLog->marketplace)
-                        ->whereNotIn('sku', $allowedSkus)
-                        ->update(['integration_id' => null]);
-                        
-                    if ($unlinkedCount > 0) {
-                        Log::info("Unlinked old products from integration", [
-                            'integration_id' => $integrationId,
-                            'unlinked_count' => $unlinkedCount
-                        ]);
-                    }
-                }
-
-                $originalCount = count($products);
-
-                if ($allowedSkus !== null) {
-                    $products = array_filter($products, function ($product) use ($allowedSkus) {
-                        return in_array((string) ($product['sku'] ?? ''), $allowedSkus, true);
-                    });
-                }
-
-                Log::info('Filtered products by integration SKUs', [
-                    'integration_id' => $integrationId,
-                    'original_count' => $originalCount,
-                    'filtered_count' => count($products),
-                    'allowed_skus_count' => $allowedSkus !== null ? count($allowedSkus) : 'all',
-                ]);
-            }
 
             $synced = 0;
             $failed = 0;
