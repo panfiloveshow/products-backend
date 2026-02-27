@@ -71,8 +71,15 @@ class ProductController extends Controller
 
         // Подгружаем остатки из inventory_warehouses
         $productSkus = $products->pluck('sku')->toArray();
-        $inventoryStocks = \DB::table('inventory_warehouses')
-            ->whereIn('sku', $productSkus)
+        $inventoryQuery = \DB::table('inventory_warehouses')
+            ->whereIn('sku', $productSkus);
+        
+        // Фильтруем по integration_id если он указан
+        if (!empty($validated['integration_id'])) {
+            $inventoryQuery->where('integration_id', (int) $validated['integration_id']);
+        }
+        
+        $inventoryStocks = $inventoryQuery
             ->select('sku', \DB::raw('SUM(quantity) as total_stock'))
             ->groupBy('sku')
             ->pluck('total_stock', 'sku');
