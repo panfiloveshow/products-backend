@@ -23,18 +23,41 @@ class UpdateProductsIntegrationId extends Command
             ->map(fn($group) => $group->first());
 
         $updated = 0;
+        $skipped = 0;
 
         foreach ($integrations as $marketplace => $integration) {
-            $count = DB::table('products')
+            // Получаем товары без integration_id
+            $products = DB::table('products')
                 ->where('marketplace', $marketplace)
                 ->whereNull('integration_id')
-                ->update(['integration_id' => $integration->id]);
+                ->select('id', 'marketplace_id')
+                ->get();
 
-            $this->info("Обновлено {$count} товаров для {$marketplace} (integration_id={$integration->id})");
-            $updated += $count;
+            foreach ($products as $product) {
+                // Проверяем нет ли уже товара с таким marketplace_id и другим integration_id
+                $exists = DB::table('products')
+                    ->where('marketplace', $marketplace)
+                    ->where('marketplace_id', $product->marketplace_id)
+                    ->whereNotNull('integration_id')
+                    ->exists();
+
+                if ($exists) {
+                    $skipped++;
+                    continue;
+                }
+
+                // Обновляем integration_id
+                DB::table('products')
+                    ->where('id', $product->id)
+                    ->update(['integration_id' => $integration->id]);
+                
+                $updated++;
+            }
+
+            $this->info("Обработано товаров для {$marketplace}: обновлено {$updated}, пропущено {$skipped}");
         }
 
-        $this->info("Всего обновлено товаров: {$updated}");
+        $this->info("Всего обновлено товаров: {$updated}, пропущено: {$skipped}");
         return 0;
     }
 }
