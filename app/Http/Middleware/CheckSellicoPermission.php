@@ -49,6 +49,73 @@ class CheckSellicoPermission
         'auto-supply-plans.export' => 'auto_supply.export',
         'auto-supply-plans.export.xlsx' => 'auto_supply.export',
         'auto-supply-plans.export.csv' => 'auto_supply.export',
+
+        // Остатки
+        'inventory.index' => 'inventory.view',
+        'inventory.show' => 'inventory.view',
+        'inventory.matrix' => 'inventory.view',
+        'inventory.stats' => 'inventory.view',
+        'inventory.alerts' => 'inventory.view',
+        'inventory.recommendations' => 'inventory.view',
+        'inventory.redistribution' => 'inventory.view',
+        'inventory.history' => 'inventory.view',
+        'inventory.forecast' => 'inventory.view',
+        'inventory.sync' => 'inventory.sync.execute',
+        'inventory.syncStatus' => 'inventory.sync.status',
+        'inventory.syncStorageFees' => 'inventory.sync.execute',
+
+        // Поставки
+        'shipments.index' => 'shipments.view',
+        'shipments.show' => 'shipments.view',
+        'shipments.slots' => 'shipments.view',
+        'shipments.recommendations' => 'shipments.view',
+        'shipments.stats' => 'shipments.view',
+        'shipments.store' => 'shipments.create',
+        'shipments.update' => 'shipments.edit',
+        'shipments.destroy' => 'shipments.delete',
+        'shipments.addItem' => 'shipments.edit',
+        'shipments.updateItem' => 'shipments.edit',
+        'shipments.removeItem' => 'shipments.edit',
+        'shipments.submit' => 'shipments.workflow',
+        'shipments.approve' => 'shipments.workflow',
+        'shipments.reject' => 'shipments.workflow',
+        'shipments.send' => 'shipments.workflow',
+        'shipments.deliver' => 'shipments.workflow',
+        'shipments.bookSlot' => 'shipments.workflow',
+        'shipments.export' => 'shipments.export',
+
+        // Поставщики
+        'suppliers.index' => 'suppliers.view',
+        'suppliers.show' => 'suppliers.view',
+        'suppliers.store' => 'suppliers.create',
+        'suppliers.update' => 'suppliers.edit',
+        'suppliers.destroy' => 'suppliers.delete',
+
+        // Остатки продавца
+        'seller-stocks.index' => 'seller_stocks.view',
+        'seller-stocks.summary' => 'seller_stocks.view',
+        'seller-stocks.catalog' => 'seller_stocks.view',
+        'seller-stocks.upsert' => 'seller_stocks.edit',
+        'seller-stocks.bulkUpsert' => 'seller_stocks.edit',
+        'seller-stocks.destroy' => 'seller_stocks.delete',
+
+        // WB себестоимости по баркодам
+        'wb-barcode-costs.index' => 'wb_barcode_costs.view',
+        'wb-barcode-costs.bulkUpsert' => 'wb_barcode_costs.edit',
+        'wb-barcode-costs.destroy' => 'wb_barcode_costs.delete',
+
+        // Ozon отчёты
+        'ozon-reports.index' => 'ozon_reports.view',
+        'ozon-reports.summary' => 'ozon_reports.view',
+        'ozon-reports.warehouseSales' => 'ozon_reports.view',
+        'ozon-reports.upload' => 'ozon_reports.upload',
+        'ozon-reports.destroy' => 'ozon_reports.delete',
+
+        // Интеграции
+        'integrations.index' => 'integrations.view',
+        'integrations.premiumStatus' => 'integrations.view',
+        'integrations.sync' => 'integrations.sync',
+        'integrations.syncStatus' => 'integrations.sync',
     ];
 
     /**

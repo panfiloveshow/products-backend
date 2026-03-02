@@ -21,11 +21,11 @@ use Illuminate\Support\Facades\Route;
 | Integrations Module
 |--------------------------------------------------------------------------
 */
-Route::prefix('integrations')->group(function () {
-    Route::get('/', [IntegrationController::class, 'index']);
-    Route::get('/{id}/premium-status', [IntegrationController::class, 'getPremiumStatus']);
-    Route::post('/{id}/sync', [IntegrationController::class, 'sync']);
-    Route::get('/{id}/sync-status', [IntegrationController::class, 'syncStatus']);
+Route::prefix('integrations')->middleware('sellico.permission')->group(function () {
+    Route::get('/', [IntegrationController::class, 'index'])->name('integrations.index');
+    Route::get('/{id}/premium-status', [IntegrationController::class, 'getPremiumStatus'])->name('integrations.premiumStatus');
+    Route::post('/{id}/sync', [IntegrationController::class, 'sync'])->name('integrations.sync');
+    Route::get('/{id}/sync-status', [IntegrationController::class, 'syncStatus'])->name('integrations.syncStatus');
 });
 
 /*
@@ -66,20 +66,21 @@ Route::prefix('products')->middleware('sellico.permission')->group(function () {
 | Inventory Module
 |--------------------------------------------------------------------------
 */
-Route::prefix('inventory')->group(function () {
-    Route::get('/', [InventoryController::class, 'index']);
-    Route::get('/sync/status', [InventoryController::class, 'syncStatus']);
-    Route::get('/alerts', [InventoryController::class, 'alerts']);
-    Route::get('/matrix', [InventoryController::class, 'matrix']);
-    Route::get('/recommendations', [InventoryController::class, 'recommendations']);
-    Route::get('/redistribution', [InventoryController::class, 'redistribution']);
-    Route::get('/stats', [InventoryController::class, 'stats']);
+Route::prefix('inventory')->middleware('sellico.permission')->group(function () {
+    Route::get('/', [InventoryController::class, 'index'])->name('inventory.index');
+    Route::get('/sync/status', [InventoryController::class, 'syncStatus'])->name('inventory.syncStatus');
+    Route::get('/alerts', [InventoryController::class, 'alerts'])->name('inventory.alerts');
+    Route::get('/matrix', [InventoryController::class, 'matrix'])->name('inventory.matrix');
+    Route::get('/recommendations', [InventoryController::class, 'recommendations'])->name('inventory.recommendations');
+    Route::get('/redistribution', [InventoryController::class, 'redistribution'])->name('inventory.redistribution');
+    Route::get('/stats', [InventoryController::class, 'stats'])->name('inventory.stats');
     Route::post('/sync/{marketplace}', [InventoryController::class, 'sync'])
-        ->whereIn('marketplace', ['wildberries', 'ozon', 'yandex']);
-    Route::post('/sync-storage-fees', [InventoryController::class, 'syncStorageFees']);
-    Route::get('/{sku}', [InventoryController::class, 'show']);
-    Route::get('/{sku}/history', [InventoryController::class, 'history']);
-    Route::get('/{sku}/forecast', [InventoryController::class, 'forecast']);
+        ->whereIn('marketplace', ['wildberries', 'ozon', 'yandex'])
+        ->name('inventory.sync');
+    Route::post('/sync-storage-fees', [InventoryController::class, 'syncStorageFees'])->name('inventory.syncStorageFees');
+    Route::get('/{sku}', [InventoryController::class, 'show'])->name('inventory.show');
+    Route::get('/{sku}/history', [InventoryController::class, 'history'])->name('inventory.history');
+    Route::get('/{sku}/forecast', [InventoryController::class, 'forecast'])->name('inventory.forecast');
 });
 
 /*
@@ -87,35 +88,35 @@ Route::prefix('inventory')->group(function () {
 | Shipments Module
 |--------------------------------------------------------------------------
 */
-Route::prefix('shipments')->group(function () {
-    Route::get('/', [ShipmentController::class, 'index']);
-    Route::get('/slots', [ShipmentController::class, 'slots']);
-    Route::get('/recommendations', [ShipmentController::class, 'recommendations']);
-    Route::get('/stats', [ShipmentController::class, 'stats']);
+Route::prefix('shipments')->middleware('sellico.permission')->group(function () {
+    Route::get('/', [ShipmentController::class, 'index'])->name('shipments.index');
+    Route::get('/slots', [ShipmentController::class, 'slots'])->name('shipments.slots');
+    Route::get('/recommendations', [ShipmentController::class, 'recommendations'])->name('shipments.recommendations');
+    Route::get('/stats', [ShipmentController::class, 'stats'])->name('shipments.stats');
     Route::post('/from-recommendation/{recommendationId}', [ShipmentController::class, 'createFromRecommendation']);
     
-    Route::get('/{id}', [ShipmentController::class, 'show']);
-    Route::post('/', [ShipmentController::class, 'store']);
-    Route::put('/{id}', [ShipmentController::class, 'update']);
-    Route::delete('/{id}', [ShipmentController::class, 'destroy']);
+    Route::get('/{id}', [ShipmentController::class, 'show'])->name('shipments.show');
+    Route::post('/', [ShipmentController::class, 'store'])->name('shipments.store');
+    Route::put('/{id}', [ShipmentController::class, 'update'])->name('shipments.update');
+    Route::delete('/{id}', [ShipmentController::class, 'destroy'])->name('shipments.destroy');
     
     // Items management
-    Route::post('/{id}/items', [ShipmentController::class, 'addItem']);
-    Route::put('/{id}/items/{itemId}', [ShipmentController::class, 'updateItem']);
-    Route::delete('/{id}/items/{itemId}', [ShipmentController::class, 'removeItem']);
+    Route::post('/{id}/items', [ShipmentController::class, 'addItem'])->name('shipments.addItem');
+    Route::put('/{id}/items/{itemId}', [ShipmentController::class, 'updateItem'])->name('shipments.updateItem');
+    Route::delete('/{id}/items/{itemId}', [ShipmentController::class, 'removeItem'])->name('shipments.removeItem');
     
     // Workflow
-    Route::post('/{id}/submit', [ShipmentController::class, 'submit']);
-    Route::post('/{id}/approve', [ShipmentController::class, 'approve']);
-    Route::post('/{id}/reject', [ShipmentController::class, 'reject']);
-    Route::post('/{id}/send', [ShipmentController::class, 'send']);
-    Route::post('/{id}/deliver', [ShipmentController::class, 'deliver']);
+    Route::post('/{id}/submit', [ShipmentController::class, 'submit'])->name('shipments.submit');
+    Route::post('/{id}/approve', [ShipmentController::class, 'approve'])->name('shipments.approve');
+    Route::post('/{id}/reject', [ShipmentController::class, 'reject'])->name('shipments.reject');
+    Route::post('/{id}/send', [ShipmentController::class, 'send'])->name('shipments.send');
+    Route::post('/{id}/deliver', [ShipmentController::class, 'deliver'])->name('shipments.deliver');
     
     // Slots
-    Route::post('/{id}/book-slot', [ShipmentController::class, 'bookSlot']);
+    Route::post('/{id}/book-slot', [ShipmentController::class, 'bookSlot'])->name('shipments.bookSlot');
     
     // Export
-    Route::get('/{id}/export/pdf', [ShipmentController::class, 'exportPdf']);
+    Route::get('/{id}/export/pdf', [ShipmentController::class, 'exportPdf'])->name('shipments.export');
     Route::get('/{id}/export/csv', [ShipmentController::class, 'exportCsv']);
 });
 
@@ -200,12 +201,12 @@ Route::prefix('auto-supply-plans')->middleware('sellico.permission')->group(func
 | Suppliers Module
 |--------------------------------------------------------------------------
 */
-Route::prefix('suppliers')->group(function () {
-    Route::get('/', [SupplierController::class, 'index']);
-    Route::get('/{id}', [SupplierController::class, 'show']);
-    Route::post('/', [SupplierController::class, 'store']);
-    Route::put('/{id}', [SupplierController::class, 'update']);
-    Route::delete('/{id}', [SupplierController::class, 'destroy']);
+Route::prefix('suppliers')->middleware('sellico.permission')->group(function () {
+    Route::get('/', [SupplierController::class, 'index'])->name('suppliers.index');
+    Route::get('/{id}', [SupplierController::class, 'show'])->name('suppliers.show');
+    Route::post('/', [SupplierController::class, 'store'])->name('suppliers.store');
+    Route::put('/{id}', [SupplierController::class, 'update'])->name('suppliers.update');
+    Route::delete('/{id}', [SupplierController::class, 'destroy'])->name('suppliers.destroy');
 });
 
 /*
@@ -213,13 +214,13 @@ Route::prefix('suppliers')->group(function () {
 | Seller Warehouse Stocks Module
 |--------------------------------------------------------------------------
 */
-Route::prefix('seller-stocks')->group(function () {
-    Route::get('/summary', [SellerStockController::class, 'summary']);
-    Route::get('/catalog', [SellerStockController::class, 'catalog']);
-    Route::get('/', [SellerStockController::class, 'index']);
-    Route::post('/bulk', [SellerStockController::class, 'bulkUpsert']);
-    Route::post('/', [SellerStockController::class, 'upsert']);
-    Route::delete('/{id}', [SellerStockController::class, 'destroy']);
+Route::prefix('seller-stocks')->middleware('sellico.permission')->group(function () {
+    Route::get('/summary', [SellerStockController::class, 'summary'])->name('seller-stocks.summary');
+    Route::get('/catalog', [SellerStockController::class, 'catalog'])->name('seller-stocks.catalog');
+    Route::get('/', [SellerStockController::class, 'index'])->name('seller-stocks.index');
+    Route::post('/bulk', [SellerStockController::class, 'bulkUpsert'])->name('seller-stocks.bulkUpsert');
+    Route::post('/', [SellerStockController::class, 'upsert'])->name('seller-stocks.upsert');
+    Route::delete('/{id}', [SellerStockController::class, 'destroy'])->name('seller-stocks.destroy');
 });
 
 /*
@@ -227,10 +228,10 @@ Route::prefix('seller-stocks')->group(function () {
 | WB Barcode Costs Module
 |--------------------------------------------------------------------------
 */
-Route::prefix('wb-barcode-costs')->group(function () {
-    Route::get('/', [WbBarcodeCostController::class, 'index']);
-    Route::post('/bulk', [WbBarcodeCostController::class, 'bulkUpsert']);
-    Route::delete('/', [WbBarcodeCostController::class, 'destroy']);
+Route::prefix('wb-barcode-costs')->middleware('sellico.permission')->group(function () {
+    Route::get('/', [WbBarcodeCostController::class, 'index'])->name('wb-barcode-costs.index');
+    Route::post('/bulk', [WbBarcodeCostController::class, 'bulkUpsert'])->name('wb-barcode-costs.bulkUpsert');
+    Route::delete('/', [WbBarcodeCostController::class, 'destroy'])->name('wb-barcode-costs.destroy');
 });
 
 /*
@@ -238,12 +239,12 @@ Route::prefix('wb-barcode-costs')->group(function () {
 | Ozon Order Reports Module
 |--------------------------------------------------------------------------
 */
-Route::prefix('ozon-reports')->group(function () {
-    Route::get('/', [OzonOrderReportController::class, 'index']);
-    Route::post('/upload', [OzonOrderReportController::class, 'upload']);
-    Route::get('/summary', [OzonOrderReportController::class, 'reportSummary']);
-    Route::get('/warehouse-sales', [OzonOrderReportController::class, 'warehouseSales']);
-    Route::delete('/{id}', [OzonOrderReportController::class, 'destroy']);
+Route::prefix('ozon-reports')->middleware('sellico.permission')->group(function () {
+    Route::get('/', [OzonOrderReportController::class, 'index'])->name('ozon-reports.index');
+    Route::post('/upload', [OzonOrderReportController::class, 'upload'])->name('ozon-reports.upload');
+    Route::get('/summary', [OzonOrderReportController::class, 'reportSummary'])->name('ozon-reports.summary');
+    Route::get('/warehouse-sales', [OzonOrderReportController::class, 'warehouseSales'])->name('ozon-reports.warehouseSales');
+    Route::delete('/{id}', [OzonOrderReportController::class, 'destroy'])->name('ozon-reports.destroy');
 });
 
 /*
