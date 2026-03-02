@@ -133,9 +133,19 @@ class CheckSellicoPermission
         $permission = self::ROUTE_PERMISSIONS[$routeName];
 
         // Получаем параметры из заголовков или query
-        $token = $request->header('X-Sellico-Token') ?? $request->input('token');
-        $user = $request->header('X-Sellico-User') ?? $request->input('user');
-        $workspace = $request->header('X-Sellico-Workspace') ?? $request->input('workspace');
+        // Поддерживаем оба формата: X-Sellico-* и X-* (от фронтенда)
+        $token = $request->header('X-Sellico-Token') 
+            ?? $request->header('X-Token') 
+            ?? $request->input('token');
+        
+        $user = $request->header('X-Sellico-User') 
+            ?? $request->header('X-User-Id') 
+            ?? $request->header('X-User-Email')
+            ?? $request->input('user');
+        
+        $workspace = $request->header('X-Sellico-Workspace') 
+            ?? $request->header('X-Workspace-Id')
+            ?? $request->input('workspace');
 
         if (!$token || !$user || !$workspace) {
             Log::warning('CheckSellicoPermission: missing credentials', [
