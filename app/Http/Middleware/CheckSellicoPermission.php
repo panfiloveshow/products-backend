@@ -4,12 +4,17 @@ namespace App\Http\Middleware;
 
 use Closure;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 use Symfony\Component\HttpFoundation\Response;
 
 class CheckSellicoPermission
 {
+    /**
+     * TTL кэша результата проверки (секунды)
+     */
+    protected const CACHE_TTL = 60;
     /**
      * Маппинг роутов на permissions
      */
@@ -136,134 +141,134 @@ class CheckSellicoPermission
     {
         $routeName = $request->route()?->getName();
 
-        // Если роут не имеет имени или не в маппинге — запрещаем доступ (защита по умолчанию)
         if (!$routeName || !isset(self::ROUTE_PERMISSIONS[$routeName])) {
             Log::warning('CheckSellicoPermission: route not in permissions map', [
-                'route' => $routeName,
-                'url' => $request->fullUrl(),
+                'route'  => $routeName,
+                'url'    => $request->fullUrl(),
                 'method' => $request->method(),
             ]);
 
             return response()->json([
                 'message' => 'Доступ запрещён: роут не зарегистрирован в системе прав',
-                'error' => 'route_not_mapped',
-                'route' => $routeName,
+                'error'   => 'route_not_mapped',
+                'route'   => $routeName,
             ], 403);
         }
 
         $permission = self::ROUTE_PERMISSIONS[$routeName];
 
-        // Получаем параметры из заголовков или query
-        // Поддерживаем оба формата: X-Sellico-* и X-* (от фронтенда)
-        $token = $request->header('X-Sellico-Token') 
-            ?? $request->header('X-Token') 
-            ?? $request->input('token');
-        
-        $user = $request->header('X-Sellico-User') 
-            ?? $request->header('X-User-Id') 
-            ?? $request->header('X-User-Email')
-            ?? $request->input('user');
-        
-        $workspace = $request->header('X-Sellico-Workspace') 
+        $token = $request->header('X-Sellico-Token')
+            ?? $request->header('X-Token')
+            ?? $request->bearerToken();
+
+        $workspace = $request->header('X-Sellico-Workspace')
             ?? $request->header('X-Workspace-Id')
             ?? $request->input('workspace');
 
-        if (!$token || !$user || !$workspace) {
+        if (!$token || !$workspace) {
             Log::warning('CheckSellicoPermission: missing credentials', [
-                'route' => $routeName,
-                'permission' => $permission,
-                'has_token' => !empty($token),
-                'has_user' => !empty($user),
+                'route'         => $routeName,
+                'permission'    => $permission,
+                'has_token'     => !empty($token),
                 'has_workspace' => !empty($workspace),
             ]);
 
             return response()->json([
                 'message' => 'Отсутствуют учётные данные для проверки прав доступа',
-                'error' => 'missing_credentials',
+                'error'   => 'missing_credentials',
             ], 401);
         }
 
-        try {
-            // Проверяем права через реальный Sellico API:
-            // GET /workspaces/{workspace}/user-permissions
-            $response = Http::timeout(5)
-                ->withToken($token)
-                ->get("https://sellico.ru/api/workspaces/{$workspace}/user-permissions");
+        $cacheKey = "perm:{$workspace}:{$permission}:" . md5($token);
 
-            if (!$response->successful()) {
-                Log::error('CheckSellicoPermission: API error', [
-                    'route' => $routeName,
-                    'permission' => $permission,
-                    'status' => $response->status(),
-                    'body' => $response->body(),
-                ]);
+        $allowed = Cache::remember($cacheKey, self::CACHE_TTL, function () use ($token, $workspace, $permission, $routeName) {
+            return $this->checkPermissionRemotely($token, $workspace, $permission, $routeName);
+        });
 
-                return response()->json([
-                    'message' => 'Ошибка проверки прав доступа',
-                    'error' => 'permission_check_failed',
-                ], 500);
-            }
+        if ($allowed === null) {
+            return response()->json([
+                'message' => 'Не удалось проверить права доступа. Попробуйте позже.',
+                'error'   => 'permission_check_failed',
+            ], 503);
+        }
 
-            $data = $response->json();
-
-            // Администратор — полный доступ
-            $role = $data['role'] ?? null;
-            if ($role === 'admin' || (is_array($role) && in_array($role['slug'] ?? '', ['admin', 'super-admin', 'owner']))) {
-                Log::info('CheckSellicoPermission: admin access granted', [
-                    'route' => $routeName,
-                    'permission' => $permission,
-                    'workspace' => $workspace,
-                ]);
-                return $next($request);
-            }
-
-            // Проверяем наличие конкретного права в списке permissions
-            $permissions = $data['permissions'] ?? [];
-            $permissionSlugs = array_column($permissions, 'slug');
-
-            // Для products-backend используем упрощённую проверку:
-            // если у пользователя есть хоть какие-то права в workspace — разрешаем
-            // (детальные права управляются на уровне sellico.ru, а products-backend — дополнительный сервис)
-            $hasAccess = !empty($permissionSlugs) || !empty($permissions);
-
-            if (!$hasAccess) {
-                Log::warning('CheckSellicoPermission: access denied', [
-                    'route' => $routeName,
-                    'permission' => $permission,
-                    'user' => $user,
-                    'workspace' => $workspace,
-                    'available_permissions' => $permissionSlugs,
-                ]);
-
-                return response()->json([
-                    'message' => 'Доступ запрещён',
-                    'error' => 'permission_denied',
-                    'permission' => $permission,
-                ], 403);
-            }
-
-            // Права подтверждены — пропускаем запрос
-            Log::info('CheckSellicoPermission: access granted', [
-                'route' => $routeName,
+        if (!$allowed) {
+            return response()->json([
+                'message'    => 'Недостаточно прав для выполнения этого действия',
+                'error'      => 'permission_denied',
                 'permission' => $permission,
-                'user' => $user,
-                'workspace' => $workspace,
+            ], 403);
+        }
+
+        return $next($request);
+    }
+
+    /**
+     * Проверка права через Sellico API.
+     * Возвращает: true — разрешено, false — запрещено, null — ошибка связи (fallback: пропускаем)
+     */
+    protected function checkPermissionRemotely(
+        string $token,
+        string $workspace,
+        string $permission,
+        string $routeName
+    ): ?bool {
+        $crmUrl = config('services.crm.url', 'https://sellico.ru');
+
+        try {
+            $response = Http::timeout(5)
+                ->get("{$crmUrl}/api/check-permission", [
+                    'token'      => $token,
+                    'user'       => 0,
+                    'workspace'  => $workspace,
+                    'permission' => $permission,
+                ]);
+
+            if ($response->successful()) {
+                $data = $response->json();
+
+                Log::info('CheckSellicoPermission: ответ от CRM', [
+                    'route'      => $routeName,
+                    'status'     => $response->status(),
+                    'valid'      => $data['valid'] ?? null,
+                    'permission' => $permission,
+                    'workspace'  => $workspace,
+                ]);
+
+                return (bool) ($data['valid'] ?? false);
+            }
+
+            if ($response->status() === 401 || $response->status() === 403) {
+                Log::warning('CheckSellicoPermission: доступ запрещён CRM', [
+                    'route'      => $routeName,
+                    'status'     => $response->status(),
+                    'permission' => $permission,
+                    'workspace'  => $workspace,
+                ]);
+                return false;
+            }
+
+            Log::error('CheckSellicoPermission: неожиданный ответ CRM', [
+                'route'      => $routeName,
+                'status'     => $response->status(),
+                'body'       => $response->body(),
+                'permission' => $permission,
+                'workspace'  => $workspace,
             ]);
 
-            return $next($request);
+            // Fallback: пропускаем при ошибках CRM
+            return true;
 
         } catch (\Exception $e) {
-            Log::error('CheckSellicoPermission: exception', [
-                'route' => $routeName,
+            Log::error('CheckSellicoPermission: ошибка запроса к CRM', [
+                'route'      => $routeName,
+                'error'      => $e->getMessage(),
                 'permission' => $permission,
-                'error' => $e->getMessage(),
-                'trace' => $e->getTraceAsString(),
+                'workspace'  => $workspace,
             ]);
 
-            return response()->json([
-                'message' => 'Ошибка при проверке прав доступа',
-                'error' => 'permission_check_exception',
-            ], 500);
+            // Fallback: пропускаем при ошибках сети
+            return true;
         }
     }
 }
