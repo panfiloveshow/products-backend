@@ -209,8 +209,9 @@ class CheckSellicoPermission
     }
 
     /**
-     * Проверка права через Sellico API.
-     * Возвращает: true — разрешено, false — запрещено, null — ошибка связи (fallback: пропускаем)
+     * Проверка права через Sellico API (POST /api/check-permission).
+     * Вызов выполняется от имени сервис-аккаунта (SELLICO_SERVICE_TOKEN из .env).
+     * Возвращает: true — разрешено, false — запрещено, null — ошибка (fallback: пропускаем)
      */
     protected function checkPermissionRemotely(
         string $token,
@@ -219,11 +220,22 @@ class CheckSellicoPermission
         string $permission,
         string $routeName
     ): ?bool {
-        $crmUrl = config('services.crm.url', 'https://sellico.ru');
+        $crmUrl        = config('services.crm.url', 'https://sellico.ru');
+        $serviceToken  = config('services.crm.service_token');
+
+        // Если сервис-токен не настроен — пропускаем запрос (fallback)
+        if (empty($serviceToken)) {
+            Log::warning('CheckSellicoPermission: SELLICO_SERVICE_TOKEN не задан, пропускаем проверку', [
+                'route'      => $routeName,
+                'permission' => $permission,
+            ]);
+            return true;
+        }
 
         try {
             $response = Http::timeout(5)
                 ->accept('application/json')
+                ->withToken($serviceToken)
                 ->get("{$crmUrl}/api/check-permission", [
                     'token'      => $token,
                     'user'       => $user,
@@ -249,6 +261,7 @@ class CheckSellicoPermission
                 Log::warning('CheckSellicoPermission: доступ запрещён CRM', [
                     'route'      => $routeName,
                     'status'     => $response->status(),
+                    'body'       => $response->body(),
                     'permission' => $permission,
                     'workspace'  => $workspace,
                 ]);
@@ -263,7 +276,7 @@ class CheckSellicoPermission
                 'workspace'  => $workspace,
             ]);
 
-            // Fallback: пропускаем при ошибках CRM
+            // Fallback: пропускаем при прочих ошибках CRM
             return true;
 
         } catch (\Exception $e) {

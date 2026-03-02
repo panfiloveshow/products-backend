@@ -64,7 +64,8 @@ return [
     ],
 
     'crm' => [
-        'url' => env('CRM_URL', 'https://sellico.ru'),
+        'url'           => env('CRM_URL', 'https://sellico.ru'),
+        'service_token' => env('SELLICO_SERVICE_TOKEN'),
     ],
 
 ];
