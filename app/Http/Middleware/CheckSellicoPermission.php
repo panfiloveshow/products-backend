@@ -217,6 +217,7 @@ class CheckSellicoPermission
 
         try {
             $response = Http::timeout(5)
+                ->accept('application/json')
                 ->get("{$crmUrl}/api/check-permission", [
                     'token'      => $token,
                     'user'       => 0,
