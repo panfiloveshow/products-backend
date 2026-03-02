@@ -243,16 +243,25 @@ class CheckSellicoPermission
             return true;
         }
 
+        $requestParams = [
+            'token'      => $token,
+            'user'       => $user,
+            'workspace'  => $workspace,
+            'permission' => $permission,
+        ];
+
+        Log::info('CheckSellicoPermission: отправка запроса к CRM', [
+            'route'           => $routeName,
+            'url'             => "{$crmUrl}/api/check-permission",
+            'params'          => $requestParams,
+            'service_token'   => substr($serviceToken, 0, 10) . '...',
+        ]);
+
         try {
             $response = Http::timeout(5)
                 ->accept('application/json')
                 ->withToken($serviceToken)
-                ->get("{$crmUrl}/api/check-permission", [
-                    'token'      => $token,
-                    'user'       => $user,
-                    'workspace'  => $workspace,
-                    'permission' => $permission,
-                ]);
+                ->get("{$crmUrl}/api/check-permission", $requestParams);
 
             if ($response->successful()) {
                 $data = $response->json();
