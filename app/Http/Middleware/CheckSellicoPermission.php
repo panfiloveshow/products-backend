@@ -290,7 +290,13 @@ class CheckSellicoPermission
                     ]);
                     return true;
                 }
-
+                Log::info('CheckSellicoPermission: повторная авторизация', [
+                    'route'      => $routeName,
+                    'permission' => $permission,
+                    'workspace'  => $workspace,
+                    'user'       => $user,
+                    'token'      => $token,
+                ]);
                 $retryResponse = Http::timeout(5)
                     ->accept('application/json')
                     ->withToken($freshToken)
@@ -300,7 +306,7 @@ class CheckSellicoPermission
                         'workspace'  => $workspace,
                         'permission' => $permission,
                     ]);
-
+                Log::info($retryResponse);
                 if ($retryResponse->successful()) {
                     $data = $retryResponse->json();
                     return (bool) ($data['valid'] ?? false);
