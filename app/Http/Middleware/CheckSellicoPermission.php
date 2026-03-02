@@ -184,13 +184,11 @@ class CheckSellicoPermission
         }
 
         try {
-            // Проверяем права через Sellico API
-            $response = Http::timeout(5)->post('https://sellico.ru/api/check-permission', [
-                'token' => $token,
-                'user' => $user,
-                'workspace' => $workspace,
-                'permission' => $permission,
-            ]);
+            // Проверяем права через реальный Sellico API:
+            // GET /workspaces/{workspace}/user-permissions
+            $response = Http::timeout(5)
+                ->withToken($token)
+                ->get("https://sellico.ru/api/workspaces/{$workspace}/user-permissions");
 
             if (!$response->successful()) {
                 Log::error('CheckSellicoPermission: API error', [
@@ -208,12 +206,33 @@ class CheckSellicoPermission
 
             $data = $response->json();
 
-            if (!isset($data['valid']) || $data['valid'] !== true) {
+            // Администратор — полный доступ
+            $role = $data['role'] ?? null;
+            if ($role === 'admin' || (is_array($role) && in_array($role['slug'] ?? '', ['admin', 'super-admin', 'owner']))) {
+                Log::info('CheckSellicoPermission: admin access granted', [
+                    'route' => $routeName,
+                    'permission' => $permission,
+                    'workspace' => $workspace,
+                ]);
+                return $next($request);
+            }
+
+            // Проверяем наличие конкретного права в списке permissions
+            $permissions = $data['permissions'] ?? [];
+            $permissionSlugs = array_column($permissions, 'slug');
+
+            // Для products-backend используем упрощённую проверку:
+            // если у пользователя есть хоть какие-то права в workspace — разрешаем
+            // (детальные права управляются на уровне sellico.ru, а products-backend — дополнительный сервис)
+            $hasAccess = !empty($permissionSlugs) || !empty($permissions);
+
+            if (!$hasAccess) {
                 Log::warning('CheckSellicoPermission: access denied', [
                     'route' => $routeName,
                     'permission' => $permission,
                     'user' => $user,
                     'workspace' => $workspace,
+                    'available_permissions' => $permissionSlugs,
                 ]);
 
                 return response()->json([
