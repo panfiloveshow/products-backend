@@ -23,6 +23,10 @@ class CheckSellicoPermission
         'products.sync' => 'products.sync.execute',
         'products.syncStatus' => 'products.sync.status',
         'products.export' => 'products.export',
+        'products.cost-price.index' => 'products.view',
+        'products.cost-price.upload' => 'products.edit',
+        'products.cost-price.bulk' => 'products.edit',
+        'products.cost-price.template' => 'products.view',
 
         // Юнит-экономика
         'unit-economics.index' => 'unit_economics.view',
@@ -34,14 +38,18 @@ class CheckSellicoPermission
         'unit-economics.settings.bulk' => 'unit_economics.settings.edit',
         'unit-economics.recalculate' => 'unit_economics.recalculate',
         'unit-economics.stats' => 'unit_economics.stats.view',
+        'unit-economics.stats.marketplace' => 'unit_economics.stats.view',
         'unit-economics.comparison' => 'unit_economics.stats.view',
         'unit-economics.commissions' => 'unit_economics.tariffs.view',
         'unit-economics.tariffs' => 'unit_economics.tariffs.view',
+        'unit-economics.cache-stats' => 'unit_economics.view',
 
         // Автопланирование
         'auto-supply-plans.index' => 'auto_supply.view',
         'auto-supply-plans.show' => 'auto_supply.view',
         'auto-supply-plans.lines' => 'auto_supply.view',
+        'auto-supply-plans.lines.update' => 'auto_supply.view',
+        'auto-supply-plans.warehouses' => 'auto_supply.view',
         'auto-supply-plans.simulate' => 'auto_supply.simulate',
         'auto-supply-plans.store' => 'auto_supply.create',
         'auto-supply-plans.destroy' => 'auto_supply.delete',
@@ -49,6 +57,7 @@ class CheckSellicoPermission
         'auto-supply-plans.export' => 'auto_supply.export',
         'auto-supply-plans.export.xlsx' => 'auto_supply.export',
         'auto-supply-plans.export.csv' => 'auto_supply.export',
+        'auto-supply-plans.export.wb' => 'auto_supply.export',
 
         // Остатки
         'inventory.index' => 'inventory.view',
@@ -83,6 +92,8 @@ class CheckSellicoPermission
         'shipments.deliver' => 'shipments.workflow',
         'shipments.bookSlot' => 'shipments.workflow',
         'shipments.export' => 'shipments.export',
+        'shipments.export.csv' => 'shipments.export',
+        'shipments.createFromRecommendation' => 'shipments.create',
 
         // Поставщики
         'suppliers.index' => 'suppliers.view',
@@ -125,9 +136,19 @@ class CheckSellicoPermission
     {
         $routeName = $request->route()?->getName();
 
-        // Если роут не требует проверки прав — пропускаем
+        // Если роут не имеет имени или не в маппинге — запрещаем доступ (защита по умолчанию)
         if (!$routeName || !isset(self::ROUTE_PERMISSIONS[$routeName])) {
-            return $next($request);
+            Log::warning('CheckSellicoPermission: route not in permissions map', [
+                'route' => $routeName,
+                'url' => $request->fullUrl(),
+                'method' => $request->method(),
+            ]);
+
+            return response()->json([
+                'message' => 'Доступ запрещён: роут не зарегистрирован в системе прав',
+                'error' => 'route_not_mapped',
+                'route' => $routeName,
+            ], 403);
         }
 
         $permission = self::ROUTE_PERMISSIONS[$routeName];

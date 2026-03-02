@@ -51,10 +51,10 @@ Route::prefix('products')->middleware('sellico.permission')->group(function () {
     Route::post('/sync/{marketplace}', [ProductController::class, 'sync'])
         ->whereIn('marketplace', ['wildberries', 'ozon', 'yandex'])
         ->name('products.sync');
-    Route::get('/cost-price', [CostPriceController::class, 'index']);
-    Route::post('/cost-price/upload', [CostPriceController::class, 'upload']);
-    Route::post('/cost-price/bulk', [CostPriceController::class, 'bulk']);
-    Route::get('/cost-price/template', [CostPriceController::class, 'template']);
+    Route::get('/cost-price', [CostPriceController::class, 'index'])->name('products.cost-price.index');
+    Route::post('/cost-price/upload', [CostPriceController::class, 'upload'])->name('products.cost-price.upload');
+    Route::post('/cost-price/bulk', [CostPriceController::class, 'bulk'])->name('products.cost-price.bulk');
+    Route::get('/cost-price/template', [CostPriceController::class, 'template'])->name('products.cost-price.template');
     Route::get('/{id}', [ProductController::class, 'show'])->name('products.show');
     Route::post('/', [ProductController::class, 'store'])->name('products.store');
     Route::put('/{id}', [ProductController::class, 'update'])->name('products.update');
@@ -93,7 +93,7 @@ Route::prefix('shipments')->middleware('sellico.permission')->group(function () 
     Route::get('/slots', [ShipmentController::class, 'slots'])->name('shipments.slots');
     Route::get('/recommendations', [ShipmentController::class, 'recommendations'])->name('shipments.recommendations');
     Route::get('/stats', [ShipmentController::class, 'stats'])->name('shipments.stats');
-    Route::post('/from-recommendation/{recommendationId}', [ShipmentController::class, 'createFromRecommendation']);
+    Route::post('/from-recommendation/{recommendationId}', [ShipmentController::class, 'createFromRecommendation'])->name('shipments.createFromRecommendation');
     
     Route::get('/{id}', [ShipmentController::class, 'show'])->name('shipments.show');
     Route::post('/', [ShipmentController::class, 'store'])->name('shipments.store');
@@ -117,7 +117,7 @@ Route::prefix('shipments')->middleware('sellico.permission')->group(function () 
     
     // Export
     Route::get('/{id}/export/pdf', [ShipmentController::class, 'exportPdf'])->name('shipments.export');
-    Route::get('/{id}/export/csv', [ShipmentController::class, 'exportCsv']);
+    Route::get('/{id}/export/csv', [ShipmentController::class, 'exportCsv'])->name('shipments.export.csv');
 });
 
 /*
@@ -138,7 +138,8 @@ Route::prefix('unit-economics')->middleware('sellico.permission')->group(functio
         ->whereIn('marketplace', ['wildberries', 'ozon', 'yandex_market'])
         ->name('unit-economics.tariffs');
     Route::get('/stats/{marketplace}', [UnitEconomicsCacheController::class, 'statsByMarketplace'])
-        ->whereIn('marketplace', ['wildberries', 'ozon', 'yandex_market']);
+        ->whereIn('marketplace', ['wildberries', 'ozon', 'yandex_market'])
+        ->name('unit-economics.stats.marketplace');
 
     // Settings (PUT) — должны быть до /{marketplace} чтобы не конфликтовать
     Route::put('/settings/bulk', [UnitEconomicsCacheController::class, 'bulkUpdateSettings'])
@@ -149,7 +150,7 @@ Route::prefix('unit-economics')->middleware('sellico.permission')->group(functio
     // Recalculate
     Route::post('/recalculate/{integrationId}', [UnitEconomicsCacheController::class, 'recalculate'])
         ->name('unit-economics.recalculate');
-    Route::get('/cache-stats/{integrationId}', [UnitEconomicsCacheController::class, 'cacheStats']);
+    Route::get('/cache-stats/{integrationId}', [UnitEconomicsCacheController::class, 'cacheStats'])->name('unit-economics.cache-stats');
 
     // Calculate
     Route::post('/calculate/{marketplace}', [UnitEconomicsCacheController::class, 'calculate'])
@@ -171,7 +172,7 @@ Route::prefix('unit-economics')->middleware('sellico.permission')->group(functio
 |--------------------------------------------------------------------------
 */
 Route::prefix('auto-supply-plans')->middleware('sellico.permission')->group(function () {
-    Route::get('/warehouses', [AutoSupplyPlanController::class, 'warehouses']);
+    Route::get('/warehouses', [AutoSupplyPlanController::class, 'warehouses'])->name('auto-supply-plans.warehouses');
     Route::get('/', [AutoSupplyPlanController::class, 'index'])
         ->name('auto-supply-plans.index');
     Route::post('/', [AutoSupplyPlanController::class, 'store'])
@@ -184,7 +185,7 @@ Route::prefix('auto-supply-plans')->middleware('sellico.permission')->group(func
         ->name('auto-supply-plans.calculate');
     Route::get('/{id}/lines', [AutoSupplyPlanController::class, 'lines'])
         ->name('auto-supply-plans.lines');
-    Route::put('/{id}/lines/{lineId}', [AutoSupplyPlanController::class, 'updateLine']);
+    Route::put('/{id}/lines/{lineId}', [AutoSupplyPlanController::class, 'updateLine'])->name('auto-supply-plans.lines.update');
     Route::get('/{id}/simulate', [AutoSupplyPlanController::class, 'simulate'])
         ->name('auto-supply-plans.simulate');
     Route::get('/{id}/export/ozon', [AutoSupplyPlanController::class, 'exportOzon'])
@@ -193,7 +194,7 @@ Route::prefix('auto-supply-plans')->middleware('sellico.permission')->group(func
         ->name('auto-supply-plans.export.xlsx');
     Route::get('/{id}/export/ozon-by-warehouse', [AutoSupplyPlanController::class, 'exportOzonByWarehouse'])
         ->name('auto-supply-plans.export.csv');
-    Route::get('/{id}/export/wb', [AutoSupplyPlanController::class, 'exportWb']);
+    Route::get('/{id}/export/wb', [AutoSupplyPlanController::class, 'exportWb'])->name('auto-supply-plans.export.wb');
 });
 
 /*
