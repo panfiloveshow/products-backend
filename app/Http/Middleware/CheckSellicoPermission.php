@@ -161,6 +161,11 @@ class CheckSellicoPermission
             ?? $request->header('X-Token')
             ?? $request->bearerToken();
 
+        $user = $request->header('X-Sellico-User')
+            ?? $request->header('X-User-Id')
+            ?? $request->header('X-User-Email')
+            ?? 0;
+
         $workspace = $request->header('X-Sellico-Workspace')
             ?? $request->header('X-Workspace-Id')
             ?? $request->input('workspace');
@@ -181,8 +186,8 @@ class CheckSellicoPermission
 
         $cacheKey = "perm:{$workspace}:{$permission}:" . md5($token);
 
-        $allowed = Cache::remember($cacheKey, self::CACHE_TTL, function () use ($token, $workspace, $permission, $routeName) {
-            return $this->checkPermissionRemotely($token, $workspace, $permission, $routeName);
+        $allowed = Cache::remember($cacheKey, self::CACHE_TTL, function () use ($token, $user, $workspace, $permission, $routeName) {
+            return $this->checkPermissionRemotely($token, $user, $workspace, $permission, $routeName);
         });
 
         if ($allowed === null) {
@@ -209,6 +214,7 @@ class CheckSellicoPermission
      */
     protected function checkPermissionRemotely(
         string $token,
+        mixed $user,
         string $workspace,
         string $permission,
         string $routeName
@@ -220,7 +226,7 @@ class CheckSellicoPermission
                 ->accept('application/json')
                 ->get("{$crmUrl}/api/check-permission", [
                     'token'      => $token,
-                    'user'       => 0,
+                    'user'       => $user,
                     'workspace'  => $workspace,
                     'permission' => $permission,
                 ]);
