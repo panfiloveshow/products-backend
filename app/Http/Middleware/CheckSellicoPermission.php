@@ -15,6 +15,16 @@ class CheckSellicoPermission
      * TTL кэша результата проверки (секунды)
      */
     protected const CACHE_TTL = 60;
+
+    /**
+     * TTL кэша авторизационного токена (секунды) — 23 часа
+     */
+    protected const TOKEN_CACHE_TTL = 82800;
+
+    /**
+     * Ключ кэша для авторизационного токена сервис-аккаунта
+     */
+    protected const TOKEN_CACHE_KEY = 'sellico_access_token';
     /**
      * Маппинг роутов на permissions
      */
@@ -209,8 +219,9 @@ class CheckSellicoPermission
     }
 
     /**
-     * Проверка права через Sellico API (POST /api/check-permission).
-     * Вызов выполняется от имени сервис-аккаунта (SELLICO_SERVICE_TOKEN из .env).
+     * Проверка права через Sellico API (GET /api/check-permission).
+     * Вызов выполняется от имени сервис-аккаунта — токен берётся из кеша,
+     * при отсутствии — выполняется авторизация через sellico.ru/api/login.
      * Возвращает: true — разрешено, false — запрещено, null — ошибка (fallback: пропускаем)
      */
     protected function checkPermissionRemotely(
@@ -220,12 +231,12 @@ class CheckSellicoPermission
         string $permission,
         string $routeName
     ): ?bool {
-        $crmUrl        = config('services.crm.url', 'https://sellico.ru');
-        $serviceToken  = config('services.crm.service_token');
+        $crmUrl = config('services.crm.url', 'https://sellico.ru');
 
-        // Если сервис-токен не настроен — пропускаем запрос (fallback)
+        $serviceToken = $this->getServiceToken();
+
         if (empty($serviceToken)) {
-            Log::warning('CheckSellicoPermission: SELLICO_SERVICE_TOKEN не задан, пропускаем проверку', [
+            Log::warning('CheckSellicoPermission: не удалось получить сервисный токен, пропускаем проверку', [
                 'route'      => $routeName,
                 'permission' => $permission,
             ]);
@@ -257,7 +268,37 @@ class CheckSellicoPermission
                 return (bool) ($data['valid'] ?? false);
             }
 
-            if ($response->status() === 401 || $response->status() === 403) {
+            // Токен протух — сбрасываем кеш и повторяем авторизацию
+            if ($response->status() === 401) {
+                Cache::forget(self::TOKEN_CACHE_KEY);
+
+                $freshToken = $this->authorizeAndCacheToken();
+
+                if (!$freshToken) {
+                    Log::warning('CheckSellicoPermission: повторная авторизация не удалась', [
+                        'route'      => $routeName,
+                        'permission' => $permission,
+                    ]);
+                    return true;
+                }
+
+                $retryResponse = Http::timeout(5)
+                    ->accept('application/json')
+                    ->withToken($freshToken)
+                    ->get("{$crmUrl}/api/check-permission", [
+                        'token'      => $token,
+                        'user'       => $user,
+                        'workspace'  => $workspace,
+                        'permission' => $permission,
+                    ]);
+
+                if ($retryResponse->successful()) {
+                    $data = $retryResponse->json();
+                    return (bool) ($data['valid'] ?? false);
+                }
+            }
+
+            if ($response->status() === 403) {
                 Log::warning('CheckSellicoPermission: доступ запрещён CRM', [
                     'route'      => $routeName,
                     'status'     => $response->status(),
@@ -289,6 +330,71 @@ class CheckSellicoPermission
 
             // Fallback: пропускаем при ошибках сети
             return true;
+        }
+    }
+
+    /**
+     * Получить сервисный токен: из кеша или через авторизацию.
+     */
+    protected function getServiceToken(): ?string
+    {
+        $cached = Cache::get(self::TOKEN_CACHE_KEY);
+
+        if ($cached) {
+            return $cached;
+        }
+
+        return $this->authorizeAndCacheToken();
+    }
+
+    /**
+     * Авторизация в sellico.ru/api/login с данными из .env, сохранение токена в кеш.
+     */
+    protected function authorizeAndCacheToken(): ?string
+    {
+        $baseUrl  = config('services.sellico.base_url', 'https://sellico.ru/api');
+        $email    = config('services.sellico.email');
+        $password = config('services.sellico.password');
+
+        if (empty($email) || empty($password)) {
+            Log::warning('CheckSellicoPermission: SELLICO_EMAIL или SELLICO_PASSWORD не заданы в .env');
+            return null;
+        }
+
+        try {
+            $response = Http::timeout(10)
+                ->accept('application/json')
+                ->post("{$baseUrl}/login", [
+                    'email'    => $email,
+                    'password' => $password,
+                ]);
+
+            if ($response->successful()) {
+                $token = $response->json('access_token');
+
+                if ($token) {
+                    Cache::put(self::TOKEN_CACHE_KEY, $token, self::TOKEN_CACHE_TTL);
+                    Log::info('CheckSellicoPermission: авторизация в Sellico прошла успешно, токен закешировн');
+                    return $token;
+                }
+
+                Log::warning('CheckSellicoPermission: авторизация успешна, но access_token отсутствует в ответе', [
+                    'body' => $response->body(),
+                ]);
+                return null;
+            }
+
+            Log::error('CheckSellicoPermission: ошибка авторизации в Sellico', [
+                'status' => $response->status(),
+                'body'   => $response->body(),
+            ]);
+            return null;
+
+        } catch (\Exception $e) {
+            Log::error('CheckSellicoPermission: исключение при авторизации в Sellico', [
+                'error' => $e->getMessage(),
+            ]);
+            return null;
         }
     }
 }

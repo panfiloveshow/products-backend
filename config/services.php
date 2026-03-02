@@ -61,6 +61,8 @@ return [
 
     'sellico' => [
         'base_url' => env('SELLICO_API_URL', 'https://sellico.ru/api'),
+        'email'    => env('SELLICO_EMAIL'),
+        'password' => env('SELLICO_PASSWORD'),
     ],
 
     'crm' => [
