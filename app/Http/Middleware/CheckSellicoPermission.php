@@ -344,6 +344,7 @@ class CheckSellicoPermission
                 $token = $response->json('access_token');
 
                 if ($token) {
+                    $token = str_contains($token, '|') ? explode('|', $token, 2)[1] : $token;
                     Cache::put(self::TOKEN_CACHE_KEY, $token, self::TOKEN_CACHE_TTL);
                     Log::info('CheckSellicoPermission: авторизация в Sellico прошла успешно, токен закешировн');
                     return $token;
