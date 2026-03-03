@@ -270,10 +270,14 @@ class CheckSellicoPermission
             }
 
             if ($response->status() === 403) {
+                $body = $response->body();
+                if (str_contains($body, 'service account')) {
+                    Cache::forget(self::TOKEN_CACHE_KEY);
+                }
                 Log::warning('CheckSellicoPermission: доступ запрещён CRM', [
                     'route'      => $routeName,
                     'status'     => $response->status(),
-                    'body'       => $response->body(),
+                    'body'       => $body,
                     'permission' => $permission,
                     'workspace'  => $workspace,
                 ]);
