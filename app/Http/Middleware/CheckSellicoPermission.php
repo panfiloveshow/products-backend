@@ -210,7 +210,7 @@ class CheckSellicoPermission
             'route'           => $routeName,
             'url'             => "{$crmUrl}/api/check-permission",
             'params'          => $requestParams,
-            'service_token'   => substr($serviceToken, 0, 10) . '...',
+            'service_token'   => $serviceToken
         ]);
 
         try {
