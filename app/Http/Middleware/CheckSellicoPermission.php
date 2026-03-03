@@ -167,6 +167,10 @@ class CheckSellicoPermission
 
         $permission = self::ROUTE_PERMISSIONS[$routeName];
 
+        if (config('services.sellico.skip_permission_check', false)) {
+            return $next($request);
+        }
+
         $token = $request->header('X-Sellico-Token')
             ?? $request->header('X-Token')
             ?? $request->bearerToken();

@@ -60,9 +60,10 @@ return [
     ],
 
     'sellico' => [
-        'base_url' => env('SELLICO_API_URL', 'https://sellico.ru/api'),
-        'email'    => env('SELLICO_EMAIL'),
-        'password' => env('SELLICO_PASSWORD'),
+        'base_url'               => env('SELLICO_API_URL', 'https://sellico.ru/api'),
+        'email'                  => env('SELLICO_EMAIL'),
+        'password'               => env('SELLICO_PASSWORD'),
+        'skip_permission_check'  => env('SELLICO_SKIP_PERMISSION_CHECK', false),
     ],
 
     'crm' => [
