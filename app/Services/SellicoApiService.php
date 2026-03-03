@@ -31,9 +31,9 @@ class SellicoApiService
                 $data = $response->json();
                 $this->accessToken = $data['access_token'] ?? null;
                 
-                // Кэшируем токен
+                // Кэшируем токен пользователя (отдельный ключ, не пересекается с сервис-аккаунтом)
                 if ($this->accessToken) {
-                    Cache::put('sellico_access_token', $this->accessToken, now()->addHours(23));
+                    Cache::put('sellico_user_access_token', $this->accessToken, now()->addHours(23));
                 }
 
                 return [
@@ -300,7 +300,7 @@ class SellicoApiService
             return $this->accessToken;
         }
 
-        return Cache::get('sellico_access_token');
+        return Cache::get('sellico_user_access_token');
     }
 
     /**
@@ -309,7 +309,7 @@ class SellicoApiService
     public function setAccessToken(string $token): void
     {
         $this->accessToken = $token;
-        Cache::put('sellico_access_token', $token, now()->addHours(23));
+        Cache::put('sellico_user_access_token', $token, now()->addHours(23));
     }
 
     /**
