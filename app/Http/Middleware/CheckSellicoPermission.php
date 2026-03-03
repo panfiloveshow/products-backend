@@ -38,10 +38,10 @@ class CheckSellicoPermission
         'products.sync'                => 'products.sync.execute',
         'products.syncStatus'          => 'products.sync.status',
         'products.export'              => 'products.export',
-        'products.cost-price.index'    => 'products.cost_price.view',
-        'products.cost-price.upload'   => 'products.cost_price.upload',
-        'products.cost-price.bulk'     => 'products.cost_price.edit',
-        'products.cost-price.template' => 'products.cost_price.view',
+        'products.cost-price.index'    => 'products.view',
+        'products.cost-price.upload'   => 'products.upload',
+        'products.cost-price.bulk'     => 'products.edit',
+        'products.cost-price.template' => 'products.view',
 
         // Юнит-экономика
         'unit-economics.index'             => 'unit_economics.view',
@@ -74,15 +74,15 @@ class CheckSellicoPermission
         'auto-supply-plans.export.wb'    => 'auto_supply.export',
 
         // Остатки
-        'inventory.index'           => 'products.inventory.view',
-        'inventory.show'            => 'products.inventory.view',
-        'inventory.stats'           => 'products.inventory.view',
-        'inventory.alerts'          => 'products.inventory.view',
-        'inventory.recommendations' => 'products.inventory.view',
-        'inventory.redistribution'  => 'products.inventory.view',
-        'inventory.history'         => 'products.inventory.view',
-        'inventory.forecast'        => 'products.inventory.view',
-        'inventory.matrix'          => 'products.inventory.view',
+        'inventory.index'           => 'products.view',
+        'inventory.show'            => 'products.view',
+        'inventory.stats'           => 'products.view',
+        'inventory.alerts'          => 'products.view',
+        'inventory.recommendations' => 'products.view',
+        'inventory.redistribution'  => 'products.view',
+        'inventory.history'         => 'products.view',
+        'inventory.forecast'        => 'products.view',
+        'inventory.matrix'          => 'products.view',
         'inventory.sync'            => 'products.sync.execute',
         'inventory.syncStatus'      => 'products.sync.status',
         'inventory.syncStorageFees' => 'products.sync.execute',
@@ -123,24 +123,24 @@ class CheckSellicoPermission
         'suppliers.destroy' => 'products.delete',
 
         // Складские остатки продавца
-        'seller-stocks.index'      => 'products.warehouse_stock.edit',
-        'seller-stocks.summary'    => 'products.inventory.view',
-        'seller-stocks.catalog'    => 'products.inventory.view',
-        'seller-stocks.upsert'     => 'products.warehouse_stock.edit',
-        'seller-stocks.bulkUpsert' => 'products.warehouse_stock.edit',
-        'seller-stocks.destroy'    => 'products.warehouse_stock.edit',
+        'seller-stocks.index'      => 'products.edit',
+        'seller-stocks.summary'    => 'products.view',
+        'seller-stocks.catalog'    => 'products.view',
+        'seller-stocks.upsert'     => 'products.edit',
+        'seller-stocks.bulkUpsert' => 'products.edit',
+        'seller-stocks.destroy'    => 'products.edit',
 
         // WB штрихкоды/себестоимость
-        'wb-barcode-costs.index'      => 'products.cost_price.view',
-        'wb-barcode-costs.bulkUpsert' => 'products.cost_price.edit',
-        'wb-barcode-costs.destroy'    => 'products.cost_price.edit',
+        'wb-barcode-costs.index'      => 'products.view',
+        'wb-barcode-costs.bulkUpsert' => 'products.edit',
+        'wb-barcode-costs.destroy'    => 'products.edit',
 
         // Отчёты Ozon
-        'ozon-reports.index'           => 'unit_economics.stats.view',
-        'ozon-reports.upload'          => 'unit_economics.stats.view',
-        'ozon-reports.summary'         => 'unit_economics.stats.view',
-        'ozon-reports.warehouseSales'  => 'unit_economics.stats.view',
-        'ozon-reports.destroy'         => 'unit_economics.stats.view',
+        'ozon-reports.index'           => 'unit_economics.view',
+        'ozon-reports.upload'          => 'unit_economics.view',
+        'ozon-reports.summary'         => 'unit_economics.view',
+        'ozon-reports.warehouseSales'  => 'unit_economics.view',
+        'ozon-reports.destroy'         => 'unit_economics.view',
     ];
 
     /**
