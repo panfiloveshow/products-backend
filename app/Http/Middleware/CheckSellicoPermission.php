@@ -183,8 +183,10 @@ class CheckSellicoPermission
             return true;
         }
 
+        $plainToken = str_contains($token, '|') ? explode('|', $token, 2)[1] : $token;
+
         $requestParams = [
-            'token'      => $token,
+            'token'      => $plainToken,
             'user'       => $user,
             'workspace'  => $workspace,
             'permission' => $permission,
@@ -241,7 +243,7 @@ class CheckSellicoPermission
                     ->accept('application/json')
                     ->withToken($freshToken)
                     ->get("{$crmUrl}/api/check-permission", [
-                        'token'      => $token,
+                        'token'      => $plainToken,
                         'user'       => $user,
                         'workspace'  => $workspace,
                         'permission' => $permission,
