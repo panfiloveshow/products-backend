@@ -73,6 +73,20 @@ class CheckSellicoPermission
         'auto-supply-plans.export.csv'  => 'auto_supply.export',
         'auto-supply-plans.export.wb'   => 'auto_supply.export',
 
+        // Остатки
+        'inventory.index'           => 'inventory.view',
+        'inventory.show'            => 'inventory.view',
+        'inventory.stats'           => 'inventory.view',
+        'inventory.alerts'          => 'inventory.view',
+        'inventory.recommendations' => 'inventory.view',
+        'inventory.redistribution'  => 'inventory.view',
+        'inventory.history'         => 'inventory.view',
+        'inventory.forecast'        => 'inventory.view',
+        'inventory.matrix'          => 'inventory.view',
+        'inventory.sync'            => 'inventory.sync.execute',
+        'inventory.syncStatus'      => 'inventory.sync.status',
+        'inventory.syncStorageFees' => 'inventory.sync.execute',
+
         // Интеграции (служебные)
         'integrations.index'        => 'products.view',
         'integrations.premiumStatus'=> 'products.view',
