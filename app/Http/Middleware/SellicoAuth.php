@@ -20,12 +20,14 @@ class SellicoAuth
      */
     public function handle(Request $request, Closure $next): Response
     {
-        $token = $request->bearerToken();
+        $token = $request->bearerToken()
+            ?? $request->header('X-Sellico-Token')
+            ?? $request->header('X-Token');
         
         if (!$token) {
             return response()->json([
                 'success' => false,
-                'message' => 'Токен авторизации не предоставлен',
+                'message' => 'Токен не предоставлен',
             ], 401);
         }
 
