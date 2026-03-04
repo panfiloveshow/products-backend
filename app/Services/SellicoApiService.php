@@ -355,6 +355,12 @@ class SellicoApiService
      */
     public function getIntegrationById(int $integrationId): array
     {
+        $cacheKey = "sellico_integration_{$integrationId}";
+        $cached = Cache::get($cacheKey);
+        if ($cached) {
+            return $cached;
+        }
+
         $token = $this->getAccessToken();
         
         if (!$token) {
@@ -366,13 +372,13 @@ class SellicoApiService
 
         try {
             // 1) Пробуем прямой endpoint (может отсутствовать на некоторых версиях Sellico API)
-            $response = Http::withToken($token)
+            $response = Http::timeout(8)->withToken($token)
                 ->get("{$this->baseUrl}/integrations/{$integrationId}");
 
             if ($response->successful()) {
                 $data = $response->json('data') ?? $response->json();
 
-                return [
+                $result = [
                     'success' => true,
                     'integration' => $data,
                     'credentials' => $data['credentials'] ?? [
@@ -383,10 +389,12 @@ class SellicoApiService
                         'business_id' => $data['business_id'] ?? null,
                     ],
                 ];
+                Cache::put($cacheKey, $result, 3600);
+                return $result;
             }
 
             // 2) Fallback: ищем интеграцию во всех workspace пользователя
-            $workspacesResponse = Http::withToken($token)
+            $workspacesResponse = Http::timeout(8)->withToken($token)
                 ->get("{$this->baseUrl}/workspaces");
 
             if ($workspacesResponse->successful()) {
@@ -399,7 +407,7 @@ class SellicoApiService
                         continue;
                     }
 
-                    $integrationsResponse = Http::withToken($token)
+                    $integrationsResponse = Http::timeout(8)->withToken($token)
                         ->get("{$this->baseUrl}/workspaces/{$workspaceId}/integrations");
 
                     if (!$integrationsResponse->successful()) {
@@ -414,7 +422,7 @@ class SellicoApiService
                             continue;
                         }
 
-                        return [
+                        $result = [
                             'success' => true,
                             'integration' => $integration,
                             'credentials' => $integration['credentials'] ?? [
@@ -425,6 +433,8 @@ class SellicoApiService
                                 'business_id' => $integration['business_id'] ?? null,
                             ],
                         ];
+                        Cache::put($cacheKey, $result, 3600);
+                        return $result;
                     }
                 }
             }
