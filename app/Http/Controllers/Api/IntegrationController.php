@@ -154,8 +154,10 @@ class IntegrationController extends Controller
      */
     public function sync(Request $request, int $id, ProductService $productService, SellicoApiService $sellicoApi): JsonResponse
     {
-        $token = $request->bearerToken();
-        
+        $token = $request->bearerToken()
+            ?? $request->header('X-Sellico-Token')
+            ?? $request->header('X-Token');
+
         if (!$token) {
             return response()->json([
                 'success' => false,
