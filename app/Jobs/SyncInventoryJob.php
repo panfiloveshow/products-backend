@@ -144,6 +144,19 @@ class SyncInventoryJob implements ShouldQueue
                 unset($stockData);
             }
 
+            // Нормализуем статичные warehouse_id — добавляем integration_id чтобы разные интеграции не конфликтовали
+            $integId = $this->syncLog->integration_id;
+            if ($integId) {
+                foreach ($flatInventory as &$item) {
+                    $wid = (string)($item['warehouse_id'] ?? '');
+                    // Статичные warehouse_id без привязки к конкретному складу — добавляем суффикс интеграции
+                    if (in_array(strtolower($wid), ['fbs', 'fbo', 'ozon_fbs', 'ozon_fbo'], true)) {
+                        $item['warehouse_id'] = $wid . '_integ' . $integId;
+                    }
+                }
+                unset($item);
+            }
+
             // Формируем набор актуальных sku+warehouse_id из API для последующей очистки устаревших записей
             $apiPairs = [];
             foreach ($flatInventory as $stockData) {
@@ -260,10 +273,10 @@ class SyncInventoryJob implements ShouldQueue
     {
         $integrationId = $this->syncLog->integration_id;
 
-        // Ищем существующую запись по sku + warehouse_id + integration_id
+        // Ищем существующую запись по sku + warehouse_id + integration_id (все три поля — уникальный ключ)
         $existing = InventoryWarehouse::where('sku', $stockData['sku'])
             ->where('warehouse_id', $stockData['warehouse_id'])
-            ->when($integrationId, fn($q) => $q->where('integration_id', $integrationId))
+            ->where('integration_id', $integrationId)
             ->first();
 
         // Для WB: используем реальные продажи из Statistics API
