@@ -148,7 +148,7 @@ class InventoryApi implements InventoryApiInterface
      * ВАЖНО: API требует передать offer_id - нельзя запрашивать без параметров!
      * Если $skus пустой, сначала получаем список всех товаров через v3/product/list
      */
-    private function getStocksForFbsSchemes(array $skus = []): array
+    public function getStocksForFbsSchemes(array $skus = []): array
     {
         // Если SKU не переданы, получаем список всех товаров
         if (empty($skus)) {
@@ -299,6 +299,75 @@ class InventoryApi implements InventoryApiInterface
         $response = $this->client->post('/v1/product/info/stocks-by-warehouse/fbs', $body);
         
         return $response['result'] ?? [];
+    }
+
+    /**
+     * Получить остатки по каждому реальному FBO-складу Ozon.
+     * Использует /v2/analytics/stock_on_warehouses.
+     * Возвращает массив в формате SyncInventoryJob:
+     * [['sku' => offer_id, 'warehouses' => [['warehouse_id', 'warehouse_name', 'quantity', 'fulfillment_type']]]]
+     */
+    public function getStocksPerWarehouse(): array
+    {
+        $allRows  = [];
+        $offset   = 0;
+        $limit    = 1000;
+
+        do {
+            $response = $this->client->post('/v2/analytics/stock_on_warehouses', [
+                'limit'          => $limit,
+                'offset'         => $offset,
+                'warehouse_type' => 'ALL',
+            ]);
+
+            $rows = $response['result']['rows'] ?? [];
+            $allRows = array_merge($allRows, $rows);
+            $offset += $limit;
+        } while (count($rows) === $limit);
+
+        // Группируем по offer_id (item_code = offer_id продавца)
+        $grouped = [];
+        foreach ($allRows as $row) {
+            $offerId     = $row['item_code'] ?? null;
+            $whName      = $row['warehouse_name'] ?? '';
+            // quantity = free_to_sell + reserved = present (как показывает Ozon Seller)
+            // promised_amount — товар едет на склад или в обработке, не учитываем в остатке
+            $qty         = (int)($row['free_to_sell_amount'] ?? 0)
+                         + (int)($row['reserved_amount'] ?? 0);
+
+            if (!$offerId || !$whName) {
+                continue;
+            }
+
+            // warehouse_id формируем из названия склада (стабильный строковый ключ)
+            $warehouseId = 'ozon_' . substr(md5($whName), 0, 12);
+
+            if (!isset($grouped[$offerId])) {
+                $grouped[$offerId] = [
+                    'sku'              => $offerId,
+                    'warehouses'       => [],
+                    'total'            => 0,
+                    'fulfillment_type' => 'FBO',
+                ];
+            }
+
+            $grouped[$offerId]['warehouses'][] = [
+                'warehouse_id'     => $warehouseId,
+                'warehouse_name'   => $whName,
+                'warehouse_type'   => 'fbo',
+                'quantity'         => $qty,
+                'reserved'         => (int)($row['promised_amount'] ?? 0),
+                'fulfillment_type' => 'FBO',
+            ];
+            $grouped[$offerId]['total'] += $qty;
+        }
+
+        \Log::info('Ozon getStocksPerWarehouse: остатки по складам загружены', [
+            'rows'  => count($allRows),
+            'skus'  => count($grouped),
+        ]);
+
+        return array_values($grouped);
     }
 
     /**

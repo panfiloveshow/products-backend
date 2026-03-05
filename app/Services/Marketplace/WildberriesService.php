@@ -347,17 +347,31 @@ class WildberriesService implements MarketplaceInterface
     public function getInventory(): array
     {
         try {
-            $warehouses = $this->getWarehouses();
             $inventory = [];
 
-            // Получаем остатки через Statistics API
-            $response = $this->wbGet("{$this->statisticsApiUrl}/api/v1/supplier/stocks", [
-                'dateFrom' => now()->subDays(1)->format('Y-m-d'),
-            ]);
+            // dateFrom=2019-01-01 — получаем ВСЕ остатки (не только изменённые сегодня)
+            // Документация: «enter the earliest possible value to get the total leftover»
+            $dateFrom = '2019-01-01';
 
-            if ($response->successful()) {
+            do {
+                $response = $this->wbGet("{$this->statisticsApiUrl}/api/v1/supplier/stocks", [
+                    'dateFrom' => $dateFrom,
+                ]);
+
+                if (!$response->successful()) {
+                    Log::error('WB getInventory error', [
+                        'status' => $response->status(),
+                        'body'   => $response->body(),
+                    ]);
+                    break;
+                }
+
                 $stocks = $response->json() ?? [];
-                
+
+                if (empty($stocks)) {
+                    break;
+                }
+
                 foreach ($stocks as $stock) {
                     $warehouseName = $stock['warehouseName'] ?? 'WB Склад';
                     $warehouseId   = $warehouseName !== '' ? 'wb_' . substr(md5($warehouseName), 0, 8) : '0';
@@ -367,14 +381,27 @@ class WildberriesService implements MarketplaceInterface
                         'warehouse_id'   => $warehouseId,
                         'warehouse_name' => $warehouseName,
                         'marketplace'    => 'wildberries',
-                        'quantity'       => $stock['quantity'] ?? 0,
+                        'quantity'       => $stock['quantityFull'] ?? $stock['quantity'] ?? 0,
+                        'in_transit'     => ($stock['inWayToClient'] ?? 0) + ($stock['inWayFromClient'] ?? 0),
                     ];
                 }
-            }
+
+                // Пагинация: берём lastChangeDate последней записи для следующего запроса
+                $lastRecord = end($stocks);
+                $nextDateFrom = $lastRecord['lastChangeDate'] ?? null;
+
+                // Если следующая дата та же что текущая — значит получили все данные
+                if (!$nextDateFrom || $nextDateFrom === $dateFrom) {
+                    break;
+                }
+
+                $dateFrom = $nextDateFrom;
+
+            } while (count($inventory) < 100000);
 
             Log::info('Wildberries inventory fetched', ['count' => count($inventory)]);
             return $inventory;
-            
+
         } catch (\Exception $e) {
             Log::error('WB getInventory error: ' . $e->getMessage());
             return [];
@@ -502,8 +529,11 @@ class WildberriesService implements MarketplaceInterface
 
     /**
      * Получение FBS-остатков на складах продавца
-     * Эндпоинт: GET /api/v3/stocks/{warehouseId}
+     * Эндпоинт: POST /api/v3/stocks/{warehouseId}
      * Документация: https://dev.wildberries.ru/openapi/orders-fbs
+     *
+     * ВАЖНО: параметр skus deprecated с 9.02.2025.
+     * Используем chrtIds (ID размеров) из карточек товаров (Content API).
      */
     public function getFbsStocks(): array
     {
@@ -514,51 +544,55 @@ class WildberriesService implements MarketplaceInterface
                 return [];
             }
 
+            // Получаем chrtIds из Content API (карточки товаров)
+            $chrtIds = $this->getAllChrtIdsFromContent();
+            if (empty($chrtIds)) {
+                Log::warning('WB FBS: не удалось получить chrtIds из карточек товаров');
+                return [];
+            }
+
+            Log::info('WB FBS: получено chrtIds', ['count' => count($chrtIds)]);
+
             $result = [];
 
             foreach ($sellerWarehouses as $warehouse) {
                 $warehouseId = $warehouse['id'];
                 $warehouseName = $warehouse['name'];
 
-                $skusPage = [];
-                $cursor = null;
+                // API позволяет до 1000 chrtIds за запрос
+                $chunks = array_chunk($chrtIds, 1000);
 
-                do {
-                    // Для получения всех остатков передаем пустой массив skus (согласно документации WB API)
-                    $postData = ['skus' => []];
-                    
-                    $response = $this->wbPost("https://marketplace-api.wildberries.ru/api/v3/stocks/{$warehouseId}", $postData);
+                foreach ($chunks as $chunk) {
+                    $response = $this->wbPost(
+                        "https://marketplace-api.wildberries.ru/api/v3/stocks/{$warehouseId}",
+                        ['chrtIds' => $chunk]
+                    );
 
                     if (!$response->successful()) {
                         Log::warning('WB FBS stocks error', [
                             'warehouseId' => $warehouseId,
-                            'status' => $response->status(),
-                            'body' => $response->body()
+                            'status'      => $response->status(),
+                            'body'        => $response->body(),
                         ]);
                         break;
                     }
 
-                    $data = $response->json();
-                    $stocks = $data['stocks'] ?? [];
+                    $stocks = $response->json()['stocks'] ?? [];
 
                     foreach ($stocks as $stock) {
                         $barcode = $stock['sku'] ?? null;
                         if (!$barcode) continue;
 
                         $result[] = [
-                            'sku'            => $barcode,
-                            'warehouse_id'   => 'fbs_' . $warehouseId,
-                            'warehouse_name' => '[FBS] ' . $warehouseName,
-                            'marketplace'    => 'wildberries',
+                            'sku'              => $barcode,
+                            'warehouse_id'     => 'fbs_' . $warehouseId,
+                            'warehouse_name'   => '[FBS] ' . $warehouseName,
+                            'marketplace'      => 'wildberries',
                             'fulfillment_type' => 'fbs',
-                            'quantity'       => $stock['amount'] ?? 0,
+                            'quantity'         => $stock['amount'] ?? 0,
                         ];
                     }
-
-                    // Этот POST эндпоинт не возвращает cursor
-                    $cursor = null;
-
-                } while ($cursor && count($stocks) > 0);
+                }
             }
 
             Log::info('WB FBS stocks fetched', ['count' => count($result)]);
@@ -568,6 +602,65 @@ class WildberriesService implements MarketplaceInterface
             Log::error('WB getFbsStocks error: ' . $e->getMessage());
             return [];
         }
+    }
+
+    /**
+     * Получить все chrtIds (ID размеров) из карточек товаров через WB Content API.
+     * POST https://content-api.wildberries.ru/content/v2/get/cards/list
+     */
+    private function getAllChrtIdsFromContent(): array
+    {
+        $chrtIds = [];
+        $cursor = null;
+        $maxIterations = 100;
+        $iteration = 0;
+
+        do {
+            $body = [
+                'settings' => [
+                    'cursor'  => $cursor ? ['updatedAt' => $cursor['updatedAt'] ?? null, 'nmID' => $cursor['nmID'] ?? null, 'limit' => 100] : ['limit' => 100],
+                    'filter'  => ['withPhoto' => -1],
+                ],
+            ];
+
+            // Убираем null из cursor
+            if (isset($body['settings']['cursor']['updatedAt']) && $body['settings']['cursor']['updatedAt'] === null) {
+                $body['settings']['cursor'] = ['limit' => 100];
+            }
+
+            $response = Http::withHeaders([
+                'Authorization' => $this->apiKey,
+                'Content-Type'  => 'application/json',
+            ])->timeout(30)->post('https://content-api.wildberries.ru/content/v2/get/cards/list', $body);
+
+            if (!$response->successful()) {
+                Log::warning('WB getAllChrtIdsFromContent: ошибка Content API', [
+                    'status' => $response->status(),
+                    'body'   => $response->body(),
+                ]);
+                break;
+            }
+
+            $data  = $response->json();
+            $cards = $data['cards'] ?? [];
+
+            foreach ($cards as $card) {
+                $sizes = $card['sizes'] ?? [];
+                foreach ($sizes as $size) {
+                    $chrtId = $size['chrtID'] ?? null;
+                    if ($chrtId) {
+                        $chrtIds[] = (int) $chrtId;
+                    }
+                }
+            }
+
+            $cursor  = $data['cursor'] ?? null;
+            $hasMore = !empty($cards) && $cursor && isset($cursor['nmID']);
+            $iteration++;
+
+        } while ($hasMore && $iteration < $maxIterations);
+
+        return array_unique($chrtIds);
     }
 
     /**

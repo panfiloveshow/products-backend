@@ -648,6 +648,49 @@ class OzonMarketplace implements MarketplaceInterface
         return $this->inventory->getStocks($this->integration);
     }
 
+    /**
+     * Остатки по каждому реальному FBO-складу Ozon через /v2/analytics/stock_on_warehouses
+     */
+    public function getInventoryPerWarehouse(): array
+    {
+        return $this->inventory->getStocksPerWarehouse();
+    }
+
+    /**
+     * Остатки по FBS-складам продавца через /v1/product/info/stocks-by-warehouse/fbs
+     * Возвращает формат, совместимый с SyncInventoryJob:
+     * [['sku' => offer_id, 'warehouses' => [...], 'fulfillment_type' => 'FBS']]
+     */
+    public function getInventoryFbsPerWarehouse(): array
+    {
+        $items = $this->inventory->getStocksForFbsSchemes();
+
+        // Устанавливаем fulfillment_type и правильный warehouse_id для каждого склада
+        foreach ($items as &$item) {
+            $item['fulfillment_type'] = 'FBS';
+            foreach ($item['warehouses'] as &$wh) {
+                $whId = $wh['warehouse_id'] ?? null;
+                $whName = $wh['warehouse_name'] ?? '';
+                // warehouse_id из API — числовой; формируем строковый ключ
+                if ($whId) {
+                    $wh['warehouse_id']       = 'ozonfbs_' . $whId;
+                } else {
+                    $wh['warehouse_id']       = 'ozonfbs_' . substr(md5($whName), 0, 12);
+                }
+                $wh['fulfillment_type']   = 'fbs';
+                $wh['warehouse_type']     = 'fbs';
+            }
+            unset($wh);
+        }
+        unset($item);
+
+        \Log::info('Ozon getInventoryFbsPerWarehouse: загружено FBS остатков', [
+            'count' => count($items),
+        ]);
+
+        return $items;
+    }
+
     public function getDetailedInventory(): array
     {
         return $this->warehouses->getDetailedInventory();
@@ -670,6 +713,16 @@ class OzonMarketplace implements MarketplaceInterface
         // Получаем маппинг product_id -> offer_id из БД
         $productIdToOfferId = $this->getProductIdToOfferIdMap();
         return $this->sales->getSalesBySku($days, $productIdToOfferId);
+    }
+
+    /**
+     * Получить продажи по SKU и складу через /v1/analytics/data (dimension: sku + warehouse_id)
+     * Возвращает [offer_id => [warehouse_id => [sales_7_days, sales_30_days, avg_daily_sales, ...]]]
+     */
+    public function getSalesBySkuAndWarehouse(int $days = 28): array
+    {
+        $productIdToOfferId = $this->getProductIdToOfferIdMap();
+        return $this->sales->getSalesBySkuAndWarehouse($days, $productIdToOfferId);
     }
     
     /**
