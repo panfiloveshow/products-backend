@@ -150,62 +150,87 @@ class InventoryApi implements InventoryApiInterface
      */
     public function getStocksForFbsSchemes(array $skus = []): array
     {
-        // Если SKU не переданы, получаем список всех товаров
+        // Если SKU не переданы, получаем список всех offer_id
         if (empty($skus)) {
             $skus = $this->getAllOfferIds();
-            
+
             if (empty($skus)) {
-                \Log::info('Ozon getStocksForFbsSchemes: нет товаров для запроса FBS остатков');
+                \Log::warning('Ozon getStocksForFbsSchemes: нет offer_id для запроса FBS остатков');
                 return [];
             }
         }
-        
-        $body = ['offer_id' => $skus];
 
-        $response = $this->client->post('/v1/product/info/stocks-by-warehouse/fbs', $body);
-        
-        if (!$response) {
-            \Log::warning('Ozon getStocksForFbsSchemes: пустой ответ API');
-            return [];
-        }
-
-        $items = $response['result'] ?? [];
+        // API принимает до 500 offer_id за раз — разбиваем на чанки
+        $chunks    = array_chunk($skus, 500);
         $allStocks = [];
 
-        foreach ($items as $item) {
-            $sku = $item['offer_id'] ?? null;
-            if (!$sku) continue;
+        foreach ($chunks as $chunk) {
+            $body = ['offer_id' => $chunk];
 
-            if (!isset($allStocks[$sku])) {
-                $allStocks[$sku] = [
-                    'sku' => $sku,
-                    'product_id' => $item['product_id'] ?? null,
-                    'warehouses' => [],
-                    'total' => 0,
-                    'reserved' => 0,
-                    'fulfillment_type' => 'FBS', // Может быть FBS/RFBS/EXPRESS
-                ];
+            \Log::info('Ozon getStocksForFbsSchemes: запрос', [
+                'offer_id_count' => count($chunk),
+                'first'          => $chunk[0] ?? null,
+            ]);
+
+            $response = $this->client->post('/v1/product/info/stocks-by-warehouse/fbs', $body);
+
+            if (!$response) {
+                \Log::warning('Ozon getStocksForFbsSchemes: пустой ответ API');
+                continue;
             }
 
-            // Остатки по складам
-            $quantity = $item['present'] ?? 0;
-            $reserved = $item['reserved'] ?? 0;
-            $warehouseId = $item['warehouse_id'] ?? null;
-            $warehouseName = $item['warehouse_name'] ?? 'Unknown';
+            $items = $response['result'] ?? [];
 
-            $allStocks[$sku]['warehouses'][] = [
-                'warehouse_id' => $warehouseId,
-                'warehouse_name' => $warehouseName,
-                'warehouse_type' => 'fbs',
-                'quantity' => $quantity,
-                'reserved' => $reserved,
-            ];
-            
-            $allStocks[$sku]['total'] += $quantity;
-            $allStocks[$sku]['reserved'] += $reserved;
+            \Log::info('Ozon getStocksForFbsSchemes: ответ API', [
+                'result_count' => count($items),
+                'first_item'   => !empty($items) ? array_keys($items[0]) : [],
+                'sample'       => array_slice($items, 0, 2),
+            ]);
+
+            foreach ($items as $item) {
+                // offer_id — артикул продавца, sku — числовой ID Ozon
+                $offerId = $item['offer_id'] ?? null;
+                $ozonSku = $item['sku'] ?? null;
+
+                // Используем offer_id как ключ; если пустой — пропускаем (нет привязки к артикулу)
+                $key = $offerId ?: null;
+                if (!$key) {
+                    \Log::debug('Ozon getStocksForFbsSchemes: пропускаем элемент без offer_id', ['sku' => $ozonSku]);
+                    continue;
+                }
+
+                $quantity      = (int)($item['present']  ?? 0);
+                $reserved      = (int)($item['reserved'] ?? 0);
+                $warehouseId   = $item['warehouse_id']   ?? null;
+                $warehouseName = $item['warehouse_name'] ?? 'FBS склад';
+
+                if (!isset($allStocks[$key])) {
+                    $allStocks[$key] = [
+                        'sku'              => $key,
+                        'ozon_sku'         => $ozonSku,
+                        'product_id'       => $item['product_id'] ?? null,
+                        'warehouses'       => [],
+                        'total'            => 0,
+                        'reserved'         => 0,
+                        'fulfillment_type' => 'FBS',
+                    ];
+                }
+
+                $allStocks[$key]['warehouses'][] = [
+                    'warehouse_id'     => $warehouseId,
+                    'warehouse_name'   => $warehouseName,
+                    'warehouse_type'   => 'fbs',
+                    'quantity'         => $quantity,
+                    'reserved'         => $reserved,
+                    'fulfillment_type' => 'fbs',
+                ];
+
+                $allStocks[$key]['total']    += $quantity;
+                $allStocks[$key]['reserved'] += $reserved;
+            }
         }
 
-        \Log::info('Ozon getStocksForFbsSchemes: загружено остатков', ['count' => count($allStocks)]);
+        \Log::info('Ozon getStocksForFbsSchemes: итого загружено SKU', ['count' => count($allStocks)]);
         return array_values($allStocks);
     }
 

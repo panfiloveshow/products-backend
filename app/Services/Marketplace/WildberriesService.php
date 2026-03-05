@@ -607,31 +607,40 @@ class WildberriesService implements MarketplaceInterface
     /**
      * Получить все chrtIds (ID размеров) из карточек товаров через WB Content API.
      * POST https://content-api.wildberries.ru/content/v2/get/cards/list
+     *
+     * Структура запроса согласно документации:
+     * { settings: { cursor: { limit, updatedAt?, nmID? }, filter: { withPhoto: -1 } } }
+     * Курсор пагинации в ответе: cursor.updatedAt + cursor.nmID
      */
     private function getAllChrtIdsFromContent(): array
     {
-        $chrtIds = [];
-        $cursor = null;
-        $maxIterations = 100;
-        $iteration = 0;
+        $chrtIds    = [];
+        $updatedAt  = null;
+        $nmID       = null;
+        $maxIter    = 100;
+        $iter       = 0;
 
         do {
+            $cursorPayload = ['limit' => 100];
+            if ($updatedAt !== null) {
+                $cursorPayload['updatedAt'] = $updatedAt;
+                $cursorPayload['nmID']      = $nmID;
+            }
+
             $body = [
                 'settings' => [
-                    'cursor'  => $cursor ? ['updatedAt' => $cursor['updatedAt'] ?? null, 'nmID' => $cursor['nmID'] ?? null, 'limit' => 100] : ['limit' => 100],
-                    'filter'  => ['withPhoto' => -1],
+                    'cursor' => $cursorPayload,
+                    'filter' => ['withPhoto' => -1],
                 ],
             ];
-
-            // Убираем null из cursor
-            if (isset($body['settings']['cursor']['updatedAt']) && $body['settings']['cursor']['updatedAt'] === null) {
-                $body['settings']['cursor'] = ['limit' => 100];
-            }
 
             $response = Http::withHeaders([
                 'Authorization' => $this->apiKey,
                 'Content-Type'  => 'application/json',
-            ])->timeout(30)->post('https://content-api.wildberries.ru/content/v2/get/cards/list', $body);
+            ])->timeout(30)->post(
+                'https://content-api.wildberries.ru/content/v2/get/cards/list',
+                $body
+            );
 
             if (!$response->successful()) {
                 Log::warning('WB getAllChrtIdsFromContent: ошибка Content API', [
@@ -644,9 +653,14 @@ class WildberriesService implements MarketplaceInterface
             $data  = $response->json();
             $cards = $data['cards'] ?? [];
 
+            Log::info('WB getAllChrtIdsFromContent: получено карточек', [
+                'count'     => count($cards),
+                'updatedAt' => $updatedAt,
+                'nmID'      => $nmID,
+            ]);
+
             foreach ($cards as $card) {
-                $sizes = $card['sizes'] ?? [];
-                foreach ($sizes as $size) {
+                foreach (($card['sizes'] ?? []) as $size) {
                     $chrtId = $size['chrtID'] ?? null;
                     if ($chrtId) {
                         $chrtIds[] = (int) $chrtId;
@@ -654,13 +668,20 @@ class WildberriesService implements MarketplaceInterface
                 }
             }
 
-            $cursor  = $data['cursor'] ?? null;
-            $hasMore = !empty($cards) && $cursor && isset($cursor['nmID']);
-            $iteration++;
+            // Курсор для следующей страницы
+            $cursor    = $data['cursor'] ?? null;
+            $updatedAt = $cursor['updatedAt'] ?? null;
+            $nmID      = $cursor['nmID'] ?? null;
 
-        } while ($hasMore && $iteration < $maxIterations);
+            // Продолжаем если карточек столько же сколько запросили (100)
+            $hasMore = count($cards) === 100 && $updatedAt !== null;
+            $iter++;
 
-        return array_unique($chrtIds);
+        } while ($hasMore && $iter < $maxIter);
+
+        $result = array_values(array_unique($chrtIds));
+        Log::info('WB getAllChrtIdsFromContent: итого chrtIds', ['count' => count($result)]);
+        return $result;
     }
 
     /**
