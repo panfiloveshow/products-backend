@@ -5,7 +5,7 @@ namespace App\Jobs;
 use App\Models\InventoryWarehouse;
 use App\Models\Product;
 use App\Models\SyncLog;
-use App\Services\Marketplace\MarketplaceFactory;
+use App\Domains\Marketplace\MarketplaceFactory;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
