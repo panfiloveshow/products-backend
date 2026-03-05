@@ -32,10 +32,34 @@ class SyncInventoryJob implements ShouldQueue
         try {
             // Получаем credentials из SyncLog (зашифрованы в БД)
             $credentials = $this->syncLog->credentials ?? [];
-            
+
+            // Загружаем Integration объект для передачи в фабрику (нужен OzonMarketplace)
+            $integration = $this->syncLog->integration_id
+                ? \App\Models\Integration::find($this->syncLog->integration_id)
+                : null;
+
             // Создаём сервис маркетплейса с credentials
-            $marketplaceService = MarketplaceFactory::create($this->syncLog->marketplace, $credentials);
-            $inventory = $marketplaceService->getInventory();
+            $marketplaceService = MarketplaceFactory::create($this->syncLog->marketplace, $credentials, $integration);
+
+            // Для Ozon: получаем FBO + FBS остатки отдельно и объединяем
+            if ($this->syncLog->marketplace === 'ozon') {
+                $inventory = [];
+                if (method_exists($marketplaceService, 'getInventoryPerWarehouse')) {
+                    $fboInventory = $marketplaceService->getInventoryPerWarehouse();
+                    $inventory    = array_merge($inventory, $fboInventory);
+                    Log::info('Ozon FBO inventory loaded', ['skus' => count($fboInventory)]);
+                }
+                if (method_exists($marketplaceService, 'getInventoryFbsPerWarehouse')) {
+                    $fbsInventory = $marketplaceService->getInventoryFbsPerWarehouse();
+                    $inventory    = array_merge($inventory, $fbsInventory);
+                    Log::info('Ozon FBS inventory loaded', ['skus' => count($fbsInventory)]);
+                }
+                if (empty($inventory)) {
+                    $inventory = $marketplaceService->getInventory();
+                }
+            } else {
+                $inventory = $marketplaceService->getInventory();
+            }
 
             // WB: дополнительно синхронизируем FBS-остатки (склады продавца)
             if ($this->syncLog->marketplace === 'wildberries' && method_exists($marketplaceService, 'getFbsStocks')) {
@@ -120,6 +144,16 @@ class SyncInventoryJob implements ShouldQueue
                 unset($stockData);
             }
 
+            // Формируем набор актуальных sku+warehouse_id из API для последующей очистки устаревших записей
+            $apiPairs = [];
+            foreach ($flatInventory as $stockData) {
+                $sku = $stockData['sku'] ?? null;
+                $wid = $stockData['warehouse_id'] ?? null;
+                if ($sku && $wid !== null && $wid !== '') {
+                    $apiPairs[] = $sku . '||' . $wid;
+                }
+            }
+
             foreach ($flatInventory as $stockData) {
                 // Пропускаем записи без SKU
                 if (empty($stockData['sku'])) {
@@ -148,7 +182,32 @@ class SyncInventoryJob implements ShouldQueue
                     ]);
                 }
             }
-            
+
+            // Удаляем устаревшие записи — те что были в БД, но не пришли из API
+            // Это исправляет накопление старых складов и завышенный суммарный остаток
+            if (!empty($apiPairs) && $this->syncLog->integration_id) {
+                $deleted = 0;
+                InventoryWarehouse::where('marketplace', $this->syncLog->marketplace)
+                    ->where('integration_id', $this->syncLog->integration_id)
+                    ->chunkById(500, function ($rows) use ($apiPairs, &$deleted) {
+                        foreach ($rows as $row) {
+                            $key = $row->sku . '||' . $row->warehouse_id;
+                            if (!in_array($key, $apiPairs, true)) {
+                                $row->delete();
+                                $deleted++;
+                            }
+                        }
+                    });
+
+                if ($deleted > 0) {
+                    Log::info('Deleted stale inventory records', [
+                        'marketplace'    => $this->syncLog->marketplace,
+                        'integration_id' => $this->syncLog->integration_id,
+                        'deleted'        => $deleted,
+                    ]);
+                }
+            }
+
             // Сохраняем метаданные о синхронизации
             $this->syncLog->update([
                 'metadata' => [
@@ -307,6 +366,9 @@ class SyncInventoryJob implements ShouldQueue
             $existing->save();
             return 'updated';
         }
+
+        // Данные не изменились — обновляем только last_updated чтобы фиксировать факт синхронизации
+        $existing->update(['last_updated' => now()]);
 
         return 'unchanged';
     }
