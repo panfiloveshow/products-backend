@@ -13,6 +13,7 @@ use App\Models\Integration;
 use App\Services\InventoryService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
 
 class InventoryController extends Controller
 {
@@ -241,21 +242,27 @@ class InventoryController extends Controller
 
     public function matrix(Request $request): JsonResponse
     {
-        $integrationId = $request->input('integration_id');
-        $search        = $request->input('search');
-        $sort          = $request->input('sort', 'total_stock');
-        $sortOrder     = $request->input('sort_order', 'desc');
-        $stockStatus   = $request->input('stock_status');
-        $page          = (int) $request->input('page', 1);
-        $perPage       = (int) $request->input('per_page', 30);
+        $integrationId    = $request->input('integration_id');
+        $search           = $request->input('search');
+        $sort             = $request->input('sort', 'total_stock');
+        $sortOrder        = $request->input('sort_order', 'desc');
+        $stockStatus      = $request->input('stock_status');
+        $page             = (int) $request->input('page', 1);
+        $perPage          = (int) $request->input('per_page', 30);
+        $fulfillmentType  = $request->input('fulfillment_type', 'all'); // all / fbo / fbs
 
         $query = \App\Models\InventoryWarehouse::query()
-            ->when($integrationId, fn($q) => $q->where('integration_id', $integrationId));
+            ->when($integrationId, fn($q) => $q->where('integration_id', $integrationId))
+            ->when($fulfillmentType && $fulfillmentType !== 'all', function ($q) use ($fulfillmentType) {
+                $q->whereRaw('LOWER(fulfillment_type) = ?', [strtolower($fulfillmentType)]);
+            });
 
-        // Получаем уникальные склады для заголовков
+        // Получаем ВСЕ склады (включая пустые) — сначала с остатком, потом пустые
         $warehouses = (clone $query)
             ->select('warehouse_id', 'warehouse_name', 'marketplace', 'fulfillment_type', 'region')
-            ->distinct()
+            ->selectRaw('SUM(quantity) as total_qty')
+            ->groupBy('warehouse_id', 'warehouse_name', 'marketplace', 'fulfillment_type', 'region')
+            ->orderByDesc(DB::raw('SUM(quantity)'))
             ->get()
             ->map(fn($w) => [
                 'warehouse_id'      => $w->warehouse_id,
@@ -263,14 +270,13 @@ class InventoryController extends Controller
                 'marketplace'       => $w->marketplace,
                 'fulfillment_type'  => $w->fulfillment_type,
                 'region'            => $w->region,
+                'total_qty'         => (int) $w->total_qty,
             ]);
 
-        // Агрегируем по SKU
-        // ВАЖНО: SyncSalesJob записывает одинаковые sales_*/average_daily_sales на каждый склад SKU
-        // (данные общие по SKU, не разбиты по складам). Поэтому используем MAX() а не SUM() —
-        // иначе значения умножаются на количество складов.
-        // SUM() применяем только к quantity/reserved/in_transit/storage_cost — они реально разные по складам.
-        $skuQuery = \App\Models\InventoryWarehouse::query()
+        // Агрегируем по SKU с учётом фильтра по fulfillment_type
+        // MAX() для sales — данные пишутся одинаково на каждый склад SKU, SUM() раздует значения.
+        // SUM() только для quantity/reserved/in_transit/storage_cost — они реально разные по складам.
+        $skuQuery = (clone $query)
             ->select('sku')
             ->selectRaw('SUM(quantity) as total_stock')
             ->selectRaw('SUM(reserved) as reserved')
@@ -296,7 +302,6 @@ class InventoryController extends Controller
             ->selectRaw('MAX(storage_fee_report_to) as storage_fee_report_to')
             ->selectRaw('SUM(storage_fee_prev_month) as storage_fee_prev_month')
             ->selectRaw('MAX(storage_fee_prev_month_period) as storage_fee_prev_month_period')
-            ->when($integrationId, fn($q) => $q->where('integration_id', $integrationId))
             ->groupBy('sku');
 
         // Получаем полный список для поиска и сортировки с джойном на products
@@ -389,6 +394,37 @@ class InventoryController extends Controller
             }
         }
 
+        // Ozon FBS: для SKU вида "00808-16" (offer_id с суффиксом количества)
+        // ищем продукт по ozon_data->>'offer_id' = invSku или по базовому SKU (до дефиса)
+        $notFoundOzonSkus = array_diff($pagedSkus, $products->keys()->toArray());
+        if (!empty($notFoundOzonSkus)) {
+            // Собираем базовые SKU (до последнего дефиса): "00808-16" -> "00808"
+            $baseSkuMap = []; // baseSku => [invSku, ...]
+            foreach ($notFoundOzonSkus as $invSku) {
+                $lastDash = strrpos($invSku, '-');
+                if ($lastDash !== false) {
+                    $baseSku = substr($invSku, 0, $lastDash);
+                    $baseSkuMap[$baseSku][] = $invSku;
+                }
+            }
+            if (!empty($baseSkuMap)) {
+                $ozonFallbackQuery = \App\Models\Product::where('marketplace', 'ozon')
+                    ->whereIn('sku', array_keys($baseSkuMap));
+                if ($integrationId) {
+                    $ozonFallbackQuery->where(function ($q) use ($integrationId) {
+                        $q->where('integration_id', $integrationId)->orWhereNull('integration_id');
+                    });
+                }
+                foreach ($ozonFallbackQuery->get() as $prod) {
+                    foreach ($baseSkuMap[$prod->sku] ?? [] as $invSku) {
+                        if (!$products->has($invSku)) {
+                            $products->put($invSku, $prod);
+                        }
+                    }
+                }
+            }
+        }
+
         // WB: дополнительный JSONB-запрос для баркодов которые не нашлись по sku/barcode
         // но могут быть внутри wb_data->sizes[*]->skus[] других товаров
         $notFoundSkus = array_diff($pagedSkus, $products->keys()->toArray());
@@ -420,9 +456,12 @@ class InventoryController extends Controller
             }
         }
 
-        // Загружаем строки складов для страницы
+        // Загружаем строки складов для страницы (с учётом фильтра по fulfillment_type)
         $warehouseRows = \App\Models\InventoryWarehouse::whereIn('sku', $pagedSkus)
             ->when($integrationId, fn($q) => $q->where('integration_id', $integrationId))
+            ->when($fulfillmentType && $fulfillmentType !== 'all', function ($q) use ($fulfillmentType) {
+                $q->whereRaw('LOWER(fulfillment_type) = ?', [strtolower($fulfillmentType)]);
+            })
             ->get()
             ->groupBy('sku');
 
@@ -488,7 +527,20 @@ class InventoryController extends Controller
                 'sku'                  => $sku,
                 'name'                 => $prod?->name,
                 'barcode'              => $prod?->barcode,
-                'image_url'            => ($prod && is_array($prod->images) && !empty($prod->images)) ? $prod->images[0] : null,
+                'image_url'            => (function() use ($prod) {
+                    if (!$prod) return null;
+                    // 1. Первое изображение из массива images
+                    if (is_array($prod->images) && !empty($prod->images)) return $prod->images[0];
+                    // 2. Ozon: primary_image из ozon_data
+                    if (!empty($prod->ozon_data['primary_image'])) {
+                        $pi = $prod->ozon_data['primary_image'];
+                        return is_array($pi) ? ($pi[0] ?? null) : $pi;
+                    }
+                    // 3. WB: первое фото из wb_data
+                    if (!empty($prod->wb_data['photos'][0]['big'])) return $prod->wb_data['photos'][0]['big'];
+                    if (!empty($prod->wb_data['mediaFiles'][0])) return $prod->wb_data['mediaFiles'][0];
+                    return null;
+                })(),
                 'price'                => $price,
                 'cost_price'           => $costPrice,
                 'marketplace'          => $prod?->marketplace ?? ($rows->first()?->marketplace ?? ''),
