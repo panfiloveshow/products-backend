@@ -65,79 +65,90 @@ class InventoryApi implements InventoryApiInterface
     /**
      * Получить остатки для FBO схемы
      * POST /v4/product/info/stocks
+     *
+     * ВАЖНО: v4 API использует cursor-based пагинацию (не last_id).
+     * Ответ: {"items":[...],"total":N,"cursor":"..."}
+     * stocks[].type может быть "fbs" — это нормально, НЕ пропускаем.
      */
     private function getStocksForFbo(array $skus = []): array
     {
         $allStocks = [];
-        $lastId = '';
+        $cursor    = '';
+        $maxIter   = 200;
+        $iter      = 0;
 
         do {
             $body = [
-                'filter' => [
-                    'visibility' => 'ALL',
-                ],
-                'limit' => 1000,
-                'last_id' => $lastId,
+                'filter' => ['visibility' => 'ALL'],
+                'limit'  => 1000,
             ];
 
             if (!empty($skus)) {
                 $body['filter']['offer_id'] = $skus;
             }
 
-            // Используем v4 API (v3 deprecated с 31.01.2025)
+            if (!empty($cursor)) {
+                $body['cursor'] = $cursor;
+            }
+
             $response = $this->client->post('/v4/product/info/stocks', $body);
 
             if (!$response) {
                 break;
             }
 
-            $items = $response['result']['items'] ?? $response['items'] ?? [];
-            $lastId = $response['result']['last_id'] ?? $response['last_id'] ?? '';
+            // v4 возвращает items на верхнем уровне (не внутри result)
+            $items  = $response['items'] ?? $response['result']['items'] ?? [];
+            $cursor = $response['cursor'] ?? $response['result']['cursor'] ?? '';
 
             foreach ($items as $item) {
-                $sku = $item['offer_id'] ?? null;
-                if (!$sku) continue;
+                $offerId = $item['offer_id'] ?? null;
+                if (!$offerId) continue;
 
-                if (!isset($allStocks[$sku])) {
-                    $allStocks[$sku] = [
-                        'sku' => $sku,
-                        'product_id' => $item['product_id'] ?? null,
-                        'warehouses' => [],
-                        'total' => 0,
-                        'reserved' => 0,
+                if (!isset($allStocks[$offerId])) {
+                    $allStocks[$offerId] = [
+                        'sku'              => $offerId,
+                        'product_id'       => $item['product_id'] ?? null,
+                        'warehouses'       => [],
+                        'total'            => 0,
+                        'reserved'         => 0,
                         'fulfillment_type' => 'FBO',
                     ];
                 }
 
                 foreach ($item['stocks'] ?? [] as $stock) {
-                    $stockType = $stock['type'] ?? 'fbo';
-                    $quantity = $stock['present'] ?? 0;
-                    $reserved = $stock['reserved'] ?? 0;
+                    $stockType = strtolower($stock['type'] ?? 'fbo');
+                    $quantity  = (int)($stock['present']  ?? 0);
+                    $reserved  = (int)($stock['reserved'] ?? 0);
 
-                    // Пропускаем FBS записи — они загружаются через getStocksForFbsSchemes
-                    // FBO типы: fbo, fbo_crossborder, fbo_express, etc.
-                    if (strtolower($stockType) === 'fbs') {
-                        continue;
-                    }
+                    // warehouse_ids из v4 API — берём первый если есть
+                    $warehouseIds = $stock['warehouse_ids'] ?? [];
+                    $warehouseId  = !empty($warehouseIds)
+                        ? 'ozon_' . $warehouseIds[0]
+                        : 'ozon_' . $stockType;
 
-                    $allStocks[$sku]['warehouses'][] = [
-                        'warehouse_id' => 'fbo_' . $stockType,
-                        'warehouse_name' => 'Ozon FBO ' . ucfirst($stockType),
-                        'warehouse_type' => 'fbo',
-                        'quantity' => $quantity,
-                        'reserved' => $reserved,
+                    $fulfillment = strtoupper($stockType) === 'FBS' ? 'FBS' : 'FBO';
+
+                    $allStocks[$offerId]['warehouses'][] = [
+                        'warehouse_id'     => $warehouseId,
+                        'warehouse_name'   => 'Ozon ' . strtoupper($stockType),
+                        'warehouse_type'   => $stockType,
+                        'quantity'         => $quantity,
+                        'reserved'         => $reserved,
+                        'fulfillment_type' => $fulfillment,
                     ];
-                    $allStocks[$sku]['total'] += $quantity;
-                    $allStocks[$sku]['reserved'] += $reserved;
+                    $allStocks[$offerId]['total']    += $quantity;
+                    $allStocks[$offerId]['reserved'] += $reserved;
                 }
             }
 
-        } while (!empty($items) && !empty($lastId));
+            $iter++;
+        } while (!empty($items) && !empty($cursor) && $iter < $maxIter);
 
-        // Убираем записи без складов (когда все stocks были FBS и пропущены)
+        // Убираем записи без складов
         $allStocks = array_filter($allStocks, fn($item) => !empty($item['warehouses']));
 
-        \Log::info('Ozon getStocksForFbo: загружено остатков', ['count' => count($allStocks)]);
+        \Log::info('Ozon getStocksForFbo: загружено', ['skus' => count($allStocks)]);
         return array_values($allStocks);
     }
 
