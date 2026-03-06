@@ -143,26 +143,11 @@ class SyncProductsJob implements ShouldQueue
         $marketplace = $this->syncLog->marketplace;
         $integrationId = $this->syncLog->integration_id ?? null;
         
-        // Ищем существующий товар по sku + integration_id (если указан)
-        // Это предотвращает перезапись товаров из разных аккаунтов одного маркетплейса
-        $query = Product::where('marketplace', $marketplace)
-            ->where('sku', $productData['sku']);
-        
-        if ($integrationId) {
-            // Сначала ищем в рамках выбранной интеграции
-            $query->where('integration_id', $integrationId);
-        }
-        
-        $existingProduct = $query->first();
-
-        // Резервный поиск по уникальному ключу (sku + marketplace).
-        // Нужен, чтобы не ловить duplicate key, если запись уже есть
-        // с другим/пустым integration_id.
-        if (!$existingProduct) {
-            $existingProduct = Product::where('marketplace', $marketplace)
-                ->where('sku', $productData['sku'])
-                ->first();
-        }
+        // Ищем существующий товар по sku + marketplace + integration_id
+        $existingProduct = Product::where('marketplace', $marketplace)
+            ->where('sku', $productData['sku'])
+            ->where('integration_id', $integrationId)
+            ->first();
 
         if (!$existingProduct) {
             // Создаём новый товар

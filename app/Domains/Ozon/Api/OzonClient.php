@@ -41,48 +41,59 @@ class OzonClient
      */
     public function post(string $endpoint, array $data = [], bool $forceObject = false): ?array
     {
-        try {
-            // Если нужен пустой объект {} вместо пустого массива []
-            $body = (empty($data) && $forceObject) ? (object)[] : $data;
-            
-            $response = Http::withHeaders($this->getHeaders())
-                ->timeout($this->timeout)
-                ->asJson()
-                ->post(self::BASE_URL . $endpoint, $body);
+        $maxAttempts = 3;
+        $body = (empty($data) && $forceObject) ? (object)[] : $data;
 
-            if ($response->successful()) {
-                return $response->json();
+        for ($attempt = 1; $attempt <= $maxAttempts; $attempt++) {
+            try {
+                $response = Http::withHeaders($this->getHeaders())
+                    ->timeout($this->timeout)
+                    ->asJson()
+                    ->post(self::BASE_URL . $endpoint, $body);
+
+                if ($response->successful()) {
+                    return $response->json();
+                }
+
+                if ($response->status() === 429 && $attempt < $maxAttempts) {
+                    $delay = $attempt * 1500000;
+                    Log::warning('Ozon API rate limit, retry', [
+                        'endpoint' => $endpoint,
+                        'attempt'  => $attempt,
+                        'delay_ms' => $delay / 1000,
+                    ]);
+                    usleep($delay);
+                    continue;
+                }
+
+                $decoded = $response->json();
+                if (empty($decoded)) {
+                    $decoded = ['error' => ['message' => $response->body()]];
+                }
+
+                $decoded['_error']       = true;
+                $decoded['_http_status'] = $response->status();
+
+                Log::warning('Ozon API error', [
+                    'endpoint'  => $endpoint,
+                    'status'    => $response->status(),
+                    'body'      => $response->body(),
+                    'client_id' => $this->clientId ? substr($this->clientId, 0, 4) . '***' : 'empty',
+                    'has_api_key' => !empty($this->apiKey),
+                ]);
+
+                return $decoded;
+            } catch (\Exception $e) {
+                Log::error('Ozon API exception', [
+                    'endpoint'  => $endpoint,
+                    'error'     => $e->getMessage(),
+                    'client_id' => $this->clientId ? substr($this->clientId, 0, 4) . '***' : 'empty',
+                ]);
+                return null;
             }
-
-            $decoded = $response->json();
-            if (empty($decoded)) {
-                $decoded = [
-                    'error' => [
-                        'message' => $response->body(),
-                    ],
-                ];
-            }
-
-            $decoded['_error'] = true;
-            $decoded['_http_status'] = $response->status();
-
-            Log::warning('Ozon API error', [
-                'endpoint' => $endpoint,
-                'status' => $response->status(),
-                'body' => $response->body(),
-                'client_id' => $this->clientId ? substr($this->clientId, 0, 4) . '***' : 'empty',
-                'has_api_key' => !empty($this->apiKey),
-            ]);
-
-            return $decoded;
-        } catch (\Exception $e) {
-            Log::error('Ozon API exception', [
-                'endpoint' => $endpoint,
-                'error' => $e->getMessage(),
-                'client_id' => $this->clientId ? substr($this->clientId, 0, 4) . '***' : 'empty',
-            ]);
-            return null;
         }
+
+        return null;
     }
 
     /**

@@ -97,6 +97,107 @@ class SalesApi
     }
 
     /**
+     * Получить продажи по SKU и складу через /v2/posting/fbo/list за последние N дней.
+     * Каждое FBO-отправление содержит analytics_data.warehouse_id и список товаров.
+     * Агрегируем количество по offer_id + warehouse_id.
+     *
+     * @return array [offer_id => [warehouse_id => ['warehouse_name', 'sales_7_days', 'sales_14_days', 'sales_30_days', 'avg_daily_sales']]]
+     */
+    public function getSalesBySkuAndWarehouse(int $days = 28, array $productIdToOfferId = []): array
+    {
+        try {
+            $since  = now()->subDays($days)->setTime(0, 0, 0)->toIso8601String();
+            $to     = now()->toIso8601String();
+            $offset = 0;
+            $limit  = 1000;
+
+            // rawUnits[offer_id][warehouse_id] = ['units' => int, 'warehouse_name' => string]
+            $rawUnits = [];
+
+            do {
+                $response = $this->client->post('/v2/posting/fbo/list', [
+                    'dir'    => 'ASC',
+                    'filter' => [
+                        'since'  => $since,
+                        'to'     => $to,
+                        'status' => 'delivered',
+                    ],
+                    'limit'  => $limit,
+                    'offset' => $offset,
+                    'with'   => [
+                        'analytics_data' => true,
+                        'financial_data' => false,
+                    ],
+                ]);
+
+                $postings = $response['result'] ?? [];
+
+                foreach ($postings as $posting) {
+                    $warehouseId = (string)($posting['analytics_data']['warehouse_id'] ?? '');
+                    $whName      = $posting['analytics_data']['warehouse_name'] ?? $warehouseId;
+
+                    if (!$warehouseId) {
+                        continue;
+                    }
+
+                    foreach ($posting['products'] ?? [] as $product) {
+                        $ozonSku = (string)($product['sku'] ?? '');
+                        $offerId = $productIdToOfferId[$ozonSku] ?? null;
+
+                        // Fallback: ищем по offer_id если он передан напрямую
+                        if (!$offerId) {
+                            $offerIdDirect = $product['offer_id'] ?? null;
+                            if ($offerIdDirect) {
+                                $offerId = $offerIdDirect;
+                            }
+                        }
+
+                        if (!$offerId) {
+                            continue;
+                        }
+
+                        $qty = (int)($product['quantity'] ?? 0);
+                        if (!isset($rawUnits[$offerId][$warehouseId])) {
+                            $rawUnits[$offerId][$warehouseId] = ['units' => 0, 'warehouse_name' => $whName];
+                        }
+                        $rawUnits[$offerId][$warehouseId]['units'] += $qty;
+                    }
+                }
+
+                $offset += $limit;
+            } while (count($postings) === $limit);
+
+            // Преобразуем в финальный формат с продажами за периоды
+            $result = [];
+            foreach ($rawUnits as $offerId => $warehouses) {
+                foreach ($warehouses as $warehouseId => $data) {
+                    $units    = $data['units'];
+                    $avgDaily = $days > 0 ? round($units / $days, 2) : 0;
+
+                    $result[$offerId][$warehouseId] = [
+                        'warehouse_name'      => $data['warehouse_name'],
+                        'sales_7_days'        => (int)round($units * 7  / $days),
+                        'sales_14_days'       => (int)round($units * 14 / $days),
+                        'sales_30_days'       => (int)round($units * 30 / $days),
+                        'avg_daily_sales'     => $avgDaily,
+                        'ordered_units_total' => $units,
+                    ];
+                }
+            }
+
+            Log::info('Ozon getSalesBySkuAndWarehouse (FBO postings) loaded', [
+                'days'       => $days,
+                'skus_count' => count($result),
+            ]);
+
+            return $result;
+        } catch (\Exception $e) {
+            Log::error('Ozon getSalesBySkuAndWarehouse error', ['error' => $e->getMessage()]);
+            return [];
+        }
+    }
+
+    /**
      * Получить статистику заказов по SKU
      */
     public function getOrdersStatsBySku(string $dateFrom, string $dateTo): array

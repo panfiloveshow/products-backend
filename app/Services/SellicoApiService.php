@@ -100,6 +100,13 @@ class SellicoApiService
      */
     public function getIntegrations(int $workspaceId): array
     {
+        if (!$workspaceId) {
+            return [
+                'success' => false,
+                'error' => 'workspace_id обязателен для получения интеграций',
+            ];
+        }
+
         $token = $this->getAccessToken();
         
         if (!$token) {
@@ -111,7 +118,7 @@ class SellicoApiService
 
         try {
             $response = Http::withToken($token)
-                ->get("{$this->baseUrl}/workspaces/{$workspaceId}/integrations");
+                ->get("{$this->baseUrl}/get-integrations/{$workspaceId}");
 
             if ($response->successful()) {
                 return [
@@ -150,20 +157,25 @@ class SellicoApiService
             $type = strtolower($integration['type'] ?? '');
             
             $item = [
-                'id' => $integration['id'],
-                'name' => $integration['name'],
-                'type' => $integration['type'],
-                'api_key' => $integration['api_key'] ?? null,
-                'client_id' => $integration['client_id'] ?? null,
-                'created_at' => $integration['created_at'] ?? null,
+                'id'             => $integration['id'],
+                'work_space_id'  => $integration['work_space_id'] ?? $integration['workspace_id'] ?? null,
+                'name'           => $integration['name'],
+                'type'           => $integration['type'],
+                'description'    => $integration['description'] ?? null,
+                'account_status' => $integration['account_status'] ?? null,
+                'is_premium'     => $integration['is_premium'] ?? false,
+                'api_key'        => $integration['api_key'] ?? null,
+                'client_id'      => $integration['client_id'] ?? null,
+                'created_at'     => $integration['created_at'] ?? null,
+                'updated_at'     => $integration['updated_at'] ?? null,
             ];
             
             // Группируем по типу маркетплейса
             $marketplaceType = match ($type) {
                 'wildberries' => 'wildberries',
-                'ozon' => 'ozon',
+                'ozon'        => 'ozon',
                 'yandexmarket' => 'yandex_market',
-                default => $type,
+                default       => $type,
             };
             
             if (!isset($integrations[$marketplaceType])) {

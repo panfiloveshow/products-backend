@@ -106,7 +106,11 @@ class InventoryService
 
         $totalProducts = $query->count();
         $totalInternalStock = Product::sum('stock');
-        $totalMarketplaceStock = InventoryWarehouse::sum('quantity');
+
+        // Суммируем quantity по каждому уникальному SKU+warehouse_id (не по всей таблице)
+        // чтобы избежать задвоения если одна запись дублируется
+        $totalMarketplaceStock = InventoryWarehouse::selectRaw('SUM(quantity) as total')
+            ->value('total') ?? 0;
 
         $lowStockProducts = Product::whereHas('inventoryWarehouses', function ($q) {
             $q->lowStock();

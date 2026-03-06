@@ -6,6 +6,8 @@ use App\Jobs\GenerateAlertsJob;
 use App\Jobs\GenerateShipmentRecommendationsJob;
 use App\Jobs\SyncInventoryJob;
 use App\Jobs\SyncProductsJob;
+use App\Jobs\SyncSalesJob;
+use App\Models\Integration;
 use App\Models\SyncLog;
 use Illuminate\Foundation\Inspiring;
 use Illuminate\Support\Facades\Artisan;
@@ -23,11 +25,20 @@ Artisan::command('inspire', function () {
 
 // Sync products every 6 hours
 Schedule::call(function () {
-    foreach (['wildberries', 'ozon', 'yandex'] as $marketplace) {
+    if (!\Illuminate\Support\Facades\Schema::hasTable('integrations')) return;
+    $integrations = Integration::active()->autoSyncEnabled()->get();
+    foreach ($integrations as $integration) {
+        $running = SyncLog::where('integration_id', $integration->id)
+            ->where('sync_type', 'products')
+            ->running()
+            ->exists();
+        if ($running) continue;
         $syncLog = SyncLog::create([
-            'marketplace' => $marketplace,
-            'sync_type' => 'products',
-            'status' => SyncLog::STATUS_PENDING,
+            'marketplace'    => $integration->marketplace,
+            'integration_id' => $integration->id,
+            'sync_type'      => 'products',
+            'status'         => SyncLog::STATUS_PENDING,
+            'credentials'    => $integration->getDecryptedCredentials(),
         ]);
         SyncProductsJob::dispatch($syncLog);
     }
@@ -35,15 +46,30 @@ Schedule::call(function () {
 
 // Sync inventory every 2 hours
 Schedule::call(function () {
-    foreach (['wildberries', 'ozon', 'yandex'] as $marketplace) {
+    if (!\Illuminate\Support\Facades\Schema::hasTable('integrations')) return;
+    $integrations = Integration::active()->autoSyncEnabled()->get();
+    foreach ($integrations as $integration) {
+        $running = SyncLog::where('integration_id', $integration->id)
+            ->where('sync_type', 'inventory')
+            ->running()
+            ->exists();
+        if ($running) continue;
         $syncLog = SyncLog::create([
-            'marketplace' => $marketplace,
-            'sync_type' => 'inventory',
-            'status' => SyncLog::STATUS_PENDING,
+            'marketplace'    => $integration->marketplace,
+            'integration_id' => $integration->id,
+            'sync_type'      => 'inventory',
+            'status'         => SyncLog::STATUS_PENDING,
+            'credentials'    => $integration->getDecryptedCredentials(),
         ]);
         SyncInventoryJob::dispatch($syncLog);
     }
 })->everyTwoHours()->name('sync_inventory_all');
+
+// Sync sales every 3 hours (через 1 час после inventory чтобы данные уже обновились)
+Schedule::job(new SyncSalesJob())
+    ->cron('0 1,4,7,10,13,16,19,22 * * *')
+    ->name('sync_sales_all')
+    ->withoutOverlapping();
 
 // Calculate forecasts daily at 03:00
 Schedule::job(new CalculateForecastsJob())

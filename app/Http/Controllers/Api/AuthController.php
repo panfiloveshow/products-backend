@@ -117,6 +117,13 @@ class AuthController extends Controller
      */
     public function integrations(Request $request, int $workspaceId): JsonResponse
     {
+        if (!$workspaceId) {
+            return response()->json([
+                'success' => false,
+                'message' => 'workspace_id обязателен',
+            ], 422);
+        }
+
         $token = $request->bearerToken();
         
         if (!$token) {
