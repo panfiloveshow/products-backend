@@ -39,15 +39,18 @@ class ProductController extends Controller
                 ?? $request->input('workspace');
 
             if ($workspace) {
-                $integrationBelongsToWorkspace = \App\Models\Integration::where('id', $integrationId)
-                    ->where('work_space_id', (int) $workspace)
-                    ->exists();
+                $integration = \App\Models\Integration::where('id', $integrationId)->first();
 
-                if (!$integrationBelongsToWorkspace) {
+                if ($integration && $integration->work_space_id !== null && $integration->work_space_id !== (int) $workspace) {
                     return response()->json([
                         'success' => false,
-                        'message' => 'Интеграция не найдена или не принадлежит текущему workspace',
+                        'message' => 'Интеграция не принадлежит текущему workspace',
                     ], 403);
+                }
+
+                // Заполняем work_space_id если ещё не заполнен
+                if ($integration && $integration->work_space_id === null) {
+                    $integration->update(['work_space_id' => (int) $workspace]);
                 }
             }
 
