@@ -33,9 +33,28 @@ class ProductController extends Controller
 
         if (!empty($validated['integration_id'])) {
             $integrationId = (int) $validated['integration_id'];
+
+            $workspace = $request->header('X-Sellico-Workspace')
+                ?? $request->header('X-Workspace-Id')
+                ?? $request->input('workspace');
+
+            if ($workspace) {
+                $integrationBelongsToWorkspace = \App\Models\Integration::where('id', $integrationId)
+                    ->where('work_space_id', (int) $workspace)
+                    ->exists();
+
+                if (!$integrationBelongsToWorkspace) {
+                    return response()->json([
+                        'success' => false,
+                        'message' => 'Интеграция не найдена или не принадлежит текущему workspace',
+                    ], 403);
+                }
+            }
+
             \Log::info('ProductController: Фильтр по integration_id', [
                 'raw_value' => $validated['integration_id'],
                 'casted_value' => $integrationId,
+                'workspace' => $workspace ?? null,
             ]);
             $query->where('integration_id', $integrationId);
         }

@@ -21,7 +21,18 @@ class IntegrationController extends Controller
      */
     public function index(Request $request): JsonResponse
     {
-        $query = Integration::query();
+        $workspace = $request->header('X-Sellico-Workspace')
+            ?? $request->header('X-Workspace-Id')
+            ?? $request->input('workspace');
+
+        if (!$workspace) {
+            return response()->json([
+                'success' => false,
+                'message' => 'workspace_id обязателен',
+            ], 422);
+        }
+
+        $query = Integration::query()->forWorkspace((int) $workspace);
         
         if ($request->has('marketplace')) {
             $query->where('marketplace', $request->marketplace);
@@ -181,6 +192,7 @@ class IntegrationController extends Controller
         $integrationData = $result['integration'];
         $credentials = $result['credentials'];
         $credentials['_sellico_token'] = $token; // Прокидываем токен для фоновых задач
+        $workspaceId = (int) ($integrationData['work_space_id'] ?? $integrationData['workspace_id'] ?? 0);
         $marketplace = strtolower($integrationData['type'] ?? '');
         
         // Нормализуем тип маркетплейса
@@ -196,6 +208,11 @@ class IntegrationController extends Controller
             ], 400);
         }
         
+        // Сохраняем work_space_id в локальную запись если ещё не сохранён
+        if ($workspaceId) {
+            Integration::where('id', $id)->update(['work_space_id' => $workspaceId]);
+        }
+
         $syncType = $request->input('type', 'products');
         
         try {
@@ -203,6 +220,7 @@ class IntegrationController extends Controller
                 'integration_id' => $id,
                 'marketplace' => $marketplace,
                 'sync_type' => $syncType,
+                'workspace_id' => $workspaceId,
             ]);
             
             $syncLog = $productService->startSync(

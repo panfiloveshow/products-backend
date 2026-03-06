@@ -15,6 +15,7 @@ class Integration extends Model
 
     protected $fillable = [
         'id', // Важно! ID из Sellico
+        'work_space_id',
         'name',
         'marketplace',
         'credentials',
@@ -67,6 +68,14 @@ class Integration extends Model
     public function syncLogs(): HasMany
     {
         return $this->hasMany(SyncLog::class, 'integration_id');
+    }
+
+    /**
+     * Scope: по workspace
+     */
+    public function scopeForWorkspace($query, int $workspaceId)
+    {
+        return $query->where('work_space_id', $workspaceId);
     }
 
     /**
