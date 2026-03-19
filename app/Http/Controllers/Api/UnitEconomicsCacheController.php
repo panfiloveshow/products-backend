@@ -54,9 +54,10 @@ class UnitEconomicsCacheController extends Controller
      */
     public function index(Request $request, string $marketplace): JsonResponse
     {
+        $marketplace = $this->normalizeMarketplace($marketplace);
         $validated = $request->validate([
             'integration_id' => 'required|integer|exists:integrations,id',
-            'fulfillment_type' => 'required|string|in:FBO,FBS,RFBS,EXPRESS,DBS,EDBS,DBW,MIXED,fbo,fbs,rfbs,express,dbs,edbs,dbw,mixed',
+            'fulfillment_type' => 'required|string|in:FBO,FBS,RFBS,EXPRESS,DBS,EDBS,DBW,MIXED,FBY,fbo,fbs,rfbs,express,dbs,edbs,dbw,mixed,fby',
             'search' => 'nullable|string|max:255',
             'profitable' => 'nullable|boolean',
             'margin_min' => 'nullable|numeric',
@@ -110,7 +111,10 @@ class UnitEconomicsCacheController extends Controller
         $actualScheme = $this->getActualScheme($validated['integration_id'], $marketplace);
         
         // default_scheme = actual_scheme (схема по умолчанию для выбора таба)
-        $defaultScheme = $actualScheme ?? 'FBO';
+        $defaultScheme = $actualScheme ?? match ($marketplace) {
+            'yandex', 'yandex_market' => 'FBY',
+            default => 'FBO',
+        };
 
         // Общая статистика
         $stats = $this->getStats($validated['integration_id'], $marketplace, $validated['fulfillment_type']);
@@ -140,12 +144,16 @@ class UnitEconomicsCacheController extends Controller
      */
     public function show(Request $request, string $marketplace, string $sku): JsonResponse
     {
+        $marketplace = $this->normalizeMarketplace($marketplace);
         $validated = $request->validate([
             'integration_id' => 'required|integer|exists:integrations,id',
-            'fulfillment_type' => 'nullable|string|in:FBO,FBS,RFBS,EXPRESS,DBS,EDBS,DBW,MIXED',
+            'fulfillment_type' => 'nullable|string|in:FBO,FBS,RFBS,EXPRESS,DBS,EDBS,DBW,MIXED,FBY',
         ]);
 
-        $fulfillmentType = $validated['fulfillment_type'] ?? 'FBO';
+        $fulfillmentType = $validated['fulfillment_type'] ?? match ($marketplace) {
+            'yandex', 'yandex_market' => 'FBY',
+            default => 'FBO',
+        };
 
         $cache = UnitEconomicsCache::where('integration_id', $validated['integration_id'])
             ->where('marketplace', $marketplace)
@@ -342,6 +350,7 @@ class UnitEconomicsCacheController extends Controller
             $schemes = match ($marketplace) {
                 'ozon' => ['FBO', 'FBS', 'RFBS', 'EXPRESS'],
                 'wildberries' => ['FBO', 'FBS', 'DBS', 'EDBS', 'DBW'],
+                'yandex', 'yandex_market' => ['FBY', 'FBS', 'DBS', 'EXPRESS'],
                 default => ['FBO', 'FBS'],
             };
 
@@ -430,12 +439,16 @@ class UnitEconomicsCacheController extends Controller
     {
         $product = $cache->product;
         $ozonData = $product?->ozon_data ?? [];
+        $yandexData = $product?->yandex_data ?? [];
         $commissions = $ozonData['commissions'] ?? [];
         $redemption = $ozonData['redemption'] ?? [];
         $salesCount = max(1, (int) $cache->sales_count);
         
         // Получаем реальную схему товара из Product (там актуальные данные из Ozon API)
-        $realScheme = $product?->fulfillment_type ?? 'FBO';
+        $realScheme = $product?->fulfillment_type ?? match ($cache->marketplace) {
+            'yandex', 'yandex_market' => 'FBY',
+            default => 'FBO',
+        };
         
         // Базовые данные из кэша
         $data = $cache->toArray();
@@ -540,6 +553,10 @@ class UnitEconomicsCacheController extends Controller
             $wbCommissions = $wbData['commissions'] ?? [];
             $price = (float) $cache->price;
             $costPrice = (float) ($settings?->cost_price ?? $cache->cost_price);
+
+            $data['acquiring_percent'] = 0.0;
+            $data['acquiring_amount'] = 0.0;
+            $data['acquiring_per_unit'] = 0.0;
             
             // Габариты из wb_data (приоритет: настройки > wb_data > кэш)
             if (!$lengthMm && isset($wbData['length_mm'])) {
@@ -661,14 +678,53 @@ class UnitEconomicsCacheController extends Controller
             // Сохраняем wb_data.commissions для фронтенда (аналогично ozon_data)
             $data['commissions'] = $wbCommissions;
         }
+
+        if ($marketplace === 'yandex' || $marketplace === 'yandex_market') {
+            $price = (float) $cache->price;
+
+            $data['yandex'] = [
+                'shopSku' => $cache->sku,
+                'marketSku' => $yandexData['marketSku'] ?? null,
+                'categoryId' => $yandexData['categoryId'] ?? null,
+                'parameters' => $yandexData['parameters'] ?? [],
+            ];
+
+            $data['agency_commission'] = round((float) ($data['agency_commission'] ?? 0), 2);
+            $data['payment_transfer'] = round((float) ($data['payment_transfer'] ?? 0), 2);
+            $data['delivery_to_customer'] = round((float) ($data['delivery_to_customer'] ?? $cache->logistics_cost), 2);
+            $data['crossregional_delivery'] = round((float) ($data['crossregional_delivery'] ?? 0), 2);
+            $data['middle_mile'] = round((float) ($data['middle_mile'] ?? 0), 2);
+            $data['express_delivery'] = round((float) ($data['express_delivery'] ?? 0), 2);
+            $data['sorting'] = round((float) ($data['sorting'] ?? $cache->processing_cost), 2);
+
+            $data['referral_fee_percent'] = round((float) ($data['referral_fee_percent'] ?? $cache->commission_percent), 2);
+            $data['commission_percent'] = round((float) ($data['commission_percent'] ?? $cache->commission_percent), 2);
+            $data['commission_amount'] = round((float) ($data['commission_amount'] ?? $cache->commission_amount), 2);
+            $data['acquiring_percent'] = round((float) ($data['acquiring_percent'] ?? $cache->acquiring_percent), 2);
+            $data['acquiring_amount'] = round((float) ($data['acquiring_amount'] ?? $cache->acquiring_amount), 2);
+
+            $data['fby_delivery'] = round((float) ($data['fby_delivery'] ?? $data['delivery_to_customer']), 2);
+            $data['fbs_delivery'] = round((float) ($data['fbs_delivery'] ?? $data['delivery_to_customer']), 2);
+            $data['return_logistics'] = round((float) $cache->return_logistics_cost, 2);
+            $data['to_settlement_account'] = round(
+                (float) ($data['to_settlement_account'] ?? ($price - (float) $cache->commission_amount - (float) $cache->acquiring_amount - (float) $cache->logistics_cost)),
+                2
+            );
+        }
         
         // Рекламные расходы (пока 0)
         $data['advertising_cost'] = 0;
         $data['litrobonus'] = 0;
         
         // Для realFBS
-        $data['own_delivery_cost'] = 0;
-        $data['ozon_compensation'] = 0;
+        if (!isset($data['own_delivery_cost'])) {
+            $data['own_delivery_cost'] = in_array(strtoupper((string) ($cache->fulfillment_type ?? '')), ['RFBS', 'EXPRESS', 'DBS', 'EDBS'], true)
+                ? round((float) $cache->logistics_cost, 2)
+                : 0;
+        }
+        if (!isset($data['ozon_compensation'])) {
+            $data['ozon_compensation'] = 0;
+        }
         
         // === Себестоимость: приоритет settings > cache (для ВСЕХ маркетплейсов) ===
         $settingsCostPrice = ($settings?->cost_price && $settings->cost_price > 0) ? (float) $settings->cost_price : null;
@@ -684,10 +740,10 @@ class UnitEconomicsCacheController extends Controller
         
         // Суммы на основе процентов
         $price = (float) $cache->price;
-        $data['drr_amount'] = round($price * $data['drr_percent'] / 100, 2);
-        $data['our_share_amount'] = round($price * $data['our_share_percent'] / 100, 2);
-        $data['tax_amount'] = round($price * $data['tax_percent'] / 100, 2);
-        $data['vat_amount'] = round($price * $data['vat_percent'] / 100, 2);
+        $data['drr_amount'] = round((float) ($cache->drr_amount ?? ($price * $data['drr_percent'] / 100)), 2);
+        $data['our_share_amount'] = round((float) ($cache->our_share_amount ?? ($price * $data['our_share_percent'] / 100)), 2);
+        $data['tax_amount'] = round((float) ($cache->tax_amount ?? ($price * $data['tax_percent'] / 100)), 2);
+        $data['vat_amount'] = round((float) ($cache->vat_amount ?? ($price * $data['vat_percent'] / 100)), 2);
         
         return $data;
     }
@@ -702,9 +758,13 @@ class UnitEconomicsCacheController extends Controller
      */
     public function calculate(CalculateRequest $request, string $marketplace): JsonResponse
     {
+        $marketplace = $this->normalizeMarketplace($marketplace);
         $validated = $request->validated();
         $validated['marketplace'] = $marketplace;
-        $validated['fulfillment_type'] = $validated['fulfillment_type'] ?? 'FBO';
+        $validated['fulfillment_type'] = $validated['fulfillment_type'] ?? match ($marketplace) {
+            'yandex_market' => 'FBY',
+            default => 'FBO',
+        };
 
         try {
             $input = CalculationInput::fromArray($validated);
@@ -1069,6 +1129,46 @@ class UnitEconomicsCacheController extends Controller
                 ],
             };
         }
+
+        if ($marketplace === 'yandex' || $marketplace === 'yandex_market') {
+            return match ($scheme) {
+                'FBY' => [
+                    'code' => 'FBY',
+                    'name' => 'Склад Маркета',
+                    'full_name' => 'FBY — Fulfillment by Yandex',
+                    'logistics_by' => 'yandex_market',
+                    'storage_by' => 'yandex_market',
+                ],
+                'FBS' => [
+                    'code' => 'FBS',
+                    'name' => 'Ваш склад',
+                    'full_name' => 'FBS — Fulfillment by Seller',
+                    'logistics_by' => 'yandex_market',
+                    'storage_by' => 'seller',
+                ],
+                'DBS' => [
+                    'code' => 'DBS',
+                    'name' => 'Своя доставка',
+                    'full_name' => 'DBS — Delivery by Seller',
+                    'logistics_by' => 'seller',
+                    'storage_by' => 'seller',
+                ],
+                'EXPRESS' => [
+                    'code' => 'EXPRESS',
+                    'name' => 'Экспресс',
+                    'full_name' => 'EXPRESS — Экспресс-доставка',
+                    'logistics_by' => 'yandex_market',
+                    'storage_by' => 'seller',
+                ],
+                default => [
+                    'code' => $scheme,
+                    'name' => $scheme,
+                    'full_name' => $scheme,
+                    'logistics_by' => 'unknown',
+                    'storage_by' => 'unknown',
+                ],
+            };
+        }
         
         return [
             'code' => $scheme,
@@ -1077,5 +1177,13 @@ class UnitEconomicsCacheController extends Controller
             'logistics_by' => 'unknown',
             'storage_by' => 'unknown',
         ];
+    }
+
+    private function normalizeMarketplace(string $marketplace): string
+    {
+        return match (strtolower($marketplace)) {
+            'yandex', 'yandex_market' => 'yandex_market',
+            default => strtolower($marketplace),
+        };
     }
 }

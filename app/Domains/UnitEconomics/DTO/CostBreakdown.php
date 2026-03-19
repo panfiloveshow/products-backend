@@ -34,6 +34,8 @@ class CostBreakdown
         // Агентские (для realFBS)
         public readonly float $agentFee = 0,             // Агентское вознаграждение
         public readonly float $integrationFee = 0,       // Сервисный сбор за интеграцию
+        public readonly float $acceptanceCost = 0,       // Приёмка
+        public readonly float $penaltyCost = 0,          // Штрафы
         
         // Коэффициенты (для отображения)
         public readonly ?float $deliveryCoefficient = null,  // Коэффициент времени доставки
@@ -51,7 +53,9 @@ class CostBreakdown
             + $this->storageCost
             + $this->expectedReturnCost
             + $this->agentFee
-            + $this->integrationFee;
+            + $this->integrationFee
+            + $this->acceptanceCost
+            + $this->penaltyCost;
     }
 
     /**
@@ -102,6 +106,8 @@ class CostBreakdown
             // Агентские
             'agent_fee' => round($this->agentFee, 2),
             'integration_fee' => round($this->integrationFee, 2),
+            'acceptance_cost' => round($this->acceptanceCost, 2),
+            'penalty_cost' => round($this->penaltyCost, 2),
             
             // Коэффициенты
             'delivery_coefficient' => $this->deliveryCoefficient,

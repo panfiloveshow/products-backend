@@ -15,6 +15,7 @@ class YandexMarketService implements MarketplaceInterface
     private string $token;
     private string $campaignId;
     private string $baseUrl = 'https://api.partner.market.yandex.ru';
+    private string $defaultCurrency = 'RUR';
 
     public function __construct(?string $token = null, ?string $campaignId = null)
     {
@@ -100,7 +101,7 @@ class YandexMarketService implements MarketplaceInterface
             'brand' => $offer['vendor'] ?? null,
             'rating' => null,
             'reviews_count' => 0,
-            'marketplace' => 'yandex',
+            'marketplace' => 'yandex_market',
             'marketplace_id' => (string)($mapping['marketSku'] ?? $offer['shopSku']),
             'url' => isset($mapping['marketSku']) 
                 ? "https://market.yandex.ru/product/{$mapping['marketSku']}" 
@@ -155,7 +156,7 @@ class YandexMarketService implements MarketplaceInterface
                                 'sku' => $offer['shopSku'],
                                 'warehouse_id' => (string)$warehouse['warehouseId'],
                                 'warehouse_name' => $warehouse['warehouseName'] ?? "Склад {$warehouse['warehouseId']}",
-                                'marketplace' => 'yandex',
+                                'marketplace' => 'yandex_market',
                                 'quantity' => $stock['count'] ?? 0,
                             ];
                         }
@@ -241,22 +242,54 @@ class YandexMarketService implements MarketplaceInterface
      */
     public function getCommissions(): array
     {
+        Log::warning('YM getCommissions called without offer context, returning empty result');
+        return [];
+    }
+
+    public function calculateTariffs(array $offers, array $parameters = []): array
+    {
+        if (empty($offers)) {
+            return [];
+        }
+
         try {
+            $sellingProgram = strtoupper((string) ($parameters['sellingProgram'] ?? $parameters['selling_program'] ?? 'FBY'));
             $response = Http::withHeaders([
                 'Authorization' => "OAuth {$this->token}",
                 'Content-Type' => 'application/json',
-            ])->post("{$this->baseUrl}/tariffs/calculate", [
-                'campaignId' => $this->campaignId,
+            ])->post("{$this->baseUrl}/v2/tariffs/calculate", [
+                'parameters' => [
+                    'campaignId' => (int) ($parameters['campaignId'] ?? $parameters['campaign_id'] ?? $this->campaignId),
+                    'sellingProgram' => $sellingProgram,
+                    'frequency' => strtoupper((string) ($parameters['frequency'] ?? 'DAILY')),
+                    'paymentDelayWeeks' => (int) ($parameters['paymentDelayWeeks'] ?? $parameters['payment_delay_weeks'] ?? 0),
+                    'currency' => (string) ($parameters['currency'] ?? $this->defaultCurrency),
+                ],
+                'offers' => array_map(function (array $offer) {
+                    return [
+                        'categoryId' => (int) ($offer['categoryId'] ?? $offer['category_id'] ?? 0),
+                        'price' => (float) ($offer['price'] ?? 0),
+                        'length' => (float) ($offer['length'] ?? 0),
+                        'width' => (float) ($offer['width'] ?? 0),
+                        'height' => (float) ($offer['height'] ?? 0),
+                        'weight' => (float) ($offer['weight'] ?? 0),
+                        'quantity' => (int) ($offer['quantity'] ?? 1),
+                    ];
+                }, $offers),
             ]);
 
             if (!$response->successful()) {
+                Log::error('YM calculateTariffs error', [
+                    'status' => $response->status(),
+                    'body' => $response->body(),
+                ]);
                 return [];
             }
 
-            return $response->json()['result'] ?? [];
+            return $response->json()['result']['offers'] ?? $response->json()['result'] ?? [];
             
         } catch (\Exception $e) {
-            Log::error('YM getCommissions error', ['error' => $e->getMessage()]);
+            Log::error('YM calculateTariffs error', ['error' => $e->getMessage()]);
             return [];
         }
     }

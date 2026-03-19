@@ -213,14 +213,19 @@ class InventoryService
 
     public function getSyncStatuses(): array
     {
-        $marketplaces = ['wildberries', 'ozon', 'yandex'];
+        $marketplaces = ['wildberries', 'ozon', 'yandex_market'];
         $statuses = [];
 
         foreach ($marketplaces as $marketplace) {
-            $lastSync = SyncLog::where('marketplace', $marketplace)
-                ->where('sync_type', 'inventory')
-                ->latest()
-                ->first();
+            $lastSyncQuery = SyncLog::where('sync_type', 'inventory')->latest();
+
+            if ($marketplace === 'yandex_market') {
+                $lastSyncQuery->whereIn('marketplace', ['yandex_market', 'yandex']);
+            } else {
+                $lastSyncQuery->where('marketplace', $marketplace);
+            }
+
+            $lastSync = $lastSyncQuery->first();
 
             $statuses[$marketplace] = [
                 'last_sync' => $lastSync?->completed_at,

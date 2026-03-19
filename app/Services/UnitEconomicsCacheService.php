@@ -234,101 +234,120 @@ class UnitEconomicsCacheService
         }
     }
 
-    /**
-     * Подготовить данные для нового CalculationInput DTO
-     * Поддерживает Ozon (ozon_data) и WB (wb_data)
-     */
     private function prepareCalculationInput(Product $product, ?UnitEconomicsSettings $settings, string $fulfillmentType): array
     {
-        $marketplace = $product->marketplace;
-        
-        // Получаем данные маркетплейса (аналогичная структура для ozon_data и wb_data)
-        $marketplaceData = $marketplace === 'wildberries' 
-            ? ($product->wb_data ?? [])
-            : ($product->ozon_data ?? []);
+        $marketplace = $product->marketplace === 'yandex' ? 'yandex_market' : $product->marketplace;
+
+        $marketplaceData = match ($marketplace) {
+            'wildberries' => ($product->wb_data ?? []),
+            'yandex_market' => ($product->yandex_data ?? []),
+            default => ($product->ozon_data ?? []),
+        };
         $commissions = $marketplaceData['commissions'] ?? [];
         $redemption = $marketplaceData['redemption'] ?? [];
-        
-        // Получаем существующую запись UnitEconomics для конкретной схемы (там актуальные данные из API)
+        $tariffBreakdown = $marketplaceData['tariffs'] ?? [];
+
         $existingUE = $this->getUnitEconomicsCached($product->integration_id, $product->sku, strtoupper($fulfillmentType));
-        
-        // Определяем комиссию по схеме
-        // ПРИОРИТЕТ: ozon_data.commissions (актуальные из API товаров) > UnitEconomics > дефолт
+
         $schemeKey = strtolower($fulfillmentType);
-        // Нормализуем ключи схем
         if ($schemeKey === 'realfbs' || $schemeKey === 'dbs') {
             $schemeKey = 'rfbs';
         }
-        
-        // Берём комиссию для конкретной схемы, fallback на FBS, затем FBO
-        $commissionPercent = $commissions[$schemeKey]['percent'] 
+
+        $commissionPercent = $commissions[$schemeKey]['percent']
             ?? $commissions['fbs']['percent']
             ?? $commissions['fbo']['percent']
             ?? $existingUE?->commission_percent
             ?? 15;
-        
-        // Процент выкупа (WB: по умолчанию 80%, Ozon: 100%)
+
         $defaultRedemptionRate = $marketplace === 'wildberries' ? 80 : 100;
-        $redemptionRate = $settings?->redemption_rate_override 
+        $redemptionRate = $settings?->redemption_rate_override
             ?? $existingUE?->redemption_rate
-            ?? $redemption['redemption_rate'] 
+            ?? $redemption['redemption_rate']
             ?? $defaultRedemptionRate;
-        
-        // Время доставки и коэффициент — ПРИОРИТЕТ из UnitEconomics (там данные из API)
-        $avgDeliveryTimeHours = $existingUE?->avg_delivery_time_hours ?? 29;
-        // Коэффициент берём из UnitEconomics если есть, иначе рассчитываем
-        $deliveryCoefficient = $existingUE?->logistics_coefficient ?? $this->calculateDeliveryCoefficient($avgDeliveryTimeHours);
-        // Дополнительный процент из UnitEconomics
-        $additionalCommissionPercent = $existingUE?->additional_commission_percent ?? 0;
-        
-        // Габариты: приоритет settings > wb_data/ozon_data > Product
-        // Product хранит мм/г, DTO ожидает см/кг
+
+        $integration = $this->getIntegrationCached($product->integration_id);
+        $integrationSettings = $integration?->settings ?? [];
+
+        $avgDeliveryTimeHours = $marketplace === 'ozon'
+            ? (int) ($integrationSettings['avg_delivery_time_hours'] ?? $existingUE?->avg_delivery_time_hours ?? 29)
+            : (int) ($existingUE?->avg_delivery_time_hours ?? 29);
+
+        $deliveryCoefficient = $marketplace === 'ozon'
+            ? (float) ($integrationSettings['localization_coefficient'] ?? $existingUE?->logistics_coefficient ?? $this->calculateDeliveryCoefficient($avgDeliveryTimeHours))
+            : (float) ($existingUE?->logistics_coefficient ?? 1.0);
+
+        $additionalCommissionPercent = $marketplace === 'ozon'
+            ? (float) ($integrationSettings['localization_additional_percent'] ?? $existingUE?->additional_commission_percent ?? 0)
+            : (float) ($existingUE?->additional_commission_percent ?? 0);
+
+        $tariffStatus = $marketplace === 'ozon'
+            ? (string) ($integrationSettings['localization_tariff_status'] ?? $existingUE?->tariff_status ?? 'UNKNOWN')
+            : (string) ($existingUE?->tariff_status ?? 'UNKNOWN');
+
         $lengthMm = $settings?->length_mm ?? $marketplaceData['length_mm'] ?? $product->depth;
         $widthMm = $settings?->width_mm ?? $marketplaceData['width_mm'] ?? $product->width;
         $heightMm = $settings?->height_mm ?? $marketplaceData['height_mm'] ?? $product->height;
         $weightG = $settings?->weight_g ?? $marketplaceData['weight_g'] ?? $product->weight;
-        
+
         $lengthCm = $lengthMm !== null ? ((float) $lengthMm / 10) : 0.0;
         $widthCm = $widthMm !== null ? ((float) $widthMm / 10) : 0.0;
         $heightCm = $heightMm !== null ? ((float) $heightMm / 10) : 0.0;
         $weightKg = $weightG !== null ? ((float) $weightG / 1000) : 0.0;
-        
-        // Себестоимость
-        $costPrice = ($settings?->cost_price && $settings->cost_price > 0) 
-            ? $settings->cost_price 
+
+        $costPrice = ($settings?->cost_price && $settings->cost_price > 0)
+            ? $settings->cost_price
             : ($existingUE?->cost_price ?? 0);
-        
-        // Актуальная цена с учётом акций (marketing_seller_price)
-        // Приоритет: actual_price (уже рассчитан) > marketing_seller_price > price
-        $actualPrice = $marketplaceData['actual_price'] 
+
+        $actualPrice = $marketplaceData['actual_price']
             ?? $marketplaceData['marketing_seller_price']
-            ?? $commissions['actual_price'] 
-            ?? $existingUE?->price 
+            ?? $commissions['actual_price']
+            ?? $existingUE?->price
             ?? $product->price;
-        
-        // Если marketing_seller_price меньше actual_price — используем его (акция)
+
         $marketingPrice = (float) ($marketplaceData['marketing_seller_price'] ?? 0);
         if ($marketingPrice > 0 && $marketingPrice < $actualPrice) {
             $actualPrice = $marketingPrice;
         }
-        
-        // WB-специфичные данные
-        $sppPercent = 0;
+
+        $sppPercent = 0.0;
         $warehouseCoefficient = 1.0;
         $localizationIndex = 1.0;
         if ($marketplace === 'wildberries') {
             $sppPercent = (float) ($settings?->spp_percent ?? $marketplaceData['spp_percent'] ?? 0);
-            // КС (коэффициент склада) — средний взвешенный по всем складам товара
             $warehouseCoefficient = $this->getAverageWarehouseCoefficient($product->sku, $marketplace);
-            // ИЛ (индекс локализации) — из настроек интеграции (ручной ввод)
-            $integration = $this->getIntegrationCached($product->integration_id);
             $localizationIndex = (float) ($integration?->localization_index ?? 1.0);
         }
-        
+
+        $drrPercent = (float) ($settings?->drr_percent ?? $existingUE?->drr_percent ?? 0);
+        $ourSharePercent = (float) ($settings?->our_share_percent ?? $existingUE?->our_share_percent ?? 0);
+        $taxPercent = (float) ($settings?->tax_percent ?? $existingUE?->tax_percent ?? 6);
+        $vatPercent = (float) ($settings?->vat_percent ?? $existingUE?->vat_percent ?? 0);
+        $acquiringPercent = (float) ($marketplace === 'wildberries' ? 0 : ($existingUE?->acquiring_percent ?? 1.5));
+        $storageCost = (float) ($marketplaceData['storage_cost'] ?? $product->storage_cost ?? $existingUE?->storage_cost ?? 0);
+        $ownDeliveryCost = (float) (
+            $marketplaceData['own_delivery_cost']
+            ?? $integrationSettings['own_delivery_cost']
+            ?? $existingUE?->logistics_cost
+            ?? 0
+        );
+        $ownReturnCost = (float) (
+            $marketplaceData['own_return_cost']
+            ?? $existingUE?->return_logistics_cost
+            ?? 0
+        );
+        $marketplaceCompensation = (float) (
+            $marketplaceData['ozon_compensation']
+            ?? $marketplaceData['marketplace_compensation']
+            ?? 0
+        );
+        $acceptanceCost = (float) ($marketplaceData['acceptance_cost'] ?? 0);
+        $penaltyCost = (float) ($marketplaceData['penalty_cost'] ?? 0);
+
         return [
             'sku' => $product->sku,
             'integration_id' => $product->integration_id,
-            'marketplace' => $product->marketplace,
+            'marketplace' => $marketplace,
             'fulfillment_type' => strtoupper($fulfillmentType),
             'price' => (float) $actualPrice,
             'old_price' => $product->old_price,
@@ -345,26 +364,38 @@ class UnitEconomicsCacheService
             'delivery_coefficient' => (float) $deliveryCoefficient,
             'warehouse_coefficient' => (float) $warehouseCoefficient,
             'localization_index' => (float) $localizationIndex,
+            'spp_percent' => $sppPercent,
+            'drr_percent' => $drrPercent,
+            'our_share_percent' => $ourSharePercent,
+            'tax_percent' => $taxPercent,
+            'vat_percent' => $vatPercent,
+            'acquiring_percent' => $acquiringPercent,
+            'storage_cost' => $storageCost,
+            'additional_commission_percent' => $additionalCommissionPercent,
+            'own_delivery_cost' => $ownDeliveryCost,
+            'own_return_cost' => $ownReturnCost,
+            'marketplace_compensation' => $marketplaceCompensation,
+            'acceptance_cost' => $acceptanceCost,
+            'penalty_cost' => $penaltyCost,
+            'tariff_breakdown' => is_array($tariffBreakdown) ? $tariffBreakdown : [],
             'product_name' => $product->name,
-            // Дополнительные данные для сохранения в кэш
             '_extra' => [
                 'sales_count' => max(1, (int) ($existingUE?->sales_count ?? $product->sales_30_days ?? 1)),
                 'avg_delivery_time_hours' => (int) $avgDeliveryTimeHours,
                 'logistics_coefficient' => (float) $deliveryCoefficient,
                 'additional_commission_percent' => (float) $additionalCommissionPercent,
+                'tariff_status' => $tariffStatus,
                 'turnover_days' => (int) ($existingUE?->turnover_days ?? 30),
-                'drr_percent' => (float) ($settings?->drr_percent ?? $existingUE?->drr_percent ?? 0),
-                'our_share_percent' => (float) ($settings?->our_share_percent ?? $existingUE?->our_share_percent ?? 0),
-                'tax_percent' => (float) ($settings?->tax_percent ?? $existingUE?->tax_percent ?? 6),
-                'vat_percent' => (float) ($settings?->vat_percent ?? $existingUE?->vat_percent ?? 0),
-                'acquiring_percent' => (float) ($marketplace === 'wildberries' ? 0 : ($existingUE?->acquiring_percent ?? 1.5)),
+                'drr_percent' => $drrPercent,
+                'our_share_percent' => $ourSharePercent,
+                'tax_percent' => $taxPercent,
+                'vat_percent' => $vatPercent,
+                'acquiring_percent' => $acquiringPercent,
                 'is_in_promotion' => $marketplaceData['is_in_promotion'] ?? $commissions['is_in_promotion'] ?? false,
                 'promotion_discount' => $marketplaceData['promotion_discount'] ?? $commissions['promotion_discount'] ?? 0,
-                // Данные выкупа из UnitEconomics (для Premium аккаунтов)
                 'redemption_source' => $existingUE?->redemption_source ?? 'default',
                 'orders_count' => $existingUE?->orders_count ?? null,
                 'returns_count' => $existingUE?->returns_count ?? null,
-                // WB-специфичные
                 'spp_percent' => $sppPercent,
             ],
         ];
@@ -389,12 +420,23 @@ class UnitEconomicsCacheService
         $ourSharePercent = $extra['our_share_percent'] ?? 0;
         $ourShareAmount = $price * ($ourSharePercent / 100);
         $taxPercent = $extra['tax_percent'] ?? 6;
-        $taxAmount = $result->netProfit > 0 ? $result->netProfit * ($taxPercent / 100) : 0;
         $vatPercent = $extra['vat_percent'] ?? 0;
         $vatAmount = $price * ($vatPercent / 100);
+        $metaDrrAmount = array_key_exists('drr_amount', $result->metadata) ? (float) $result->metadata['drr_amount'] : null;
+        $metaTaxAmount = array_key_exists('tax_amount', $result->metadata) ? (float) $result->metadata['tax_amount'] : null;
+        $metaVatAmount = array_key_exists('vat_amount', $result->metadata) ? (float) $result->metadata['vat_amount'] : null;
+        $taxAmount = $metaTaxAmount ?? ($result->netProfit > 0 ? $result->netProfit * ($taxPercent / 100) : 0);
+        $effectiveDrrAmount = $metaDrrAmount ?? $drrAmount;
+        $effectiveTaxAmount = $metaTaxAmount ?? $taxAmount;
+        $effectiveVatAmount = $metaVatAmount ?? $vatAmount;
+        $totalCosts = $result->totalCosts
+            + $ourShareAmount
+            + $effectiveVatAmount
+            + ($metaDrrAmount === null ? $drrAmount : 0)
+            + ($metaTaxAmount === null ? $taxAmount : 0);
         
         // Корректируем чистую прибыль
-        $netProfit = $result->netProfit - $drrAmount - $ourShareAmount - $taxAmount - $vatAmount;
+        $netProfit = $result->revenue - $totalCosts;
         $marginPercent = $price > 0 ? ($netProfit / $price) * 100 : 0;
         $markupPercent = $costs->costPrice > 0 ? (($netProfit / $costs->costPrice) * 100) : 0;
         $roiPercent = $costs->getProductCosts() > 0 ? (($netProfit / $costs->getProductCosts()) * 100) : 0;
@@ -428,6 +470,7 @@ class UnitEconomicsCacheService
             'avg_delivery_time_hours' => $extra['avg_delivery_time_hours'] ?? 29,
             'logistics_coefficient' => $extra['logistics_coefficient'] ?? $costs->deliveryCoefficient ?? 1,
             'additional_commission_percent' => $extra['additional_commission_percent'] ?? $costs->additionalPercent ?? 0,
+            'tariff_status' => $extra['tariff_status'] ?? 'UNKNOWN',
             // base_logistics_cost — базовая логистика БЕЗ КС и ИЛ (из metadata для WB)
             'base_logistics_cost' => $result->metadata['base_logistics'] ?? $costs->logistics,
             // logistics_cost — итоговая логистика С учётом КС и ИЛ
@@ -450,19 +493,19 @@ class UnitEconomicsCacheService
             // Себестоимость и настройки
             'cost_price' => $costs->costPrice,
             'drr_percent' => $drrPercent,
-            'drr_amount' => $drrAmount,
+            'drr_amount' => $effectiveDrrAmount,
             'our_share_percent' => $ourSharePercent,
             'our_share_amount' => $ourShareAmount,
             'tax_percent' => $taxPercent,
-            'tax_amount' => $taxAmount,
+            'tax_amount' => $effectiveTaxAmount,
             'vat_percent' => $vatPercent,
-            'vat_amount' => $vatAmount,
+            'vat_amount' => $effectiveVatAmount,
             // Итоги
             'revenue' => $result->revenue,
-            'total_costs' => $result->totalCosts + $drrAmount + $ourShareAmount + $taxAmount + $vatAmount,
+            'total_costs' => $totalCosts,
             'gross_profit' => $result->netProfit,
             'net_profit' => $netProfit,
-            'to_settlement_account' => $result->price - $costs->commission - $costs->acquiring - $costs->deliveryCost,
+            'to_settlement_account' => $result->metadata['to_settlement_account'] ?? ($result->price - $costs->getMarketplaceCosts()),
             'margin_percent' => $marginPercent,
             'markup_percent' => $markupPercent,
             'roi_percent' => $roiPercent,

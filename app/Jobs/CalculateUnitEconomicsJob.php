@@ -110,7 +110,7 @@ class CalculateUnitEconomicsJob implements ShouldQueue
                 'acquiring_percent' => 1.5,
                 'fulfillment_type' => 'FBO',
             ],
-            'yandex' => [
+            'yandex', 'yandex_market' => [
                 'referral_fee_percent' => 5,
                 'fby_delivery' => 50,
             ],

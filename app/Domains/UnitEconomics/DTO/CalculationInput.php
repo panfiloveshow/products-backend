@@ -39,6 +39,20 @@ class CalculationInput
         public readonly ?float $deliveryCoefficient = null,  // Коэффициент времени доставки (Ozon FBO)
         public readonly ?float $warehouseCoefficient = null,  // КС (коэффициент склада) — множитель логистики WB (1.0 = 100%, 1.4 = 140%)
         public readonly ?float $localizationIndex = null,  // ИЛ (индекс локализации) — множитель логистики WB (1.0 = без изменений)
+        public readonly ?float $sppPercent = null,
+        public readonly ?float $drrPercent = null,
+        public readonly ?float $ourSharePercent = null,
+        public readonly ?float $taxPercent = null,
+        public readonly ?float $vatPercent = null,
+        public readonly ?float $acquiringPercent = null,
+        public readonly ?float $storageCost = null,
+        public readonly ?float $additionalCommissionPercent = null,
+        public readonly array $tariffBreakdown = [],
+        public readonly ?float $ownDeliveryCost = null,
+        public readonly ?float $ownReturnCost = null,
+        public readonly ?float $marketplaceCompensation = null,
+        public readonly ?float $acceptanceCost = null,
+        public readonly ?float $penaltyCost = null,
         
         // Название товара (для отображения)
         public readonly ?string $productName = null,
@@ -95,6 +109,20 @@ class CalculationInput
             deliveryCoefficient: isset($data['delivery_coefficient']) ? (float) $data['delivery_coefficient'] : null,
             warehouseCoefficient: isset($data['warehouse_coefficient']) ? (float) $data['warehouse_coefficient'] : null,
             localizationIndex: isset($data['localization_index']) ? (float) $data['localization_index'] : null,
+            sppPercent: isset($data['spp_percent']) ? (float) $data['spp_percent'] : null,
+            drrPercent: isset($data['drr_percent']) ? (float) $data['drr_percent'] : null,
+            ourSharePercent: isset($data['our_share_percent']) ? (float) $data['our_share_percent'] : null,
+            taxPercent: isset($data['tax_percent']) ? (float) $data['tax_percent'] : null,
+            vatPercent: isset($data['vat_percent']) ? (float) $data['vat_percent'] : null,
+            acquiringPercent: isset($data['acquiring_percent']) ? (float) $data['acquiring_percent'] : null,
+            storageCost: isset($data['storage_cost']) ? (float) $data['storage_cost'] : null,
+            additionalCommissionPercent: isset($data['additional_commission_percent']) ? (float) $data['additional_commission_percent'] : null,
+            tariffBreakdown: isset($data['tariff_breakdown']) && is_array($data['tariff_breakdown']) ? $data['tariff_breakdown'] : [],
+            ownDeliveryCost: isset($data['own_delivery_cost']) ? (float) $data['own_delivery_cost'] : null,
+            ownReturnCost: isset($data['own_return_cost']) ? (float) $data['own_return_cost'] : null,
+            marketplaceCompensation: isset($data['marketplace_compensation']) ? (float) $data['marketplace_compensation'] : null,
+            acceptanceCost: isset($data['acceptance_cost']) ? (float) $data['acceptance_cost'] : null,
+            penaltyCost: isset($data['penalty_cost']) ? (float) $data['penalty_cost'] : null,
             productName: $data['product_name'] ?? null,
         );
     }

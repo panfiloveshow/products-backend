@@ -75,6 +75,7 @@ class UnitEconomicsController extends Controller
 
     public function byMarketplace(IndexUnitEconomicsRequest $request, string $marketplace): JsonResponse
     {
+        $marketplace = $this->normalizeMarketplace($marketplace);
         $validated = $request->validated();
         $validated['marketplace'] = $marketplace;
 
@@ -180,6 +181,7 @@ class UnitEconomicsController extends Controller
 
     public function show(string $marketplace, string $sku): JsonResponse
     {
+        $marketplace = $this->normalizeMarketplace($marketplace);
         $unitEconomics = UnitEconomics::where('marketplace', $marketplace)
             ->where('sku', $sku)
             ->latest()
@@ -192,6 +194,7 @@ class UnitEconomicsController extends Controller
 
     public function store(StoreUnitEconomicsRequest $request, string $marketplace): JsonResponse
     {
+        $marketplace = $this->normalizeMarketplace($marketplace);
         $validated = $request->validated();
         $validated['marketplace'] = $marketplace;
 
@@ -205,6 +208,7 @@ class UnitEconomicsController extends Controller
 
     public function update(UpdateUnitEconomicsRequest $request, string $marketplace, int $id): JsonResponse
     {
+        $marketplace = $this->normalizeMarketplace($marketplace);
         $unitEconomics = UnitEconomics::where('marketplace', $marketplace)
             ->findOrFail($id);
 
@@ -218,6 +222,7 @@ class UnitEconomicsController extends Controller
 
     public function destroy(string $marketplace, int $id): JsonResponse
     {
+        $marketplace = $this->normalizeMarketplace($marketplace);
         $unitEconomics = UnitEconomics::where('marketplace', $marketplace)
             ->findOrFail($id);
 
@@ -230,6 +235,7 @@ class UnitEconomicsController extends Controller
 
     public function calculate(CalculateRequest $request, string $marketplace): JsonResponse
     {
+        $marketplace = $this->normalizeMarketplace($marketplace);
         $validated = $request->validated();
         $validated['marketplace'] = $marketplace;
 
@@ -260,6 +266,7 @@ class UnitEconomicsController extends Controller
 
     public function statsByMarketplace(string $marketplace): JsonResponse
     {
+        $marketplace = $this->normalizeMarketplace($marketplace);
         $stats = $this->unitEconomicsService->getStatsByMarketplace($marketplace);
 
         return response()->json([
@@ -269,6 +276,7 @@ class UnitEconomicsController extends Controller
 
     public function commissions(string $marketplace): JsonResponse
     {
+        $marketplace = $this->normalizeMarketplace($marketplace);
         $commissions = $this->unitEconomicsService->getCommissions($marketplace);
 
         return response()->json([
@@ -278,10 +286,19 @@ class UnitEconomicsController extends Controller
 
     public function tariffs(string $marketplace): JsonResponse
     {
+        $marketplace = $this->normalizeMarketplace($marketplace);
         $tariffs = $this->unitEconomicsService->getTariffs($marketplace);
 
         return response()->json([
             'data' => $tariffs,
         ]);
+    }
+
+    private function normalizeMarketplace(string $marketplace): string
+    {
+        return match (strtolower($marketplace)) {
+            'yandex', 'yandex_market' => 'yandex_market',
+            default => strtolower($marketplace),
+        };
     }
 }

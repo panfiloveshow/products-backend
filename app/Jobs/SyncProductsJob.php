@@ -235,18 +235,17 @@ class SyncProductsJob implements ShouldQueue
             }
         }
 
-        // Проверяем marketplace-specific данные
         $marketplaceDataField = match ($this->syncLog->marketplace) {
             'wildberries' => 'wb_data',
             'ozon' => 'ozon_data',
-            'yandex' => 'yandex_data',
+            'yandex', 'yandex_market' => 'yandex_data',
             default => null,
         };
 
         if ($marketplaceDataField && isset($newData[$marketplaceDataField])) {
             $existingMpData = $existing->{$marketplaceDataField} ?? [];
             $newMpData = $newData[$marketplaceDataField] ?? [];
-            
+
             if (json_encode($existingMpData) !== json_encode($newMpData)) {
                 return true;
             }

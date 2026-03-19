@@ -14,7 +14,7 @@ class MarketplaceFactory
                 $credentials['client_id'] ?? null,
                 $credentials['api_key'] ?? null
             ),
-            'yandex' => new YandexMarketService(
+            'yandex', 'yandex_market' => new YandexMarketService(
                 $credentials['token'] ?? null,
                 $credentials['campaign_id'] ?? null
             ),

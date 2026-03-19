@@ -147,6 +147,37 @@ class OzonTariffs implements TariffsProviderInterface
     }
 
     /**
+     * Получить стоимость последней мили.
+     */
+    public function getLastMileCost(string $scheme, array $options = []): float
+    {
+        return match (strtoupper($scheme)) {
+            'FBO', 'FBS' => min((float) ($options['last_mile'] ?? self::LAST_MILE_MAX), self::LAST_MILE_MAX),
+            default => 0.0,
+        };
+    }
+
+    /**
+     * Получить стоимость обработки отправления.
+     */
+    public function getProcessingFee(string $scheme, float $volume): float
+    {
+        if (strtoupper($scheme) !== 'FBS') {
+            return 0.0;
+        }
+
+        return self::FBS_PROCESSING_BASE + $this->getProcessingCost($volume);
+    }
+
+    /**
+     * Получить стоимость обработки возврата.
+     */
+    public function getReturnProcessingFee(string $scheme): float
+    {
+        return in_array(strtoupper($scheme), ['FBO', 'FBS'], true) ? self::RETURN_PROCESSING : 0.0;
+    }
+
+    /**
      * Рассчитать FBO логистику (прогрессивная шкала с 10.12.2025)
      */
     private function calculateFboLogistics(float $volume, array $options = []): float
@@ -163,11 +194,8 @@ class OzonTariffs implements TariffsProviderInterface
         
         // Доп. % от цены
         $additionalCost = $price * ($additionalPercent / 100);
-        
-        // Последняя миля
-        $lastMile = min($options['last_mile'] ?? self::LAST_MILE_MAX, self::LAST_MILE_MAX);
 
-        return $logisticsCost + $additionalCost + $lastMile;
+        return $logisticsCost + $additionalCost;
     }
 
     /**
@@ -214,16 +242,7 @@ class OzonTariffs implements TariffsProviderInterface
      */
     private function calculateFbsLogistics(float $volume, array $options = []): float
     {
-        // Базовая логистика
-        $logisticsCost = $this->getVolumeCost(self::FBS_VOLUME_TARIFFS, $volume);
-        
-        // Обработка отправления
-        $processingCost = self::FBS_PROCESSING_BASE + $this->getProcessingCost($volume);
-        
-        // Последняя миля
-        $lastMile = min($options['last_mile'] ?? self::LAST_MILE_MAX, self::LAST_MILE_MAX);
-
-        return $logisticsCost + $processingCost + $lastMile;
+        return $this->getVolumeCost(self::FBS_VOLUME_TARIFFS, $volume);
     }
 
     /**
@@ -265,36 +284,16 @@ class OzonTariffs implements TariffsProviderInterface
     }
 
     /**
-     * Получить коэффициенты
-     */
-    public function getCoefficients(string $scheme, array $options = []): array
-    {
-        if (strtoupper($scheme) === 'FBO') {
-            return [
-                'delivery_coefficient' => $options['delivery_coefficient'] ?? 1.0,
-                'additional_percent' => $options['additional_percent'] ?? 0,
-            ];
-        }
-
-        return [
-            'delivery_coefficient' => 1.0,
-            'additional_percent' => 0,
-        ];
-    }
-
-    /**
      * Рассчитать обратную логистику (возврат)
      * Ozon: базовый тариф БЕЗ коэффициента + 15₽ обработка
      */
     public function calculateReturnLogisticsCost(string $scheme, float $volume): float
     {
-        $baseCost = match (strtoupper($scheme)) {
+        return match (strtoupper($scheme)) {
             'FBO' => $this->calculateFboBaseCost(ceil($volume)),
             'FBS' => $this->getVolumeCost(self::FBS_VOLUME_TARIFFS, $volume),
             default => 0,
         };
-
-        return $baseCost + self::RETURN_PROCESSING;
     }
 
     /**

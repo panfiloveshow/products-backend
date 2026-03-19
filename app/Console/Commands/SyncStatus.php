@@ -76,12 +76,17 @@ class SyncStatus extends Command
         }
         
         // Проверяем давно не синхронизировались
-        $marketplaces = ['wildberries', 'ozon', 'yandex'];
+        $marketplaces = ['wildberries', 'ozon', 'yandex_market'];
         foreach ($marketplaces as $mp) {
-            $lastSync = SyncLog::where('marketplace', $mp)
-                ->where('status', 'completed')
-                ->latest()
-                ->first();
+            $lastSyncQuery = SyncLog::where('status', 'completed')->latest();
+
+            if ($mp === 'yandex_market') {
+                $lastSyncQuery->whereIn('marketplace', ['yandex_market', 'yandex']);
+            } else {
+                $lastSyncQuery->where('marketplace', $mp);
+            }
+
+            $lastSync = $lastSyncQuery->first();
             
             if (!$lastSync || $lastSync->updated_at < now()->subHours(24)) {
                 $warnings[] = "⚠️  {$mp}: не синхронизировался >24ч";

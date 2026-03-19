@@ -107,13 +107,18 @@ class ProductService
 
     public function getSyncStatuses(?int $integrationId = null): array
     {
-        $marketplaces = ['wildberries', 'ozon', 'yandex'];
+        $marketplaces = ['wildberries', 'ozon', 'yandex_market'];
         $statuses = [];
 
         foreach ($marketplaces as $marketplace) {
-            $syncQuery = SyncLog::where('marketplace', $marketplace)
-                ->where('sync_type', 'products')
+            $syncQuery = SyncLog::where('sync_type', 'products')
                 ->latest();
+
+            if ($marketplace === 'yandex_market') {
+                $syncQuery->whereIn('marketplace', ['yandex_market', 'yandex']);
+            } else {
+                $syncQuery->where('marketplace', $marketplace);
+            }
 
             if ($integrationId) {
                 $syncQuery->where('integration_id', $integrationId);

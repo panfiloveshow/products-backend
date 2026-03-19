@@ -55,12 +55,12 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
         $commission = $price * ($commissionRate / 100);
 
         // Эквайринг
-        $acquiringRate = $this->commissions->getAcquiringRate();
+        $acquiringRate = $input->acquiringPercent ?? $this->commissions->getAcquiringRate();
         $acquiring = $price * ($acquiringRate / 100);
 
         // Логистика FBO
         $deliveryCoefficient = $input->deliveryCoefficient ?? 1.0;
-        $additionalPercent = $this->getAdditionalPercent($price, $deliveryCoefficient);
+        $additionalPercent = $input->additionalCommissionPercent ?? $this->getAdditionalPercent($price, $deliveryCoefficient);
         
         $logistics = $this->tariffs->calculateLogisticsCost('FBO', $volume, $input->weight, [
             'delivery_coefficient' => $deliveryCoefficient,
@@ -69,13 +69,13 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
         ]);
 
         // Последняя миля
-        $lastMile = 25.0; // Максимум
+        $lastMile = $this->tariffs->getLastMileCost('FBO');
 
-        // Возвраты
-        $expectedReturnCost = $this->calculateExpectedReturnCost('FBO', $volume, $input->redemptionRate);
+        $returnCosts = $this->calculateExpectedReturnCosts('FBO', $volume, $input->redemptionRate);
 
         return $this->buildResult($input, $commission, $commissionRate, $acquiring, $acquiringRate, 
-            $logistics, $lastMile, 0, $expectedReturnCost, $deliveryCoefficient, $additionalPercent);
+            $logistics, $lastMile, 0, $returnCosts['expected'], $deliveryCoefficient, $additionalPercent, 0, 0,
+            $returnCosts['logistics'], $returnCosts['processing']);
     }
 
     /**
@@ -92,23 +92,21 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
         $commission = $price * ($commissionRate / 100);
 
         // Эквайринг
-        $acquiringRate = $this->commissions->getAcquiringRate();
+        $acquiringRate = $input->acquiringPercent ?? $this->commissions->getAcquiringRate();
         $acquiring = $price * ($acquiringRate / 100);
 
-        // Логистика FBS (включает обработку)
+        // Логистика FBS
         $logistics = $this->tariffs->calculateLogisticsCost('FBS', $volume, $input->weight);
         
-        // Обработка отправления (20₽ базовая)
-        $processingFee = 20.0;
+        $processingFee = $this->tariffs->getProcessingFee('FBS', $volume);
         
-        // Последняя миля
-        $lastMile = 25.0;
+        $lastMile = $this->tariffs->getLastMileCost('FBS');
 
-        // Возвраты
-        $expectedReturnCost = $this->calculateExpectedReturnCost('FBS', $volume, $input->redemptionRate);
+        $returnCosts = $this->calculateExpectedReturnCosts('FBS', $volume, $input->redemptionRate);
 
         return $this->buildResult($input, $commission, $commissionRate, $acquiring, $acquiringRate,
-            $logistics, $lastMile, $processingFee, $expectedReturnCost);
+            $logistics, $lastMile, $processingFee, $returnCosts['expected'], null, null, 0, 0,
+            $returnCosts['logistics'], $returnCosts['processing']);
     }
 
     /**
@@ -124,17 +122,20 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
         $commission = $price * ($commissionRate / 100);
 
         // Эквайринг
-        $acquiringRate = $this->commissions->getAcquiringRate();
+        $acquiringRate = $input->acquiringPercent ?? $this->commissions->getAcquiringRate();
         $acquiring = $price * ($acquiringRate / 100);
 
         // Агентское вознаграждение
         $agentFee = $this->tariffs->getAgentFee('RFBS');
 
         // Своя доставка (из настроек пользователя)
-        $ownDeliveryCost = 0; // Пользователь указывает сам
+        $ownDeliveryCost = $input->ownDeliveryCost ?? 0;
+
+        $returnRate = $input->redemptionRate !== null ? max(0, (100 - $input->redemptionRate) / 100) : 0;
+        $expectedReturnCost = ($input->ownReturnCost ?? 0) * $returnRate;
 
         return $this->buildResult($input, $commission, $commissionRate, $acquiring, $acquiringRate,
-            $ownDeliveryCost, 0, 0, 0, null, null, $agentFee);
+            $ownDeliveryCost, 0, 0, $expectedReturnCost, null, null, $agentFee, 0, 0, 0);
     }
 
     /**
@@ -150,20 +151,23 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
         $commission = $price * ($commissionRate / 100);
 
         // Эквайринг
-        $acquiringRate = $this->commissions->getAcquiringRate();
+        $acquiringRate = $input->acquiringPercent ?? $this->commissions->getAcquiringRate();
         $acquiring = $price * ($acquiringRate / 100);
 
         // Агентское вознаграждение
         $agentFee = $this->tariffs->getAgentFee('EXPRESS');
         
         // Возмещение за экспресс (своя служба)
-        $expressCompensation = $this->tariffs->getExpressCompensation(); // -199₽ (возврат от Ozon)
+        $expressCompensation = $input->marketplaceCompensation ?? $this->tariffs->getExpressCompensation();
 
         // Своя доставка
-        $ownDeliveryCost = 0;
+        $ownDeliveryCost = $input->ownDeliveryCost ?? 0;
+
+        $returnRate = $input->redemptionRate !== null ? max(0, (100 - $input->redemptionRate) / 100) : 0;
+        $expectedReturnCost = ($input->ownReturnCost ?? 0) * $returnRate;
 
         return $this->buildResult($input, $commission, $commissionRate, $acquiring, $acquiringRate,
-            $ownDeliveryCost, 0, 0, 0, null, null, $agentFee, -$expressCompensation);
+            $ownDeliveryCost, 0, 0, $expectedReturnCost, null, null, $agentFee, -$expressCompensation, 0, 0);
     }
 
     /**
@@ -182,7 +186,9 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
         ?float $deliveryCoefficient = null,
         ?float $additionalPercent = null,
         float $agentFee = 0,
-        float $integrationFee = 0
+        float $integrationFee = 0,
+        float $returnLogistics = 0,
+        float $returnProcessing = 0
     ): UnitEconomicsResult {
         $price = $input->price;
         
@@ -190,6 +196,9 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
         $costPrice = $input->costPrice ?? 0;
         $packagingCost = $input->packagingCost ?? 0;
         $additionalCosts = $input->additionalCosts ?? 0;
+        $storageCost = $input->storageCost ?? 0;
+        $acceptanceCost = $input->acceptanceCost ?? 0;
+        $penaltyCost = $input->penaltyCost ?? 0;
 
         // Стоимость доставки
         $deliveryCost = $logistics + $lastMile + $processingFee;
@@ -202,15 +211,17 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
             lastMile: $lastMile,
             processingFee: $processingFee,
             deliveryCost: $deliveryCost,
-            storageCost: 0,
-            returnLogistics: 0,
-            returnProcessing: 0,
+            storageCost: $storageCost,
+            returnLogistics: $returnLogistics,
+            returnProcessing: $returnProcessing,
             expectedReturnCost: $expectedReturnCost,
             costPrice: $costPrice,
             packagingCost: $packagingCost,
             additionalCosts: $additionalCosts,
             agentFee: $agentFee,
             integrationFee: $integrationFee,
+            acceptanceCost: $acceptanceCost,
+            penaltyCost: $penaltyCost,
             deliveryCoefficient: $deliveryCoefficient,
             additionalPercent: $additionalPercent,
         );
@@ -219,8 +230,9 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
         $totalCosts = $costs->getTotalCosts();
         $netProfit = $price - $totalCosts;
         $marginPercent = $price > 0 ? ($netProfit / $price) * 100 : 0;
+        $toSettlementAccount = $price - $costs->getMarketplaceCosts();
 
-        return new UnitEconomicsResult(
+        $result = new UnitEconomicsResult(
             sku: $input->sku,
             marketplace: $this->getMarketplace(),
             fulfillmentType: $input->fulfillmentType,
@@ -240,21 +252,48 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
             productName: $input->productName,
             calculatedAt: now()->toIso8601String(),
         );
-    }
+
+        $result->metadata = [
+            'base_logistics' => round($logistics, 2),
+            'last_mile' => round($lastMile, 2),
+            'processing_fee' => round($processingFee, 2),
+            'storage_cost' => round($storageCost, 2),
+            'return_logistics' => round($returnLogistics, 2),
+            'return_processing' => round($returnProcessing, 2),
+            'expected_return_cost' => round($expectedReturnCost, 2),
+            'effective_logistics' => round($deliveryCost + $expectedReturnCost, 2),
+            'acceptance_cost' => round($acceptanceCost, 2),
+            'penalty_cost' => round($penaltyCost, 2),
+            'to_settlement_account' => round($toSettlementAccount, 2),
+            'own_delivery_cost' => round($input->ownDeliveryCost ?? 0, 2),
+            'marketplace_compensation' => round($input->marketplaceCompensation ?? 0, 2),
+        ];
+
+        return $result;
+     }
 
     /**
      * Рассчитать ожидаемые расходы на возвраты
      */
-    private function calculateExpectedReturnCost(string $scheme, float $volume, ?float $redemptionRate): float
+    private function calculateExpectedReturnCosts(string $scheme, float $volume, ?float $redemptionRate): array
     {
         if ($redemptionRate === null || $redemptionRate >= 100) {
-            return 0;
+            return [
+                'expected' => 0.0,
+                'logistics' => 0.0,
+                'processing' => 0.0,
+            ];
         }
 
         $returnLogistics = $this->tariffs->calculateReturnLogisticsCost($scheme, $volume);
+        $returnProcessing = $this->tariffs->getReturnProcessingFee($scheme);
         $returnRate = (100 - $redemptionRate) / 100;
-        
-        return $returnLogistics * $returnRate;
+
+        return [
+            'expected' => ($returnLogistics + $returnProcessing) * $returnRate,
+            'logistics' => $returnLogistics,
+            'processing' => $returnProcessing,
+        ];
     }
 
     /**

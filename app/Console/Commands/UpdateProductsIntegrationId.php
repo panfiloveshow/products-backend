@@ -17,7 +17,7 @@ class UpdateProductsIntegrationId extends Command
         // Получаем первую интеграцию для каждого маркетплейса
         $integrations = DB::table('integrations')
             ->select('id', 'marketplace')
-            ->whereIn('marketplace', ['wildberries', 'ozon', 'yandex'])
+            ->whereIn('marketplace', ['wildberries', 'ozon', 'yandex', 'yandex_market'])
             ->get()
             ->groupBy('marketplace')
             ->map(fn($group) => $group->first());

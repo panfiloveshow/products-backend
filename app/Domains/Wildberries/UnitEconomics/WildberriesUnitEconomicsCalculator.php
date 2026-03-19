@@ -39,6 +39,7 @@ class WildberriesUnitEconomicsCalculator implements UnitEconomicsCalculatorInter
         $price = $input->price;
         $volumeInLiters = $input->getVolumeInLiters();
         $weight = $input->weight;
+        $scheme = strtoupper($input->fulfillmentType);
 
         // === РЕДАКТИРУЕМЫЕ ПОЛЯ ===
         $sppPercent = $options['spp_percent'] ?? $input->sppPercent ?? 0; // СПП, %
@@ -70,11 +71,14 @@ class WildberriesUnitEconomicsCalculator implements UnitEconomicsCalculatorInter
         $sppAmount = $price * ($sppPercent / 100);
         
         // Базовая логистика (без КС)
-        $baseLogistics = $this->tariffs->calculateLogisticsCost(
-            $input->fulfillmentType,
-            $volumeInLiters,
-            $weight
-        );
+        $baseLogistics = in_array($scheme, ['DBS', 'EDBS'], true)
+            ? ($input->ownDeliveryCost ?? 0)
+            : $this->tariffs->calculateLogisticsCost(
+                $input->fulfillmentType,
+                $volumeInLiters,
+                $weight,
+                ['own_delivery_cost' => $input->ownDeliveryCost ?? 0]
+            );
         
         // КС, ₽ = базовая логистика × (КС - 1) — надбавка к логистике от КС
         $warehouseCoefAmount = $baseLogistics * ($warehouseCoef - 1);
@@ -83,10 +87,14 @@ class WildberriesUnitEconomicsCalculator implements UnitEconomicsCalculatorInter
         $localizationAmount = $baseLogistics * $warehouseCoef * ($localizationIndex - 1);
         
         // Логистика = базовая × КС × ИЛ (формула WB: логистика × коэф.склада × индекс локализации)
-        $logistics = $baseLogistics * $warehouseCoef * $localizationIndex;
+        $logistics = in_array($scheme, ['DBS', 'EDBS'], true)
+            ? $baseLogistics
+            : $baseLogistics * $warehouseCoef * $localizationIndex;
 
         // Обратная логистика (возврат)
-        $returnLogistics = $this->tariffs->calculateReturnLogisticsCost($volumeInLiters, $weight);
+        $returnLogistics = in_array($scheme, ['DBS', 'EDBS'], true)
+            ? ($input->ownReturnCost ?? 0)
+            : $this->tariffs->calculateReturnLogisticsCost($volumeInLiters, $weight);
         
         // Ожидаемые возвраты = обр.логистика × (100 - %выкупа) / 100
         $returnRate = (100 - $redemptionRate) / 100;
@@ -97,7 +105,10 @@ class WildberriesUnitEconomicsCalculator implements UnitEconomicsCalculatorInter
         
         // Хранение (если есть данные о днях хранения)
         $daysInStock = $options['days_in_stock'] ?? 30;
-        $storageCost = $this->tariffs->calculateStorageCost($volumeInLiters, $daysInStock);
+        $storageCost = $input->storageCost ?? $this->tariffs->calculateStorageCost($volumeInLiters, $daysInStock);
+
+        $acceptanceCost = $input->acceptanceCost ?? 0;
+        $penaltyCost = $input->penaltyCost ?? 0;
 
         // Эквайринг (WB не берёт отдельно, включено в комиссию)
         $acquiringRate = 0;
@@ -106,13 +117,13 @@ class WildberriesUnitEconomicsCalculator implements UnitEconomicsCalculatorInter
         // === ИТОГОВЫЕ РАСЧЁТЫ ===
         
         // Всего затрат (без себестоимости)
-        $marketplaceCosts = $commission + $logistics + $expectedReturnCost + $storageCost;
+        $marketplaceCosts = $commission + $logistics + $expectedReturnCost + $storageCost + $acceptanceCost + $penaltyCost;
         
         // Всего затрат, % = затраты / цена × 100
         $totalExpensesPercent = $price > 0 ? ($marketplaceCosts / $price) * 100 : 0;
         
         // На р/с = цена покупателя - комиссия - логистика - ожид.возвраты - хранение
-        $toSettlementAccount = $customerPrice - $commission - $logistics - $expectedReturnCost - $storageCost;
+        $toSettlementAccount = $customerPrice - $marketplaceCosts;
         
         // ДРР, ₽ = цена × ДРР%
         $drrAmount = $price * ($drrPercent / 100);
@@ -143,6 +154,8 @@ class WildberriesUnitEconomicsCalculator implements UnitEconomicsCalculatorInter
             costPrice: $costPrice,
             packagingCost: $input->packagingCost ?? 0,
             additionalCosts: $input->additionalCosts ?? 0,
+            acceptanceCost: $acceptanceCost,
+            penaltyCost: $penaltyCost,
         );
 
         $totalCosts = $costs->getTotalCosts() + $drrAmount + $taxAmount;
@@ -190,6 +203,9 @@ class WildberriesUnitEconomicsCalculator implements UnitEconomicsCalculatorInter
             'tax_amount' => round($taxAmount, 2),
             'redemption_rate' => $redemptionRate,
             'volume_liters' => round($volumeInLiters, 4),
+            'acceptance_cost' => round($acceptanceCost, 2),
+            'penalty_cost' => round($penaltyCost, 2),
+            'own_delivery_cost' => round($input->ownDeliveryCost ?? 0, 2),
         ];
 
         return $result;
@@ -208,6 +224,6 @@ class WildberriesUnitEconomicsCalculator implements UnitEconomicsCalculatorInter
      */
     public function getSupportedSchemes(): array
     {
-        return ['FBO', 'FBS'];
+        return ['FBO', 'FBS', 'DBS', 'EDBS', 'DBW'];
     }
 }

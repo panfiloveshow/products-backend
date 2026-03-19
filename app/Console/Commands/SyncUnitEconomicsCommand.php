@@ -460,6 +460,7 @@ class SyncUnitEconomicsCommand extends Command
         // === YANDEX MARKET API ===
         $yandexSalesData = [];
         $yandexPricesData = [];
+        $yandexTariffsData = [];
         
         if ($marketplace === 'yandex' || $marketplace === 'yandex_market') {
             try {
@@ -504,6 +505,15 @@ class SyncUnitEconomicsCommand extends Command
                     $yandexPricesData = $yandexService->getProductPrices();
                     if (!empty($yandexPricesData)) {
                         $this->info("  Yandex Цены: получено для " . count($yandexPricesData) . " товаров");
+                    }
+
+                    $yandexTariffService = new \App\Services\Marketplace\YandexMarketService(
+                        $yandexToken,
+                        (string) $yandexCampaignId
+                    );
+                    $yandexTariffsData = $this->loadYandexTariffsData($products, $yandexPricesData, $yandexTariffService, (string) $yandexCampaignId);
+                    if (!empty($yandexTariffsData)) {
+                        $this->info("  Yandex Тарифы: подготовлены для " . count($yandexTariffsData['FBY'] ?? []) . " товаров");
                     }
                     
                     // Ручной % выкупа из интеграции
@@ -561,13 +571,18 @@ class SyncUnitEconomicsCommand extends Command
                 $productYandexPrice = $yandexPricesData[$product->sku] ?? null;
                 
                 // Определяем фактическую схему работы товара (из остатков API)
-                $actualFulfillmentType = strtoupper($inventory?->fulfillment_type ?? 'FBO');
+                $defaultFulfillmentType = match ($marketplace) {
+                    'yandex', 'yandex_market' => 'FBY',
+                    default => 'FBO',
+                };
+                $actualFulfillmentType = strtoupper($inventory?->fulfillment_type ?? $defaultFulfillmentType);
                 
                 // Создаём/обновляем записи для ВСЕХ схем работы (для предварительного расчёта)
                 foreach ($fulfillmentTypes as $fulfillmentType) {
                     // WB: получаем СПП по nmId товара
                 $nmId = $product->wb_data['nmID'] ?? null;
                 $productWbSpp = $nmId ? ($wbSppData[$nmId] ?? null) : null;
+                $productYandexTariffs = $yandexTariffsData[$fulfillmentType][$product->sku] ?? null;
                 
                 // Ozon: получаем актуальные цены из API
                 $productPriceData = $productPrices[$product->sku] ?? null;
@@ -587,7 +602,10 @@ class SyncUnitEconomicsCommand extends Command
                         $productWbStorage, // WB: хранение
                         $wbTariffsData,   // WB: тарифы складов
                         $productWbSpp,    // WB: СПП из статистики продаж
-                        $productPriceData // Ozon: актуальные цены из API
+                        $productPriceData, // Ozon: актуальные цены из API
+                        $productYandexPrice,
+                        $productYandexTariffs,
+                        $productYandexSales
                     );
                     
                     if ($data['price'] <= 0) {
@@ -739,7 +757,10 @@ class SyncUnitEconomicsCommand extends Command
         ?array $wbStorageData = null,
         ?array $wbTariffsData = null,
         ?array $wbSppData = null,
-        ?array $productPriceData = null
+        ?array $productPriceData = null,
+        ?array $productYandexPrice = null,
+        ?array $productYandexTariffs = null,
+        ?array $productYandexSales = null
     ): array
     {
         // Актуальная цена: приоритет API (actual_price = marketing_seller_price если акция) > Product.price
@@ -754,11 +775,30 @@ class SyncUnitEconomicsCommand extends Command
         }
         $costPrice = $inventory?->cost_price ?? 0;
         
-        // Продажи: приоритет WB API > inventory
-        $salesCount = $wbSalesData['sales_30_days'] ?? $inventory?->sales_30_days ?? 0;
+        $salesCount = match ($marketplace) {
+            'yandex', 'yandex_market' => $productYandexSales['sales_30_days'] ?? $inventory?->sales_30_days ?? 0,
+            default => $wbSalesData['sales_30_days'] ?? $inventory?->sales_30_days ?? 0,
+        };
         
         // Хранение: приоритет WB API > inventory
         $storageCost = ($wbStorageData['storage_cost_per_month'] ?? null) ?? $inventory?->storage_cost_per_month ?? 0;
+
+        $sales7Days = match ($marketplace) {
+            'yandex', 'yandex_market' => $productYandexSales['sales_7_days'] ?? null,
+            default => $wbSalesData['sales_7_days'] ?? null,
+        };
+        $sales14Days = match ($marketplace) {
+            'yandex', 'yandex_market' => $productYandexSales['sales_14_days'] ?? null,
+            default => $wbSalesData['sales_14_days'] ?? null,
+        };
+        $revenue30Days = match ($marketplace) {
+            'yandex', 'yandex_market' => $productYandexSales['revenue'] ?? null,
+            default => $wbSalesData['revenue_30_days'] ?? null,
+        };
+        $avgDailySales = match ($marketplace) {
+            'yandex', 'yandex_market' => $productYandexSales['avg_daily_sales'] ?? null,
+            default => $wbSalesData['avg_daily_sales'] ?? null,
+        };
 
         $data = [
             'sku' => $product->sku,
@@ -767,10 +807,10 @@ class SyncUnitEconomicsCommand extends Command
             'sales_count' => $salesCount,
             'storage_cost' => $storageCost,
             // WB: дополнительные данные о продажах
-            'sales_7_days' => $wbSalesData['sales_7_days'] ?? null,
-            'sales_14_days' => $wbSalesData['sales_14_days'] ?? null,
-            'revenue_30_days' => $wbSalesData['revenue_30_days'] ?? null,
-            'avg_daily_sales' => $wbSalesData['avg_daily_sales'] ?? null,
+            'sales_7_days' => $sales7Days,
+            'sales_14_days' => $sales14Days,
+            'revenue_30_days' => $revenue30Days,
+            'avg_daily_sales' => $avgDailySales,
         ];
 
         switch ($marketplace) {
@@ -1063,9 +1103,44 @@ class SyncUnitEconomicsCommand extends Command
 
             case 'yandex':
             case 'yandex_market':
-                $data['referral_fee_percent'] = 5;
-                $data['fby_delivery'] = 50;
-                $data['fbs_delivery'] = 40;
+                $yandexData = $product->yandex_data ?? [];
+                $fulfillmentType = $forceFulfillmentType
+                    ? strtoupper($forceFulfillmentType)
+                    : strtoupper($inventory?->fulfillment_type ?? 'FBY');
+
+                $lengthMm = (float) ($yandexData['length_mm'] ?? $product->depth ?? 0);
+                $widthMm = (float) ($yandexData['width_mm'] ?? $product->width ?? 0);
+                $heightMm = (float) ($yandexData['height_mm'] ?? $product->height ?? 0);
+                $weightG = (float) ($yandexData['weight_g'] ?? $product->weight ?? 0);
+                $volumeLiters = ($lengthMm > 0 && $widthMm > 0 && $heightMm > 0)
+                    ? ($lengthMm * $widthMm * $heightMm) / 1000000
+                    : 0;
+
+                if (($productYandexPrice['price'] ?? 0) > 0) {
+                    $data['price'] = (float) $productYandexPrice['price'];
+                }
+
+                $data['fulfillment_type'] = $fulfillmentType;
+                $data['length_mm'] = $lengthMm;
+                $data['width_mm'] = $widthMm;
+                $data['height_mm'] = $heightMm;
+                $data['weight_g'] = $weightG;
+                $data['volume_liters'] = round($volumeLiters, 2);
+                $data['volume_weight'] = round($volumeLiters / 5, 2);
+                $data['actual_weight'] = round($weightG / 1000, 2);
+                $data['category_id'] = $yandexData['categoryId'] ?? $product->category ?? 'default';
+                $data['redemption_rate'] = $manualRedemptionRate ?? ($yandexData['redemption_rate'] ?? 95);
+                $data['tariff_breakdown'] = $productYandexTariffs ?? [];
+
+                $normalizedTariffs = $this->normalizeYandexTariffBreakdown($data['tariff_breakdown']);
+                $data['referral_fee_percent'] = isset($normalizedTariffs['FEE']) && $data['price'] > 0
+                    ? round(($normalizedTariffs['FEE'] / $data['price']) * 100, 2)
+                    : 5;
+                $data['fby_delivery'] = (float) ($normalizedTariffs['DELIVERY_TO_CUSTOMER'] ?? 50);
+                $data['fbs_delivery'] = (float) ($normalizedTariffs['DELIVERY_TO_CUSTOMER'] ?? 40);
+                $data['acquiring_percent'] = $data['price'] > 0
+                    ? round((((float) ($normalizedTariffs['AGENCY_COMMISSION'] ?? 0) + (float) ($normalizedTariffs['PAYMENT_TRANSFER'] ?? 0)) / $data['price']) * 100, 2)
+                    : 0;
                 break;
         }
 
@@ -1100,6 +1175,7 @@ class SyncUnitEconomicsCommand extends Command
                 'fulfillment_type' => $fulfillmentType,
                 'avg_delivery_time_hours' => $isFbo ? ($data['avg_delivery_time_hours'] ?? 29) : null,
                 'localization_index' => $isFbo ? ($data['localization_index'] ?? null) : null,
+                'tariff_status' => $isFbo ? ($data['localization_status'] ?? 'UNKNOWN') : null,
                 'base_logistics_cost' => $calculated['base_logistics_cost'] ?? null,
                 'logistics_coefficient' => $isFbo ? ($data['localization_index'] ?? $calculated['logistics_coefficient'] ?? 1.0) : 1.0,
                 'additional_commission_percent' => $isFbo ? ($data['localization_additional_percent'] ?? $calculated['additional_commission_percent'] ?? 0) : 0,
@@ -1266,10 +1342,17 @@ class SyncUnitEconomicsCommand extends Command
                 'referral_fee_percent' => $calculated['referral_fee_percent'] ?? $data['referral_fee_percent'] ?? 5,
                 'commission_percent' => $calculated['commission_percent'] ?? $data['referral_fee_percent'] ?? 5,
                 'commission_amount' => $calculated['commission_amount'] ?? null,
+                'acquiring_percent' => $calculated['acquiring_percent'] ?? $data['acquiring_percent'] ?? 0,
+                'acquiring_amount' => $calculated['acquiring_amount'] ?? null,
                 
                 // === ЛОГИСТИКА ===
                 'fby_delivery' => $calculated['fby_delivery'] ?? $data['fby_delivery'] ?? 50,
                 'fbs_delivery' => $calculated['fbs_delivery'] ?? $data['fbs_delivery'] ?? 40,
+                'delivery_to_customer' => $calculated['delivery_to_customer'] ?? null,
+                'crossregional_delivery' => $calculated['crossregional_delivery'] ?? null,
+                'middle_mile' => $calculated['middle_mile'] ?? null,
+                'express_delivery' => $calculated['express_delivery'] ?? null,
+                'sorting' => $calculated['sorting'] ?? null,
                 'logistics_cost' => $calculated['logistics_cost'] ?? null,
                 'delivery_cost' => $calculated['delivery_cost'] ?? null,
                 
@@ -1298,6 +1381,121 @@ class SyncUnitEconomicsCommand extends Command
         }
         
         return $detailed;
+    }
+
+    private function loadYandexTariffsData(
+        iterable $products,
+        array $yandexPricesData,
+        \App\Services\Marketplace\YandexMarketService $yandexTariffService,
+        string $campaignId
+    ): array {
+        $offersBySku = [];
+
+        foreach ($products as $product) {
+            $offer = $this->buildYandexTariffOffer($product, $yandexPricesData[$product->sku] ?? null);
+            if ($offer !== null) {
+                $offersBySku[$product->sku] = $offer;
+            }
+        }
+
+        if (empty($offersBySku)) {
+            return [];
+        }
+
+        $tariffsByScheme = [];
+        foreach (['FBY', 'FBS', 'DBS', 'EXPRESS'] as $scheme) {
+            foreach (array_chunk($offersBySku, 100, true) as $chunk) {
+                $responses = $yandexTariffService->calculateTariffs(array_values($chunk), [
+                    'campaign_id' => $campaignId,
+                    'selling_program' => $scheme,
+                ]);
+
+                $responseValues = array_values($responses);
+                $skuKeys = array_keys($chunk);
+
+                foreach ($skuKeys as $index => $sku) {
+                    $responseItem = $responseValues[$index] ?? null;
+                    if (!is_array($responseItem)) {
+                        continue;
+                    }
+
+                    $tariffsByScheme[$scheme][$sku] = $this->extractYandexTariffBreakdown($responseItem);
+                }
+            }
+        }
+
+        return $tariffsByScheme;
+    }
+
+    private function buildYandexTariffOffer(Product $product, ?array $priceData): ?array
+    {
+        $price = (float) ($priceData['price'] ?? $product->price ?? 0);
+        if ($price <= 0) {
+            return null;
+        }
+
+        $yandexData = $product->yandex_data ?? [];
+        $categoryId = (int) ($yandexData['categoryId'] ?? 0);
+        $lengthCm = ((float) ($yandexData['length_mm'] ?? $product->depth ?? 0)) / 10;
+        $widthCm = ((float) ($yandexData['width_mm'] ?? $product->width ?? 0)) / 10;
+        $heightCm = ((float) ($yandexData['height_mm'] ?? $product->height ?? 0)) / 10;
+        $weightKg = ((float) ($yandexData['weight_g'] ?? $product->weight ?? 0)) / 1000;
+
+        if ($categoryId <= 0 || $lengthCm <= 0 || $widthCm <= 0 || $heightCm <= 0 || $weightKg <= 0) {
+            return null;
+        }
+
+        return [
+            'category_id' => $categoryId,
+            'price' => $price,
+            'length' => round($lengthCm, 2),
+            'width' => round($widthCm, 2),
+            'height' => round($heightCm, 2),
+            'weight' => round($weightKg, 3),
+            'quantity' => 1,
+        ];
+    }
+
+    private function extractYandexTariffBreakdown(array $responseItem): array
+    {
+        if (isset($responseItem['tariffs']) && is_array($responseItem['tariffs'])) {
+            return $responseItem['tariffs'];
+        }
+
+        if (isset($responseItem['services']) && is_array($responseItem['services'])) {
+            return $responseItem['services'];
+        }
+
+        if (isset($responseItem[0]) && is_array($responseItem[0])) {
+            return $responseItem;
+        }
+
+        return [];
+    }
+
+    private function normalizeYandexTariffBreakdown(array $items): array
+    {
+        $normalized = [];
+
+        foreach ($items as $item) {
+            if (!is_array($item)) {
+                continue;
+            }
+
+            $type = strtoupper((string) ($item['type'] ?? $item['tariffType'] ?? $item['serviceType'] ?? $item['code'] ?? ''));
+            if ($type === '') {
+                continue;
+            }
+
+            $amount = $item['amount'] ?? $item['price'] ?? $item['total'] ?? $item['value'] ?? 0;
+            if (is_array($amount)) {
+                $amount = $amount['value'] ?? 0;
+            }
+
+            $normalized[$type] = (float) $amount;
+        }
+
+        return $normalized;
     }
     
     /**
