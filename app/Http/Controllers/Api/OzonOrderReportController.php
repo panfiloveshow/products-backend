@@ -143,8 +143,11 @@ class OzonOrderReportController extends Controller
                 'unique_warehouses' => count($uniqueWarehouses),
             ]);
 
+            // Рассчитываем 7/14/30-дневные продажи из сырых строк по датам
+            $recentSales = $this->computeRecentSalesByPeriod($rows, $dateTo);
+
             // Пересчитываем оборачиваемость по складам
-            $this->recalculateWarehouseTurnover($report);
+            $this->recalculateWarehouseTurnover($report, $recentSales);
 
             DB::commit();
 
@@ -599,9 +602,46 @@ class OzonOrderReportController extends Controller
     }
 
     /**
+     * Рассчитать продажи за последние 7/14/30 дней из сырых строк отчёта по датам.
+     * @return array<string, array{7d: int, 14d: int, 30d: int}> ключ = sku||warehouse
+     */
+    private function computeRecentSalesByPeriod(array $rows, $dateTo): array
+    {
+        if (!$dateTo) return [];
+
+        $result = [];
+        $from7  = $dateTo->copy()->subDays(6)->startOfDay();
+        $from14 = $dateTo->copy()->subDays(13)->startOfDay();
+        $from30 = $dateTo->copy()->subDays(29)->startOfDay();
+
+        foreach ($rows as $row) {
+            $key = $row['sku'] . '||' . $row['warehouse'];
+            if (!isset($result[$key])) {
+                $result[$key] = ['7d' => 0, '14d' => 0, '30d' => 0];
+            }
+
+            $date = $row['report_date'] ?? null;
+            if (!$date) continue;
+
+            $qty = $row['quantity'] ?? 1;
+            if ($date->gte($from30)) {
+                $result[$key]['30d'] += $qty;
+            }
+            if ($date->gte($from14)) {
+                $result[$key]['14d'] += $qty;
+            }
+            if ($date->gte($from7)) {
+                $result[$key]['7d'] += $qty;
+            }
+        }
+
+        return $result;
+    }
+
+    /**
      * Пересчёт оборачиваемости по складам на основе реальных данных
      */
-    private function recalculateWarehouseTurnover(OzonOrderReport $report): void
+    private function recalculateWarehouseTurnover(OzonOrderReport $report, array $recentSales = []): void
     {
         $sales = OzonWarehouseSale::where('report_id', $report->id)->get();
 
@@ -651,12 +691,30 @@ class OzonOrderReportController extends Controller
                 $realTurnover = $avgDaily > 0 ? round($warehouse->quantity / $avgDaily, 1) : ($warehouse->quantity > 0 ? 999 : 0);
                 $realDaysOfStock = $avgDaily > 0 ? (int) ceil($warehouse->quantity / $avgDaily) : ($warehouse->quantity > 0 ? 999 : 0);
 
+                // Ищем 7/14/30-дневные продажи из raw rows
+                $saleKey1 = $sale->sku . '||' . $sale->warehouse_name;
+                $saleKey2 = ($sale->article ?? '') . '||' . $sale->warehouse_name;
+                $recent = $recentSales[$saleKey1] ?? $recentSales[$saleKey2] ?? null;
+
+                $sales7  = $recent ? $recent['7d']  : (int) round($avgDaily * 7);
+                $sales14 = $recent ? $recent['14d'] : (int) round($avgDaily * 14);
+                $sales30 = $recent ? $recent['30d'] : (int) round($avgDaily * 30);
+
+                $daysOfStock = $avgDaily > 0 ? (int) ceil($warehouse->quantity / $avgDaily) : ($warehouse->quantity > 0 ? 999 : 0);
+
                 $warehouse->update([
                     'real_avg_daily_sales' => $avgDaily,
                     'real_sales_period_days' => $sale->period_days,
                     'real_turnover_days' => $realTurnover,
                     'real_days_of_stock' => $realDaysOfStock,
                     'sales_report_id' => $report->id,
+                    'average_daily_sales' => $avgDaily,
+                    'effective_daily_sales' => $avgDaily,
+                    'sales_7_days' => $sales7,
+                    'sales_14_days' => $sales14,
+                    'sales_30_days' => $sales30,
+                    'days_of_stock' => $daysOfStock,
+                    'turnover_days' => $realTurnover,
                 ]);
                 $matched++;
             } else {
@@ -700,6 +758,13 @@ class OzonOrderReportController extends Controller
                     'real_turnover_days' => $iw->quantity > 0 ? 999 : 0,
                     'real_days_of_stock' => $iw->quantity > 0 ? 999 : 0,
                     'sales_report_id' => $report->id,
+                    'average_daily_sales' => 0,
+                    'effective_daily_sales' => 0,
+                    'sales_7_days' => 0,
+                    'sales_14_days' => 0,
+                    'sales_30_days' => 0,
+                    'days_of_stock' => $iw->quantity > 0 ? 999 : 0,
+                    'turnover_days' => $iw->quantity > 0 ? 999 : 0,
                 ]);
                 $zeroFilled++;
             }
