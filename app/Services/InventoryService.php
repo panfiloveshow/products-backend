@@ -30,6 +30,7 @@ class InventoryService
         }
 
         $maxIdRows = DB::table('unit_economics')
+            ->select('sku')
             ->selectRaw('MAX(id) as max_id')
             ->whereIn('sku', $skus)
             ->groupBy('sku')
