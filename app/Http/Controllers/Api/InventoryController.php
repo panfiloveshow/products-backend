@@ -26,17 +26,27 @@ class InventoryController extends Controller
     {
         $validated = $request->validated();
 
-        $query = Product::with(['inventoryWarehouses'])
-            ->whereHas('inventoryWarehouses');
+        $integrationId = !empty($validated['integration_id']) ? (int) $validated['integration_id'] : null;
+        $marketplace = $validated['marketplace'] ?? null;
+
+        $warehouseScope = function ($q) use ($integrationId, $marketplace) {
+            if ($integrationId) {
+                $q->where('integration_id', $integrationId);
+            }
+            if (!empty($marketplace) && $marketplace !== 'all') {
+                $q->where('marketplace', $marketplace);
+            }
+        };
+
+        $query = Product::with(['inventoryWarehouses' => $warehouseScope])
+            ->whereHas('inventoryWarehouses', $warehouseScope);
+
+        if ($integrationId) {
+            $query->where('integration_id', $integrationId);
+        }
 
         if (!empty($validated['search'])) {
             $query->search($validated['search']);
-        }
-
-        if (!empty($validated['marketplace']) && $validated['marketplace'] !== 'all') {
-            $query->whereHas('inventoryWarehouses', function ($q) use ($validated) {
-                $q->where('marketplace', $validated['marketplace']);
-            });
         }
 
         if (!empty($validated['category'])) {
@@ -44,20 +54,22 @@ class InventoryController extends Controller
         }
 
         if (isset($validated['low_stock']) && $validated['low_stock']) {
-            $query->whereHas('inventoryWarehouses', function ($q) {
+            $query->whereHas('inventoryWarehouses', function ($q) use ($warehouseScope) {
+                $warehouseScope($q);
                 $q->lowStock();
             });
         }
 
         if (isset($validated['out_of_stock']) && $validated['out_of_stock']) {
-            $query->whereHas('inventoryWarehouses', function ($q) {
+            $query->whereHas('inventoryWarehouses', function ($q) use ($warehouseScope) {
+                $warehouseScope($q);
                 $q->outOfStock();
             });
         }
 
         $sortField = $validated['sort'] ?? 'sku';
-        $sortOrder = $validated['sort_order'] ?? 'asc';
-        $query->orderBy($sortField, $sortOrder);
+        $sortOrder = strtolower($validated['sort_order'] ?? 'asc') === 'desc' ? 'desc' : 'asc';
+        $this->applyInventoryIndexSorting($query, $sortField, $sortOrder, $marketplace, $integrationId);
 
         $limit = $validated['limit'] ?? 50;
         $page = $validated['page'] ?? 1;
@@ -78,6 +90,45 @@ class InventoryController extends Controller
             ],
             'stats' => $stats,
         ]);
+    }
+
+    /**
+     * Сортировка только по реальным колонкам products / агрегатам.
+     * internal_stock → stock; marketplace_stock → sum(quantity) по складам;
+     * days_of_stock → turnover_days (поле на products из синка продаж).
+     */
+    private function applyInventoryIndexSorting(
+        \Illuminate\Database\Eloquent\Builder $query,
+        string $sortField,
+        string $sortOrder,
+        ?string $marketplace,
+        ?int $integrationId
+    ): void {
+        switch ($sortField) {
+            case 'internal_stock':
+                $query->orderBy('stock', $sortOrder);
+                break;
+            case 'marketplace_stock':
+                $query->withSum([
+                    'inventoryWarehouses as marketplace_stock_sort' => function ($q) use ($marketplace, $integrationId) {
+                        if ($integrationId) {
+                            $q->where('integration_id', $integrationId);
+                        }
+                        if (!empty($marketplace) && $marketplace !== 'all') {
+                            $q->where('marketplace', $marketplace);
+                        }
+                    },
+                ], 'quantity');
+                $query->orderBy('marketplace_stock_sort', $sortOrder);
+                break;
+            case 'days_of_stock':
+                $query->orderByRaw('CASE WHEN turnover_days IS NULL THEN 1 ELSE 0 END ASC')
+                    ->orderBy('turnover_days', $sortOrder);
+                break;
+            default:
+                $query->orderBy($sortField, $sortOrder);
+                break;
+        }
     }
 
     public function show(string $sku): JsonResponse
