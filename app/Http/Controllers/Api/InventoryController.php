@@ -277,25 +277,31 @@ class InventoryController extends Controller
             ]);
 
         // Агрегируем по SKU с учётом фильтра по fulfillment_type
-        // MAX() для sales — данные пишутся одинаково на каждый склад SKU, SUM() раздует значения.
-        // SUM() только для quantity/reserved/in_transit/storage_cost — они реально разные по складам.
+        // WB / синк остатков: одинаковые sales и avg на каждой строке склада → берём MAX (SUM раздует в N раз).
+        // Ozon SyncSalesJob: продажи и avg по каждому складу отдельно → для артикула нужен SUM по строкам.
+        // Различение в PHP: inventoryMatrixRowsLookDuplicated() по ratio SUM/MAX и числу складов.
         $skuQuery = (clone $query)
             ->select('sku')
+            ->selectRaw('COUNT(*) as wh_row_count')
             ->selectRaw('SUM(quantity) as total_stock')
             ->selectRaw('SUM(reserved) as reserved')
             ->selectRaw('SUM(in_transit) as in_transit')
             ->selectRaw('MAX(sales_7_days) as sales_7_days')
+            ->selectRaw('SUM(sales_7_days) as sales_7_days_sum')
             ->selectRaw('MAX(sales_14_days) as sales_14_days')
+            ->selectRaw('SUM(sales_14_days) as sales_14_days_sum')
             ->selectRaw('MAX(sales_30_days) as sales_30_days')
+            ->selectRaw('SUM(sales_30_days) as sales_30_days_sum')
             ->selectRaw('MAX(average_daily_sales) as avg_daily_sales')
+            ->selectRaw('SUM(average_daily_sales) as avg_daily_sum')
             ->selectRaw('MAX(effective_daily_sales) as effective_daily_sales')
+            ->selectRaw('SUM(effective_daily_sales) as effective_daily_sum')
             ->selectRaw('MAX(days_in_stock_30) as days_in_stock_30')
-            ->selectRaw('CASE WHEN MAX(average_daily_sales) > 0 THEN ROUND(SUM(quantity)::numeric / MAX(average_daily_sales), 1) ELSE NULL END as turnover_days')
-            ->selectRaw('CASE WHEN MAX(average_daily_sales) > 0 THEN ROUND(SUM(quantity)::numeric / MAX(average_daily_sales)) ELSE NULL END as days_of_stock')
             ->selectRaw('MAX(stock_status) as stock_status')
             ->selectRaw('SUM(storage_cost_per_day) as storage_cost_daily')
             ->selectRaw('SUM(storage_cost_per_month) as storage_cost_monthly')
             ->selectRaw('MAX(real_avg_daily_sales) as real_avg_daily_sales')
+            ->selectRaw('SUM(real_avg_daily_sales) as real_avg_daily_sum')
             ->selectRaw('MAX(real_turnover_days) as real_turnover_days')
             ->selectRaw('MAX(real_days_of_stock) as real_days_of_stock')
             ->selectRaw('MAX(real_sales_period_days) as real_sales_period_days')
@@ -330,7 +336,7 @@ class InventoryController extends Controller
 
             return match ($sort) {
                 'total_stock' => (int) $row->total_stock,
-                'sales_30_days' => (int) $row->sales_30_days,
+                'sales_30_days' => $this->articleTotalSalesN($row, 'sales_30_days', 'sales_30_days_sum'),
                 'avg_daily_sales' => $demand > 0 ? $demand : (float) ($row->avg_daily_sales ?? 0),
                 'days_of_stock' => $dos,
                 'turnover_days' => $dos,
@@ -492,9 +498,9 @@ class InventoryController extends Controller
             // Определяем stock_status по total_stock и avg_daily_sales
             $totalStock = (int) ($agg->total_stock ?? 0);
             $resolvedDemand = $this->resolveInventoryMatrixDailyDemand($agg);
-            $avgDailySales = $resolvedDemand > 0 ? $resolvedDemand : (float) ($agg->avg_daily_sales ?? 0);
-            $salesTrend7 = (int) ($agg->sales_7_days ?? 0);
-            $sales30 = (int) ($agg->sales_30_days ?? 0);
+            $avgDailySales = $resolvedDemand > 0 ? $resolvedDemand : $this->articleMetricSumOrMax($agg, 'avg_daily_sales', 'avg_daily_sum');
+            $salesTrend7 = $this->articleTotalSalesN($agg, 'sales_7_days', 'sales_7_days_sum');
+            $sales30 = $this->articleTotalSalesN($agg, 'sales_30_days', 'sales_30_days_sum');
             $daysOfStock = $avgDailySales > 0 ? round($totalStock / $avgDailySales) : null;
 
             if ($totalStock <= 0) {
@@ -509,8 +515,8 @@ class InventoryController extends Controller
                 $computedStatus = 'optimal';
             }
 
-            // Тренд продаж
-            $sales14 = (int) ($agg->sales_14_days ?? 0);
+            // Тренд продаж (по артикулу: сумма по складам или одно значение при дубликатах WB)
+            $sales14 = $this->articleTotalSalesN($agg, 'sales_14_days', 'sales_14_days_sum');
             $s1 = $sales30 > 0 ? $sales30 / 30 : 0;
             $s2 = $salesTrend7 > 0 ? $salesTrend7 / 7 : 0;
             $trendPct = $s1 > 0 ? round(($s2 - $s1) / $s1 * 100) : 0;
@@ -526,6 +532,8 @@ class InventoryController extends Controller
             $storageFeeRow = (float) ($agg->storage_fee_total ?? 0);
             $storageMonthlyRow = (float) ($agg->storage_cost_monthly ?? 0);
             $storageCurrentDisplay = $storageFeeRow > 0 ? $storageFeeRow : $storageMonthlyRow;
+
+            $realDailyArticle = $this->articleMetricSumOrMax($agg, 'real_avg_daily_sales', 'real_avg_daily_sum');
 
             // Матрица по складам
             $warehouseMatrix = $rows->map(fn($w) => [
@@ -577,7 +585,7 @@ class InventoryController extends Controller
                 'sales_14_days'        => $sales14,
                 'sales_30_days'        => $sales30,
                 'avg_daily_sales'      => round($avgDailySales, 2),
-                'effective_daily_sales'=> round((float) ($agg->effective_daily_sales ?? 0), 2),
+                'effective_daily_sales'=> round($this->articleMetricSumOrMax($agg, 'effective_daily_sales', 'effective_daily_sum'), 2),
                 'days_in_stock_30'     => (int) ($agg->days_in_stock_30 ?? 30),
                 'turnover_days'        => $avgDailySales > 0 ? round($totalStock / $avgDailySales, 1) : null,
                 'days_of_stock'        => $daysOfStock,
@@ -592,8 +600,8 @@ class InventoryController extends Controller
                 'storage_fee_report_to'    => $agg->storage_fee_report_to    ? (string) $agg->storage_fee_report_to    : null,
                 'storage_fee_prev_month'   => round((float) ($agg->storage_fee_prev_month ?? 0), 2),
                 'storage_fee_prev_month_period' => $agg->storage_fee_prev_month_period ? (string) $agg->storage_fee_prev_month_period : null,
-                'real_avg_daily_sales' => $agg->real_avg_daily_sales ? round($agg->real_avg_daily_sales, 2) : null,
-                'real_turnover_days'   => $agg->real_turnover_days   ? round($agg->real_turnover_days, 1)  : null,
+                'real_avg_daily_sales' => $realDailyArticle > 0 ? round($realDailyArticle, 2) : null,
+                'real_turnover_days'   => $realDailyArticle > 0 ? round($totalStock / $realDailyArticle, 1) : null,
                 'real_days_of_stock'   => $agg->real_days_of_stock   ? round($agg->real_days_of_stock)     : null,
                 'real_sales_period_days' => $agg->real_sales_period_days ? round($agg->real_sales_period_days) : null,
                 'warehouses_with_stock'=> $rows->where('quantity', '>', 0)->count(),
@@ -717,28 +725,84 @@ class InventoryController extends Controller
     }
 
     /**
-     * Единый дневной спрос для матрицы: как в AutoSupplyPlan — real / effective / API avg, затем sales_30/30, sales_7/7.
+     * Единый дневной спрос по артикулу: real / effective / avg с учётом SUM vs MAX, затем продажи 30д/7д.
      */
     private function resolveInventoryMatrixDailyDemand(object $row): float
     {
         foreach ([
-            (float) ($row->real_avg_daily_sales ?? 0),
-            (float) ($row->effective_daily_sales ?? 0),
-            (float) ($row->avg_daily_sales ?? 0),
-        ] as $v) {
+            ['real_avg_daily_sales', 'real_avg_daily_sum'],
+            ['effective_daily_sales', 'effective_daily_sum'],
+            ['avg_daily_sales', 'avg_daily_sum'],
+        ] as [$maxKey, $sumKey]) {
+            $v = $this->articleMetricSumOrMax($row, $maxKey, $sumKey);
             if ($v > 0) {
                 return $v;
             }
         }
-        $s30 = (int) ($row->sales_30_days ?? 0);
+
+        $s30 = $this->articleTotalSalesN($row, 'sales_30_days', 'sales_30_days_sum');
         if ($s30 > 0) {
             return $s30 / 30.0;
         }
-        $s7 = (int) ($row->sales_7_days ?? 0);
+        $s7 = $this->articleTotalSalesN($row, 'sales_7_days', 'sales_7_days_sum');
         if ($s7 > 0) {
             return $s7 / 7.0;
         }
 
         return 0.0;
+    }
+
+    /**
+     * WB / синк с дублями: на каждой строке склада одни и те же sales → SUM ≈ MAX * N.
+     * Ozon по складам: SUM заметно меньше N*MAX или иначе не «копия на каждый склад».
+     */
+    private function inventoryMatrixRowsLookDuplicated(object $row): bool
+    {
+        $n = (int) ($row->wh_row_count ?? 1);
+        if ($n <= 1) {
+            return true;
+        }
+        $max30 = (float) ($row->sales_30_days ?? 0);
+        $sum30 = (float) ($row->sales_30_days_sum ?? 0);
+        if ($max30 > 0) {
+            $expected = $max30 * $n;
+            $tol = max(1.0, $max30 * 0.05 * $n);
+
+            return abs($sum30 - $expected) <= $tol;
+        }
+        $max7 = (float) ($row->sales_7_days ?? 0);
+        $sum7 = (float) ($row->sales_7_days_sum ?? 0);
+        if ($max7 > 0) {
+            $expected7 = $max7 * $n;
+            $tol7 = max(1.0, $max7 * 0.05 * $n);
+
+            return abs($sum7 - $expected7) <= $tol7;
+        }
+
+        return true;
+    }
+
+    private function articleMetricSumOrMax(object $row, string $maxColumn, string $sumColumn): float
+    {
+        $dup = $this->inventoryMatrixRowsLookDuplicated($row);
+        $max = (float) ($row->{$maxColumn} ?? 0);
+        $sum = (float) ($row->{$sumColumn} ?? 0);
+        if ($dup) {
+            return $max > 0 ? $max : $sum;
+        }
+
+        return $sum > 0 ? $sum : $max;
+    }
+
+    private function articleTotalSalesN(object $row, string $maxColumn, string $sumColumn): int
+    {
+        $dup = $this->inventoryMatrixRowsLookDuplicated($row);
+        $max = (int) round((float) ($row->{$maxColumn} ?? 0));
+        $sum = (int) round((float) ($row->{$sumColumn} ?? 0));
+        if ($dup) {
+            return $max;
+        }
+
+        return $sum > 0 ? $sum : $max;
     }
 }
