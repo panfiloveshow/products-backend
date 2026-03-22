@@ -20,8 +20,8 @@ class YandexMarketClient
 
     public function __construct(?string $token = null, ?string $campaignId = null, ?string $businessId = null)
     {
-        $this->apiKey = $token ?? config('services.yandex_market.token', '');
-        $this->campaignId = $campaignId ?? config('services.yandex_market.campaign_id', '');
+        $this->apiKey = $token ?? config('services.yandex_market.token') ?? '';
+        $this->campaignId = $campaignId ?? config('services.yandex_market.campaign_id');
         $this->businessId = $businessId ?? config('services.yandex_market.business_id');
     }
 

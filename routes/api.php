@@ -7,6 +7,7 @@ use App\Http\Controllers\Api\CostPriceController;
 use App\Http\Controllers\Api\ProductController;
 use App\Http\Controllers\Api\InventoryController;
 use App\Http\Controllers\Api\ShipmentController;
+use App\Http\Controllers\Api\PlaceholderController;
 use App\Http\Controllers\Api\UnitEconomicsController;
 use App\Http\Controllers\Api\UnitEconomicsCacheController;
 use App\Http\Controllers\Api\SellerStockController;
@@ -33,6 +34,10 @@ Route::prefix('integrations')->middleware('sellico.permission')->group(function 
 | Auth & Integrations (Sellico API)
 |--------------------------------------------------------------------------
 */
+Route::get('/placeholder/{width}/{height}', [PlaceholderController::class, 'show'])
+    ->whereNumber('width')
+    ->whereNumber('height');
+
 Route::prefix('auth')->group(function () {
     Route::post('/login', [AuthController::class, 'login']);
     Route::get('/me', [AuthController::class, 'me']);

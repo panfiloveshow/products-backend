@@ -8,19 +8,94 @@ use App\Models\InventoryWarehouse;
 use App\Models\Product;
 use App\Models\SyncLog;
 use App\Jobs\SyncInventoryJob;
+use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
 
 class InventoryService
 {
-    public function formatProductInventory(Product $product): array
+    /**
+     * Пакетная предзагрузка для formatProductInventory (одна страница списка).
+     *
+     * @return array{cost_price_by_sku: array<string, mixed>, alerts_by_sku: Collection, previous_period_sales_by_sku: array<string, float>}
+     */
+    public function preloadFormatProductInventoryData(Collection $products): array
+    {
+        $skus = $products->pluck('sku')->unique()->filter()->values()->all();
+        if ($skus === []) {
+            return [
+                'cost_price_by_sku' => [],
+                'alerts_by_sku' => collect(),
+                'previous_period_sales_by_sku' => [],
+            ];
+        }
+
+        $maxIdRows = DB::table('unit_economics')
+            ->selectRaw('MAX(id) as max_id')
+            ->whereIn('sku', $skus)
+            ->groupBy('sku')
+            ->pluck('max_id', 'sku');
+
+        $costPriceBySku = [];
+        $ids = $maxIdRows->filter()->values()->all();
+        if ($ids !== []) {
+            $rows = DB::table('unit_economics')
+                ->whereIn('id', $ids)
+                ->get(['sku', 'cost_price']);
+            foreach ($rows as $row) {
+                $costPriceBySku[$row->sku] = $row->cost_price;
+            }
+        }
+
+        $alertsBySku = InventoryAlert::query()
+            ->whereIn('sku', $skus)
+            ->active()
+            ->get()
+            ->groupBy('sku');
+
+        $skusNeedingTrend = $products->filter(function (Product $product) {
+            $sumAds = $product->inventoryWarehouses->sum('average_daily_sales');
+
+            return $sumAds * 28 > 0;
+        })->pluck('sku')->unique()->values()->all();
+
+        $previousPeriodSalesBySku = [];
+        if ($skusNeedingTrend !== []) {
+            $dateFrom = now()->subDays(56)->toDateString();
+            $dateTo = now()->subDays(28)->toDateString();
+            $previousPeriodSalesBySku = InventoryHistory::query()
+                ->whereIn('sku', $skusNeedingTrend)
+                ->whereBetween('date', [$dateFrom, $dateTo])
+                ->selectRaw('sku, COALESCE(SUM(sales), 0) as total')
+                ->groupBy('sku')
+                ->pluck('total', 'sku')
+                ->map(fn ($v) => (float) $v)
+                ->all();
+        }
+
+        return [
+            'cost_price_by_sku' => $costPriceBySku,
+            'alerts_by_sku' => $alertsBySku,
+            'previous_period_sales_by_sku' => $previousPeriodSalesBySku,
+        ];
+    }
+
+    public function formatProductInventory(Product $product, array $preloaded = []): array
     {
         $warehouses = $product->inventoryWarehouses;
         $totalMarketplaceStock = $warehouses->sum('quantity');
         $sales28Days = $warehouses->sum('average_daily_sales') * 28;
 
+        $usePreload = isset(
+            $preloaded['cost_price_by_sku'],
+            $preloaded['alerts_by_sku'],
+            $preloaded['previous_period_sales_by_sku']
+        );
+
         $salesTrend = 'stable';
         if ($sales28Days > 0) {
-            $previousSales = $this->getPreviousPeriodSales($product->sku, 28);
+            $previousSales = $usePreload
+                ? (float) ($preloaded['previous_period_sales_by_sku'][$product->sku] ?? 0)
+                : $this->getPreviousPeriodSales($product->sku, 28);
             if ($previousSales > 0) {
                 $change = (($sales28Days - $previousSales) / $previousSales) * 100;
                 if ($change > 10) {
@@ -31,13 +106,25 @@ class InventoryService
             }
         }
 
+        $totalStock = $product->stock + $totalMarketplaceStock;
+
+        $costPrice = $usePreload
+            ? ($preloaded['cost_price_by_sku'][$product->sku] ?? null)
+            : $product->unitEconomics()->latest()->value('cost_price');
+
+        $alerts = $usePreload
+            ? ($preloaded['alerts_by_sku'][$product->sku] ?? collect())
+            : $product->alerts()->active()->get();
+
         return [
             'id' => $product->id,
             'sku' => $product->sku,
             'name' => $product->name,
+            'marketplace' => $product->marketplace,
             'internal_stock' => $product->stock,
-            'image_url' => $product->images[0] ?? null,
-            'cost_price' => $product->unitEconomics()->latest()->value('cost_price'),
+            'total_stock' => $totalStock,
+            'image_url' => ($product->images ?? [])[0] ?? null,
+            'cost_price' => $costPrice,
             'category' => $product->category,
             'sales_trend' => $salesTrend,
             'sales_28_days' => round($sales28Days),
@@ -55,8 +142,12 @@ class InventoryService
                 'in_way_to_client' => $w->in_way_to_client,
                 'in_way_from_client' => $w->in_way_from_client,
             ]),
-            'financials' => $this->calculateFinancials($product, $warehouses),
-            'alerts' => $product->alerts()->active()->get(),
+            'financials' => $this->calculateFinancials(
+                $product,
+                $warehouses,
+                $usePreload ? (float) ($costPrice ?? 0) : null
+            ),
+            'alerts' => $alerts instanceof Collection ? $alerts->values() : $alerts,
             'last_updated' => $warehouses->max('last_updated'),
         ];
     }
@@ -71,9 +162,11 @@ class InventoryService
             ->sum('sales');
     }
 
-    private function calculateFinancials(Product $product, $warehouses): array
+    private function calculateFinancials(Product $product, $warehouses, ?float $resolvedCostPrice = null): array
     {
-        $costPrice = $product->unitEconomics()->latest()->value('cost_price') ?? 0;
+        $costPrice = $resolvedCostPrice !== null
+            ? $resolvedCostPrice
+            : (float) ($product->unitEconomics()->latest()->value('cost_price') ?? 0);
         $totalStock = $product->stock + $warehouses->sum('quantity');
         $totalValue = $totalStock * $costPrice;
 

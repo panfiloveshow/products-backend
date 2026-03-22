@@ -147,6 +147,23 @@ class OzonTariffs implements TariffsProviderInterface
     }
 
     /**
+     * Получить коэффициенты для расчёта логистики.
+     */
+    public function getCoefficients(string $scheme, array $options = []): array
+    {
+        return match (strtoupper($scheme)) {
+            'FBO' => [
+                'delivery_coefficient' => (float) ($options['delivery_coefficient'] ?? $options['localization_index'] ?? 1.0),
+                'additional_percent' => (float) ($options['additional_percent'] ?? $options['localization_additional_percent'] ?? 0.0),
+            ],
+            default => [
+                'delivery_coefficient' => 1.0,
+                'additional_percent' => 0.0,
+            ],
+        };
+    }
+
+    /**
      * Получить стоимость последней мили.
      */
     public function getLastMileCost(string $scheme, array $options = []): float

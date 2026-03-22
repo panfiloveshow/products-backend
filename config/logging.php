@@ -38,6 +38,18 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Verbose Product index logging
+    |--------------------------------------------------------------------------
+    |
+    | When true, ProductController::index writes info-level diagnostics for
+    | integration filter and stock aggregation. Per-SKU logs are never emitted.
+    |
+    */
+
+    'verbose_product_index' => env('LOG_VERBOSE_PRODUCT_INDEX', false),
+
+    /*
+    |--------------------------------------------------------------------------
     | Log Channels
     |--------------------------------------------------------------------------
     |

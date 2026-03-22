@@ -10,6 +10,7 @@ use App\Models\AutoSupplyPlanLine;
 use App\Models\Integration;
 use App\Models\OzonWarehouseCluster;
 use App\Models\Product;
+use App\Services\IntegrationAccessService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use PhpOffice\PhpSpreadsheet\Spreadsheet;
@@ -18,6 +19,10 @@ use Symfony\Component\HttpFoundation\StreamedResponse;
 
 class AutoSupplyPlanController extends Controller
 {
+    public function __construct(
+        private IntegrationAccessService $integrationAccessService
+    ) {}
+
     /**
      * GET /api/auto-supply-plans
      */
@@ -34,7 +39,16 @@ class AutoSupplyPlanController extends Controller
             ->orderByDesc('created_at');
 
         if ($request->filled('integration_id')) {
-            $query->where('integration_id', $request->input('integration_id'));
+            $integrationAccess = $this->integrationAccessService
+                ->ensureAccessibleIntegration($request, (int) $request->input('integration_id'));
+
+            if (!($integrationAccess['success'] ?? false)) {
+                return response()->json([
+                    'message' => $integrationAccess['message'] ?? 'Интеграция не найдена',
+                ], $integrationAccess['status'] ?? 404);
+            }
+
+            $query->where('integration_id', $integrationAccess['integration']->id);
         }
 
         if ($request->filled('status')) {
@@ -55,7 +69,17 @@ class AutoSupplyPlanController extends Controller
      */
     public function store(StoreAutoSupplyPlanRequest $request): JsonResponse
     {
-        $integration = Integration::findOrFail($request->input('integration_id'));
+        $integrationAccess = $this->integrationAccessService
+            ->ensureAccessibleIntegration($request, (int) $request->input('integration_id'));
+
+        if (!($integrationAccess['success'] ?? false)) {
+            return response()->json([
+                'message' => $integrationAccess['message'] ?? 'Интеграция не найдена',
+            ], $integrationAccess['status'] ?? 404);
+        }
+
+        /** @var Integration $integration */
+        $integration = $integrationAccess['integration'];
 
         $plan = AutoSupplyPlan::create([
             'integration_id' => $integration->id,
@@ -144,6 +168,9 @@ class AutoSupplyPlanController extends Controller
                 SUM(qty_recommended) as qty_recommended,
                 SUM(current_stock) as current_stock,
                 SUM(in_transit) as in_transit,
+                SUM(sales_7_days) as sales_7_days,
+                SUM(sales_14_days) as sales_14_days,
+                SUM(sales_30_days) as sales_30_days,
                 MAX(avg_daily_sales) as avg_daily_sales,
                 MAX(ewma_daily_sales) as ewma_daily_sales,
                 MAX(demand_daily) as demand_daily,
@@ -232,6 +259,9 @@ class AutoSupplyPlanController extends Controller
                 SUM(qty_recommended) as qty_recommended,
                 SUM(current_stock) as current_stock,
                 SUM(in_transit) as in_transit,
+                SUM(sales_7_days) as sales_7_days,
+                SUM(sales_14_days) as sales_14_days,
+                SUM(sales_30_days) as sales_30_days,
                 MAX(avg_daily_sales) as avg_daily_sales,
                 MAX(ewma_daily_sales) as ewma_daily_sales,
                 MAX(demand_daily) as demand_daily,
@@ -394,11 +424,21 @@ class AutoSupplyPlanController extends Controller
     public function warehouses(Request $request): JsonResponse
     {
         $request->validate([
-            'integration_id' => 'required|integer|exists:integrations,id',
+            'integration_id' => 'required|integer',
         ]);
 
-        $integrationId = $request->input('integration_id');
-        $integration = Integration::findOrFail($integrationId);
+        $integrationAccess = $this->integrationAccessService
+            ->ensureAccessibleIntegration($request, (int) $request->input('integration_id'));
+
+        if (!($integrationAccess['success'] ?? false)) {
+            return response()->json([
+                'message' => $integrationAccess['message'] ?? 'Интеграция не найдена',
+            ], $integrationAccess['status'] ?? 404);
+        }
+
+        /** @var Integration $integration */
+        $integration = $integrationAccess['integration'];
+        $integrationId = $integration->id;
 
         $warehouses = \App\Models\InventoryWarehouse::where('integration_id', $integrationId)
             ->where('marketplace', $integration->marketplace)

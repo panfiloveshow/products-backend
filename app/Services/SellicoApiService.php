@@ -13,7 +13,7 @@ class SellicoApiService
 
     public function __construct()
     {
-        $this->baseUrl = config('services.sellico.base_url', 'https://sellico.ru/api');
+        $this->baseUrl = config('services.sellico.base_url') ?? 'https://sellico.ru/api';
     }
 
     /**

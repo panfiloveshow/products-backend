@@ -19,8 +19,8 @@ class YandexMarketService implements MarketplaceInterface
 
     public function __construct(?string $token = null, ?string $campaignId = null)
     {
-        $this->token = $token ?? config('services.yandex_market.token', '');
-        $this->campaignId = $campaignId ?? config('services.yandex_market.campaign_id', '');
+        $this->token = $token ?? config('services.yandex_market.token') ?? '';
+        $this->campaignId = $campaignId ?? config('services.yandex_market.campaign_id') ?? '';
     }
 
     /**

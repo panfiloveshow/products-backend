@@ -110,14 +110,13 @@ class WildberriesUnitEconomicsCalculator implements UnitEconomicsCalculatorInter
         $acceptanceCost = $input->acceptanceCost ?? 0;
         $penaltyCost = $input->penaltyCost ?? 0;
 
-        // Эквайринг (WB не берёт отдельно, включено в комиссию)
-        $acquiringRate = 0;
-        $acquiring = 0;
+        $acquiringRate = $options['acquiring_percent'] ?? $input->acquiringPercent ?? 1.5;
+        $acquiring = $price * ($acquiringRate / 100);
 
         // === ИТОГОВЫЕ РАСЧЁТЫ ===
         
         // Всего затрат (без себестоимости)
-        $marketplaceCosts = $commission + $logistics + $expectedReturnCost + $storageCost + $acceptanceCost + $penaltyCost;
+        $marketplaceCosts = $commission + $logistics + $expectedReturnCost + $storageCost + $acceptanceCost + $penaltyCost + $acquiring;
         
         // Всего затрат, % = затраты / цена × 100
         $totalExpensesPercent = $price > 0 ? ($marketplaceCosts / $price) * 100 : 0;
@@ -202,6 +201,8 @@ class WildberriesUnitEconomicsCalculator implements UnitEconomicsCalculatorInter
             'tax_percent' => $taxPercent,
             'tax_amount' => round($taxAmount, 2),
             'redemption_rate' => $redemptionRate,
+            'acquiring_percent' => round($acquiringRate, 2),
+            'acquiring_amount' => round($acquiring, 2),
             'volume_liters' => round($volumeInLiters, 4),
             'acceptance_cost' => round($acceptanceCost, 2),
             'penalty_cost' => round($penaltyCost, 2),

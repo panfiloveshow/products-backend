@@ -521,6 +521,11 @@ class WildberriesMarketplace implements MarketplaceInterface
         return $this->sales->getSalesByRegion($days);
     }
 
+    public function getRedemptionStatsByNmId(int $days = 30): array
+    {
+        return $this->sales->getRedemptionStatsByNmId($days);
+    }
+
     public function getSppFromSales(int $days = 30): array
     {
         return $this->sales->getSppFromSales($days);

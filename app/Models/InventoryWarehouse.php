@@ -19,6 +19,7 @@ class InventoryWarehouse extends Model
         'sku',
         'warehouse_id',
         'warehouse_name',
+        'warehouse_coefficient',
         'marketplace',
         'integration_id',
         'fulfillment_type',
@@ -59,6 +60,7 @@ class InventoryWarehouse extends Model
 
     protected $casts = [
         'quantity'            => 'integer',
+        'warehouse_coefficient' => 'decimal:3',
         'average_daily_sales' => 'decimal:4',
         'days_of_stock'       => 'integer',
         'recommended_quantity'=> 'integer',

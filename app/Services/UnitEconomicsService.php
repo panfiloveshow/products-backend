@@ -46,7 +46,8 @@ class UnitEconomicsService
         $grossProfit = $revenue - $totalCosts;
         $netProfit = $grossProfit;
         $marginPercent = $revenue > 0 ? ($netProfit / $revenue) * 100 : 0;
-        $markupPercent = $costPrice > 0 ? ($netProfit / ($costPrice * $salesCount)) * 100 : 0;
+        $totalCostPrice = $costPrice * $salesCount;
+        $markupPercent = $totalCostPrice > 0 ? ($netProfit / $totalCostPrice) * 100 : 0;
         $roiPercent = $totalCosts > 0 ? ($netProfit / $totalCosts) * 100 : 0;
         $toSettlementAccount = $calculator['details']['to_settlement_account']
             ?? ($revenue - $calculator['total_fees']);
@@ -110,13 +111,16 @@ class UnitEconomicsService
         $redemptionRate = (float) ($data['redemption_rate'] ?? 80);
         $expectedReturnCost = $returnLogisticsCost * ((100 - $redemptionRate) / 100);
 
+        $acquiringPercent = (float) ($data['acquiring_percent'] ?? 1.5);
+        $acquiringAmount = ($price * $acquiringPercent / 100) * $salesCount;
+
         $sppRub = ($price * $sppPercent / 100) * $salesCount;
 
         $ksPercent = $data['ks_percent'] ?? 0;
         $ksRub = ($price * $ksPercent / 100) * $salesCount;
 
         $totalFees = $commissionAmount + $storageCost + $logisticsCost + 
-                     $acceptanceCost + $penaltyCost + $expectedReturnCost + $ksRub;
+                     $acceptanceCost + $penaltyCost + $expectedReturnCost + $acquiringAmount + $ksRub;
 
         $effectiveLogistics = $logisticsCost + $expectedReturnCost;
         $toSettlementAccount = ($customerPrice * $salesCount) - $totalFees;
@@ -139,6 +143,8 @@ class UnitEconomicsService
                 'return_logistics_cost' => round($returnLogisticsPerUnit, 2),
                 'expected_return_cost' => round($expectedReturnCost, 2),
                 'effective_logistics' => round($effectiveLogistics, 2),
+                'acquiring_percent' => round($acquiringPercent, 2),
+                'acquiring_amount' => round($acquiringAmount, 2),
                 'spp_percent' => $sppPercent,
                 'spp_rub' => round($sppRub, 2),
                 'ks_percent' => $ksPercent,

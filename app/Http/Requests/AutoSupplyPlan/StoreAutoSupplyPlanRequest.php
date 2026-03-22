@@ -14,7 +14,7 @@ class StoreAutoSupplyPlanRequest extends FormRequest
     public function rules(): array
     {
         return [
-            'integration_id' => 'required|integer|exists:integrations,id',
+            'integration_id' => 'required|integer',
             'mode' => 'nullable|string|in:anti_oos,balanced,cash_safe',
             'horizon_days' => 'nullable|integer|in:14,30,60,90',
             'min_cover_days' => 'nullable|integer|min:1|max:90',

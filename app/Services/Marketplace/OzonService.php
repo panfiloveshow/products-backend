@@ -18,8 +18,8 @@ class OzonService implements MarketplaceInterface
 
     public function __construct(?string $clientId = null, ?string $apiKey = null)
     {
-        $this->clientId = $clientId ?? config('services.ozon.client_id', '');
-        $this->apiKey = $apiKey ?? config('services.ozon.api_key', '');
+        $this->clientId = $clientId ?? config('services.ozon.client_id') ?? '';
+        $this->apiKey = $apiKey ?? config('services.ozon.api_key') ?? '';
     }
 
     /**

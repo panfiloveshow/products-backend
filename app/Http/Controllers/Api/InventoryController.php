@@ -8,6 +8,7 @@ use App\Models\InventoryAlert;
 use App\Models\InventoryHistory;
 use App\Models\InventoryWarehouse;
 use App\Models\Product;
+use App\Models\UnitEconomics;
 use App\Jobs\SyncStorageFeesJob;
 use App\Models\Integration;
 use App\Services\InventoryService;
@@ -63,8 +64,9 @@ class InventoryController extends Controller
 
         $products = $query->paginate($limit, ['*'], 'page', $page);
 
-        $items = $products->getCollection()->map(function ($product) {
-            return $this->inventoryService->formatProductInventory($product);
+        $preloaded = $this->inventoryService->preloadFormatProductInventoryData($products->getCollection());
+        $items = $products->getCollection()->map(function ($product) use ($preloaded) {
+            return $this->inventoryService->formatProductInventory($product, $preloaded);
         });
 
         $stats = $this->inventoryService->getInventoryStats($validated);
@@ -256,6 +258,7 @@ class InventoryController extends Controller
             ->when($fulfillmentType && $fulfillmentType !== 'all', function ($q) use ($fulfillmentType) {
                 $q->whereRaw('LOWER(fulfillment_type) = ?', [strtolower($fulfillmentType)]);
             });
+        $marketplace = (clone $query)->value('marketplace');
 
         // Получаем ВСЕ склады (включая пустые) — сначала с остатком, потом пустые
         $warehouses = (clone $query)
@@ -304,7 +307,7 @@ class InventoryController extends Controller
             ->selectRaw('MAX(storage_fee_prev_month_period) as storage_fee_prev_month_period')
             ->groupBy('sku');
 
-        // Получаем полный список для поиска и сортировки с джойном на products
+        // Полный список для поиска и сортировки (спрос для дней запаса/оборачиваемости — с fallback как в синке UE)
         $allSkus = $skuQuery->get()->keyBy('sku');
 
         // Получаем данные о товарах
@@ -321,14 +324,18 @@ class InventoryController extends Controller
 
         // Сортировка
         $sortCallback = function ($row) use ($sort) {
+            $demand = $this->resolveInventoryMatrixDailyDemand($row);
+            $qty = (int) ($row->total_stock ?? 0);
+            $dos = $demand > 0 ? $qty / $demand : 9999.0;
+
             return match ($sort) {
-                'total_stock'    => (int)   $row->total_stock,
-                'sales_30_days'  => (int)   $row->sales_30_days,
-                'avg_daily_sales'=> (float) $row->avg_daily_sales,
-                'days_of_stock'  => (float) ($row->days_of_stock ?? 9999),
-                'turnover_days'  => (float) ($row->turnover_days ?? 9999),
-                'stock_value'    => (float) $row->total_stock,
-                default          => (int)   $row->total_stock,
+                'total_stock' => (int) $row->total_stock,
+                'sales_30_days' => (int) $row->sales_30_days,
+                'avg_daily_sales' => $demand > 0 ? $demand : (float) ($row->avg_daily_sales ?? 0),
+                'days_of_stock' => $dos,
+                'turnover_days' => $dos,
+                'stock_value' => (float) $row->total_stock,
+                default => (int) $row->total_stock,
             };
         };
 
@@ -340,7 +347,7 @@ class InventoryController extends Controller
         if ($stockStatus) {
             $sortedSkus = $sortedSkus->filter(function ($row) use ($stockStatus) {
                 $qty = (int) ($row->total_stock ?? 0);
-                $avg = (float) ($row->avg_daily_sales ?? 0);
+                $avg = $this->resolveInventoryMatrixDailyDemand($row);
                 $dos = $avg > 0 ? round($qty / $avg) : null;
                 if ($qty <= 0) {
                     $s = 'out_of_stock';
@@ -393,6 +400,16 @@ class InventoryController extends Controller
                 }
             }
         }
+
+        $unitEconomicsQuery = UnitEconomics::query()
+            ->whereIn('sku', $pagedSkus)
+            ->when($marketplace, fn($q) => $q->where('marketplace', $marketplace));
+        if ($integrationId) {
+            $unitEconomicsQuery->where(function ($q) use ($integrationId) {
+                $q->where('integration_id', $integrationId)->orWhereNull('integration_id');
+            })->orderByDesc('integration_id');
+        }
+        $unitEconomics = $unitEconomicsQuery->get()->keyBy('sku');
 
         // Ozon FBS: для SKU вида "00808-16" (offer_id с суффиксом количества)
         // ищем продукт по ozon_data->>'offer_id' = invSku или по базовому SKU (до дефиса)
@@ -473,11 +490,12 @@ class InventoryController extends Controller
             $rows = $warehouseRows[$sku] ?? collect();
 
             // Определяем stock_status по total_stock и avg_daily_sales
-            $totalStock    = (int)   ($agg->total_stock    ?? 0);
-            $avgDailySales = (float) ($agg->avg_daily_sales ?? 0);
-            $salesTrend7   = (int)   ($agg->sales_7_days   ?? 0);
-            $sales30       = (int)   ($agg->sales_30_days  ?? 0);
-            $daysOfStock   = $avgDailySales > 0 ? round($totalStock / $avgDailySales) : null;
+            $totalStock = (int) ($agg->total_stock ?? 0);
+            $resolvedDemand = $this->resolveInventoryMatrixDailyDemand($agg);
+            $avgDailySales = $resolvedDemand > 0 ? $resolvedDemand : (float) ($agg->avg_daily_sales ?? 0);
+            $salesTrend7 = (int) ($agg->sales_7_days ?? 0);
+            $sales30 = (int) ($agg->sales_30_days ?? 0);
+            $daysOfStock = $avgDailySales > 0 ? round($totalStock / $avgDailySales) : null;
 
             if ($totalStock <= 0) {
                 $computedStatus = 'out_of_stock';
@@ -498,9 +516,16 @@ class InventoryController extends Controller
             $trendPct = $s1 > 0 ? round(($s2 - $s1) / $s1 * 100) : 0;
             $trend = $trendPct > 10 ? 'growing' : ($trendPct < -10 ? 'declining' : 'stable');
 
-            $costPrice   = (float) ($prod?->cost_price ?? 0);
-            $price       = (float) ($prod?->price ?? 0);
+            $ue          = $unitEconomics->get($sku);
+            $productCost = (float) ($prod?->cost_price ?? 0);
+            $productPrice= (float) ($prod?->price ?? 0);
+            $costPrice   = $productCost > 0 ? $productCost : (float) ($ue?->cost_price ?? 0);
+            $price       = $productPrice > 0 ? $productPrice : (float) ($ue?->price ?? 0);
             $stockValue  = $totalStock * ($price ?: $costPrice);
+
+            $storageFeeRow = (float) ($agg->storage_fee_total ?? 0);
+            $storageMonthlyRow = (float) ($agg->storage_cost_monthly ?? 0);
+            $storageCurrentDisplay = $storageFeeRow > 0 ? $storageFeeRow : $storageMonthlyRow;
 
             // Матрица по складам
             $warehouseMatrix = $rows->map(fn($w) => [
@@ -551,21 +576,21 @@ class InventoryController extends Controller
                 'sales_7_days'         => $salesTrend7,
                 'sales_14_days'        => $sales14,
                 'sales_30_days'        => $sales30,
-                'avg_daily_sales'      => round((float) ($agg->avg_daily_sales  ?? 0), 2),
+                'avg_daily_sales'      => round($avgDailySales, 2),
                 'effective_daily_sales'=> round((float) ($agg->effective_daily_sales ?? 0), 2),
                 'days_in_stock_30'     => (int) ($agg->days_in_stock_30 ?? 30),
-                'turnover_days'        => $agg->turnover_days ? round($agg->turnover_days, 1) : null,
+                'turnover_days'        => $avgDailySales > 0 ? round($totalStock / $avgDailySales, 1) : null,
                 'days_of_stock'        => $daysOfStock,
                 'sales_trend'          => $trend,
                 'sales_trend_pct'      => $trendPct,
                 'stock_status'         => $computedStatus,
                 'storage_cost_daily'   => round((float) ($agg->storage_cost_daily   ?? 0), 2),
                 'storage_cost_monthly' => round((float) ($agg->storage_cost_monthly ?? 0), 2),
-                'storage_fee_total'    => $agg->storage_fee_total    ? round((float) $agg->storage_fee_total, 2)    : null,
-                'storage_fee_last_week'=> $agg->storage_fee_last_week ? round((float) $agg->storage_fee_last_week, 2) : null,
+                'storage_fee_total'    => round($storageCurrentDisplay, 2),
+                'storage_fee_last_week'=> round((float) ($agg->storage_fee_last_week ?? 0), 2),
                 'storage_fee_report_from'  => $agg->storage_fee_report_from  ? (string) $agg->storage_fee_report_from  : null,
                 'storage_fee_report_to'    => $agg->storage_fee_report_to    ? (string) $agg->storage_fee_report_to    : null,
-                'storage_fee_prev_month'   => $agg->storage_fee_prev_month   ? round((float) $agg->storage_fee_prev_month, 2)   : null,
+                'storage_fee_prev_month'   => round((float) ($agg->storage_fee_prev_month ?? 0), 2),
                 'storage_fee_prev_month_period' => $agg->storage_fee_prev_month_period ? (string) $agg->storage_fee_prev_month_period : null,
                 'real_avg_daily_sales' => $agg->real_avg_daily_sales ? round($agg->real_avg_daily_sales, 2) : null,
                 'real_turnover_days'   => $agg->real_turnover_days   ? round($agg->real_turnover_days, 1)  : null,
@@ -587,7 +612,7 @@ class InventoryController extends Controller
         $lowCount        = 0;
         foreach ($allSkus as $row) {
             $qty = (int) ($row->total_stock ?? 0);
-            $avg = (float) ($row->avg_daily_sales ?? 0);
+            $avg = $this->resolveInventoryMatrixDailyDemand($row);
             $dos = $avg > 0 ? round($qty / $avg) : null;
             if ($qty <= 0) {
                 $outOfStockCount++;
@@ -598,8 +623,10 @@ class InventoryController extends Controller
             }
         }
 
-        // Суммы хранения по всем SKU для карточек
-        $storageFeeTotal     = $allSkus->sum(fn($r) => (float) ($r->storage_fee_total ?? 0));
+        // Суммы хранения: WB — storage_fee_*; для Ozon и др. часто заполнен только storage_cost_monthly
+        $storageFeeTotalRaw = $allSkus->sum(fn ($r) => (float) ($r->storage_fee_total ?? 0));
+        $storageMonthlySum = $allSkus->sum(fn ($r) => (float) ($r->storage_cost_monthly ?? 0));
+        $storageFeeTotal = $storageFeeTotalRaw > 0 ? $storageFeeTotalRaw : $storageMonthlySum;
         $storageFeePrevMonth = $allSkus->sum(fn($r) => (float) ($r->storage_fee_prev_month ?? 0));
         $storageFeeFromVals  = $allSkus->filter(fn($r) => !empty($r->storage_fee_report_from))->pluck('storage_fee_report_from');
         $storageFeeToVals    = $allSkus->filter(fn($r) => !empty($r->storage_fee_report_to))->pluck('storage_fee_report_to');
@@ -610,16 +637,29 @@ class InventoryController extends Controller
         // total_stock_value считаем по всем SKU через products + allSkus
         $allProductSkus = $allSkus->keys()->toArray();
         $allProductsMap = \App\Models\Product::whereIn('sku', $allProductSkus)
+            ->when($marketplace, fn($q) => $q->where('marketplace', $marketplace))
             ->when($integrationId, fn($q) => $q->where(function ($q) use ($integrationId) {
                 $q->where('integration_id', $integrationId)->orWhereNull('integration_id');
             }))
             ->get(['sku', 'price', 'cost_price'])
             ->keyBy('sku');
+        $allUnitEconomicsQuery = UnitEconomics::query()
+            ->whereIn('sku', $allProductSkus)
+            ->when($marketplace, fn($q) => $q->where('marketplace', $marketplace));
+        if ($integrationId) {
+            $allUnitEconomicsQuery->where(function ($q) use ($integrationId) {
+                $q->where('integration_id', $integrationId)->orWhereNull('integration_id');
+            })->orderByDesc('integration_id');
+        }
+        $allUnitEconomicsMap = $allUnitEconomicsQuery->get()->keyBy('sku');
         $totalStockValue = 0;
         foreach ($allSkus as $sku => $row) {
             $prod = $allProductsMap[$sku] ?? null;
-            $price = (float) ($prod?->price ?? 0);
-            $costPrice = (float) ($prod?->cost_price ?? 0);
+            $ue = $allUnitEconomicsMap[$sku] ?? null;
+            $productPrice = (float) ($prod?->price ?? 0);
+            $productCost = (float) ($prod?->cost_price ?? 0);
+            $price = $productPrice > 0 ? $productPrice : (float) ($ue?->price ?? 0);
+            $costPrice = $productCost > 0 ? $productCost : (float) ($ue?->cost_price ?? 0);
             $qty = (int) ($row->total_stock ?? 0);
             $totalStockValue += $qty * ($price ?: $costPrice);
         }
@@ -628,7 +668,7 @@ class InventoryController extends Controller
         $avgTurnoverDays = 0;
         $turnoverCount = 0;
         foreach ($allSkus as $row) {
-            $avg = (float) ($row->avg_daily_sales ?? 0);
+            $avg = $this->resolveInventoryMatrixDailyDemand($row);
             $qty = (int) ($row->total_stock ?? 0);
             if ($avg > 0) {
                 $avgTurnoverDays += round($qty / $avg, 1);
@@ -674,5 +714,31 @@ class InventoryController extends Controller
                 'summary' => $summary,
             ],
         ]);
+    }
+
+    /**
+     * Единый дневной спрос для матрицы: как в AutoSupplyPlan — real / effective / API avg, затем sales_30/30, sales_7/7.
+     */
+    private function resolveInventoryMatrixDailyDemand(object $row): float
+    {
+        foreach ([
+            (float) ($row->real_avg_daily_sales ?? 0),
+            (float) ($row->effective_daily_sales ?? 0),
+            (float) ($row->avg_daily_sales ?? 0),
+        ] as $v) {
+            if ($v > 0) {
+                return $v;
+            }
+        }
+        $s30 = (int) ($row->sales_30_days ?? 0);
+        if ($s30 > 0) {
+            return $s30 / 30.0;
+        }
+        $s7 = (int) ($row->sales_7_days ?? 0);
+        if ($s7 > 0) {
+            return $s7 / 7.0;
+        }
+
+        return 0.0;
     }
 }

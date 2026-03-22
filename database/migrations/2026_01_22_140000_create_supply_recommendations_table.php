@@ -14,6 +14,10 @@ return new class extends Migration
 {
     public function up(): void
     {
+        if (Schema::hasTable('supply_recommendations')) {
+            return;
+        }
+
         Schema::create('supply_recommendations', function (Blueprint $table) {
             $table->id();
             $table->foreignId('integration_id')->constrained()->onDelete('cascade');

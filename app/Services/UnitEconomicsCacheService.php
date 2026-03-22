@@ -56,6 +56,7 @@ class UnitEconomicsCacheService
      */
     public function recalculateProduct(Product $product): array
     {
+        $this->forgetUnitEconomicsCache($product->integration_id, $product->sku);
         $schemes = $this->getSchemesForProduct($product);
         $results = [];
         
@@ -143,6 +144,8 @@ class UnitEconomicsCacheService
      */
     public function recalculateIntegration(int $integrationId): array
     {
+        $this->unitEconomicsCache = [];
+        $this->settingsCache = [];
         $integration = $this->getIntegrationCached($integrationId);
         if (!$integration) {
             return ['error' => 'Integration not found'];
@@ -314,16 +317,24 @@ class UnitEconomicsCacheService
         $warehouseCoefficient = 1.0;
         $localizationIndex = 1.0;
         if ($marketplace === 'wildberries') {
-            $sppPercent = (float) ($settings?->spp_percent ?? $marketplaceData['spp_percent'] ?? 0);
-            $warehouseCoefficient = $this->getAverageWarehouseCoefficient($product->sku, $marketplace);
-            $localizationIndex = (float) ($integration?->localization_index ?? 1.0);
+            $sppPercent = (float) ($settings?->spp_percent ?? $marketplaceData['spp_percent'] ?? $existingUE?->spp_percent ?? 0);
+            $warehouseCoefficient = $this->getAverageWarehouseCoefficient($product->integration_id, $product->sku, $marketplace);
+            $localizationIndex = (float) (
+                $existingUE?->localization_index
+                ?? $integrationSettings['wb_localization_index']
+                ?? $integration?->localization_index
+                ?? 1.0
+            );
         }
 
         $drrPercent = (float) ($settings?->drr_percent ?? $existingUE?->drr_percent ?? 0);
         $ourSharePercent = (float) ($settings?->our_share_percent ?? $existingUE?->our_share_percent ?? 0);
         $taxPercent = (float) ($settings?->tax_percent ?? $existingUE?->tax_percent ?? 6);
         $vatPercent = (float) ($settings?->vat_percent ?? $existingUE?->vat_percent ?? 0);
-        $acquiringPercent = (float) ($marketplace === 'wildberries' ? 0 : ($existingUE?->acquiring_percent ?? 1.5));
+        $existingAcquiringPercent = $existingUE?->acquiring_percent;
+        $acquiringPercent = (float) ($marketplace === 'wildberries'
+            ? (($existingAcquiringPercent !== null && (float) $existingAcquiringPercent > 0) ? $existingAcquiringPercent : 1.5)
+            : ($existingAcquiringPercent ?? 0));
         $storageCost = (float) ($marketplaceData['storage_cost'] ?? $product->storage_cost ?? $existingUE?->storage_cost ?? 0);
         $ownDeliveryCost = (float) (
             $marketplaceData['own_delivery_cost']
@@ -382,7 +393,7 @@ class UnitEconomicsCacheService
             '_extra' => [
                 'sales_count' => max(1, (int) ($existingUE?->sales_count ?? $product->sales_30_days ?? 1)),
                 'avg_delivery_time_hours' => (int) $avgDeliveryTimeHours,
-                'logistics_coefficient' => (float) $deliveryCoefficient,
+                'logistics_coefficient' => (float) ($marketplace === 'wildberries' ? $localizationIndex : $deliveryCoefficient),
                 'additional_commission_percent' => (float) $additionalCommissionPercent,
                 'tariff_status' => $tariffStatus,
                 'turnover_days' => (int) ($existingUE?->turnover_days ?? 30),
@@ -772,14 +783,15 @@ class UnitEconomicsCacheService
      * @param string $marketplace Маркетплейс
      * @return float Средний КС (1.0 = 100%, 1.4 = 140%)
      */
-    private function getAverageWarehouseCoefficient(string $sku, string $marketplace): float
+    private function getAverageWarehouseCoefficient(int $integrationId, string $sku, string $marketplace): float
     {
-        $cacheKey = $marketplace . '|' . $sku;
+        $cacheKey = $integrationId . '|' . $marketplace . '|' . $sku;
         if (array_key_exists($cacheKey, $this->warehouseCoefficientCache)) {
             return $this->warehouseCoefficientCache[$cacheKey];
         }
 
         $warehouses = InventoryWarehouse::where('sku', $sku)
+            ->where('integration_id', $integrationId)
             ->where('marketplace', $marketplace)
             ->get(['warehouse_coefficient', 'quantity']);
         
@@ -845,6 +857,22 @@ class UnitEconomicsCacheService
             ->first();
 
         return $this->settingsCache[$key];
+    }
+
+    private function forgetUnitEconomicsCache(int $integrationId, string $sku, ?string $fulfillmentType = null): void
+    {
+        if ($fulfillmentType !== null) {
+            $key = $integrationId . '|' . $sku . '|' . strtoupper($fulfillmentType);
+            unset($this->unitEconomicsCache[$key]);
+            return;
+        }
+
+        $prefix = $integrationId . '|' . $sku . '|';
+        foreach (array_keys($this->unitEconomicsCache) as $key) {
+            if (str_starts_with($key, $prefix)) {
+                unset($this->unitEconomicsCache[$key]);
+            }
+        }
     }
 
     private function forgetSettingsCache(int $integrationId, string $sku): void

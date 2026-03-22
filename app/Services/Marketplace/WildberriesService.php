@@ -20,6 +20,7 @@ class WildberriesService implements MarketplaceInterface
     private string $statisticsApiUrl = 'https://statistics-api.wildberries.ru';
     private string $analyticsApiUrl = 'https://seller-analytics-api.wildberries.ru';
     private string $pricesApiUrl = 'https://discounts-prices-api.wildberries.ru';
+    private string $commonApiUrl = 'https://common-api.wildberries.ru';
 
     // Задержка между запросами (мс) — глобальный лимит WB: 6 рек/мин на эндпоинт
     private int $requestDelayMs = 500;
@@ -28,7 +29,7 @@ class WildberriesService implements MarketplaceInterface
 
     public function __construct(?string $apiKey = null)
     {
-        $this->apiKey = $apiKey ?? config('services.wildberries.api_key', '');
+        $this->apiKey = $apiKey ?? config('services.wildberries.api_key') ?? '';
     }
 
     /**
@@ -161,9 +162,12 @@ class WildberriesService implements MarketplaceInterface
             $prices = $this->loadAllPrices();
             Log::info('WB getProducts: prices loaded', ['count' => count($prices)]);
 
+            $commissions = $this->getCommissions();
+            Log::info('WB getProducts: commissions loaded', ['count' => count($commissions)]);
+
             $products = [];
             foreach ($allCards as $card) {
-                foreach ($this->transformProduct($card, $prices) as $productData) {
+                foreach ($this->transformProduct($card, $prices, $commissions) as $productData) {
                     $products[] = $productData;
                 }
             }
@@ -232,10 +236,12 @@ class WildberriesService implements MarketplaceInterface
      * WB Statistics API возвращает остатки по баркодам, поэтому нужна запись на каждый баркод.
      * Возвращает массив массивов (может быть несколько вариантов одной карточки).
      */
-    private function transformProduct(array $card, array $prices = []): array
+    private function transformProduct(array $card, array $prices = [], array $commissions = []): array
     {
         $nmId       = (string) ($card['nmID'] ?? '');
         $vendorCode = $card['vendorCode'] ?? null;
+        $subjectId = $card['subjectID'] ?? null;
+        $subjectCommissions = $subjectId ? ($commissions[(string) $subjectId] ?? null) : null;
 
         // Цена из Prices API (приоритет)
         $priceData = $prices[$vendorCode] ?? $prices[$nmId] ?? null;
@@ -326,6 +332,14 @@ class WildberriesService implements MarketplaceInterface
                     'imtID'           => $card['imtID'] ?? null,
                     'vendorCode'      => $vendorCode,
                     'subjectID'       => $card['subjectID'] ?? null,
+                    'commissions'     => [
+                        'fbo' => [
+                            'percent' => (float) ($subjectCommissions['fbo'] ?? 15.0),
+                        ],
+                        'fbs' => [
+                            'percent' => (float) ($subjectCommissions['fbs'] ?? $subjectCommissions['fbo'] ?? 15.0),
+                        ],
+                    ],
                     'chrtID'          => $sizeInfo['chrtID'],
                     'size'            => $sizeName,
                     'sizes'           => $sizes,
@@ -348,6 +362,7 @@ class WildberriesService implements MarketplaceInterface
     {
         try {
             $inventory = [];
+            $warehouseCoefficients = $this->getWarehouseCoefficients();
 
             // dateFrom=2019-01-01 — получаем ВСЕ остатки (не только изменённые сегодня)
             // Документация: «enter the earliest possible value to get the total leftover»
@@ -376,6 +391,7 @@ class WildberriesService implements MarketplaceInterface
                     $warehouseName = $stock['warehouseName'] ?? 'WB Склад';
                     $warehouseId   = $warehouseName !== '' ? 'wb_' . substr(md5($warehouseName), 0, 8) : '0';
                     $barcode       = $stock['barcode'] ?? null;
+                    $warehouseCoefficient = $this->resolveWarehouseCoefficient($warehouseName, $warehouseCoefficients);
                     $inventory[] = [
                         'sku'            => $barcode ?? $stock['supplierArticle'],
                         'warehouse_id'   => $warehouseId,
@@ -383,6 +399,7 @@ class WildberriesService implements MarketplaceInterface
                         'marketplace'    => 'wildberries',
                         'quantity'       => $stock['quantityFull'] ?? $stock['quantity'] ?? 0,
                         'in_transit'     => ($stock['inWayToClient'] ?? 0) + ($stock['inWayFromClient'] ?? 0),
+                        'warehouse_coefficient' => $warehouseCoefficient,
                     ];
                 }
 
@@ -748,17 +765,95 @@ class WildberriesService implements MarketplaceInterface
     public function getCommissions(): array
     {
         try {
-            $response = $this->wbGet("{$this->analyticsApiUrl}/api/v1/tariffs/commission");
+            $response = $this->wbGet("{$this->commonApiUrl}/api/v1/tariffs/commission", ['locale' => 'ru']);
 
             if (!$response->successful()) {
                 return [];
             }
 
-            return $response->json()['report'] ?? [];
+            $report = $response->json()['report'] ?? [];
+            $result = [];
+            foreach ($report as $item) {
+                $subjectId = $item['subjectID'] ?? null;
+                if (!$subjectId) {
+                    continue;
+                }
+
+                $result[(string) $subjectId] = [
+                    'fbo' => (float) ($item['kgvpMarketplace'] ?? 15.0),
+                    'fbs' => (float) ($item['kgvpSupplier'] ?? 15.0),
+                ];
+            }
+
+            return $result;
             
         } catch (\Exception $e) {
             Log::error('WB getCommissions error: ' . $e->getMessage());
             return [];
         }
+    }
+
+    public function getWarehouseCoefficients(): array
+    {
+        try {
+            $response = $this->wbGet("{$this->commonApiUrl}/api/v1/tariffs/box", [
+                'date' => now()->format('Y-m-d'),
+            ]);
+
+            if (!$response->successful()) {
+                return [];
+            }
+
+            $warehouseList = $response->json()['response']['data']['warehouseList'] ?? [];
+            $result = [];
+
+            foreach ($warehouseList as $warehouse) {
+                $name = (string) ($warehouse['warehouseName'] ?? '');
+                if ($name === '') {
+                    continue;
+                }
+
+                $normalizedName = $this->normalizeWarehouseName($name);
+                $coefPercent = (float) ($warehouse['boxDeliveryCoefExpr'] ?? 100);
+
+                $result[$normalizedName] = [
+                    'warehouse_name' => $name,
+                    'warehouse_coefficient' => $coefPercent / 100,
+                ];
+            }
+
+            return $result;
+        } catch (\Exception $e) {
+            Log::error('WB getWarehouseCoefficients error: ' . $e->getMessage());
+            return [];
+        }
+    }
+
+    private function resolveWarehouseCoefficient(string $warehouseName, array $coefficients): ?float
+    {
+        if ($warehouseName === '' || empty($coefficients)) {
+            return null;
+        }
+
+        $normalizedName = $this->normalizeWarehouseName($warehouseName);
+        if (isset($coefficients[$normalizedName])) {
+            return (float) ($coefficients[$normalizedName]['warehouse_coefficient'] ?? 1.0);
+        }
+
+        foreach ($coefficients as $name => $data) {
+            if (str_contains($name, $normalizedName) || str_contains($normalizedName, $name)) {
+                return (float) ($data['warehouse_coefficient'] ?? 1.0);
+            }
+        }
+
+        return null;
+    }
+
+    private function normalizeWarehouseName(string $name): string
+    {
+        $name = mb_strtolower(trim($name));
+        $name = str_replace(['-', '–', '—'], ' ', $name);
+        $name = preg_replace('/\s+/', ' ', $name);
+        return trim($name);
     }
 }

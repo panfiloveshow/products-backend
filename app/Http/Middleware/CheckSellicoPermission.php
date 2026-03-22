@@ -39,7 +39,7 @@ class CheckSellicoPermission
         'products.syncStatus'          => 'products.sync.status',
         'products.export'              => 'products.export',
         'products.cost-price.index'    => 'products.view',
-        'products.cost-price.upload'   => 'products.upload',
+        'products.cost-price.upload'   => 'products.edit',
         'products.cost-price.bulk'     => 'products.edit',
         'products.cost-price.template' => 'products.view',
 
@@ -234,7 +234,7 @@ class CheckSellicoPermission
         string $permission,
         string $routeName
     ): ?bool {
-        $crmUrl = config('services.crm.url', 'https://sellico.ru');
+        $crmUrl = config('services.crm.url') ?? 'https://sellico.ru';
 
         $serviceToken = $this->getServiceToken();
 
@@ -376,7 +376,7 @@ class CheckSellicoPermission
      */
     protected function authorizeAndCacheToken(): ?string
     {
-        $baseUrl  = config('services.sellico.base_url', 'https://sellico.ru/api');
+        $baseUrl  = config('services.sellico.base_url') ?? 'https://sellico.ru/api';
         $email    = config('services.sellico.email');
         $password = config('services.sellico.password');
 

@@ -9,6 +9,8 @@ use App\Models\UnitEconomicsCache;
 use App\Models\UnitEconomicsSettings;
 use App\Models\Product;
 use App\Models\Integration;
+use App\Models\InventoryWarehouse;
+use App\Services\IntegrationAccessService;
 use App\Services\UnitEconomicsCacheService;
 use App\Services\UnitEconomicsService;
 use App\Jobs\SyncUnitEconomicsJob;
@@ -16,6 +18,7 @@ use App\Domains\UnitEconomics\UnitEconomicsOrchestrator;
 use App\Domains\UnitEconomics\DTO\CalculationInput;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Validator;
 
@@ -32,15 +35,18 @@ class UnitEconomicsCacheController extends Controller
     private UnitEconomicsCacheService $cacheService;
     private UnitEconomicsService $unitEconomicsService;
     private UnitEconomicsOrchestrator $orchestrator;
+    private IntegrationAccessService $integrationAccessService;
 
     public function __construct(
         UnitEconomicsCacheService $cacheService,
         UnitEconomicsService $unitEconomicsService,
-        UnitEconomicsOrchestrator $orchestrator
+        UnitEconomicsOrchestrator $orchestrator,
+        IntegrationAccessService $integrationAccessService
     ) {
         $this->cacheService = $cacheService;
         $this->unitEconomicsService = $unitEconomicsService;
         $this->orchestrator = $orchestrator;
+        $this->integrationAccessService = $integrationAccessService;
     }
 
     /**
@@ -55,8 +61,8 @@ class UnitEconomicsCacheController extends Controller
     public function index(Request $request, string $marketplace): JsonResponse
     {
         $marketplace = $this->normalizeMarketplace($marketplace);
-        $validated = $request->validate([
-            'integration_id' => 'required|integer|exists:integrations,id',
+        $validated = Validator::make($request->all(), [
+            'integration_id' => 'required|integer',
             'fulfillment_type' => 'required|string|in:FBO,FBS,RFBS,EXPRESS,DBS,EDBS,DBW,MIXED,FBY,fbo,fbs,rfbs,express,dbs,edbs,dbw,mixed,fby',
             'search' => 'nullable|string|max:255',
             'profitable' => 'nullable|boolean',
@@ -68,7 +74,21 @@ class UnitEconomicsCacheController extends Controller
             'sort_order' => 'nullable|string|in:asc,desc',
             'limit' => 'nullable|integer|min:1|max:500',
             'page' => 'nullable|integer|min:1',
-        ]);
+        ])->validate();
+
+        $resolution = $this->integrationAccessService->ensureAccessibleIntegration(
+            $request,
+            (int) $validated['integration_id'],
+            $marketplace
+        );
+        if (!($resolution['success'] ?? false)) {
+            return response()->json([
+                'message' => $resolution['message'] ?? 'Интеграция не найдена',
+                'errors' => [
+                    'integration_id' => [$resolution['message'] ?? 'Интеграция не найдена'],
+                ],
+            ], $resolution['status'] ?? 404);
+        }
 
         $query = UnitEconomicsCache::query()
             ->forIntegration($validated['integration_id'])
@@ -98,10 +118,13 @@ class UnitEconomicsCacheController extends Controller
                 ->keyBy('sku');
         }
 
+        $pageContext = $this->buildWildberriesUnitEconomicsPageContext($marketplace, $itemsCollection);
+
         // Обогащаем данные полями из Product для совместимости с v1
-        $items = $itemsCollection->map(function ($cache) use ($validated, $settingsMap) {
+        $items = $itemsCollection->map(function ($cache) use ($validated, $settingsMap, $pageContext) {
             $settings = $settingsMap->get($cache->sku);
-            return $this->enrichCacheItem($cache, $validated['fulfillment_type'], $settings);
+
+            return $this->enrichCacheItem($cache, $validated['fulfillment_type'], $settings, $pageContext);
         })->toArray();
 
         // Статистика по схемам
@@ -145,10 +168,24 @@ class UnitEconomicsCacheController extends Controller
     public function show(Request $request, string $marketplace, string $sku): JsonResponse
     {
         $marketplace = $this->normalizeMarketplace($marketplace);
-        $validated = $request->validate([
-            'integration_id' => 'required|integer|exists:integrations,id',
+        $validated = Validator::make($request->all(), [
+            'integration_id' => 'required|integer',
             'fulfillment_type' => 'nullable|string|in:FBO,FBS,RFBS,EXPRESS,DBS,EDBS,DBW,MIXED,FBY',
-        ]);
+        ])->validate();
+
+        $resolution = $this->integrationAccessService->ensureAccessibleIntegration(
+            $request,
+            (int) $validated['integration_id'],
+            $marketplace
+        );
+        if (!($resolution['success'] ?? false)) {
+            return response()->json([
+                'message' => $resolution['message'] ?? 'Интеграция не найдена',
+                'errors' => [
+                    'integration_id' => [$resolution['message'] ?? 'Интеграция не найдена'],
+                ],
+            ], $resolution['status'] ?? 404);
+        }
 
         $fulfillmentType = $validated['fulfillment_type'] ?? match ($marketplace) {
             'yandex', 'yandex_market' => 'FBY',
@@ -190,24 +227,43 @@ class UnitEconomicsCacheController extends Controller
      */
     public function updateSettings(Request $request, string $sku): JsonResponse
     {
-        $validated = $request->validate([
-            'integration_id' => 'required|integer|exists:integrations,id',
+        $validated = Validator::make($request->all(), [
+            'integration_id' => 'required|integer',
             'cost_price' => 'nullable|numeric|min:0',
             'drr_percent' => 'nullable|numeric|min:0|max:100',
             'our_share_percent' => 'nullable|numeric|min:0|max:100',
             'tax_percent' => 'nullable|numeric|min:0|max:100',
             'vat_percent' => 'nullable|numeric|min:0|max:100',
+            'redemption_rate' => 'nullable|numeric|min:0|max:100',
             'redemption_rate_override' => 'nullable|numeric|min:0|max:100',
             // WB-специфичные
             'spp_percent' => 'nullable|numeric|min:0|max:100',
             // ИЛ (индекс локализации) — хранится на уровне интеграции, но принимаем здесь для удобства
             'localization_index' => 'nullable|numeric|min:0.50|max:2.50',
             // Габариты НЕ редактируемые — берутся из API маркетплейса
-        ]);
+        ])->validate();
+
+        $resolution = $this->integrationAccessService->ensureAccessibleIntegration(
+            $request,
+            (int) $validated['integration_id']
+        );
+        if (!($resolution['success'] ?? false)) {
+            return response()->json([
+                'message' => $resolution['message'] ?? 'Интеграция не найдена',
+                'errors' => [
+                    'integration_id' => [$resolution['message'] ?? 'Интеграция не найдена'],
+                ],
+            ], $resolution['status'] ?? 404);
+        }
 
         $integrationId = $validated['integration_id'];
         $localizationIndex = $validated['localization_index'] ?? null;
         unset($validated['integration_id'], $validated['localization_index']);
+
+        if (array_key_exists('redemption_rate', $validated) && !array_key_exists('redemption_rate_override', $validated)) {
+            $validated['redemption_rate_override'] = $validated['redemption_rate'];
+        }
+        unset($validated['redemption_rate']);
 
         // Если передан localization_index — обновляем интеграцию (это настройка магазина, не товара)
         if ($localizationIndex !== null) {
@@ -249,8 +305,8 @@ class UnitEconomicsCacheController extends Controller
      */
     public function bulkUpdateSettings(Request $request): JsonResponse
     {
-        $validated = $request->validate([
-            'integration_id' => 'required|integer|exists:integrations,id',
+        $validated = Validator::make($request->all(), [
+            'integration_id' => 'required|integer',
             'items' => 'required|array|min:1|max:100',
             'items.*.sku' => 'required|string',
             'items.*.cost_price' => 'nullable|numeric|min:0',
@@ -258,6 +314,7 @@ class UnitEconomicsCacheController extends Controller
             'items.*.our_share_percent' => 'nullable|numeric|min:0|max:100',
             'items.*.tax_percent' => 'nullable|numeric|min:0|max:100',
             'items.*.vat_percent' => 'nullable|numeric|min:0|max:100',
+            'items.*.redemption_rate' => 'nullable|numeric|min:0|max:100',
             'items.*.redemption_rate_override' => 'nullable|numeric|min:0|max:100',
             // Габариты (мм и г)
             'items.*.length_mm' => 'nullable|numeric|min:0',
@@ -266,7 +323,20 @@ class UnitEconomicsCacheController extends Controller
             'items.*.weight_g' => 'nullable|numeric|min:0',
             // WB-специфичные
             'items.*.spp_percent' => 'nullable|numeric|min:0|max:100',
-        ]);
+        ])->validate();
+
+        $resolution = $this->integrationAccessService->ensureAccessibleIntegration(
+            $request,
+            (int) $validated['integration_id']
+        );
+        if (!($resolution['success'] ?? false)) {
+            return response()->json([
+                'message' => $resolution['message'] ?? 'Интеграция не найдена',
+                'errors' => [
+                    'integration_id' => [$resolution['message'] ?? 'Интеграция не найдена'],
+                ],
+            ], $resolution['status'] ?? 404);
+        }
 
         $integrationId = $validated['integration_id'];
         $skus = [];
@@ -274,6 +344,11 @@ class UnitEconomicsCacheController extends Controller
         foreach ($validated['items'] as $item) {
             $sku = $item['sku'];
             unset($item['sku']);
+
+            if (array_key_exists('redemption_rate', $item) && !array_key_exists('redemption_rate_override', $item)) {
+                $item['redemption_rate_override'] = $item['redemption_rate'];
+            }
+            unset($item['redemption_rate']);
             
             UnitEconomicsSettings::updateOrCreate(
                 ['integration_id' => $integrationId, 'sku' => $sku],
@@ -429,12 +504,49 @@ class UnitEconomicsCacheController extends Controller
     }
 
     /**
+     * Одна выборка складов и интеграций на страницу (WB), чтобы не бить N+1 в enrichCacheItem.
+     *
+     * @return array{wb_warehouses_by_key: Collection, integrations_by_id: Collection}|null
+     */
+    private function buildWildberriesUnitEconomicsPageContext(string $marketplace, Collection $itemsCollection): ?array
+    {
+        if ($marketplace !== 'wildberries' || $itemsCollection->isEmpty()) {
+            return null;
+        }
+
+        $skus = $itemsCollection->pluck('sku')->unique()->filter()->values()->all();
+        $integrationIds = $itemsCollection->pluck('integration_id')->unique()->filter()->values()->all();
+        if ($skus === [] || $integrationIds === []) {
+            return null;
+        }
+
+        $warehouseRows = InventoryWarehouse::query()
+            ->whereIn('sku', $skus)
+            ->whereIn('integration_id', $integrationIds)
+            ->where('marketplace', 'wildberries')
+            ->get(['warehouse_id', 'warehouse_name', 'warehouse_coefficient', 'quantity', 'sku', 'integration_id']);
+
+        $wbWarehousesByKey = $warehouseRows->groupBy(fn ($w) => $w->sku.'|'.$w->integration_id);
+
+        $integrationsById = Integration::query()
+            ->whereIn('id', $integrationIds)
+            ->get()
+            ->keyBy('id');
+
+        return [
+            'wb_warehouses_by_key' => $wbWarehousesByKey,
+            'integrations_by_id' => $integrationsById,
+        ];
+    }
+
+    /**
      * Обогатить данные кэша полями из Product для совместимости с v1 API
      */
     private function enrichCacheItem(
         UnitEconomicsCache $cache,
         string $fulfillmentType,
-        ?UnitEconomicsSettings $settings = null
+        ?UnitEconomicsSettings $settings = null,
+        ?array $pageContext = null
     ): array
     {
         $product = $cache->product;
@@ -554,9 +666,9 @@ class UnitEconomicsCacheController extends Controller
             $price = (float) $cache->price;
             $costPrice = (float) ($settings?->cost_price ?? $cache->cost_price);
 
-            $data['acquiring_percent'] = 0.0;
-            $data['acquiring_amount'] = 0.0;
-            $data['acquiring_per_unit'] = 0.0;
+            $data['acquiring_percent'] = round((float) ($data['acquiring_percent'] ?? $cache->acquiring_percent ?? 1.5), 2);
+            $data['acquiring_amount'] = round((float) ($data['acquiring_amount'] ?? $cache->acquiring_amount ?? ($price * $data['acquiring_percent'] / 100)), 2);
+            $data['acquiring_per_unit'] = round((float) ($data['acquiring_per_unit'] ?? ($data['acquiring_amount'] ?? 0)), 2);
             
             // Габариты из wb_data (приоритет: настройки > wb_data > кэш)
             if (!$lengthMm && isset($wbData['length_mm'])) {
@@ -584,9 +696,9 @@ class UnitEconomicsCacheController extends Controller
             
             // Комиссия из wb_data.commissions (аналогично ozon_data.commissions)
             $schemeKey = strtolower($cache->fulfillment_type ?? 'fbo');
-            $commissionPercent = (float) ($wbCommissions[$schemeKey]['percent'] ?? $cache->commission_percent ?? 15);
+            $commissionPercent = (float) ($cache->commission_percent ?? $wbCommissions[$schemeKey]['percent'] ?? 15);
             $data['commission_percent'] = $commissionPercent;
-            $data['commission_amount'] = round($price * $commissionPercent / 100, 2);
+            $data['commission_amount'] = round((float) ($cache->commission_amount ?? ($price * $commissionPercent / 100)), 2);
             
             // СПП (скидка постоянного покупателя) — приоритет: настройки > wb_data > 0
             $sppPercent = (float) ($settings?->spp_percent ?? $wbData['spp_percent'] ?? $cache->spp_percent ?? 0);
@@ -602,9 +714,15 @@ class UnitEconomicsCacheController extends Controller
             
             // КС (коэффициент склада) — средний по всем складам товара
             // Получаем ВСЕ склады товара для детализации (включая с нулевыми остатками)
-            $warehouses = \App\Models\InventoryWarehouse::where('sku', $cache->sku)
-                ->where('marketplace', 'wildberries')
-                ->get(['warehouse_id', 'warehouse_name', 'warehouse_coefficient', 'quantity']);
+            $wbKey = $cache->sku.'|'.$cache->integration_id;
+            if ($pageContext !== null && isset($pageContext['wb_warehouses_by_key'])) {
+                $warehouses = $pageContext['wb_warehouses_by_key']->get($wbKey, collect());
+            } else {
+                $warehouses = InventoryWarehouse::where('sku', $cache->sku)
+                    ->where('integration_id', $cache->integration_id)
+                    ->where('marketplace', 'wildberries')
+                    ->get(['warehouse_id', 'warehouse_name', 'warehouse_coefficient', 'quantity']);
+            }
             
             // Для расчёта среднего КС используем только склады с остатками
             $warehousesWithStock = $warehouses->filter(fn($w) => $w->quantity > 0);
@@ -625,9 +743,14 @@ class UnitEconomicsCacheController extends Controller
                 // Детализация для всплывающего окна — все склады
                 // Проценты 100-значные: 1.0 = 100%, 1.4 = 140%, 2.05 = 205%
                 $warehouseDetails[] = [
+                    'warehouse_id' => $wh->warehouse_id,
                     'warehouse_name' => $wh->warehouse_name,
+                    'coefficient_raw' => round($coef, 3),
                     'coefficient' => round($coef * 100, 0),
                     'quantity' => $qty,
+                    'share_percent' => $totalQuantity > 0 && $qty > 0
+                        ? round(($qty / $totalQuantity) * 100, 2)
+                        : 0.0,
                 ];
             }
             
@@ -652,8 +775,12 @@ class UnitEconomicsCacheController extends Controller
             $data['warehouse_coef_amount'] = round($baseLogistics * ($avgWarehouseCoef - 1), 2);
             
             // ИЛ (индекс локализации) — из интеграции (настройка магазина)
-            $integration = Integration::find($cache->integration_id);
-            $localizationIndex = (float) ($integration?->localization_index ?? 1.0);
+            if ($pageContext !== null && isset($pageContext['integrations_by_id'])) {
+                $integration = $pageContext['integrations_by_id']->get($cache->integration_id);
+            } else {
+                $integration = Integration::find($cache->integration_id);
+            }
+            $localizationIndex = (float) ($cache->logistics_coefficient ?? $integration?->localization_index ?? 1.0);
             $data['localization_index'] = $localizationIndex;
             // Сумма надбавки/скидки ИЛ = базовая логистика × КС × (ИЛ - 1)
             $data['localization_amount'] = round($baseLogistics * $avgWarehouseCoef * ($localizationIndex - 1), 2);
@@ -667,12 +794,12 @@ class UnitEconomicsCacheController extends Controller
             // Всего затрат, %
             $commissionAmount = $price * $commissionPercent / 100;
             $totalExpenses = $commissionAmount + (float) $cache->logistics_cost + 
-                             $expectedReturnCost + (float) $cache->storage_cost;
+                             $expectedReturnCost + (float) $cache->storage_cost + (float) ($data['acquiring_amount'] ?? 0);
             $data['total_expenses_percent'] = $price > 0 ? round($totalExpenses / $price * 100, 2) : 0;
             
             // На р/с (to_settlement_account)
             $toSettlement = $customerPrice - $commissionAmount - 
-                           (float) $cache->logistics_cost - $expectedReturnCost - (float) $cache->storage_cost;
+                           (float) $cache->logistics_cost - $expectedReturnCost - (float) $cache->storage_cost - (float) ($data['acquiring_amount'] ?? 0);
             $data['to_settlement_account'] = round($toSettlement, 2);
             
             // Сохраняем wb_data.commissions для фронтенда (аналогично ozon_data)

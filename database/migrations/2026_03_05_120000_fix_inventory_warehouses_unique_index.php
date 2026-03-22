@@ -11,7 +11,9 @@ return new class extends Migration
     {
         // Удаляем старый уникальный индекс (sku, warehouse_id) — не включал integration_id,
         // что приводило к коллизиям между разными интеграциями
-        DB::statement('ALTER TABLE inventory_warehouses DROP CONSTRAINT IF EXISTS inventory_warehouses_sku_warehouse_id_unique');
+        if (Schema::getConnection()->getDriverName() === 'pgsql') {
+            DB::statement('ALTER TABLE inventory_warehouses DROP CONSTRAINT IF EXISTS inventory_warehouses_sku_warehouse_id_unique');
+        }
         DB::statement('DROP INDEX IF EXISTS inventory_warehouses_sku_warehouse_id_unique');
 
         // Создаём новый уникальный индекс с учётом integration_id

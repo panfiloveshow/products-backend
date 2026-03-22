@@ -13,6 +13,50 @@ class SalesApi
         private WildberriesClient $client
     ) {}
 
+    private function extractNmId(array $item): ?string
+    {
+        $nmId = $item['nmId'] ?? $item['nmID'] ?? $item['nm_id'] ?? null;
+        return $nmId !== null && $nmId !== '' ? (string) $nmId : null;
+    }
+
+    private function extractQuantity(array $item): int
+    {
+        return max(1, (int) ($item['quantity'] ?? $item['qty'] ?? 1));
+    }
+
+    private function extractSrid(array $item): ?string
+    {
+        $srid = $item['srid'] ?? null;
+        return $srid !== null && $srid !== '' ? (string) $srid : null;
+    }
+
+    private function extractLastChangeTimestamp(array $item): int
+    {
+        $value = $item['lastChangeDate'] ?? $item['date'] ?? null;
+        $timestamp = $value ? strtotime((string) $value) : false;
+
+        return $timestamp !== false ? $timestamp : 0;
+    }
+
+    private function isReturnSale(array $item): bool
+    {
+        $saleId = strtoupper((string) ($item['saleID'] ?? ''));
+
+        if ($saleId !== '') {
+            if (str_starts_with($saleId, 'R')) {
+                return true;
+            }
+
+            if (str_starts_with($saleId, 'S')) {
+                return false;
+            }
+        }
+
+        return ((float) ($item['forPay'] ?? 0)) < 0
+            || ((float) ($item['priceWithDisc'] ?? 0)) < 0
+            || ((float) ($item['totalPrice'] ?? 0)) < 0;
+    }
+
     /**
      * Получить статистику продаж за период
      */
@@ -110,6 +154,138 @@ class SalesApi
         }
     }
 
+    public function getSalesCountByNmId(int $days = 30): array
+    {
+        try {
+            $dateFrom = now()->subDays($days)->format('Y-m-d');
+
+            $response = $this->client->statistics('/api/v1/supplier/sales', [
+                'dateFrom' => $dateFrom,
+            ]);
+
+            $salesByNmId = [];
+            $salesStateByNmId = [];
+
+            foreach ($response ?? [] as $sale) {
+                $nmId = $this->extractNmId($sale);
+                if (!$nmId) {
+                    continue;
+                }
+
+                $srid = $this->extractSrid($sale);
+                $timestamp = $this->extractLastChangeTimestamp($sale);
+                $stateKey = $srid ?: md5(json_encode([
+                    $nmId,
+                    $sale['saleID'] ?? null,
+                    $sale['date'] ?? null,
+                    $sale['barcode'] ?? null,
+                ]));
+
+                if (!isset($salesStateByNmId[$nmId][$stateKey]) || $timestamp >= $salesStateByNmId[$nmId][$stateKey]['timestamp']) {
+                    $salesStateByNmId[$nmId][$stateKey] = [
+                        'timestamp' => $timestamp,
+                        'is_return' => $this->isReturnSale($sale),
+                    ];
+                }
+            }
+
+            foreach ($salesStateByNmId as $nmId => $states) {
+                $salesByNmId[$nmId] = collect($states)
+                    ->filter(fn (array $state) => !$state['is_return'])
+                    ->count();
+            }
+
+            return $salesByNmId;
+        } catch (\Exception $e) {
+            Log::error('WB getSalesCountByNmId error', ['error' => $e->getMessage()]);
+            return [];
+        }
+    }
+
+    public function getOrdersByNmId(int $days = 30): array
+    {
+        try {
+            $dateFrom = now()->subDays($days)->format('Y-m-d');
+
+            $response = $this->client->statistics('/api/v1/supplier/orders', [
+                'dateFrom' => $dateFrom,
+            ]);
+
+            $ordersByNmId = [];
+            $orderStateByNmId = [];
+
+            foreach ($response ?? [] as $order) {
+                $nmId = $this->extractNmId($order);
+                if (!$nmId) {
+                    continue;
+                }
+
+                $srid = $this->extractSrid($order);
+                $timestamp = $this->extractLastChangeTimestamp($order);
+                $stateKey = $srid ?: md5(json_encode([
+                    $nmId,
+                    $order['date'] ?? null,
+                    $order['barcode'] ?? null,
+                    $order['gNumber'] ?? null,
+                ]));
+
+                if (!isset($orderStateByNmId[$nmId][$stateKey]) || $timestamp >= $orderStateByNmId[$nmId][$stateKey]['timestamp']) {
+                    $orderStateByNmId[$nmId][$stateKey] = [
+                        'timestamp' => $timestamp,
+                        'is_cancel' => (bool) ($order['isCancel'] ?? false),
+                    ];
+                }
+            }
+
+            foreach ($orderStateByNmId as $nmId => $states) {
+                $ordersByNmId[$nmId] = collect($states)
+                    ->filter(fn (array $state) => !$state['is_cancel'])
+                    ->count();
+            }
+
+            return $ordersByNmId;
+        } catch (\Exception $e) {
+            Log::error('WB getOrdersByNmId error', ['error' => $e->getMessage()]);
+            return [];
+        }
+    }
+
+    public function getRedemptionStatsByNmId(int $days = 30): array
+    {
+        try {
+            $ordersByNmId = $this->getOrdersByNmId($days);
+            $salesByNmId = $this->getSalesCountByNmId($days);
+
+            $keys = array_unique(array_merge(array_keys($ordersByNmId), array_keys($salesByNmId)));
+            $result = [];
+
+            foreach ($keys as $key) {
+                $ordersCount = (int) ($ordersByNmId[$key] ?? 0);
+                $salesCount = (int) ($salesByNmId[$key] ?? 0);
+
+                if ($ordersCount <= 0) {
+                    continue;
+                }
+
+                $returnsCount = max(0, $ordersCount - $salesCount);
+                $redemptionRate = round(min(100, ($salesCount / $ordersCount) * 100), 2);
+
+                $result[$key] = [
+                    'redemption_rate' => $redemptionRate,
+                    'orders_count' => $ordersCount,
+                    'returns_count' => $returnsCount,
+                    'sales_count' => $salesCount,
+                    'source' => 'api',
+                ];
+            }
+
+            return $result;
+        } catch (\Exception $e) {
+            Log::error('WB getRedemptionStatsByNmId error', ['error' => $e->getMessage()]);
+            return [];
+        }
+    }
+
     /**
      * Получить продажи по регионам (федеральным округам) для расчёта индекса локализации
      * 
@@ -153,10 +329,10 @@ class SalesApi
             $salesByNmId = [];
             
             foreach ($response as $sale) {
-                $nmId = $sale['nmId'] ?? null;
-                $warehouseName = $sale['warehouseName'] ?? '';
-                $deliveryFo = $sale['oblastOkrugName'] ?? '';
-                $qty = 1; // Каждая запись = 1 продажа
+                $nmId = $this->extractNmId($sale);
+                $warehouseName = $sale['warehouseName'] ?? $sale['warehouse_name'] ?? '';
+                $deliveryFo = $sale['oblastOkrugName'] ?? $sale['oblast_okrug_name'] ?? '';
+                $qty = $this->extractQuantity($sale);
                 
                 if (!$nmId) continue;
                 
@@ -292,7 +468,7 @@ class SalesApi
 
             $sppByNmId = [];
             foreach ($response ?? [] as $sale) {
-                $nmId = $sale['nmId'] ?? null;
+                $nmId = $this->extractNmId($sale);
                 if (!$nmId) continue;
 
                 $spp = (float)($sale['spp'] ?? 0);

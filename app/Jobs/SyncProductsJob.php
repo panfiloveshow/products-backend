@@ -142,12 +142,8 @@ class SyncProductsJob implements ShouldQueue
     {
         $marketplace = $this->syncLog->marketplace;
         $integrationId = $this->syncLog->integration_id ?? null;
-        
-        // Ищем существующий товар по sku + marketplace + integration_id
-        $existingProduct = Product::where('marketplace', $marketplace)
-            ->where('sku', $productData['sku'])
-            ->where('integration_id', $integrationId)
-            ->first();
+
+        $existingProduct = $this->findExistingProduct($marketplace, $integrationId, $productData);
 
         if (!$existingProduct) {
             // Создаём новый товар
@@ -158,12 +154,10 @@ class SyncProductsJob implements ShouldQueue
             return 'created';
         }
 
-        // Всегда обновляем integration_id если он не проставлен или совпадает
-        $forceUpdate = ($integrationId && $existingProduct->integration_id !== $integrationId
-            && $existingProduct->integration_id === null);
+        $integrationChanged = $integrationId && $existingProduct->integration_id !== $integrationId;
 
         // Проверяем есть ли изменения
-        $hasChanges = $forceUpdate || $this->hasChanges($existingProduct, $productData);
+        $hasChanges = $integrationChanged || $this->hasChanges($existingProduct, $productData);
 
         if ($hasChanges) {
             // Не перезаписываем цену нулём/null если уже есть реальная цена
@@ -174,7 +168,18 @@ class SyncProductsJob implements ShouldQueue
             if (empty($updateData['old_price']) && !empty($existingProduct->old_price)) {
                 unset($updateData['old_price']);
             }
-            if ($integrationId) {
+
+            if ($integrationChanged) {
+                Log::warning('Rebinding product to current integration during sync', [
+                    'marketplace' => $marketplace,
+                    'sku' => $productData['sku'] ?? null,
+                    'marketplace_id' => $productData['marketplace_id'] ?? null,
+                    'from_integration_id' => $existingProduct->integration_id,
+                    'to_integration_id' => $integrationId,
+                ]);
+            }
+
+            if ($integrationId !== null) {
                 $updateData['integration_id'] = $integrationId;
             }
             $existingProduct->update($updateData);
@@ -182,6 +187,40 @@ class SyncProductsJob implements ShouldQueue
         }
 
         return 'unchanged';
+    }
+
+    private function findExistingProduct(string $marketplace, ?int $integrationId, array $productData): ?Product
+    {
+        $sku = $productData['sku'] ?? null;
+        if (!$sku) {
+            return null;
+        }
+
+        if ($integrationId) {
+            $byIntegration = Product::where('marketplace', $marketplace)
+                ->where('sku', $sku)
+                ->where('integration_id', $integrationId)
+                ->first();
+
+            if ($byIntegration) {
+                return $byIntegration;
+            }
+        }
+
+        $marketplaceId = $productData['marketplace_id'] ?? null;
+        if ($marketplaceId !== null && $marketplaceId !== '') {
+            $byMarketplaceId = Product::where('marketplace', $marketplace)
+                ->where('marketplace_id', (string) $marketplaceId)
+                ->first();
+
+            if ($byMarketplaceId) {
+                return $byMarketplaceId;
+            }
+        }
+
+        return Product::where('marketplace', $marketplace)
+            ->where('sku', $sku)
+            ->first();
     }
 
     /**

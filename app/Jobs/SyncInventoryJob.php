@@ -70,11 +70,14 @@ class SyncInventoryJob implements ShouldQueue
                 }
             }
 
-            // WB: загружаем продажи по складам для расчёта average_daily_sales
-            $wbSalesByWarehouse = [];
+            // WB / Ozon: продажи по складам для average_daily_sales и sales_* (в matrix используется MAX)
+            $salesBySkuWarehouse = [];
             if ($this->syncLog->marketplace === 'wildberries' && method_exists($marketplaceService, 'getSalesByWarehouse')) {
-                $wbSalesByWarehouse = $marketplaceService->getSalesByWarehouse(30);
-                Log::info('WB sales by warehouse loaded', ['skus' => count($wbSalesByWarehouse)]);
+                $salesBySkuWarehouse = $marketplaceService->getSalesByWarehouse(30);
+                Log::info('WB sales by warehouse loaded', ['skus' => count($salesBySkuWarehouse)]);
+            } elseif ($this->syncLog->marketplace === 'ozon' && method_exists($marketplaceService, 'getSalesBySkuAndWarehouse')) {
+                $salesBySkuWarehouse = $marketplaceService->getSalesBySkuAndWarehouse(30);
+                Log::info('Ozon sales by warehouse loaded', ['skus' => count($salesBySkuWarehouse)]);
             }
 
             if (empty($inventory)) {
@@ -178,7 +181,7 @@ class SyncInventoryJob implements ShouldQueue
                 }
 
                 try {
-                    $result = $this->syncInventoryItem($stockData, $wbSalesByWarehouse);
+                    $result = $this->syncInventoryItem($stockData, $salesBySkuWarehouse);
                     $synced++;
                     
                     if ($result === 'created') {
@@ -194,6 +197,27 @@ class SyncInventoryJob implements ShouldQueue
                         'error' => $e->getMessage(),
                     ]);
                 }
+            }
+
+            foreach ($flatInventory as $stockData) {
+                if (empty($stockData['sku']) || !isset($stockData['warehouse_id']) || $stockData['warehouse_id'] === null || $stockData['warehouse_id'] === '') {
+                    continue;
+                }
+
+                if (!array_key_exists('warehouse_coefficient', $stockData) || $stockData['warehouse_coefficient'] === null) {
+                    continue;
+                }
+
+                InventoryWarehouse::where('sku', $stockData['sku'])
+                    ->where('warehouse_id', $stockData['warehouse_id'])
+                    ->where('integration_id', $this->syncLog->integration_id)
+                    ->update([
+                        'warehouse_coefficient' => (float) $stockData['warehouse_coefficient'],
+                    ]);
+            }
+
+            if ($this->syncLog->marketplace === 'wildberries') {
+                $this->refreshWildberriesWarehouseCoefficients($marketplaceService);
             }
 
             // Удаляем устаревшие записи — те что были в БД, но не пришли из API
@@ -269,7 +293,7 @@ class SyncInventoryJob implements ShouldQueue
      * 
      * @return string 'created'|'updated'|'unchanged'
      */
-    private function syncInventoryItem(array $stockData, array $wbSalesByWarehouse = []): string
+    private function syncInventoryItem(array $stockData, array $salesBySkuWarehouse = []): string
     {
         $integrationId = $this->syncLog->integration_id;
 
@@ -279,19 +303,19 @@ class SyncInventoryJob implements ShouldQueue
             ->where('integration_id', $integrationId)
             ->first();
 
-        // Для WB: используем реальные продажи из Statistics API
+        // Продажи из API маркетплейса (WB Statistics / Ozon postings) + опционально из payload остатков
         $avgDailySales = $stockData['average_daily_sales'] ?? null;
         $sales7        = null;
         $sales14       = null;
         $sales30       = null;
 
-        if (!empty($wbSalesByWarehouse)) {
+        if (!empty($salesBySkuWarehouse)) {
             $sku             = $stockData['sku'];
             $supplierArticle = $stockData['supplier_article'] ?? $sku;
 
             // Все склады этого SKU (приводим к строке для корректного поиска)
-            $allWarehouses = $wbSalesByWarehouse[(string)$sku]
-                          ?? $wbSalesByWarehouse[(string)$supplierArticle]
+            $allWarehouses = $salesBySkuWarehouse[(string) $sku]
+                          ?? $salesBySkuWarehouse[(string) $supplierArticle]
                           ?? null;
 
             if ($allWarehouses) {
@@ -303,10 +327,10 @@ class SyncInventoryJob implements ShouldQueue
                 $totalS30   = 0;
                 foreach ($allWarehouses as $wData) {
                     if (is_array($wData)) {
-                        $totalAvg += (float)($wData['avg_daily_sales'] ?? 0);
-                        $totalS7  += (int)($wData['sales_7_days']  ?? 0);
-                        $totalS14 += (int)($wData['sales_14_days'] ?? 0);
-                        $totalS30 += (int)($wData['sales_30_days'] ?? 0);
+                        $totalAvg += (float) ($wData['avg_daily_sales'] ?? 0);
+                        $totalS7  += (int) ($wData['sales_7_days'] ?? 0);
+                        $totalS14 += (int) ($wData['sales_14_days'] ?? 0);
+                        $totalS30 += (int) ($wData['sales_30_days'] ?? 0);
                     }
                 }
                 if ($totalAvg > 0) {
@@ -325,8 +349,15 @@ class SyncInventoryJob implements ShouldQueue
             }
         }
 
+        // Если avg не пришёл из API, но есть суммарные продажи — выводим дневной спрос (как в UE / matrix)
+        if (($avgDailySales === null || (float) $avgDailySales <= 0) && $sales30 !== null && $sales30 > 0) {
+            $avgDailySales = round($sales30 / 30.0, 4);
+        } elseif (($avgDailySales === null || (float) $avgDailySales <= 0) && $sales7 !== null && $sales7 > 0) {
+            $avgDailySales = round($sales7 / 7.0, 4);
+        }
+
         $qty         = (int) ($stockData['quantity'] ?? 0);
-        $daysOfStock = ($avgDailySales !== null && $avgDailySales > 0)
+        $daysOfStock = ($avgDailySales !== null && (float) $avgDailySales > 0)
             ? (int) round($qty / $avgDailySales)
             : null;
 
@@ -339,10 +370,14 @@ class SyncInventoryJob implements ShouldQueue
             'integration_id'   => $integrationId,
         ];
 
-        if ($avgDailySales !== null) {
+        if (array_key_exists('warehouse_coefficient', $stockData) && $stockData['warehouse_coefficient'] !== null) {
+            $newData['warehouse_coefficient'] = (float) $stockData['warehouse_coefficient'];
+        }
+
+        if ($avgDailySales !== null && (float) $avgDailySales > 0) {
             $newData['average_daily_sales'] = $avgDailySales;
             $newData['days_of_stock']       = $daysOfStock;
-            $newData['turnover_days']        = $daysOfStock;
+            $newData['turnover_days']       = $daysOfStock;
         }
 
         if ($sales7 !== null)  $newData['sales_7_days']  = $sales7;
@@ -360,6 +395,7 @@ class SyncInventoryJob implements ShouldQueue
             
             $warehouse->stock_status = $warehouse->calculateStockStatus();
             $warehouse->save();
+            $this->persistWarehouseCoefficient($stockData, $integrationId);
             
             return 'created';
         }
@@ -368,6 +404,7 @@ class SyncInventoryJob implements ShouldQueue
         $hasChanges = $existing->quantity !== (int)$stockData['quantity']
             || $existing->warehouse_name !== $stockData['warehouse_name']
             || (string)$existing->integration_id !== (string)$integrationId
+            || (array_key_exists('warehouse_coefficient', $newData) && (float) ($existing->warehouse_coefficient ?? 1.0) !== (float) $newData['warehouse_coefficient'])
             || ($sales7  !== null && (int)$existing->sales_7_days  !== $sales7)
             || ($sales14 !== null && (int)$existing->sales_14_days !== $sales14)
             || ($sales30 !== null && (int)$existing->sales_30_days !== $sales30)
@@ -377,13 +414,54 @@ class SyncInventoryJob implements ShouldQueue
             $existing->update($newData);
             $existing->stock_status = $existing->calculateStockStatus();
             $existing->save();
+            $this->persistWarehouseCoefficient($stockData, $integrationId);
             return 'updated';
         }
 
         // Данные не изменились — обновляем только last_updated чтобы фиксировать факт синхронизации
         $existing->update(['last_updated' => now()]);
+        $this->persistWarehouseCoefficient($stockData, $integrationId);
 
         return 'unchanged';
+    }
+
+    private function persistWarehouseCoefficient(array $stockData, ?int $integrationId): void
+    {
+        if (!array_key_exists('warehouse_coefficient', $stockData) || $stockData['warehouse_coefficient'] === null) {
+            return;
+        }
+
+        InventoryWarehouse::where('sku', $stockData['sku'])
+            ->where('warehouse_id', $stockData['warehouse_id'])
+            ->where('integration_id', $integrationId)
+            ->update([
+                'warehouse_coefficient' => (float) $stockData['warehouse_coefficient'],
+            ]);
+    }
+
+    private function refreshWildberriesWarehouseCoefficients(object $marketplaceService): void
+    {
+        if (!method_exists($marketplaceService, 'getInventory')) {
+            return;
+        }
+
+        $inventory = $marketplaceService->getInventory();
+        foreach ($inventory as $item) {
+            $sku = $item['sku'] ?? null;
+            $warehouseId = $item['warehouse_id'] ?? null;
+            $warehouseCoefficient = $item['warehouse_coefficient'] ?? null;
+
+            if (!$sku || !$warehouseId || $warehouseCoefficient === null) {
+                continue;
+            }
+
+            InventoryWarehouse::where('sku', $sku)
+                ->where('warehouse_id', $warehouseId)
+                ->where('integration_id', $this->syncLog->integration_id)
+                ->update([
+                    'warehouse_coefficient' => (float) $warehouseCoefficient,
+                ]);
+        }
     }
 
     public function failed(\Throwable $exception): void

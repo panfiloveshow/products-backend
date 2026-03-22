@@ -116,15 +116,7 @@ class LocalizationIndexService
     public function calculateLocalizationIndex(Integration $integration): array
     {
         try {
-            // API ключ хранится в credentials
-            $credentials = $integration->credentials;
-            if (is_string($credentials)) {
-                $credentials = json_decode($credentials, true);
-            }
-            
-            $marketplace = new WildberriesMarketplace([
-                'api_key' => $credentials['api_key'] ?? null,
-            ]);
+            $marketplace = WildberriesMarketplace::fromIntegration($integration);
             
             // Получаем продажи по регионам (с данными о складе отгрузки)
             // API /api/v1/supplier/sales ограничен 7 днями

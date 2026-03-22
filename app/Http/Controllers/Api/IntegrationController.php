@@ -7,6 +7,7 @@ use App\Http\Requests\Integration\StoreIntegrationRequest;
 use App\Http\Requests\Integration\UpdateIntegrationRequest;
 use App\Models\Integration;
 use App\Models\SyncLog;
+use App\Services\IntegrationAccessService;
 use App\Services\ProductService;
 use App\Services\SellicoApiService;
 use Illuminate\Http\JsonResponse;
@@ -275,8 +276,8 @@ class IntegrationController extends Controller
                     'id' => $sync->id,
                     'type' => $sync->sync_type,
                     'status' => $sync->status,
-                    'synced' => $sync->synced_count,
-                    'failed' => $sync->failed_count,
+                    'synced' => $sync->items_synced,
+                    'failed' => $sync->items_failed,
                     'started_at' => $sync->created_at,
                     'finished_at' => $sync->updated_at,
                     'error' => $sync->error_message,
@@ -392,17 +393,18 @@ class IntegrationController extends Controller
     /**
      * Получить Premium статус интеграции
      */
-    public function getPremiumStatus(int $id): JsonResponse
+    public function getPremiumStatus(Request $request, int $id, IntegrationAccessService $integrationAccessService): JsonResponse
     {
-        $integration = Integration::find($id);
-        
-        if (!$integration) {
+        $resolution = $integrationAccessService->ensureAccessibleIntegration($request, $id);
+        if (!($resolution['success'] ?? false)) {
             return response()->json([
                 'success' => false,
-                'message' => 'Интеграция не найдена',
-            ], 404);
+                'message' => $resolution['message'] ?? 'Интеграция не найдена',
+            ], $resolution['status'] ?? 404);
         }
-        
+
+        $integration = $resolution['integration'];
+
         return response()->json([
             'success' => true,
             'data' => [

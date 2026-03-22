@@ -9,62 +9,48 @@ return new class extends Migration
 {
     public function up(): void
     {
-        // SQLite не поддерживает ALTER COLUMN, поэтому пересоздаём таблицу
-        if (config('database.default') === 'sqlite') {
-            // Для SQLite просто игнорируем - constraint уже nullable в новых записях
-            // или используем raw SQL
+        // SQLite не поддерживает ALTER COLUMN, поэтому пересоздаём таблицу.
+        // Схему берём из sqlite_master (как есть на момент миграции), иначе SELECT *
+        // не совпадает с жёстко заданным списком колонок (колонки из будущих миграций).
+        if (Schema::getConnection()->getDriverName() === 'sqlite') {
             DB::statement('PRAGMA foreign_keys=off;');
-            
-            // Создаём временную таблицу
-            Schema::create('shipments_temp', function (Blueprint $table) {
-                $table->uuid('id')->primary();
-                $table->uuid('supply_plan_id')->nullable();
-                $table->unsignedBigInteger('integration_id')->nullable();
-                $table->string('warehouse_id')->nullable();
-                $table->string('external_supply_id')->nullable();
-                $table->string('external_status')->nullable();
-                $table->string('name');
-                $table->string('status')->default('draft');
-                $table->string('marketplace');
-                $table->string('shipment_type')->default('fbo');
-                $table->string('warehouse_name')->nullable();
-                $table->text('description')->nullable();
-                $table->json('meta')->nullable();
-                $table->date('planned_date')->nullable();
-                $table->uuid('supplier_id')->nullable(); // Теперь nullable
-                $table->string('supplier_name')->nullable();
-                $table->string('supplier_address')->nullable();
-                $table->json('slot')->nullable();
-                $table->json('marketplace_requirements')->nullable();
-                $table->json('packaging')->nullable();
-                $table->integer('total_items')->default(0);
-                $table->integer('total_quantity')->default(0);
-                $table->decimal('total_cost', 12, 2)->default(0);
-                $table->decimal('total_volume', 10, 4)->default(0);
-                $table->decimal('total_weight', 10, 4)->default(0);
-                $table->string('truck_type')->nullable();
-                $table->decimal('truck_capacity', 10, 2)->nullable();
-                $table->decimal('delivery_cost', 12, 2)->nullable();
-                $table->decimal('delivery_cost_percent', 5, 2)->nullable();
-                $table->decimal('utilization_percent', 5, 2)->nullable();
-                $table->json('logistics_approval')->nullable();
-                $table->uuid('created_by')->nullable();
-                $table->string('created_by_name')->nullable();
-                $table->timestamp('sent_at')->nullable();
-                $table->timestamp('delivered_at')->nullable();
-                $table->timestamp('synced_at')->nullable();
-                $table->timestamps();
-            });
-            
-            // Копируем данные
+
+            $createRow = DB::selectOne(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'shipments'"
+            );
+            if ($createRow === null || empty($createRow->sql)) {
+                throw new \RuntimeException('SQLite: DDL для shipments не найден в sqlite_master.');
+            }
+
+            $indexSqls = array_column(
+                DB::select(
+                    "SELECT sql FROM sqlite_master WHERE type = 'index' AND tbl_name = 'shipments' AND sql IS NOT NULL"
+                ),
+                'sql'
+            );
+
+            $ddl = str_replace(
+                ['CREATE TABLE IF NOT EXISTS "shipments"', 'CREATE TABLE "shipments"'],
+                'CREATE TABLE "shipments_temp"',
+                $createRow->sql,
+            );
+            $ddl = preg_replace(
+                '/"supplier_id"\s+varchar\s+not\s+null/i',
+                '"supplier_id" varchar',
+                $ddl,
+                1
+            );
+
+            DB::statement($ddl);
             DB::statement('INSERT INTO shipments_temp SELECT * FROM shipments;');
-            
-            // Удаляем старую таблицу
+
             Schema::drop('shipments');
-            
-            // Переименовываем
             Schema::rename('shipments_temp', 'shipments');
-            
+
+            foreach ($indexSqls as $indexSql) {
+                DB::statement($indexSql);
+            }
+
             DB::statement('PRAGMA foreign_keys=on;');
         } else {
             Schema::table('shipments', function (Blueprint $table) {
