@@ -13,17 +13,23 @@ use Illuminate\Support\Facades\Log;
 class WildberriesService implements MarketplaceInterface
 {
     private string $apiKey;
-    
+
     // Актуальные базовые URL для разных API Wildberries
     private string $contentApiUrl = 'https://content-api.wildberries.ru';
+
     private string $suppliesApiUrl = 'https://supplies-api.wildberries.ru';
+
     private string $statisticsApiUrl = 'https://statistics-api.wildberries.ru';
+
     private string $analyticsApiUrl = 'https://seller-analytics-api.wildberries.ru';
+
     private string $pricesApiUrl = 'https://discounts-prices-api.wildberries.ru';
+
     private string $commonApiUrl = 'https://common-api.wildberries.ru';
 
     // Задержка между запросами (мс) — глобальный лимит WB: 6 рек/мин на эндпоинт
     private int $requestDelayMs = 500;
+
     // Максимум попыток при 429
     private int $maxRetries = 5;
 
@@ -50,13 +56,14 @@ class WildberriesService implements MarketplaceInterface
             $retryAfter = (int) ($response->header('Retry-After') ?: 60);
             $retryAfter = max(1, min($retryAfter, 120));
             Log::warning('WB API 429 — ожидание перед повтором', [
-                'url'         => $url,
+                'url' => $url,
                 'retry_after' => $retryAfter,
-                'attempt'     => $attempt + 1,
+                'attempt' => $attempt + 1,
             ]);
             sleep($retryAfter);
             $attempt++;
         } while ($attempt < $this->maxRetries);
+
         return $response;
     }
 
@@ -70,7 +77,7 @@ class WildberriesService implements MarketplaceInterface
         do {
             $response = Http::withHeaders([
                 'Authorization' => $this->apiKey,
-                'Content-Type'  => 'application/json',
+                'Content-Type' => 'application/json',
             ])->timeout($timeout)->post($url, $data);
             if ($response->status() !== 429) {
                 return $response;
@@ -78,13 +85,14 @@ class WildberriesService implements MarketplaceInterface
             $retryAfter = (int) ($response->header('Retry-After') ?: 60);
             $retryAfter = max(1, min($retryAfter, 120));
             Log::warning('WB API 429 — ожидание перед повтором', [
-                'url'         => $url,
+                'url' => $url,
                 'retry_after' => $retryAfter,
-                'attempt'     => $attempt + 1,
+                'attempt' => $attempt + 1,
             ]);
             sleep($retryAfter);
             $attempt++;
         } while ($attempt < $this->maxRetries);
+
         return $response;
     }
 
@@ -113,7 +121,7 @@ class WildberriesService implements MarketplaceInterface
                     ],
                 ]);
 
-                if (!$response->successful()) {
+                if (! $response->successful()) {
                     Log::error('Wildberries API error (getProducts)', [
                         'status' => $response->status(),
                         'body' => $response->body(),
@@ -122,7 +130,7 @@ class WildberriesService implements MarketplaceInterface
                 }
 
                 $data = $response->json();
-                
+
                 $cardsCount = count($data['cards'] ?? []);
                 Log::info('WB API Response: /content/v2/get/cards/list', [
                     'cards_returned' => $cardsCount,
@@ -139,7 +147,7 @@ class WildberriesService implements MarketplaceInterface
 
                 // Обновляем cursor для следующей страницы
                 $cursorData = $data['cursor'] ?? null;
-                
+
                 // Если WB вернул nmID, проверяем что он не сбросился в 0 (что бывает в конце списка)
                 if ($cursorData && isset($cursorData['nmID']) && $cardsCount > 0) {
                     $cursor = [
@@ -147,7 +155,7 @@ class WildberriesService implements MarketplaceInterface
                         'updatedAt' => $cursorData['updatedAt'] ?? null,
                         'nmID' => $cursorData['nmID'],
                     ];
-                    
+
                     // Защита от зацикливания: если WB возвращает курсор на начало
                     if ($cursor['nmID'] === 0 && ($cursorData['updatedAt'] ?? null) === null) {
                         $cursor = null;
@@ -155,7 +163,7 @@ class WildberriesService implements MarketplaceInterface
                 } else {
                     $cursor = null;
                 }
-                
+
             } while ($cursor && count($allCards) < 50000);
 
             // Загружаем цены из Prices API для всех карточек
@@ -173,10 +181,12 @@ class WildberriesService implements MarketplaceInterface
             }
 
             Log::info('Wildberries products fetched', ['count' => count($products)]);
+
             return $products;
-            
+
         } catch (\Exception $e) {
-            Log::error('WB getProducts error: ' . $e->getMessage());
+            Log::error('WB getProducts error: '.$e->getMessage());
+
             return [];
         }
     }
@@ -188,15 +198,15 @@ class WildberriesService implements MarketplaceInterface
     {
         $prices = [];
         $offset = 0;
-        $limit  = 1000;
+        $limit = 1000;
 
         do {
             $response = $this->wbGet("{$this->pricesApiUrl}/api/v2/list/goods/filter", [
-                'limit'  => $limit,
+                'limit' => $limit,
                 'offset' => $offset,
             ]);
 
-            if (!$response->successful()) {
+            if (! $response->successful()) {
                 Log::warning('WB Prices API error', ['status' => $response->status()]);
                 break;
             }
@@ -204,19 +214,21 @@ class WildberriesService implements MarketplaceInterface
             $items = $response->json()['data']['listGoods'] ?? [];
 
             foreach ($items as $item) {
-                $nmId       = $item['nmID'] ?? null;
+                $nmId = $item['nmID'] ?? null;
                 $vendorCode = $item['vendorCode'] ?? null;
-                if (!$nmId) continue;
+                if (! $nmId) {
+                    continue;
+                }
 
-                $firstSize       = $item['sizes'][0] ?? [];
+                $firstSize = $item['sizes'][0] ?? [];
                 $discountedPrice = (float) ($firstSize['discountedPrice'] ?? 0);
-                $basePrice       = (float) ($firstSize['price'] ?? 0);
+                $basePrice = (float) ($firstSize['price'] ?? 0);
 
                 $priceData = [
-                    'final_price'      => $discountedPrice > 0 ? $discountedPrice : $basePrice,
-                    'base_price'       => $basePrice,
+                    'final_price' => $discountedPrice > 0 ? $discountedPrice : $basePrice,
+                    'base_price' => $basePrice,
                     'discounted_price' => $discountedPrice,
-                    'discount'         => (int) ($item['discount'] ?? 0),
+                    'discount' => (int) ($item['discount'] ?? 0),
                 ];
 
                 $prices[(string) $nmId] = $priceData;
@@ -238,7 +250,7 @@ class WildberriesService implements MarketplaceInterface
      */
     private function transformProduct(array $card, array $prices = [], array $commissions = []): array
     {
-        $nmId       = (string) ($card['nmID'] ?? '');
+        $nmId = (string) ($card['nmID'] ?? '');
         $vendorCode = $card['vendorCode'] ?? null;
         $subjectId = $card['subjectID'] ?? null;
         $subjectCommissions = $subjectId ? ($commissions[(string) $subjectId] ?? null) : null;
@@ -246,12 +258,12 @@ class WildberriesService implements MarketplaceInterface
         // Цена из Prices API (приоритет)
         $priceData = $prices[$vendorCode] ?? $prices[$nmId] ?? null;
         $finalPrice = null;
-        $oldPrice   = null;
+        $oldPrice = null;
         if ($priceData) {
             $fp = (float) ($priceData['final_price'] ?? 0);
             $bp = (float) ($priceData['base_price'] ?? 0);
             $finalPrice = $fp > 0 ? $fp : null;
-            $oldPrice   = ($bp > 0 && $bp > $fp) ? $bp : null;
+            $oldPrice = ($bp > 0 && $bp > $fp) ? $bp : null;
         }
 
         // Собираем фото
@@ -262,8 +274,8 @@ class WildberriesService implements MarketplaceInterface
             }
         }
 
-        $baseName  = $card['title'] ?? $card['subjectName'] ?? 'Без названия';
-        $sizes     = $card['sizes'] ?? [];
+        $baseName = $card['title'] ?? $card['subjectName'] ?? 'Без названия';
+        $sizes = $card['sizes'] ?? [];
 
         // Собираем все баркоды из всех размеров
         $allBarcodes = [];
@@ -271,9 +283,9 @@ class WildberriesService implements MarketplaceInterface
             foreach ($size['skus'] ?? [] as $barcode) {
                 if ($barcode) {
                     $allBarcodes[] = [
-                        'barcode'   => $barcode,
+                        'barcode' => $barcode,
                         'size_name' => trim(($size['wbSize'] ?? '') ?: ($size['techSize'] ?? '')),
-                        'chrtID'    => $size['chrtID'] ?? null,
+                        'chrtID' => $size['chrtID'] ?? null,
                     ];
                 }
             }
@@ -282,57 +294,60 @@ class WildberriesService implements MarketplaceInterface
         // Если размеров нет — создаём одну запись с vendorCode как SKU
         if (empty($allBarcodes)) {
             $allBarcodes = [[
-                'barcode'   => $vendorCode ?? $nmId,
+                'barcode' => $vendorCode ?? $nmId,
                 'size_name' => '',
-                'chrtID'    => null,
+                'chrtID' => null,
             ]];
         }
 
         $results = [];
         foreach ($allBarcodes as $sizeInfo) {
-            $barcode  = $sizeInfo['barcode'];
+            $barcode = $sizeInfo['barcode'];
             $sizeName = $sizeInfo['size_name'];
-            $name     = $sizeName ? "{$baseName} ({$sizeName})" : $baseName;
+            $name = $sizeName ? "{$baseName} ({$sizeName})" : $baseName;
 
             // Если цены из Prices API нет — пробуем из sizes карточки
             $itemFinalPrice = $finalPrice;
-            $itemOldPrice   = $oldPrice;
+            $itemOldPrice = $oldPrice;
             if ($itemFinalPrice === null) {
                 foreach ($sizes as $size) {
                     if (in_array($barcode, $size['skus'] ?? [])) {
                         $fp = (float) ($size['discountedPrice'] ?? 0);
                         $bp = (float) ($size['price'] ?? 0);
-                        if ($fp > 100 || $bp > 100) { $fp /= 100; $bp /= 100; }
+                        if ($fp > 100 || $bp > 100) {
+                            $fp /= 100;
+                            $bp /= 100;
+                        }
                         $itemFinalPrice = $fp > 0 ? $fp : ($bp > 0 ? $bp : null);
-                        $itemOldPrice   = ($bp > 0 && $fp > 0 && $bp > $fp) ? $bp : null;
+                        $itemOldPrice = ($bp > 0 && $fp > 0 && $bp > $fp) ? $bp : null;
                         break;
                     }
                 }
             }
 
             $results[] = [
-                'sku'            => $barcode,
-                'vendor_code'    => $vendorCode,
-                'name'           => $name,
-                'barcode'        => $barcode,
-                'price'          => $itemFinalPrice,
-                'old_price'      => $itemOldPrice,
-                'stock'          => 0,
-                'description'    => $card['description'] ?? null,
-                'images'         => $photos,
-                'category'       => $card['subjectName'] ?? null,
-                'brand'          => $card['brand'] ?? null,
-                'rating'         => $card['rating'] ?? null,
-                'reviews_count'  => $card['feedbackCount'] ?? 0,
-                'marketplace'    => 'wildberries',
+                'sku' => $barcode,
+                'vendor_code' => $vendorCode,
+                'name' => $name,
+                'barcode' => $barcode,
+                'price' => $itemFinalPrice,
+                'old_price' => $itemOldPrice,
+                'stock' => 0,
+                'description' => $card['description'] ?? null,
+                'images' => $photos,
+                'category' => $card['subjectName'] ?? null,
+                'brand' => $card['brand'] ?? null,
+                'rating' => $card['rating'] ?? null,
+                'reviews_count' => $card['feedbackCount'] ?? 0,
+                'marketplace' => 'wildberries',
                 'marketplace_id' => $nmId,
-                'url'            => "https://www.wildberries.ru/catalog/{$nmId}/detail.aspx",
-                'wb_data'        => [
-                    'nmID'            => $card['nmID'],
-                    'imtID'           => $card['imtID'] ?? null,
-                    'vendorCode'      => $vendorCode,
-                    'subjectID'       => $card['subjectID'] ?? null,
-                    'commissions'     => [
+                'url' => "https://www.wildberries.ru/catalog/{$nmId}/detail.aspx",
+                'wb_data' => [
+                    'nmID' => $card['nmID'],
+                    'imtID' => $card['imtID'] ?? null,
+                    'vendorCode' => $vendorCode,
+                    'subjectID' => $card['subjectID'] ?? null,
+                    'commissions' => [
                         'fbo' => [
                             'percent' => (float) ($subjectCommissions['fbo'] ?? 15.0),
                         ],
@@ -340,12 +355,12 @@ class WildberriesService implements MarketplaceInterface
                             'percent' => (float) ($subjectCommissions['fbs'] ?? $subjectCommissions['fbo'] ?? 15.0),
                         ],
                     ],
-                    'chrtID'          => $sizeInfo['chrtID'],
-                    'size'            => $sizeName,
-                    'sizes'           => $sizes,
+                    'chrtID' => $sizeInfo['chrtID'],
+                    'size' => $sizeName,
+                    'sizes' => $sizes,
                     'characteristics' => $card['characteristics'] ?? [],
-                    'createdAt'       => $card['createdAt'] ?? null,
-                    'updatedAt'       => $card['updatedAt'] ?? null,
+                    'createdAt' => $card['createdAt'] ?? null,
+                    'updatedAt' => $card['updatedAt'] ?? null,
                 ],
             ];
         }
@@ -363,66 +378,173 @@ class WildberriesService implements MarketplaceInterface
         try {
             $inventory = [];
             $warehouseCoefficients = $this->getWarehouseCoefficients();
+            $sizeMap = $this->getWbSizeMap();
+            $stocks = $this->getWbWarehouseStocksReport();
 
-            // dateFrom=2019-01-01 — получаем ВСЕ остатки (не только изменённые сегодня)
-            // Документация: «enter the earliest possible value to get the total leftover»
-            $dateFrom = '2019-01-01';
+            if (empty($stocks)) {
+                Log::warning('WB getInventory: new analytics stocks report returned no rows, falling back to legacy statistics endpoint');
+                $stocks = $this->getLegacyStocksReport();
+            }
 
-            do {
-                $response = $this->wbGet("{$this->statisticsApiUrl}/api/v1/supplier/stocks", [
-                    'dateFrom' => $dateFrom,
-                ]);
+            foreach ($stocks as $stock) {
+                $nmId = (int) ($stock['nmId'] ?? 0);
+                $chrtId = (int) ($stock['chrtId'] ?? 0);
+                $meta = $sizeMap['by_nm_chrt']["{$nmId}:{$chrtId}"] ?? $sizeMap['by_nm'][(string) $nmId] ?? [];
+                $warehouseName = $stock['warehouseName'] ?? 'WB Склад';
+                $rawWarehouseId = $stock['warehouseId'] ?? null;
+                $warehouseId = $rawWarehouseId !== null && $rawWarehouseId !== ''
+                    ? (string) $rawWarehouseId
+                    : ($warehouseName !== '' ? 'wb_'.substr(md5($warehouseName), 0, 8) : '0');
+                $barcode = $stock['barcode'] ?? $meta['barcode'] ?? null;
+                $supplierArticle = $stock['supplierArticle'] ?? $meta['supplierArticle'] ?? null;
+                $warehouseCoefficient = $this->resolveWarehouseCoefficient($warehouseName, $warehouseCoefficients);
 
-                if (!$response->successful()) {
-                    Log::error('WB getInventory error', [
-                        'status' => $response->status(),
-                        'body'   => $response->body(),
-                    ]);
-                    break;
-                }
-
-                $stocks = $response->json() ?? [];
-
-                if (empty($stocks)) {
-                    break;
-                }
-
-                foreach ($stocks as $stock) {
-                    $warehouseName = $stock['warehouseName'] ?? 'WB Склад';
-                    $warehouseId   = $warehouseName !== '' ? 'wb_' . substr(md5($warehouseName), 0, 8) : '0';
-                    $barcode       = $stock['barcode'] ?? null;
-                    $warehouseCoefficient = $this->resolveWarehouseCoefficient($warehouseName, $warehouseCoefficients);
-                    $inventory[] = [
-                        'sku'            => $barcode ?? $stock['supplierArticle'],
-                        'warehouse_id'   => $warehouseId,
-                        'warehouse_name' => $warehouseName,
-                        'marketplace'    => 'wildberries',
-                        'quantity'       => $stock['quantityFull'] ?? $stock['quantity'] ?? 0,
-                        'in_transit'     => ($stock['inWayToClient'] ?? 0) + ($stock['inWayFromClient'] ?? 0),
-                        'warehouse_coefficient' => $warehouseCoefficient,
-                    ];
-                }
-
-                // Пагинация: берём lastChangeDate последней записи для следующего запроса
-                $lastRecord = end($stocks);
-                $nextDateFrom = $lastRecord['lastChangeDate'] ?? null;
-
-                // Если следующая дата та же что текущая — значит получили все данные
-                if (!$nextDateFrom || $nextDateFrom === $dateFrom) {
-                    break;
-                }
-
-                $dateFrom = $nextDateFrom;
-
-            } while (count($inventory) < 100000);
+                $inventory[] = [
+                    'sku' => $barcode ?? $supplierArticle,
+                    'warehouse_id' => $warehouseId,
+                    'warehouse_name' => $warehouseName,
+                    'marketplace' => 'wildberries',
+                    'quantity' => $stock['quantityFull'] ?? $stock['quantity'] ?? 0,
+                    'in_transit' => ($stock['inWayToClient'] ?? 0) + ($stock['inWayFromClient'] ?? 0),
+                    'warehouse_coefficient' => $warehouseCoefficient,
+                ];
+            }
 
             Log::info('Wildberries inventory fetched', ['count' => count($inventory)]);
+
             return $inventory;
 
         } catch (\Exception $e) {
-            Log::error('WB getInventory error: ' . $e->getMessage());
+            Log::error('WB getInventory error: '.$e->getMessage());
+
             return [];
         }
+    }
+
+    private function getWbWarehouseStocksReport(): array
+    {
+        $limit = 250000;
+        $offset = 0;
+        $result = [];
+        $pages = 0;
+
+        do {
+            $response = $this->wbPost("{$this->analyticsApiUrl}/api/analytics/v1/stocks-report/wb-warehouses", [
+                'limit' => $limit,
+                'offset' => $offset,
+            ]);
+
+            if (! $response->successful()) {
+                Log::error('WB getWbWarehouseStocksReport error', [
+                    'status' => $response->status(),
+                    'body' => $response->body(),
+                    'offset' => $offset,
+                ]);
+                break;
+            }
+
+            $items = $response->json('data.items') ?? [];
+            if (empty($items)) {
+                break;
+            }
+
+            $result = array_merge($result, $items);
+            $count = count($items);
+            $offset += $count;
+            $pages++;
+
+            if ($count === $limit) {
+                sleep(20);
+            }
+        } while ($count === $limit && $pages < 20);
+
+        return $result;
+    }
+
+    private function getLegacyStocksReport(): array
+    {
+        $response = $this->wbGet("{$this->statisticsApiUrl}/api/v1/supplier/stocks", [
+            'dateFrom' => '2019-01-01',
+        ]);
+
+        if (! $response->successful()) {
+            Log::error('WB legacy stocks report error', [
+                'status' => $response->status(),
+                'body' => $response->body(),
+            ]);
+
+            return [];
+        }
+
+        return $response->json() ?? [];
+    }
+
+    private function getWbSizeMap(): array
+    {
+        $byNmChrt = [];
+        $byNm = [];
+        $cursor = ['limit' => 100];
+        $iteration = 0;
+
+        do {
+            $response = $this->wbPost("{$this->contentApiUrl}/content/v2/get/cards/list", [
+                'settings' => [
+                    'cursor' => $cursor,
+                    'filter' => [
+                        'withPhoto' => -1,
+                    ],
+                ],
+            ]);
+
+            if (! $response->successful()) {
+                Log::warning('WB getWbSizeMap error', [
+                    'status' => $response->status(),
+                    'body' => $response->body(),
+                ]);
+                break;
+            }
+
+            $data = $response->json();
+            $cards = $data['cards'] ?? [];
+
+            foreach ($cards as $card) {
+                $nmId = (int) ($card['nmID'] ?? 0);
+                if (! $nmId) {
+                    continue;
+                }
+
+                $supplierArticle = $card['vendorCode'] ?? null;
+                $sizes = $card['sizes'] ?? [];
+
+                if (! isset($byNm[(string) $nmId])) {
+                    $byNm[(string) $nmId] = [
+                        'barcode' => $sizes[0]['skus'][0] ?? null,
+                        'supplierArticle' => $supplierArticle,
+                    ];
+                }
+
+                foreach ($sizes as $size) {
+                    $chrtId = (int) ($size['chrtID'] ?? 0);
+                    if (! $chrtId) {
+                        continue;
+                    }
+
+                    $byNmChrt["{$nmId}:{$chrtId}"] = [
+                        'barcode' => $size['skus'][0] ?? null,
+                        'supplierArticle' => $supplierArticle,
+                    ];
+                }
+            }
+
+            $cursor = $data['cursor'] ?? null;
+            $iteration++;
+            $hasMore = ! empty($cards) && $cursor && isset($cursor['nmID']);
+        } while ($hasMore && $iteration < 50);
+
+        return [
+            'by_nm_chrt' => $byNmChrt,
+            'by_nm' => $byNm,
+        ];
     }
 
     /**
@@ -435,11 +557,12 @@ class WildberriesService implements MarketplaceInterface
         try {
             $response = $this->wbGet("{$this->suppliesApiUrl}/api/v1/warehouses");
 
-            if (!$response->successful()) {
+            if (! $response->successful()) {
                 Log::error('WB getWarehouses error', [
                     'status' => $response->status(),
                     'body' => $response->body(),
                 ]);
+
                 return [];
             }
 
@@ -451,9 +574,10 @@ class WildberriesService implements MarketplaceInterface
                     'isActive' => $wh['isActive'] ?? true,
                 ];
             }, $response->json() ?? []);
-            
+
         } catch (\Exception $e) {
-            Log::error('WB getWarehouses error: ' . $e->getMessage());
+            Log::error('WB getWarehouses error: '.$e->getMessage());
+
             return [];
         }
     }
@@ -471,36 +595,39 @@ class WildberriesService implements MarketplaceInterface
 
             $response = $this->wbGet("{$this->statisticsApiUrl}/api/v1/supplier/sales", [
                 'dateFrom' => $dateFrom,
-                'flag'     => 1,
+                'flag' => 1,
             ], 120);
 
-            if (!$response->successful()) {
+            if (! $response->successful()) {
                 Log::warning('WB getSalesByWarehouse error', [
                     'status' => $response->status(),
-                    'body'   => $response->body(),
+                    'body' => $response->body(),
                 ]);
+
                 return [];
             }
 
             $sales = $response->json() ?? [];
 
-            $now     = now();
-            $date7   = $now->copy()->subDays(7);
-            $date14  = $now->copy()->subDays(14);
-            $date30  = $now->copy()->subDays(30);
+            $now = now();
+            $date7 = $now->copy()->subDays(7);
+            $date14 = $now->copy()->subDays(14);
+            $date30 = $now->copy()->subDays(30);
 
             // Агрегируем по [barcode][warehouse_key][period]
             // barcode совпадает с products.sku и inventory_warehouses.sku
             // warehouseName → wb_+md5 совпадает с warehouse_id в inventory_warehouses
             $counts = [];
             foreach ($sales as $sale) {
-                $barcode       = $sale['barcode'] ?? null;
+                $barcode = $sale['barcode'] ?? null;
                 $warehouseName = $sale['warehouseName'] ?? '';
-                $warehouseKey  = $warehouseName !== '' ? 'wb_' . substr(md5($warehouseName), 0, 8) : '0';
-                $isReturn      = $sale['isReturn'] ?? false;
-                $saleDate      = $sale['date'] ?? null;
+                $warehouseKey = $warehouseName !== '' ? 'wb_'.substr(md5($warehouseName), 0, 8) : '0';
+                $isReturn = $sale['isReturn'] ?? false;
+                $saleDate = $sale['date'] ?? null;
 
-                if (!$barcode || $isReturn || !$saleDate) continue;
+                if (! $barcode || $isReturn || ! $saleDate) {
+                    continue;
+                }
 
                 try {
                     $dt = \Carbon\Carbon::parse($saleDate);
@@ -508,13 +635,19 @@ class WildberriesService implements MarketplaceInterface
                     continue;
                 }
 
-                if (!isset($counts[$barcode][$warehouseKey])) {
+                if (! isset($counts[$barcode][$warehouseKey])) {
                     $counts[$barcode][$warehouseKey] = ['d7' => 0, 'd14' => 0, 'd30' => 0];
                 }
 
-                if ($dt->gte($date30)) $counts[$barcode][$warehouseKey]['d30']++;
-                if ($dt->gte($date14)) $counts[$barcode][$warehouseKey]['d14']++;
-                if ($dt->gte($date7))  $counts[$barcode][$warehouseKey]['d7']++;
+                if ($dt->gte($date30)) {
+                    $counts[$barcode][$warehouseKey]['d30']++;
+                }
+                if ($dt->gte($date14)) {
+                    $counts[$barcode][$warehouseKey]['d14']++;
+                }
+                if ($dt->gte($date7)) {
+                    $counts[$barcode][$warehouseKey]['d7']++;
+                }
             }
 
             // Формируем результат: [barcode][warehouse_key] = [avg_daily, sales_7, sales_14, sales_30]
@@ -523,23 +656,24 @@ class WildberriesService implements MarketplaceInterface
                 foreach ($warehouses as $warehouseKey => $periods) {
                     $result[$barcode][$warehouseKey] = [
                         'avg_daily_sales' => round($periods['d30'] / 30, 4),
-                        'sales_7_days'    => $periods['d7'],
-                        'sales_14_days'   => $periods['d14'],
-                        'sales_30_days'   => $periods['d30'],
+                        'sales_7_days' => $periods['d7'],
+                        'sales_14_days' => $periods['d14'],
+                        'sales_30_days' => $periods['d30'],
                     ];
                 }
             }
 
             Log::info('WB sales by warehouse fetched', [
-                'skus'        => count($result),
-                'raw'         => count($sales),
+                'skus' => count($result),
+                'raw' => count($sales),
                 'sample_skus' => array_slice(array_keys($result), 0, 5),
             ]);
 
             return $result;
 
         } catch (\Exception $e) {
-            Log::error('WB getSalesByWarehouse error: ' . $e->getMessage());
+            Log::error('WB getSalesByWarehouse error: '.$e->getMessage());
+
             return [];
         }
     }
@@ -558,6 +692,7 @@ class WildberriesService implements MarketplaceInterface
             $sellerWarehouses = $this->getSellerWarehouses();
             if (empty($sellerWarehouses)) {
                 Log::info('WB FBS: нет складов продавца');
+
                 return [];
             }
 
@@ -565,6 +700,7 @@ class WildberriesService implements MarketplaceInterface
             $chrtIds = $this->getAllChrtIdsFromContent();
             if (empty($chrtIds)) {
                 Log::warning('WB FBS: не удалось получить chrtIds из карточек товаров');
+
                 return [];
             }
 
@@ -585,11 +721,11 @@ class WildberriesService implements MarketplaceInterface
                         ['chrtIds' => $chunk]
                     );
 
-                    if (!$response->successful()) {
+                    if (! $response->successful()) {
                         Log::warning('WB FBS stocks error', [
                             'warehouseId' => $warehouseId,
-                            'status'      => $response->status(),
-                            'body'        => $response->body(),
+                            'status' => $response->status(),
+                            'body' => $response->body(),
                         ]);
                         break;
                     }
@@ -598,25 +734,29 @@ class WildberriesService implements MarketplaceInterface
 
                     foreach ($stocks as $stock) {
                         $barcode = $stock['sku'] ?? null;
-                        if (!$barcode) continue;
+                        if (! $barcode) {
+                            continue;
+                        }
 
                         $result[] = [
-                            'sku'              => $barcode,
-                            'warehouse_id'     => 'fbs_' . $warehouseId,
-                            'warehouse_name'   => '[FBS] ' . $warehouseName,
-                            'marketplace'      => 'wildberries',
+                            'sku' => $barcode,
+                            'warehouse_id' => 'fbs_'.$warehouseId,
+                            'warehouse_name' => '[FBS] '.$warehouseName,
+                            'marketplace' => 'wildberries',
                             'fulfillment_type' => 'fbs',
-                            'quantity'         => $stock['amount'] ?? 0,
+                            'quantity' => $stock['amount'] ?? 0,
                         ];
                     }
                 }
             }
 
             Log::info('WB FBS stocks fetched', ['count' => count($result)]);
+
             return $result;
 
         } catch (\Exception $e) {
-            Log::error('WB getFbsStocks error: ' . $e->getMessage());
+            Log::error('WB getFbsStocks error: '.$e->getMessage());
+
             return [];
         }
     }
@@ -631,17 +771,17 @@ class WildberriesService implements MarketplaceInterface
      */
     private function getAllChrtIdsFromContent(): array
     {
-        $chrtIds    = [];
-        $updatedAt  = null;
-        $nmID       = null;
-        $maxIter    = 100;
-        $iter       = 0;
+        $chrtIds = [];
+        $updatedAt = null;
+        $nmID = null;
+        $maxIter = 100;
+        $iter = 0;
 
         do {
             $cursorPayload = ['limit' => 100];
             if ($updatedAt !== null) {
                 $cursorPayload['updatedAt'] = $updatedAt;
-                $cursorPayload['nmID']      = $nmID;
+                $cursorPayload['nmID'] = $nmID;
             }
 
             $body = [
@@ -653,27 +793,27 @@ class WildberriesService implements MarketplaceInterface
 
             $response = Http::withHeaders([
                 'Authorization' => $this->apiKey,
-                'Content-Type'  => 'application/json',
+                'Content-Type' => 'application/json',
             ])->timeout(30)->post(
                 'https://content-api.wildberries.ru/content/v2/get/cards/list',
                 $body
             );
 
-            if (!$response->successful()) {
+            if (! $response->successful()) {
                 Log::warning('WB getAllChrtIdsFromContent: ошибка Content API', [
                     'status' => $response->status(),
-                    'body'   => $response->body(),
+                    'body' => $response->body(),
                 ]);
                 break;
             }
 
-            $data  = $response->json();
+            $data = $response->json();
             $cards = $data['cards'] ?? [];
 
             Log::info('WB getAllChrtIdsFromContent: получено карточек', [
-                'count'     => count($cards),
+                'count' => count($cards),
                 'updatedAt' => $updatedAt,
-                'nmID'      => $nmID,
+                'nmID' => $nmID,
             ]);
 
             foreach ($cards as $card) {
@@ -686,9 +826,9 @@ class WildberriesService implements MarketplaceInterface
             }
 
             // Курсор для следующей страницы
-            $cursor    = $data['cursor'] ?? null;
+            $cursor = $data['cursor'] ?? null;
             $updatedAt = $cursor['updatedAt'] ?? null;
-            $nmID      = $cursor['nmID'] ?? null;
+            $nmID = $cursor['nmID'] ?? null;
 
             // Продолжаем если карточек столько же сколько запросили (100)
             $hasMore = count($cards) === 100 && $updatedAt !== null;
@@ -698,6 +838,7 @@ class WildberriesService implements MarketplaceInterface
 
         $result = array_values(array_unique($chrtIds));
         Log::info('WB getAllChrtIdsFromContent: итого chrtIds', ['count' => count($result)]);
+
         return $result;
     }
 
@@ -710,23 +851,25 @@ class WildberriesService implements MarketplaceInterface
         try {
             $response = $this->wbGet('https://marketplace-api.wildberries.ru/api/v3/warehouses');
 
-            if (!$response->successful()) {
+            if (! $response->successful()) {
                 Log::error('WB getSellerWarehouses error', [
                     'status' => $response->status(),
-                    'body'   => $response->body(),
+                    'body' => $response->body(),
                 ]);
+
                 return [];
             }
 
             return array_map(function ($wh) {
                 return [
-                    'id'   => $wh['id'],
+                    'id' => $wh['id'],
                     'name' => $wh['name'],
                 ];
             }, $response->json() ?? []);
 
         } catch (\Exception $e) {
-            Log::error('WB getSellerWarehouses error: ' . $e->getMessage());
+            Log::error('WB getSellerWarehouses error: '.$e->getMessage());
+
             return [];
         }
     }
@@ -743,17 +886,19 @@ class WildberriesService implements MarketplaceInterface
                 'dateFrom' => $dateFrom,
             ]);
 
-            if (!$response->successful()) {
+            if (! $response->successful()) {
                 Log::error('WB getSalesStats error', [
                     'status' => $response->status(),
                 ]);
+
                 return [];
             }
 
             return $response->json() ?? [];
-            
+
         } catch (\Exception $e) {
-            Log::error('WB getSalesStats error: ' . $e->getMessage());
+            Log::error('WB getSalesStats error: '.$e->getMessage());
+
             return [];
         }
     }
@@ -767,7 +912,7 @@ class WildberriesService implements MarketplaceInterface
         try {
             $response = $this->wbGet("{$this->commonApiUrl}/api/v1/tariffs/commission", ['locale' => 'ru']);
 
-            if (!$response->successful()) {
+            if (! $response->successful()) {
                 return [];
             }
 
@@ -775,7 +920,7 @@ class WildberriesService implements MarketplaceInterface
             $result = [];
             foreach ($report as $item) {
                 $subjectId = $item['subjectID'] ?? null;
-                if (!$subjectId) {
+                if (! $subjectId) {
                     continue;
                 }
 
@@ -786,9 +931,10 @@ class WildberriesService implements MarketplaceInterface
             }
 
             return $result;
-            
+
         } catch (\Exception $e) {
-            Log::error('WB getCommissions error: ' . $e->getMessage());
+            Log::error('WB getCommissions error: '.$e->getMessage());
+
             return [];
         }
     }
@@ -800,7 +946,7 @@ class WildberriesService implements MarketplaceInterface
                 'date' => now()->format('Y-m-d'),
             ]);
 
-            if (!$response->successful()) {
+            if (! $response->successful()) {
                 return [];
             }
 
@@ -824,7 +970,8 @@ class WildberriesService implements MarketplaceInterface
 
             return $result;
         } catch (\Exception $e) {
-            Log::error('WB getWarehouseCoefficients error: ' . $e->getMessage());
+            Log::error('WB getWarehouseCoefficients error: '.$e->getMessage());
+
             return [];
         }
     }
@@ -854,6 +1001,7 @@ class WildberriesService implements MarketplaceInterface
         $name = mb_strtolower(trim($name));
         $name = str_replace(['-', '–', '—'], ' ', $name);
         $name = preg_replace('/\s+/', ' ', $name);
+
         return trim($name);
     }
 }

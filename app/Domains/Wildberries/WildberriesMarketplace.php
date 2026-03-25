@@ -3,19 +3,19 @@
 namespace App\Domains\Wildberries;
 
 use App\Domains\Marketplace\Contracts\MarketplaceInterface;
-use App\Domains\Wildberries\Api\WildberriesClient;
-use App\Domains\Wildberries\Api\ProductsApi;
+use App\Domains\Wildberries\Api\FbsSuppliesApi;
 use App\Domains\Wildberries\Api\InventoryApi;
+use App\Domains\Wildberries\Api\ProductsApi;
+use App\Domains\Wildberries\Api\RealizationReportApi;
 use App\Domains\Wildberries\Api\SalesApi;
 use App\Domains\Wildberries\Api\StorageApi;
-use App\Domains\Wildberries\Api\RealizationReportApi;
 use App\Domains\Wildberries\Api\SuppliesApi;
-use App\Domains\Wildberries\Api\FbsSuppliesApi;
+use App\Domains\Wildberries\Api\WildberriesClient;
 use App\Models\Integration;
 
 /**
  * Фасад для работы с Wildberries API
- * 
+ *
  * Объединяет все компоненты:
  * - ProductsApi — товары
  * - InventoryApi — остатки
@@ -25,13 +25,21 @@ use App\Models\Integration;
 class WildberriesMarketplace implements MarketplaceInterface
 {
     private WildberriesClient $client;
+
     private ProductsApi $products;
+
     private InventoryApi $inventory;
+
     private SalesApi $sales;
+
     private StorageApi $storage;
+
     private RealizationReportApi $realizationReport;
+
     private SuppliesApi $supplies;
+
     private FbsSuppliesApi $fbsSupplies;
+
     private ?Integration $integration = null;
 
     public function __construct(array $credentials = [], ?Integration $integration = null)
@@ -81,6 +89,7 @@ class WildberriesMarketplace implements MarketplaceInterface
     {
         try {
             $products = $this->products->getProducts(1);
+
             return true;
         } catch (\Exception $e) {
             return false;
@@ -98,62 +107,63 @@ class WildberriesMarketplace implements MarketplaceInterface
     {
         $result = $this->products->getProducts($this->getIntegration());
         $cards = $result['cards'] ?? $result;
-        
+
         if (empty($cards)) {
             \Illuminate\Support\Facades\Log::warning('WB Marketplace: No cards returned from Products API');
+
             return [];
         }
-        
+
         \Illuminate\Support\Facades\Log::info('WB Marketplace: Got cards from Products API', [
             'count' => count($cards),
         ]);
-        
+
         // Получаем комиссии по категориям для обогащения данных товаров
         $commissionsByCategory = $this->storage->getCommissions();
-        
+
         // Собираем nmID для запроса цен
         $nmIds = array_filter(array_column($cards, 'nmID'));
-        
+
         \Illuminate\Support\Facades\Log::info('WB Marketplace: Fetching prices for nmIds', [
             'count' => count($nmIds),
         ]);
-        
+
         // Получаем цены через Prices API (актуальный эндпоинт!)
-        $prices = !empty($nmIds) ? $this->products->getPrices(null, $nmIds) : [];
-        
+        $prices = ! empty($nmIds) ? $this->products->getPrices(null, $nmIds) : [];
+
         \Illuminate\Support\Facades\Log::info('WB Marketplace: Prices loaded', [
             'count' => count($prices),
             'sample_keys' => array_slice(array_keys($prices), 0, 5),
         ]);
-        
+
         // Получаем рейтинги карточек через официальный WB Analytics API
         // productRating = рейтинг карточки (качество заполнения, 0-10)
         // feedbackRating = рейтинг по отзывам (0-5)
         $cardRatings = $this->products->getCardRatings();
-        
+
         \Illuminate\Support\Facades\Log::info('WB Marketplace: Card ratings loaded', [
             'count' => count($cardRatings),
         ]);
-        
+
         // СПП (Скидка Постоянного Покупателя) — редактируемое поле
         // Автоматическая загрузка из отчётов продаж отключена (слишком тяжёлый запрос)
         // Пользователь может заполнить СПП вручную на фронтенде
         $sppByNmId = [];
-        
+
         // Получаем остатки через Statistics API (возвращает ВСЕ остатки сразу с ценами!)
         $stocksRaw = $this->inventory->getStocks();
-        
+
         \Illuminate\Support\Facades\Log::info('WB Marketplace: Stocks loaded from Statistics API', [
             'count' => count($stocksRaw),
         ]);
-        
+
         $stocks = [];
         foreach ($stocksRaw as $stockItem) {
             // Statistics API возвращает barcode, nmId, supplierArticle
             $barcode = $stockItem['barcode'] ?? $stockItem['sku'] ?? null;
             $nmId = $stockItem['nmId'] ?? null;
             $supplierArticle = $stockItem['supplierArticle'] ?? null;
-            
+
             $stockData = [
                 'quantity' => $stockItem['total'] ?? 0,
                 'warehouses' => $stockItem['warehouses'] ?? [],
@@ -163,7 +173,7 @@ class WildberriesMarketplace implements MarketplaceInterface
                 'price' => $stockItem['price'] ?? 0,
                 'discount' => $stockItem['discount'] ?? 0,
             ];
-            
+
             // Индексируем по всем возможным ключам (приводим к строкам для единообразия)
             if ($barcode) {
                 $stocks[(string) $barcode] = $stockData;
@@ -175,16 +185,16 @@ class WildberriesMarketplace implements MarketplaceInterface
                 $stocks[(string) $supplierArticle] = $stockData;
             }
         }
-        
+
         \Illuminate\Support\Facades\Log::info('WB Marketplace: Stocks indexed', [
             'keys_count' => count($stocks),
             'sample_keys' => array_slice(array_keys($stocks), 0, 5),
         ]);
-        
+
         // Маппинг WB cards к формату Product модели с обогащением ценами и остатками
-        return array_map(fn($card) => $this->mapCardToProduct($card, $commissionsByCategory, $prices, $stocks, $cardRatings, $sppByNmId), $cards);
+        return array_map(fn ($card) => $this->mapCardToProduct($card, $commissionsByCategory, $prices, $stocks, $cardRatings, $sppByNmId), $cards);
     }
-    
+
     /**
      * Маппинг WB карточки к формату Product модели
      * Аналогично Ozon сохраняем все данные API в wb_data
@@ -193,54 +203,54 @@ class WildberriesMarketplace implements MarketplaceInterface
     {
         // Извлекаем габариты из sizes[0].dimensions или characteristics
         $dimensions = $this->extractDimensions($card);
-        
+
         // Получаем категорию товара
         $category = $card['subjectName'] ?? '';
         $subjectId = $card['subjectID'] ?? null;
-        
+
         // Получаем комиссию по subjectID (приоритет) или по умолчанию
         $commissionData = $commissionsByCategory[$subjectId] ?? $commissionsByCategory['default'] ?? null;
         $commissionPercent = $commissionData['fbo'] ?? 15.0;
-        
+
         // Первый размер (основной)
         $firstSize = $card['sizes'][0] ?? [];
         $barcode = $firstSize['skus'][0] ?? null;
         $nmId = $card['nmID'] ?? null;
         $vendorCode = $card['vendorCode'] ?? null;
-        
+
         // Получаем цены из Prices API (приоритет)
-        $priceData = $prices[$vendorCode] ?? $prices[(string)$nmId] ?? $prices[$barcode] ?? null;
-        
+        $priceData = $prices[$vendorCode] ?? $prices[(string) $nmId] ?? $prices[$barcode] ?? null;
+
         // Получаем остатки из Statistics API (ищем по barcode, nmId, vendorCode)
-        $stockData = $stocks[$barcode] ?? $stocks[(string)$nmId] ?? $stocks[$vendorCode] ?? null;
-        
-        $price    = null;
+        $stockData = $stocks[$barcode] ?? $stocks[(string) $nmId] ?? $stocks[$vendorCode] ?? null;
+
+        $price = null;
         $oldPrice = null;
         if ($priceData) {
             // Prices API возвращает цены в sizes
             $finalPrice = (float) ($priceData['final_price'] ?? $priceData['discounted_price'] ?? $priceData['price'] ?? 0);
-            $basePrice  = (float) ($priceData['price'] ?? 0);
+            $basePrice = (float) ($priceData['price'] ?? 0);
             if ($finalPrice > 0) {
-                $price    = $finalPrice;
+                $price = $finalPrice;
                 $oldPrice = $basePrice > $finalPrice ? $basePrice : null;
             }
-        } elseif ($stockData && !empty($stockData['price'])) {
+        } elseif ($stockData && ! empty($stockData['price'])) {
             // Fallback: цены из Statistics API
             $oldPrice = (float) ($stockData['price'] ?? 0);
             $discount = (int) ($stockData['discount'] ?? 0);
-            $price    = $oldPrice > 0 ? round($oldPrice * (1 - $discount / 100), 2) : null;
+            $price = $oldPrice > 0 ? round($oldPrice * (1 - $discount / 100), 2) : null;
             $oldPrice = ($oldPrice > 0 && $discount > 0) ? $oldPrice : null;
-        } elseif (!empty($firstSize['discountedPrice']) || !empty($firstSize['price'])) {
+        } elseif (! empty($firstSize['discountedPrice']) || ! empty($firstSize['price'])) {
             // Fallback: цены из sizes карточки (могут быть устаревшими)
-            $fp       = (float) ($firstSize['discountedPrice'] ?? 0);
-            $bp       = (float) ($firstSize['price'] ?? 0);
-            $price    = $fp > 0 ? $fp : ($bp > 0 ? $bp : null);
+            $fp = (float) ($firstSize['discountedPrice'] ?? 0);
+            $bp = (float) ($firstSize['price'] ?? 0);
+            $price = $fp > 0 ? $fp : ($bp > 0 ? $bp : null);
             $oldPrice = ($bp > 0 && $fp > 0 && $bp > $fp) ? $bp : null;
         }
-        
+
         // Получаем остатки
         $stock = $stockData ? (int) ($stockData['quantity'] ?? 0) : 0;
-        
+
         // Конвертация в единицы БД:
         // products.depth/width/height — мм
         // products.weight — г
@@ -259,26 +269,26 @@ class WildberriesMarketplace implements MarketplaceInterface
         if ($volumeLiters !== null) {
             $volumeWeight = $volumeLiters / 5; // базовый делитель 5л/кг
         }
-        
+
         // Извлекаем описание из характеристик
         $description = $card['description'] ?? null;
-        if (!$description) {
+        if (! $description) {
             // Ищем описание в characteristics
             $chars = collect($card['characteristics'] ?? []);
-            $descChar = $chars->first(fn($c) => in_array($c['name'] ?? '', ['Описание', 'Description', 'Комплектация']));
+            $descChar = $chars->first(fn ($c) => in_array($c['name'] ?? '', ['Описание', 'Description', 'Комплектация']));
             if ($descChar) {
                 $value = $descChar['value'] ?? null;
                 $description = is_array($value) ? implode(', ', $value) : $value;
             }
         }
-        
+
         // Рейтинги из официального WB Analytics API
         // productRating = рейтинг карточки (качество заполнения, 0-10)
         // feedbackRating = рейтинг по отзывам (0-5)
         $ratingData = $ratings[(string) $nmId] ?? null;
         $rating = $ratingData['feedbackRating'] ?? $card['rating'] ?? null;
         $reviewsCount = $card['feedbackCount'] ?? $card['reviewsCount'] ?? 0;
-        
+
         // Рейтинг карточки (качество заполнения) из официального WB API
         // Если API не вернул — используем расчёт как fallback
         $productRating = $ratingData['productRating'] ?? null;
@@ -292,7 +302,7 @@ class WildberriesMarketplace implements MarketplaceInterface
             // Fallback: расчёт на основе данных карточки
             $cardRating = $this->calculateCardRating($card, $description);
         }
-        
+
         return [
             'marketplace_id' => (string) $card['nmID'],
             // В проекте sku используется как штрихкод (EAN) для WB, чтобы совпадало с текущими данными/кэшем
@@ -355,17 +365,17 @@ class WildberriesMarketplace implements MarketplaceInterface
             ],
         ];
     }
-    
+
     /**
      * Рассчитать рейтинг карточки (качество заполнения)
      * Аналог WB "Рейтинг карточки 10/10"
-     * 
+     *
      * Критерии оценки (по 2.5 балла каждый):
      * - Наименование: есть title длиной >= 10 символов
      * - Описание: есть description длиной >= 50 символов
      * - Фото: есть минимум 3 фото
      * - Характеристики: заполнено минимум 5 характеристик
-     * 
+     *
      * @return array ['score' => float, 'details' => array]
      */
     private function calculateCardRating(array $card, ?string $description): array
@@ -377,7 +387,7 @@ class WildberriesMarketplace implements MarketplaceInterface
             'photos' => 'не заполнено',
             'characteristics' => 'не заполнено',
         ];
-        
+
         // Наименование (2.5 балла)
         $title = $card['title'] ?? '';
         if (mb_strlen($title) >= 10) {
@@ -386,11 +396,11 @@ class WildberriesMarketplace implements MarketplaceInterface
         } elseif (mb_strlen($title) >= 5) {
             $score += 1.5;
             $details['title'] = 'можно улучшить';
-        } elseif (!empty($title)) {
+        } elseif (! empty($title)) {
             $score += 0.5;
             $details['title'] = 'слишком короткое';
         }
-        
+
         // Описание (2.5 балла)
         $descLength = mb_strlen($description ?? '');
         if ($descLength >= 100) {
@@ -403,7 +413,7 @@ class WildberriesMarketplace implements MarketplaceInterface
             $score += 0.5;
             $details['description'] = 'слишком короткое';
         }
-        
+
         // Фото (2.5 балла)
         $photosCount = count($card['photos'] ?? []);
         if ($photosCount >= 5) {
@@ -416,7 +426,7 @@ class WildberriesMarketplace implements MarketplaceInterface
             $score += 1.0;
             $details['photos'] = 'мало фото';
         }
-        
+
         // Характеристики (2.5 балла)
         $charsCount = count($card['characteristics'] ?? []);
         if ($charsCount >= 10) {
@@ -432,19 +442,19 @@ class WildberriesMarketplace implements MarketplaceInterface
             $score += 0.5;
             $details['characteristics'] = 'очень мало';
         }
-        
+
         return [
             'score' => round($score, 1),
             'max_score' => 10,
             'details' => $details,
         ];
     }
-    
+
     /**
      * Извлечь габариты из WB карточки
      * По документации WB API: dimensions на уровне карточки, размеры в см, вес в кг
      * Возвращает null если данных нет (без дефолтов — только реальные данные)
-     * 
+     *
      * @see https://dev.wildberries.ru/openapi/work-with-products
      */
     private function extractDimensions(array $card): array
@@ -459,22 +469,25 @@ class WildberriesMarketplace implements MarketplaceInterface
                 'weight' => isset($dims['weightBrutto']) ? (float) $dims['weightBrutto'] * 1000 : null, // кг → г
             ];
         }
-        
+
         // 2. Fallback: characteristics (для старых карточек)
         $chars = collect($card['characteristics'] ?? []);
-        $findValue = function($names) use ($chars) {
-            $char = $chars->first(fn($c) => in_array($c['name'] ?? '', $names));
-            if (!$char) return null;
+        $findValue = function ($names) use ($chars) {
+            $char = $chars->first(fn ($c) => in_array($c['name'] ?? '', $names));
+            if (! $char) {
+                return null;
+            }
             $value = $char['value'] ?? null;
+
             // value может быть массивом или скаляром
             return is_array($value) ? ($value[0] ?? null) : $value;
         };
-        
+
         $length = $findValue(['Глубина упаковки', 'Глубина', 'Длина упаковки', 'Длина']);
         $width = $findValue(['Ширина упаковки', 'Ширина']);
         $height = $findValue(['Высота упаковки', 'Высота']);
-        $weight = $findValue(['Вес товара с упаковкой (г)', 'Вес с упаковкой', 'Вес товара', 'Вес']);
-        
+        $weight = $findValue(['Вес товара с упаковкой (г)', 'Вес с упаковкова', 'Вес товара', 'Вес']);
+
         return [
             'length' => $length !== null ? (float) $length : null,
             'width' => $width !== null ? (float) $width : null,
@@ -482,7 +495,6 @@ class WildberriesMarketplace implements MarketplaceInterface
             'weight' => $weight !== null ? (float) $weight : null,  // г
         ];
     }
-    
 
     public function getProductPrices(): array
     {
@@ -493,12 +505,12 @@ class WildberriesMarketplace implements MarketplaceInterface
 
     public function getInventory(): array
     {
-        return $this->inventory->getStocks();
+        return $this->inventory->getStocks($this->getIntegration());
     }
 
     public function getWarehouses(): array
     {
-        return $this->inventory->getWarehouses();
+        return $this->inventory->getWarehouses($this->getIntegration());
     }
 
     // === Sales ===
@@ -511,6 +523,14 @@ class WildberriesMarketplace implements MarketplaceInterface
     public function getSalesBySku(): array
     {
         return $this->sales->getSalesBySku();
+    }
+
+    /**
+     * Продажи по складам для {@see \App\Jobs\SyncInventoryJob} (остатки × sales_* / avg_daily_sales).
+     */
+    public function getSalesByWarehouse(int $days = 30): array
+    {
+        return $this->sales->getSalesByWarehouse($days);
     }
 
     /**
@@ -562,10 +582,10 @@ class WildberriesMarketplace implements MarketplaceInterface
 
     /**
      * Получить фактические начисления за хранение из еженедельных отчётов реализации
-     * 
+     *
      * Это РЕАЛЬНЫЕ суммы (storage_fee), которые WB начислил к оплате.
-     * 
-     * @param int $weeks Количество недель для анализа
+     *
+     * @param  int  $weeks  Количество недель для анализа
      * @return array [barcode => ['storage_fee_total' => float, 'storage_fee_last_week' => float, ...]]
      */
     public function getStorageFeesBySku(int $weeks = 4): array
@@ -583,20 +603,20 @@ class WildberriesMarketplace implements MarketplaceInterface
 
     /**
      * Получить коэффициенты складов (КС) для WB
-     * 
+     *
      * Возвращает коэффициенты логистики и хранения по каждому складу WB.
      * Используется для расчёта юнит-экономики.
-     * 
+     *
      * @return array [warehouseId => ['delivery_coef' => float, 'storage_coef' => float, 'warehouse_name' => string, ...]]
      */
     public function getWarehouseCoefficients(): array
     {
         return $this->storage->getWarehouseCoefficients();
     }
-    
+
     /**
      * Получить коэффициенты для FBS складов продавца
-     * 
+     *
      * @return array [warehouseId => ['delivery_coef' => float, 'warehouse_name' => string, 'office_name' => string, ...]]
      */
     public function getFbsWarehouseCoefficients(): array

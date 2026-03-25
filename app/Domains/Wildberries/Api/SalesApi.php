@@ -16,6 +16,7 @@ class SalesApi
     private function extractNmId(array $item): ?string
     {
         $nmId = $item['nmId'] ?? $item['nmID'] ?? $item['nm_id'] ?? null;
+
         return $nmId !== null && $nmId !== '' ? (string) $nmId : null;
     }
 
@@ -27,6 +28,7 @@ class SalesApi
     private function extractSrid(array $item): ?string
     {
         $srid = $item['srid'] ?? null;
+
         return $srid !== null && $srid !== '' ? (string) $srid : null;
     }
 
@@ -63,52 +65,57 @@ class SalesApi
     public function getSalesStats(string $dateFrom, string $dateTo): array
     {
         try {
-            $response = $this->client->statistics("/api/v1/supplier/sales", [
+            $response = $this->client->statistics('/api/v1/supplier/sales', [
                 'dateFrom' => $dateFrom,
             ]);
 
             return $response ?? [];
         } catch (\Exception $e) {
             Log::error('WB getSalesStats error', ['error' => $e->getMessage()]);
+
             return [];
         }
     }
 
     /**
      * Получить продажи по SKU за последние N дней
-     * 
+     *
      * Индексирует по barcode (основной ключ в InventoryApi) и supplierArticle (fallback)
      */
     public function getSalesBySku(int $days = 30): array
     {
         try {
             $dateFrom = now()->subDays($days)->format('Y-m-d');
-            
-            $response = $this->client->statistics("/api/v1/supplier/sales", [
+
+            $response = $this->client->statistics('/api/v1/supplier/sales', [
                 'dateFrom' => $dateFrom,
             ]);
 
             $salesBySku = [];
-            
+
             foreach ($response ?? [] as $sale) {
                 // Используем barcode как основной ключ (совпадает с InventoryApi)
                 $barcode = $sale['barcode'] ?? null;
                 $supplierArticle = $sale['supplierArticle'] ?? null;
-                
+
                 // Пропускаем если нет ни barcode, ни supplierArticle
-                if (!$barcode && !$supplierArticle) continue;
+                if (! $barcode && ! $supplierArticle) {
+                    continue;
+                }
 
                 $saleDate = isset($sale['date']) ? strtotime($sale['date']) : time();
                 $daysAgo = (time() - $saleDate) / 86400;
 
-                $quantity = (int)($sale['quantity'] ?? 1);
-                $price = (float)($sale['priceWithDisc'] ?? 0);
+                $quantity = (int) ($sale['quantity'] ?? 1);
+                $price = (float) ($sale['priceWithDisc'] ?? 0);
 
                 // Функция для добавления продаж к ключу
-                $addSales = function($key) use (&$salesBySku, $quantity, $price, $daysAgo) {
-                    if (!$key) return;
-                    
-                    if (!isset($salesBySku[$key])) {
+                $addSales = function ($key) use (&$salesBySku, $quantity, $price, $daysAgo) {
+                    if (! $key) {
+                        return;
+                    }
+
+                    if (! isset($salesBySku[$key])) {
                         $salesBySku[$key] = [
                             'sales_30_days' => 0,
                             'sales_14_days' => 0,
@@ -130,7 +137,7 @@ class SalesApi
 
                 // Индексируем по barcode (основной ключ)
                 $addSales($barcode);
-                
+
                 // Также индексируем по supplierArticle для совместимости
                 if ($supplierArticle && $supplierArticle !== $barcode) {
                     $addSales($supplierArticle);
@@ -141,7 +148,7 @@ class SalesApi
             foreach ($salesBySku as $sku => &$data) {
                 $data['avg_daily_sales'] = round($data['sales_30_days'] / 30, 2);
             }
-            
+
             Log::info('WB getSalesBySku: loaded sales data', [
                 'count' => count($salesBySku),
                 'sample_keys' => array_slice(array_keys($salesBySku), 0, 5),
@@ -150,6 +157,98 @@ class SalesApi
             return $salesBySku;
         } catch (\Exception $e) {
             Log::error('WB getSalesBySku error', ['error' => $e->getMessage()]);
+
+            return [];
+        }
+    }
+
+    /**
+     * Продажи по SKU и складу отгрузки (warehouseName из /api/v1/supplier/sales).
+     * Формат для {@see \App\Jobs\SyncInventoryJob}: при записи в БД метрики суммируются по всем складам одного SKU.
+     *
+     * @return array<string, array<string, array{sales_7_days:int,sales_14_days:int,sales_30_days:int,avg_daily_sales:float}>>
+     */
+    public function getSalesByWarehouse(int $days = 30): array
+    {
+        try {
+            $days = max(1, $days);
+            $dateFrom = now()->subDays($days)->format('Y-m-d');
+
+            $response = $this->client->statistics('/api/v1/supplier/sales', [
+                'dateFrom' => $dateFrom,
+            ]);
+
+            /** @var array<string, array<string, array{sales_30_days:int,sales_14_days:int,sales_7_days:int}>> $byKeyWarehouse */
+            $byKeyWarehouse = [];
+
+            foreach ($response ?? [] as $sale) {
+                if ($this->isReturnSale($sale)) {
+                    continue;
+                }
+
+                $barcode = $sale['barcode'] ?? null;
+                $supplierArticle = $sale['supplierArticle'] ?? null;
+                if (! $barcode && ! $supplierArticle) {
+                    continue;
+                }
+
+                $warehouseName = (string) ($sale['warehouseName'] ?? $sale['warehouse_name'] ?? 'WB');
+                $quantity = $this->extractQuantity($sale);
+                $saleDate = isset($sale['date']) ? strtotime((string) $sale['date']) : time();
+                $daysAgo = $saleDate ? (time() - $saleDate) / 86400 : 0;
+
+                $accumulate = function (?string $key) use (&$byKeyWarehouse, $warehouseName, $quantity, $daysAgo): void {
+                    if ($key === null || $key === '') {
+                        return;
+                    }
+                    if (! isset($byKeyWarehouse[$key][$warehouseName])) {
+                        $byKeyWarehouse[$key][$warehouseName] = [
+                            'sales_30_days' => 0,
+                            'sales_14_days' => 0,
+                            'sales_7_days' => 0,
+                        ];
+                    }
+                    $ref = &$byKeyWarehouse[$key][$warehouseName];
+                    $ref['sales_30_days'] += $quantity;
+                    if ($daysAgo <= 14) {
+                        $ref['sales_14_days'] += $quantity;
+                    }
+                    if ($daysAgo <= 7) {
+                        $ref['sales_7_days'] += $quantity;
+                    }
+                };
+
+                if ($barcode !== null && $barcode !== '') {
+                    $accumulate((string) $barcode);
+                }
+                if ($supplierArticle && (string) $supplierArticle !== (string) $barcode) {
+                    $accumulate((string) $supplierArticle);
+                }
+            }
+
+            $result = [];
+            foreach ($byKeyWarehouse as $sku => $warehouses) {
+                $result[$sku] = [];
+                foreach ($warehouses as $whName => $data) {
+                    $s30 = (int) $data['sales_30_days'];
+                    $result[$sku][$whName] = [
+                        'sales_30_days' => $s30,
+                        'sales_14_days' => (int) $data['sales_14_days'],
+                        'sales_7_days' => (int) $data['sales_7_days'],
+                        'avg_daily_sales' => round($s30 / $days, 4),
+                    ];
+                }
+            }
+
+            Log::info('WB getSalesByWarehouse: loaded', [
+                'sku_keys' => count($result),
+                'window_days' => $days,
+            ]);
+
+            return $result;
+        } catch (\Exception $e) {
+            Log::error('WB getSalesByWarehouse error', ['error' => $e->getMessage()]);
+
             return [];
         }
     }
@@ -168,7 +267,7 @@ class SalesApi
 
             foreach ($response ?? [] as $sale) {
                 $nmId = $this->extractNmId($sale);
-                if (!$nmId) {
+                if (! $nmId) {
                     continue;
                 }
 
@@ -181,7 +280,7 @@ class SalesApi
                     $sale['barcode'] ?? null,
                 ]));
 
-                if (!isset($salesStateByNmId[$nmId][$stateKey]) || $timestamp >= $salesStateByNmId[$nmId][$stateKey]['timestamp']) {
+                if (! isset($salesStateByNmId[$nmId][$stateKey]) || $timestamp >= $salesStateByNmId[$nmId][$stateKey]['timestamp']) {
                     $salesStateByNmId[$nmId][$stateKey] = [
                         'timestamp' => $timestamp,
                         'is_return' => $this->isReturnSale($sale),
@@ -191,13 +290,14 @@ class SalesApi
 
             foreach ($salesStateByNmId as $nmId => $states) {
                 $salesByNmId[$nmId] = collect($states)
-                    ->filter(fn (array $state) => !$state['is_return'])
+                    ->filter(fn (array $state) => ! $state['is_return'])
                     ->count();
             }
 
             return $salesByNmId;
         } catch (\Exception $e) {
             Log::error('WB getSalesCountByNmId error', ['error' => $e->getMessage()]);
+
             return [];
         }
     }
@@ -216,7 +316,7 @@ class SalesApi
 
             foreach ($response ?? [] as $order) {
                 $nmId = $this->extractNmId($order);
-                if (!$nmId) {
+                if (! $nmId) {
                     continue;
                 }
 
@@ -229,7 +329,7 @@ class SalesApi
                     $order['gNumber'] ?? null,
                 ]));
 
-                if (!isset($orderStateByNmId[$nmId][$stateKey]) || $timestamp >= $orderStateByNmId[$nmId][$stateKey]['timestamp']) {
+                if (! isset($orderStateByNmId[$nmId][$stateKey]) || $timestamp >= $orderStateByNmId[$nmId][$stateKey]['timestamp']) {
                     $orderStateByNmId[$nmId][$stateKey] = [
                         'timestamp' => $timestamp,
                         'is_cancel' => (bool) ($order['isCancel'] ?? false),
@@ -239,13 +339,14 @@ class SalesApi
 
             foreach ($orderStateByNmId as $nmId => $states) {
                 $ordersByNmId[$nmId] = collect($states)
-                    ->filter(fn (array $state) => !$state['is_cancel'])
+                    ->filter(fn (array $state) => ! $state['is_cancel'])
                     ->count();
             }
 
             return $ordersByNmId;
         } catch (\Exception $e) {
             Log::error('WB getOrdersByNmId error', ['error' => $e->getMessage()]);
+
             return [];
         }
     }
@@ -282,38 +383,39 @@ class SalesApi
             return $result;
         } catch (\Exception $e) {
             Log::error('WB getRedemptionStatsByNmId error', ['error' => $e->getMessage()]);
+
             return [];
         }
     }
 
     /**
      * Получить продажи по регионам (федеральным округам) для расчёта индекса локализации
-     * 
+     *
      * Использует API /api/v1/supplier/sales который содержит:
      * - warehouseName — склад отгрузки
      * - oblastOkrugName — федеральный округ доставки
-     * 
+     *
      * Это позволяет точно определить локальные заказы (склад и доставка в одном ФО)
-     * 
-     * @param int $days Количество дней
+     *
+     * @param  int  $days  Количество дней
      * @return array [nmId => ['total' => int, 'local' => int, 'by_warehouse_fo' => array]]
      */
     public function getSalesByRegion(int $days = 31): array
     {
         try {
             $dateFrom = now()->subDays($days)->format('Y-m-d');
-            
-            $response = $this->client->statistics("/api/v1/supplier/sales", [
+
+            $response = $this->client->statistics('/api/v1/supplier/sales', [
                 'dateFrom' => $dateFrom,
             ]);
 
             if (empty($response)) {
                 return [];
             }
-            
+
             // Маппинг складов WB на федеральные округа
             $warehouseToFo = $this->getWarehouseToFoMapping();
-            
+
             // Кластеры ФО (объединённые округа)
             $foClusters = [
                 'Северо-Кавказский федеральный округ' => 'south',
@@ -325,28 +427,30 @@ class SalesApi
                 'Приволжский федеральный округ' => 'volga',
                 'Уральский федеральный округ' => 'ural',
             ];
-            
+
             $salesByNmId = [];
-            
+
             foreach ($response as $sale) {
                 $nmId = $this->extractNmId($sale);
                 $warehouseName = $sale['warehouseName'] ?? $sale['warehouse_name'] ?? '';
                 $deliveryFo = $sale['oblastOkrugName'] ?? $sale['oblast_okrug_name'] ?? '';
                 $qty = $this->extractQuantity($sale);
-                
-                if (!$nmId) continue;
-                
+
+                if (! $nmId) {
+                    continue;
+                }
+
                 // Определяем ФО склада отгрузки
                 $warehouseFo = $warehouseToFo[$warehouseName] ?? $this->guessWarehouseFo($warehouseName);
-                
+
                 // Определяем кластеры
                 $warehouseCluster = $foClusters[$warehouseFo] ?? $warehouseFo;
                 $deliveryCluster = $foClusters[$deliveryFo] ?? $deliveryFo;
-                
+
                 // Заказ локальный, если склад и доставка в одном кластере
-                $isLocal = ($warehouseCluster === $deliveryCluster) && !empty($warehouseCluster) && !empty($deliveryCluster);
-                
-                if (!isset($salesByNmId[$nmId])) {
+                $isLocal = ($warehouseCluster === $deliveryCluster) && ! empty($warehouseCluster) && ! empty($deliveryCluster);
+
+                if (! isset($salesByNmId[$nmId])) {
                     $salesByNmId[$nmId] = [
                         'total' => 0,
                         'local' => 0,
@@ -354,19 +458,19 @@ class SalesApi
                         'by_delivery_fo' => [],
                     ];
                 }
-                
+
                 $salesByNmId[$nmId]['total'] += $qty;
                 if ($isLocal) {
                     $salesByNmId[$nmId]['local'] += $qty;
                 }
-                
+
                 // Статистика по складам и ФО доставки
-                $salesByNmId[$nmId]['by_warehouse'][$warehouseName] = 
+                $salesByNmId[$nmId]['by_warehouse'][$warehouseName] =
                     ($salesByNmId[$nmId]['by_warehouse'][$warehouseName] ?? 0) + $qty;
-                $salesByNmId[$nmId]['by_delivery_fo'][$deliveryFo] = 
+                $salesByNmId[$nmId]['by_delivery_fo'][$deliveryFo] =
                     ($salesByNmId[$nmId]['by_delivery_fo'][$deliveryFo] ?? 0) + $qty;
             }
-            
+
             Log::info('WB getSalesByRegion: loaded sales with warehouse data', [
                 'count' => count($salesByNmId),
                 'total_sales' => array_sum(array_column($salesByNmId, 'total')),
@@ -376,6 +480,7 @@ class SalesApi
             return $salesByNmId;
         } catch (\Exception $e) {
             Log::error('WB getSalesByRegion error', ['error' => $e->getMessage()]);
+
             return [];
         }
     }
@@ -437,19 +542,19 @@ class SalesApi
     private function guessWarehouseFo(string $warehouseName): string
     {
         $mapping = $this->getWarehouseToFoMapping();
-        
+
         // Точное совпадение
         if (isset($mapping[$warehouseName])) {
             return $mapping[$warehouseName];
         }
-        
+
         // Частичное совпадение
         foreach ($mapping as $warehouse => $fo) {
             if (stripos($warehouseName, $warehouse) !== false || stripos($warehouse, $warehouseName) !== false) {
                 return $fo;
             }
         }
-        
+
         // По умолчанию — ЦФО (большинство складов там)
         return 'Центральный федеральный округ';
     }
@@ -461,22 +566,24 @@ class SalesApi
     {
         try {
             $dateFrom = now()->subDays($days)->format('Y-m-d');
-            
-            $response = $this->client->statistics("/api/v1/supplier/sales", [
+
+            $response = $this->client->statistics('/api/v1/supplier/sales', [
                 'dateFrom' => $dateFrom,
             ]);
 
             $sppByNmId = [];
             foreach ($response ?? [] as $sale) {
                 $nmId = $this->extractNmId($sale);
-                if (!$nmId) continue;
+                if (! $nmId) {
+                    continue;
+                }
 
-                $spp = (float)($sale['spp'] ?? 0);
-                
-                if (!isset($sppByNmId[$nmId])) {
+                $spp = (float) ($sale['spp'] ?? 0);
+
+                if (! isset($sppByNmId[$nmId])) {
                     $sppByNmId[$nmId] = ['values' => [], 'count' => 0];
                 }
-                
+
                 $sppByNmId[$nmId]['values'][] = $spp;
                 $sppByNmId[$nmId]['count']++;
             }
@@ -484,8 +591,8 @@ class SalesApi
             // Вычисляем средний SPP
             $result = [];
             foreach ($sppByNmId as $nmId => $data) {
-                $avgSpp = count($data['values']) > 0 
-                    ? array_sum($data['values']) / count($data['values']) 
+                $avgSpp = count($data['values']) > 0
+                    ? array_sum($data['values']) / count($data['values'])
                     : 0;
                 $result[$nmId] = round($avgSpp, 2);
             }
@@ -493,6 +600,7 @@ class SalesApi
             return $result;
         } catch (\Exception $e) {
             Log::error('WB getSppFromSales error', ['error' => $e->getMessage()]);
+
             return [];
         }
     }

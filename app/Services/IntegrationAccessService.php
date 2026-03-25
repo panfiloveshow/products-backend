@@ -5,6 +5,7 @@ namespace App\Services;
 use App\Models\Integration;
 use Illuminate\Database\QueryException;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Cache;
 
 class IntegrationAccessService
 {
@@ -32,10 +33,18 @@ class IntegrationAccessService
         if ($integration) {
             $workspaceCheck = $this->validateWorkspaceAccess($integration, $workspaceId);
             if ($workspaceCheck !== null) {
-                return $workspaceCheck;
+                $refreshedIntegration = $this->refreshIntegrationFromRemote($request, $integrationId, $expectedMarketplace, $workspaceId);
+                if ($refreshedIntegration !== null) {
+                    $integration = $refreshedIntegration;
+                    $workspaceCheck = $this->validateWorkspaceAccess($integration, $workspaceId);
+                }
+
+                if ($workspaceCheck !== null) {
+                    return $workspaceCheck;
+                }
             }
 
-            if ($expectedMarketplace && !empty($integration->marketplace)) {
+            if ($expectedMarketplace && ! empty($integration->marketplace)) {
                 $actualMarketplace = $this->normalizeMarketplace((string) $integration->marketplace);
                 if ($actualMarketplace !== $expectedMarketplace) {
                     return [
@@ -58,7 +67,7 @@ class IntegrationAccessService
         }
 
         $result = $this->sellicoApi->getIntegrationById($integrationId);
-        if (!($result['success'] ?? false)) {
+        if (! ($result['success'] ?? false)) {
             return [
                 'success' => false,
                 'status' => 404,
@@ -87,11 +96,11 @@ class IntegrationAccessService
         }
 
         $credentials = $result['credentials'] ?? ($integrationData['credentials'] ?? []);
-        if (!is_array($credentials)) {
+        if (! is_array($credentials)) {
             $credentials = [];
         }
 
-        $integration = Integration::find($integrationId) ?? new Integration();
+        $integration = Integration::find($integrationId) ?? new Integration;
         $integration->fill([
             'id' => $integrationId,
             'work_space_id' => $remoteWorkspaceId ?: $workspaceId,
@@ -100,11 +109,11 @@ class IntegrationAccessService
             'credentials' => $this->sanitizeStoredCredentials($credentials),
             'is_active' => (bool) ($integrationData['is_active'] ?? true),
             'is_premium' => (bool) ($integrationData['is_premium'] ?? false),
-            'premium_checked_at' => !empty($integrationData['premium_checked_at']) ? $integrationData['premium_checked_at'] : null,
+            'premium_checked_at' => ! empty($integrationData['premium_checked_at']) ? $integrationData['premium_checked_at'] : null,
             'manual_redemption_rate' => $integrationData['manual_redemption_rate'] ?? null,
         ]);
 
-        if (!$integration->exists) {
+        if (! $integration->exists) {
             $integration->auto_sync_enabled = true;
             $integration->sync_interval_hours = 6;
         }
@@ -142,7 +151,7 @@ class IntegrationAccessService
      */
     private function validateWorkspaceAccess(Integration $integration, ?int $workspaceId): ?array
     {
-        if (!$workspaceId) {
+        if (! $workspaceId) {
             return null;
         }
 
@@ -189,9 +198,67 @@ class IntegrationAccessService
     {
         return array_filter(
             $credentials,
-            static fn ($value, $key) => $value !== null && $value !== '' && !str_starts_with((string) $key, '_'),
+            static fn ($value, $key) => $value !== null && $value !== '' && ! str_starts_with((string) $key, '_'),
             ARRAY_FILTER_USE_BOTH
         );
+    }
+
+    private function refreshIntegrationFromRemote(
+        Request $request,
+        int $integrationId,
+        ?string $expectedMarketplace,
+        ?int $workspaceId
+    ): ?Integration {
+        $token = $this->extractToken($request);
+        if (! $token) {
+            return null;
+        }
+
+        $this->sellicoApi->setAccessToken($token);
+        Cache::forget("sellico_integration_{$integrationId}");
+        $result = $this->sellicoApi->getIntegrationById($integrationId);
+        if (! ($result['success'] ?? false)) {
+            return null;
+        }
+
+        $integrationData = $result['integration'] ?? [];
+        $remoteWorkspaceId = (int) ($integrationData['work_space_id'] ?? $integrationData['workspace_id'] ?? 0);
+        $marketplace = $this->normalizeMarketplace((string) ($integrationData['type'] ?? $expectedMarketplace ?? ''));
+
+        if ($workspaceId && $remoteWorkspaceId && $remoteWorkspaceId !== $workspaceId) {
+            return null;
+        }
+
+        if ($expectedMarketplace && $marketplace && $marketplace !== $expectedMarketplace) {
+            return null;
+        }
+
+        $credentials = $result['credentials'] ?? ($integrationData['credentials'] ?? []);
+        if (! is_array($credentials)) {
+            $credentials = [];
+        }
+
+        $integration = Integration::find($integrationId) ?? new Integration;
+        $integration->fill([
+            'id' => $integrationId,
+            'work_space_id' => $remoteWorkspaceId ?: $workspaceId,
+            'name' => $integrationData['name'] ?? $integration->name ?? ($marketplace ? "{$marketplace} {$integrationId}" : "integration {$integrationId}"),
+            'marketplace' => $marketplace ?: $expectedMarketplace ?: $integration->marketplace,
+            'credentials' => $this->sanitizeStoredCredentials($credentials),
+            'is_active' => (bool) ($integrationData['is_active'] ?? $integration->is_active ?? true),
+            'is_premium' => (bool) ($integrationData['is_premium'] ?? $integration->is_premium ?? false),
+            'premium_checked_at' => ! empty($integrationData['premium_checked_at']) ? $integrationData['premium_checked_at'] : $integration->premium_checked_at,
+            'manual_redemption_rate' => $integrationData['manual_redemption_rate'] ?? $integration->manual_redemption_rate,
+        ]);
+
+        if (! $integration->exists) {
+            $integration->auto_sync_enabled = true;
+            $integration->sync_interval_hours = 6;
+        }
+
+        $integration->save();
+
+        return $integration->fresh();
     }
 
     private function isDuplicateIntegrationKey(QueryException $exception, int $integrationId): bool

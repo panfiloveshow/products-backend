@@ -1,6 +1,9 @@
 <?php
 
-use Laravel\Sanctum\Sanctum;
+$appUrl = (string) env('APP_URL', 'http://localhost');
+$appHost = parse_url($appUrl, PHP_URL_HOST) ?: $appUrl;
+$appPort = parse_url($appUrl, PHP_URL_PORT);
+$appHostWithPort = $appPort ? "{$appHost}:{$appPort}" : $appHost;
 
 return [
 
@@ -16,10 +19,9 @@ return [
     */
 
     'stateful' => explode(',', env('SANCTUM_STATEFUL_DOMAINS', sprintf(
-        '%s%s',
+        '%s,%s',
         'localhost,localhost:3000,127.0.0.1,127.0.0.1:8000,::1',
-        Sanctum::currentApplicationUrlWithPort(),
-        // Sanctum::currentRequestHost(),
+        $appHostWithPort,
     ))),
 
     /*

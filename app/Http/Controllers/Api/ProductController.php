@@ -8,6 +8,7 @@ use App\Http\Requests\Product\StoreProductRequest;
 use App\Http\Requests\Product\UpdateProductRequest;
 use App\Models\Integration;
 use App\Models\Product;
+use App\Services\IntegrationAccessService;
 use App\Services\ProductService;
 use App\Services\SellicoApiService;
 use Illuminate\Http\JsonResponse;
@@ -16,44 +17,48 @@ use Illuminate\Http\Request;
 class ProductController extends Controller
 {
     public function __construct(
-        private ProductService $productService
+        private ProductService $productService,
+        private IntegrationAccessService $integrationAccessService
     ) {}
 
     public function index(IndexProductRequest $request): JsonResponse
     {
         $validated = $request->validated();
-        
-        $query = Product::query();
 
-        if (!empty($validated['search'])) {
+        $query = Product::query();
+        $this->productService->applyComputedStock($query);
+
+        if (! empty($validated['search'])) {
             $query->search($validated['search']);
         }
 
-        if (!empty($validated['marketplace'])) {
-            $query->marketplace($validated['marketplace']);
+        if (! empty($validated['marketplace'])) {
+            $mp = $validated['marketplace'];
+            if (in_array($mp, ['yandex', 'yandex_market'], true)) {
+                $query->whereIn('marketplace', ['yandex', 'yandex_market']);
+            } else {
+                $query->marketplace($mp);
+            }
         }
 
-        if (!empty($validated['integration_id'])) {
+        if (! empty($validated['integration_id'])) {
             $integrationId = (int) $validated['integration_id'];
-
             $workspace = $request->header('X-Sellico-Workspace')
                 ?? $request->header('X-Workspace-Id')
                 ?? $request->input('workspace');
+            $marketplace = $validated['marketplace'] ?? null;
 
-            if ($workspace) {
-                $integration = \App\Models\Integration::where('id', $integrationId)->first();
+            $resolution = $this->integrationAccessService->ensureAccessibleIntegration(
+                $request,
+                $integrationId,
+                $marketplace
+            );
 
-                if ($integration && $integration->work_space_id !== null && $integration->work_space_id !== (int) $workspace) {
-                    return response()->json([
-                        'success' => false,
-                        'message' => 'Интеграция не принадлежит текущему workspace',
-                    ], 403);
-                }
-
-                // Заполняем work_space_id если ещё не заполнен
-                if ($integration && $integration->work_space_id === null) {
-                    $integration->update(['work_space_id' => (int) $workspace]);
-                }
+            if (! ($resolution['success'] ?? false)) {
+                return response()->json([
+                    'success' => false,
+                    'message' => $resolution['message'] ?? 'Интеграция недоступна',
+                ], $resolution['status'] ?? 403);
             }
 
             $integrationLog = config('logging.verbose_product_index') ? 'info' : 'debug';
@@ -65,11 +70,11 @@ class ProductController extends Controller
             $query->where('integration_id', $integrationId);
         }
 
-        if (!empty($validated['category'])) {
+        if (! empty($validated['category'])) {
             $query->where('category', $validated['category']);
         }
 
-        if (!empty($validated['brand'])) {
+        if (! empty($validated['brand'])) {
             $query->where('brand', $validated['brand']);
         }
 
@@ -82,47 +87,37 @@ class ProductController extends Controller
         }
 
         if (isset($validated['in_stock']) && $validated['in_stock']) {
-            $query->inStock();
+            $query->whereRaw($this->productService->computedStockExpression().' > 0');
         }
 
         $sortField = $validated['sort'] ?? 'created_at';
         $sortOrder = $validated['sort_order'] ?? 'desc';
-        $query->orderBy($sortField, $sortOrder);
+        if ($sortField === 'stock') {
+            $query->orderByRaw($this->productService->computedStockExpression().' '.$sortOrder);
+        } else {
+            $query->orderBy($sortField, $sortOrder);
+        }
 
         $limit = min($validated['limit'] ?? 50, 200);
         $page = $validated['page'] ?? 1;
 
         $products = $query->paginate($limit, ['*'], 'page', $page);
 
-        // Подгружаем остатки из inventory_warehouses
-        $productSkus = $products->pluck('sku')->toArray();
-        $inventoryQuery = \DB::table('inventory_warehouses')
-            ->whereIn('sku', $productSkus);
-        
-        // Фильтруем по integration_id если он указан
-        if (!empty($validated['integration_id'])) {
-            $inventoryQuery->where('integration_id', (int) $validated['integration_id']);
-        }
-        
-        $inventoryStocks = $inventoryQuery
-            ->select('sku', \DB::raw('SUM(quantity) as total_stock'))
-            ->groupBy('sku')
-            ->pluck('total_stock', 'sku');
-
-        $skusWithStock = $inventoryStocks->filter(fn ($qty) => (int) $qty > 0)->count();
         $stocksLog = config('logging.verbose_product_index') ? 'info' : 'debug';
         \Log::log($stocksLog, 'ProductController: Остатки загружены', [
-            'skus_on_page' => count($productSkus),
-            'aggregate_rows' => $inventoryStocks->count(),
-            'skus_with_positive_stock' => $skusWithStock,
-            'sample' => $inventoryStocks->take(3)->toArray(),
+            'skus_on_page' => $products->count(),
+            'skus_with_positive_stock' => $products->getCollection()->filter(
+                fn ($product) => (int) ($product->computed_stock ?? 0) > 0
+            )->count(),
+            'sample' => $products->getCollection()->take(3)->mapWithKeys(
+                fn ($product) => [$product->sku => (int) ($product->computed_stock ?? 0)]
+            )->toArray(),
         ]);
 
         // Обновляем stock в товарах
-        $productsWithStock = $products->getCollection()->map(function ($product) use ($inventoryStocks) {
+        $productsWithStock = $products->getCollection()->map(function ($product) {
             $productArray = $product->toArray();
-            $stock = (int) ($inventoryStocks[$product->sku] ?? 0);
-            $productArray['stock'] = $stock;
+            $productArray['stock'] = (int) ($product->computed_stock ?? $product->stock ?? 0);
 
             return $productArray;
         });
@@ -185,7 +180,7 @@ class ProductController extends Controller
     /**
      * Запуск синхронизации товаров с маркетплейса
      * POST /api/products/sync/{marketplace}
-     * 
+     *
      * Body:
      * - api_key: string (обязательно для WB)
      * - client_id: string (обязательно для Ozon)
@@ -198,22 +193,22 @@ class ProductController extends Controller
         $marketplace = $this->normalizeMarketplace($marketplace);
         $integrationId = $request->integer('integration_id') ?: null;
 
-        if (!$integrationId && $request->bearerToken()) {
+        if (! $integrationId && $request->bearerToken()) {
             $syncLogs = $this->startMarketplaceSyncAcrossWorkspaces($request, $marketplace);
 
-            if (!empty($syncLogs)) {
+            if (! empty($syncLogs)) {
                 return response()->json([
                     'data' => [
                         'status' => 'pending',
                         'marketplace' => $marketplace,
                         'started' => count($syncLogs),
                         'syncs' => $syncLogs,
-                        'message' => "Sync started for {$marketplace} in " . count($syncLogs) . " integrations",
+                        'message' => "Sync started for {$marketplace} in ".count($syncLogs).' integrations',
                     ],
                 ]);
             }
         }
-        
+
         // Если передан integration_id, берём credentials из интеграции
         if ($integrationId) {
             $integration = Integration::find($integrationId);
@@ -226,20 +221,22 @@ class ProductController extends Controller
                     $sellicoApi = app(\App\Services\SellicoApiService::class);
                     $sellicoApi->setAccessToken($token);
                     $result = $sellicoApi->getIntegrationById($integrationId);
-                    
-                    if ($result['success'] && !empty($result['credentials'])) {
+
+                    if ($result['success'] && ! empty($result['credentials'])) {
                         $credentials = $result['credentials'];
                     } else {
                         \Log::error('ProductController::sync - Sellico API integration fetch failed', [
                             'integration_id' => $integrationId,
-                            'result' => $result
+                            'result' => $result,
                         ]);
+
                         return response()->json(['error' => 'Integration not found locally or in Sellico API', 'details' => $result], 404);
                     }
                 } else {
                     \Log::error('ProductController::sync - No local integration and no token provided', [
-                        'integration_id' => $integrationId
+                        'integration_id' => $integrationId,
                     ]);
+
                     return response()->json(['error' => 'Integration not found locally and no token provided'], 404);
                 }
             }
@@ -275,7 +272,7 @@ class ProductController extends Controller
         }
 
         $syncLog = $this->productService->startSync(
-            $marketplace, 
+            $marketplace,
             $credentials,
             $integrationId
         );
@@ -302,7 +299,7 @@ class ProductController extends Controller
     private function startMarketplaceSyncAcrossWorkspaces(Request $request, string $marketplace): array
     {
         $token = $request->bearerToken();
-        if (!$token) {
+        if (! $token) {
             return [];
         }
 
@@ -311,17 +308,18 @@ class ProductController extends Controller
         $sellicoApi->setAccessToken($token);
 
         $workspacesResult = $sellicoApi->getWorkspaces();
-        if (!($workspacesResult['success'] ?? false)) {
+        if (! ($workspacesResult['success'] ?? false)) {
             \Log::warning('ProductController::sync - Failed to load workspaces for bulk sync', [
                 'marketplace' => $marketplace,
                 'error' => $workspacesResult['error'] ?? null,
             ]);
+
             return [];
         }
 
         $workspacesRaw = $workspacesResult['workspaces'] ?? [];
         $workspaces = $workspacesRaw['data'] ?? $workspacesRaw;
-        if (!is_array($workspaces)) {
+        if (! is_array($workspaces)) {
             return [];
         }
 
@@ -330,17 +328,18 @@ class ProductController extends Controller
 
         foreach ($workspaces as $workspace) {
             $workspaceId = (int) ($workspace['id'] ?? 0);
-            if (!$workspaceId) {
+            if (! $workspaceId) {
                 continue;
             }
 
             $integrationsResult = $sellicoApi->getMarketplaceCredentials($workspaceId);
-            if (!($integrationsResult['success'] ?? false)) {
+            if (! ($integrationsResult['success'] ?? false)) {
                 \Log::warning('ProductController::sync - Failed to load workspace integrations', [
                     'workspace_id' => $workspaceId,
                     'marketplace' => $marketplace,
                     'error' => $integrationsResult['error'] ?? null,
                 ]);
+
                 continue;
             }
 
@@ -355,12 +354,12 @@ class ProductController extends Controller
                 }
 
                 $remoteIntegrationId = (int) ($integrationData['id'] ?? 0);
-                if (!$remoteIntegrationId || isset($processedIntegrationIds[$remoteIntegrationId])) {
+                if (! $remoteIntegrationId || isset($processedIntegrationIds[$remoteIntegrationId])) {
                     continue;
                 }
 
                 $credentials = $this->extractIntegrationCredentials($integrationData, $token);
-                if (!$this->hasMarketplaceCredentials($credentials)) {
+                if (! $this->hasMarketplaceCredentials($credentials)) {
                     continue;
                 }
 
@@ -403,7 +402,7 @@ class ProductController extends Controller
             'business_id' => $integrationData['business_id'] ?? null,
         ];
 
-        if (!is_array($credentials)) {
+        if (! is_array($credentials)) {
             $credentials = [];
         }
 
@@ -416,7 +415,7 @@ class ProductController extends Controller
     private function hasMarketplaceCredentials(array $credentials): bool
     {
         foreach (['api_key', 'client_id', 'token', 'campaign_id', 'business_id'] as $key) {
-            if (!empty($credentials[$key])) {
+            if (! empty($credentials[$key])) {
                 return true;
             }
         }
@@ -431,7 +430,7 @@ class ProductController extends Controller
         array $credentials
     ): void {
         $integrationId = (int) ($integrationData['id'] ?? 0);
-        if (!$integrationId) {
+        if (! $integrationId) {
             return;
         }
 
@@ -444,7 +443,7 @@ class ProductController extends Controller
             'is_active' => (bool) ($integrationData['is_active'] ?? true),
         ]);
 
-        if (!$localIntegration->exists) {
+        if (! $localIntegration->exists) {
             $localIntegration->auto_sync_enabled = true;
             $localIntegration->sync_interval_hours = 6;
         }
@@ -456,7 +455,7 @@ class ProductController extends Controller
     {
         return array_filter(
             $credentials,
-            static fn ($value, $key) => $value !== null && $value !== '' && !str_starts_with((string) $key, '_'),
+            static fn ($value, $key) => $value !== null && $value !== '' && ! str_starts_with((string) $key, '_'),
             ARRAY_FILTER_USE_BOTH
         );
     }

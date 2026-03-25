@@ -2,13 +2,15 @@
 
 namespace App\Services;
 
+use App\Jobs\SyncInventoryJob;
 use App\Models\InventoryAlert;
 use App\Models\InventoryHistory;
 use App\Models\InventoryWarehouse;
 use App\Models\Product;
 use App\Models\SyncLog;
-use App\Jobs\SyncInventoryJob;
+use App\Support\SyncStartGuard;
 use Illuminate\Support\Collection;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 
 class InventoryService
@@ -129,7 +131,7 @@ class InventoryService
             'category' => $product->category,
             'sales_trend' => $salesTrend,
             'sales_28_days' => round($sales28Days),
-            'marketplace_warehouses' => $warehouses->map(fn($w) => [
+            'marketplace_warehouses' => $warehouses->map(fn ($w) => [
                 'id' => $w->id,
                 'name' => $w->warehouse_name,
                 'marketplace' => $w->marketplace,
@@ -192,9 +194,14 @@ class InventoryService
     {
         $query = Product::whereHas('inventoryWarehouses');
 
-        if (!empty($filters['marketplace']) && $filters['marketplace'] !== 'all') {
-            $query->whereHas('inventoryWarehouses', function ($q) use ($filters) {
-                $q->where('marketplace', $filters['marketplace']);
+        if (! empty($filters['marketplace']) && $filters['marketplace'] !== 'all') {
+            $mp = strtolower((string) $filters['marketplace']);
+            $query->whereHas('inventoryWarehouses', function ($q) use ($mp) {
+                if (in_array($mp, ['yandex', 'yandex_market'], true)) {
+                    $q->whereIn('marketplace', ['yandex', 'yandex_market']);
+                } else {
+                    $q->where('marketplace', $mp);
+                }
             });
         }
 
@@ -273,36 +280,43 @@ class InventoryService
 
     /**
      * Запускает синхронизацию остатков с маркетплейса
-     * 
-     * @param string $marketplace Название маркетплейса (wildberries, ozon, yandex)
-     * @param array $credentials API-ключи для маркетплейса
-     * @param int|null $integrationId ID интеграции из Sellico (опционально)
+     *
+     * @param  string  $marketplace  Название маркетплейса (wildberries, ozon, yandex)
+     * @param  array  $credentials  API-ключи для маркетплейса
+     * @param  int|null  $integrationId  ID интеграции из Sellico (опционально)
      */
     public function startSync(
         string $marketplace,
         array $credentials = [],
-        ?int $integrationId = null
+        ?int $integrationId = null,
+        ?int $dispatchDelaySeconds = null
     ): SyncLog {
-        $existingSync = SyncLog::where('marketplace', $marketplace)
-            ->where('sync_type', 'inventory')
-            ->running()
-            ->first();
+        $lock = Cache::lock(
+            SyncStartGuard::cacheLockKey('inventory', $marketplace, $integrationId),
+            120
+        );
 
-        if ($existingSync) {
-            return $existingSync;
-        }
+        return $lock->block(15, function () use ($marketplace, $credentials, $integrationId, $dispatchDelaySeconds) {
+            $existingSync = SyncStartGuard::findActiveDuplicate('inventory', $marketplace, $integrationId);
+            if ($existingSync) {
+                return $existingSync;
+            }
 
-        $syncLog = SyncLog::create([
-            'marketplace' => $marketplace,
-            'integration_id' => $integrationId,
-            'sync_type' => 'inventory',
-            'status' => SyncLog::STATUS_PENDING,
-            'credentials' => $credentials,
-        ]);
+            $syncLog = SyncLog::create([
+                'marketplace' => SyncStartGuard::storageMarketplace($marketplace),
+                'integration_id' => $integrationId,
+                'sync_type' => 'inventory',
+                'status' => SyncLog::STATUS_PENDING,
+                'credentials' => $credentials,
+            ]);
 
-        SyncInventoryJob::dispatch($syncLog);
+            $pending = SyncInventoryJob::dispatch($syncLog);
+            if ($dispatchDelaySeconds !== null && $dispatchDelaySeconds > 0) {
+                $pending->delay(now()->addSeconds($dispatchDelaySeconds));
+            }
 
-        return $syncLog;
+            return $syncLog;
+        });
     }
 
     public function getSyncStatuses(): array
@@ -339,7 +353,7 @@ class InventoryService
             ->limit(10)
             ->get();
 
-        return $lowStockProducts->map(fn($w) => [
+        return $lowStockProducts->map(fn ($w) => [
             'id' => $w->id,
             'type' => 'warning',
             'title' => "Низкий остаток: {$w->product->name}",
@@ -385,7 +399,7 @@ class InventoryService
     public static function invalidateStatsCache(?int $integrationId = null, ?string $marketplace = null): void
     {
         \Illuminate\Support\Facades\Cache::forget("inventory_stats_{$integrationId}_{$marketplace}");
-        \Illuminate\Support\Facades\Cache::forget("inventory_stats_all");
+        \Illuminate\Support\Facades\Cache::forget('inventory_stats_all');
     }
 
     public function getOverallStats(): array

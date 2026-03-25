@@ -2,11 +2,15 @@
 
 namespace Tests\Unit;
 
-use App\Services\ProductService;
+use App\Models\Integration;
 use App\Models\Product;
 use App\Models\SyncLog;
-use App\Models\Integration;
+use App\Services\ProductService;
 use Illuminate\Foundation\Testing\LazilyRefreshDatabase;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Queue;
+use Illuminate\Support\Facades\Schema;
+use Illuminate\Support\Str;
 use Tests\TestCase;
 
 class ProductServiceTest extends TestCase
@@ -18,7 +22,8 @@ class ProductServiceTest extends TestCase
     protected function setUp(): void
     {
         parent::setUp();
-        $this->service = new ProductService();
+        Queue::fake();
+        $this->service = new ProductService;
     }
 
     /**
@@ -43,7 +48,7 @@ class ProductServiceTest extends TestCase
         $this->assertArrayHasKey('in_stock', $result);
         $this->assertArrayHasKey('out_of_stock', $result);
         $this->assertArrayHasKey('average_price', $result);
-        
+
         $this->assertEquals(8, $result['total']);
     }
 
@@ -80,12 +85,24 @@ class ProductServiceTest extends TestCase
     public function test_start_sync_creates_sync_log(): void
     {
         $credentials = ['api_key' => 'test_key'];
-        
+
         $syncLog = $this->service->startSync('ozon', $credentials);
 
         $this->assertInstanceOf(SyncLog::class, $syncLog);
         $this->assertEquals('ozon', $syncLog->marketplace);
         $this->assertEquals(SyncLog::STATUS_PENDING, $syncLog->status);
+    }
+
+    /**
+     * yandex_market в логах сохраняется как yandex (совместимость со старым ENUM в БД).
+     */
+    public function test_start_sync_maps_yandex_market_to_yandex_in_sync_log(): void
+    {
+        $credentials = ['token' => 't', 'campaign_id' => 'c'];
+
+        $syncLog = $this->service->startSync('yandex_market', $credentials, 21);
+
+        $this->assertEquals('yandex', $syncLog->marketplace);
     }
 
     /**
@@ -99,7 +116,7 @@ class ProductServiceTest extends TestCase
         ]);
 
         $credentials = ['client_id' => 'test', 'api_key' => 'test'];
-        
+
         $syncLog = $this->service->startSync('ozon', $credentials, $integration->id);
 
         $this->assertEquals($integration->id, $syncLog->integration_id);
@@ -111,20 +128,18 @@ class ProductServiceTest extends TestCase
     public function test_start_sync_blocks_duplicate(): void
     {
         $credentials = ['api_key' => 'test_key'];
-        
-        // Создаём активную синхронизацию
-        SyncLog::create([
+
+        $existing = SyncLog::create([
             'marketplace' => 'ozon',
             'sync_type' => 'products',
             'status' => SyncLog::STATUS_RUNNING,
             'credentials' => $credentials,
         ]);
 
-        // Попытка запустить ещё одну
         $syncLog = $this->service->startSync('ozon', $credentials);
 
-        // Должен вернуть существующую или создать новую (зависит от реализации)
-        $this->assertInstanceOf(SyncLog::class, $syncLog);
+        $this->assertSame($existing->id, $syncLog->id);
+        $this->assertEquals(SyncLog::STATUS_RUNNING, $syncLog->status);
     }
 
     /**
@@ -152,5 +167,102 @@ class ProductServiceTest extends TestCase
         $result = $this->service->getProductsStats(['marketplace' => 'ozon']);
 
         $this->assertEquals(5, $result['total']);
+    }
+
+    public function test_get_products_stats_uses_inventory_warehouse_stock(): void
+    {
+        if (DB::getDriverName() === 'sqlite') {
+            $this->markTestSkipped('SQLite schema for inventory_warehouses has incompatible foreign key constraints in tests.');
+        }
+
+        Product::factory()->create([
+            'marketplace' => 'wildberries',
+            'integration_id' => 36,
+            'sku' => '8901414000636',
+            'price' => 650,
+            'stock' => 0,
+        ]);
+
+        $this->insertInventoryRow([
+            'marketplace' => 'wildberries',
+            'integration_id' => 36,
+            'sku' => '8901414000636',
+            'warehouse_id' => 'wb-1',
+            'quantity' => 7,
+        ]);
+
+        $result = $this->service->getProductsStats([
+            'marketplace' => 'wildberries',
+            'integration_id' => 36,
+        ]);
+
+        $this->assertEquals(1, $result['total']);
+        $this->assertEquals(1, $result['in_stock']);
+        $this->assertEquals(0, $result['out_of_stock']);
+        $this->assertEquals(4550.0, $result['total_value']);
+    }
+
+    public function test_get_products_stats_filters_inventory_by_selected_integration(): void
+    {
+        if (DB::getDriverName() === 'sqlite') {
+            $this->markTestSkipped('SQLite schema for inventory_warehouses has incompatible foreign key constraints in tests.');
+        }
+
+        Product::factory()->create([
+            'marketplace' => 'wildberries',
+            'integration_id' => 36,
+            'sku' => 'SKU-INTEG-36',
+            'stock' => 0,
+        ]);
+
+        Product::factory()->create([
+            'marketplace' => 'wildberries',
+            'integration_id' => 99,
+            'sku' => 'SKU-INTEG-99',
+            'stock' => 0,
+        ]);
+
+        $this->insertInventoryRow([
+            'marketplace' => 'wildberries',
+            'integration_id' => 36,
+            'sku' => 'SKU-INTEG-36',
+            'warehouse_id' => 'wb-36',
+            'quantity' => 5,
+        ]);
+
+        $this->insertInventoryRow([
+            'marketplace' => 'wildberries',
+            'integration_id' => 99,
+            'sku' => 'SKU-INTEG-99',
+            'warehouse_id' => 'wb-99',
+            'quantity' => 0,
+        ]);
+
+        $for36 = $this->service->getProductsStats([
+            'marketplace' => 'wildberries',
+            'integration_id' => 36,
+        ]);
+
+        $for99 = $this->service->getProductsStats([
+            'marketplace' => 'wildberries',
+            'integration_id' => 99,
+        ]);
+
+        $this->assertEquals(1, $for36['in_stock']);
+        $this->assertEquals(0, $for99['in_stock']);
+    }
+
+    private function insertInventoryRow(array $attributes): void
+    {
+        Schema::withoutForeignKeyConstraints(function () use ($attributes) {
+            DB::table('inventory_warehouses')->insert(array_merge([
+                'id' => (string) Str::uuid(),
+                'warehouse_name' => 'Test warehouse',
+                'marketplace' => 'wildberries',
+                'quantity' => 0,
+                'created_at' => now(),
+                'updated_at' => now(),
+            ], $attributes));
+        });
     }
 }

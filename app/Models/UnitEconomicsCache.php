@@ -2,14 +2,14 @@
 
 namespace App\Models;
 
+use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
-use Illuminate\Database\Eloquent\Builder;
 
 /**
  * Кэш юнит-экономики (автоматический расчёт)
- * 
+ *
  * Хранит предрассчитанные данные для каждой схемы работы.
  * Обновляется автоматически при:
  * - синхронизации товаров
@@ -163,7 +163,7 @@ class UnitEconomicsCache extends Model
      */
     public function scopeForIntegration(Builder $query, int $integrationId): Builder
     {
-        return $query->where('integration_id', $integrationId);
+        return $query->where($this->getTable().'.integration_id', $integrationId);
     }
 
     /**
@@ -171,7 +171,7 @@ class UnitEconomicsCache extends Model
      */
     public function scopeForMarketplace(Builder $query, string $marketplace): Builder
     {
-        return $query->where('marketplace', $marketplace);
+        return $query->where($this->getTable().'.marketplace', $marketplace);
     }
 
     /**
@@ -179,7 +179,7 @@ class UnitEconomicsCache extends Model
      */
     public function scopeForScheme(Builder $query, string $fulfillmentType): Builder
     {
-        return $query->where('fulfillment_type', strtoupper($fulfillmentType));
+        return $query->where($this->getTable().'.fulfillment_type', strtoupper($fulfillmentType));
     }
 
     /**
@@ -190,10 +190,10 @@ class UnitEconomicsCache extends Model
         if (empty($search)) {
             return $query;
         }
-        
+
         return $query->where(function ($q) use ($search) {
-            $q->where('sku', 'like', "%{$search}%")
-              ->orWhere('product_name', 'like', "%{$search}%");
+            $q->where($this->getTable().'.sku', 'like', "%{$search}%")
+                ->orWhere($this->getTable().'.product_name', 'like', "%{$search}%");
         });
     }
 
@@ -205,10 +205,10 @@ class UnitEconomicsCache extends Model
         if ($profitable === null) {
             return $query;
         }
-        
-        return $profitable 
-            ? $query->where('net_profit', '>', 0)
-            : $query->where('net_profit', '<=', 0);
+
+        return $profitable
+            ? $query->where($this->getTable().'.net_profit', '>', 0)
+            : $query->where($this->getTable().'.net_profit', '<=', 0);
     }
 
     /**
@@ -217,11 +217,12 @@ class UnitEconomicsCache extends Model
     public function scopeMarginRange(Builder $query, ?float $min, ?float $max): Builder
     {
         if ($min !== null) {
-            $query->where('margin_percent', '>=', $min);
+            $query->where($this->getTable().'.margin_percent', '>=', $min);
         }
         if ($max !== null) {
-            $query->where('margin_percent', '<=', $max);
+            $query->where($this->getTable().'.margin_percent', '<=', $max);
         }
+
         return $query;
     }
 
@@ -231,11 +232,12 @@ class UnitEconomicsCache extends Model
     public function scopePriceRange(Builder $query, ?float $min, ?float $max): Builder
     {
         if ($min !== null) {
-            $query->where('price', '>=', $min);
+            $query->where($this->getTable().'.price', '>=', $min);
         }
         if ($max !== null) {
-            $query->where('price', '<=', $max);
+            $query->where($this->getTable().'.price', '<=', $max);
         }
+
         return $query;
     }
 
@@ -261,10 +263,10 @@ class UnitEconomicsCache extends Model
      */
     public function isStale(int $maxAgeMinutes = 60): bool
     {
-        if (!$this->calculated_at) {
+        if (! $this->calculated_at) {
             return true;
         }
-        
+
         return $this->calculated_at->diffInMinutes(now()) > $maxAgeMinutes;
     }
 }

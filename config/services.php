@@ -56,18 +56,19 @@ return [
     'yandex_market' => [
         'token' => env('YANDEX_MARKET_TOKEN'),
         'campaign_id' => env('YANDEX_MARKET_CAMPAIGN_ID'),
+        'business_id' => env('YANDEX_MARKET_BUSINESS_ID'),
         'base_url' => env('YANDEX_MARKET_BASE_URL', 'https://api.partner.market.yandex.ru'),
     ],
 
     'sellico' => [
-        'base_url'               => env('SELLICO_API_URL', 'https://sellico.ru/api'),
-        'email'                  => env('SELLICO_EMAIL'),
-        'password'               => env('SELLICO_PASSWORD'),
-        'skip_permission_check'  => env('SELLICO_SKIP_PERMISSION_CHECK', false),
+        'base_url' => env('SELLICO_API_URL', 'https://sellico.ru/api'),
+        'email' => env('SELLICO_EMAIL'),
+        'password' => env('SELLICO_PASSWORD'),
+        'skip_permission_check' => env('SELLICO_SKIP_PERMISSION_CHECK', false),
     ],
 
     'crm' => [
-        'url'           => env('CRM_URL', 'https://sellico.ru'),
+        'url' => env('CRM_URL', 'https://sellico.ru'),
         'service_token' => env('SELLICO_SERVICE_TOKEN'),
     ],
 

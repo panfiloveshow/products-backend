@@ -2,9 +2,9 @@
 
 namespace Tests\Unit;
 
-use App\Services\InventoryService;
 use App\Models\Product;
-use App\Models\InventoryWarehouse;
+use App\Models\SyncLog;
+use App\Services\InventoryService;
 use Illuminate\Foundation\Testing\LazilyRefreshDatabase;
 use Tests\TestCase;
 
@@ -17,7 +17,7 @@ class InventoryServiceTest extends TestCase
     protected function setUp(): void
     {
         parent::setUp();
-        $this->service = new InventoryService();
+        $this->service = new InventoryService;
     }
 
     /**
@@ -39,7 +39,7 @@ class InventoryServiceTest extends TestCase
         $this->assertArrayHasKey('name', $result);
         $this->assertArrayHasKey('total_stock', $result);
         $this->assertArrayHasKey('marketplace', $result);
-        
+
         $this->assertEquals('TEST-SKU-001', $result['sku']);
         $this->assertEquals('Test Product', $result['name']);
     }
@@ -83,5 +83,40 @@ class InventoryServiceTest extends TestCase
 
         $this->assertArrayHasKey('sales_trend', $result);
         $this->assertContains($result['sales_trend'], ['stable', 'growing', 'declining']);
+    }
+
+    public function test_start_sync_allows_inventory_for_different_integration_while_another_running(): void
+    {
+        $credentials = ['api_key' => 'k'];
+
+        SyncLog::create([
+            'marketplace' => 'wildberries',
+            'integration_id' => 1,
+            'sync_type' => 'inventory',
+            'status' => SyncLog::STATUS_RUNNING,
+            'credentials' => $credentials,
+        ]);
+
+        $log = $this->service->startSync('wildberries', $credentials, 2);
+
+        $this->assertNotEquals(1, $log->integration_id);
+        $this->assertEquals(2, $log->integration_id);
+    }
+
+    public function test_start_sync_blocks_duplicate_for_same_integration(): void
+    {
+        $credentials = ['api_key' => 'k'];
+
+        $existing = SyncLog::create([
+            'marketplace' => 'ozon',
+            'integration_id' => 10,
+            'sync_type' => 'inventory',
+            'status' => SyncLog::STATUS_PENDING,
+            'credentials' => $credentials,
+        ]);
+
+        $again = $this->service->startSync('ozon', $credentials, 10);
+
+        $this->assertSame($existing->id, $again->id);
     }
 }

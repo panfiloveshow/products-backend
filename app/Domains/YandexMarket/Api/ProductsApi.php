@@ -7,10 +7,10 @@ use App\Models\Integration;
 
 /**
  * API для работы с товарами Yandex Market
- * 
- * Endpoints:
- * - POST /campaigns/{campaignId}/offer-mapping-entries - список товаров
- * - POST /businesses/{businessId}/offer-mappings - маппинг офферов
+ *
+ * Endpoints (Partner API v2):
+ * - POST /v2/businesses/{businessId}/offer-mappings — список товаров в каталоге
+ * - GET /v2/campaigns/{campaignId}/offer-prices — цены
  */
 class ProductsApi implements ProductsApiInterface
 {
@@ -23,28 +23,27 @@ class ProductsApi implements ProductsApiInterface
      */
     public function getProducts(?Integration $integration = null, array $options = []): array
     {
-        $limit = $options['limit'] ?? 200;
+        $limit = min(100, max(1, (int) ($options['limit'] ?? 100)));
         $pageToken = $options['page_token'] ?? null;
-        
-        $params = [
-            'limit' => $limit,
-        ];
-        
-        if ($pageToken) {
-            $params['page_token'] = $pageToken;
-        }
+        $businessId = $this->client->resolveBusinessId();
 
-        $response = $this->client->get(
-            '/campaigns/{campaignId}/offer-mapping-entries',
-            $params
+        $query = array_filter([
+            'limit' => $limit,
+            'page_token' => $pageToken,
+        ]);
+
+        $response = $this->client->post(
+            '/v2/businesses/'.$businessId.'/offer-mappings',
+            [],
+            $query
         );
 
-        if (!$response) {
+        if (! $response) {
             return [];
         }
 
         return [
-            'items' => $response['result']['offerMappingEntries'] ?? [],
+            'items' => $response['result']['offerMappings'] ?? [],
             'paging' => $response['result']['paging'] ?? null,
         ];
     }
@@ -54,12 +53,13 @@ class ProductsApi implements ProductsApiInterface
      */
     public function getProductBySku(string $sku, ?Integration $integration = null): ?array
     {
-        $response = $this->client->post('/campaigns/{campaignId}/offer-mapping-entries', [
+        $businessId = $this->client->resolveBusinessId();
+        $response = $this->client->post('/v2/businesses/'.$businessId.'/offer-mappings', [
             'offerIds' => [$sku],
         ]);
 
-        $items = $response['result']['offerMappingEntries'] ?? [];
-        
+        $items = $response['result']['offerMappings'] ?? [];
+
         return $items[0] ?? null;
     }
 
@@ -78,11 +78,11 @@ class ProductsApi implements ProductsApiInterface
             }
 
             $response = $this->client->get(
-                '/campaigns/{campaignId}/offer-prices',
+                '/v2/campaigns/{campaignId}/offer-prices',
                 $params
             );
 
-            if (!$response) {
+            if (! $response) {
                 break;
             }
 
@@ -91,9 +91,13 @@ class ProductsApi implements ProductsApiInterface
 
             foreach ($items as $item) {
                 $sku = $item['offerId'] ?? null;
-                if (!$sku) continue;
+                if (! $sku) {
+                    continue;
+                }
 
-                if (!empty($skus) && !in_array($sku, $skus)) continue;
+                if (! empty($skus) && ! in_array($sku, $skus)) {
+                    continue;
+                }
 
                 $allPrices[$sku] = [
                     'price' => (float) ($item['price']['value'] ?? 0),
@@ -101,7 +105,7 @@ class ProductsApi implements ProductsApiInterface
                 ];
             }
 
-        } while (!empty($items) && $pageToken);
+        } while (! empty($items) && $pageToken);
 
         return $allPrices;
     }
@@ -109,13 +113,13 @@ class ProductsApi implements ProductsApiInterface
     /**
      * Получить все товары с пагинацией
      */
-    public function getAllProducts(Integration $integration, int $batchSize = 200): \Generator
+    public function getAllProducts(Integration $integration, int $batchSize = 100): \Generator
     {
         $pageToken = null;
 
         do {
             $result = $this->getProducts($integration, [
-                'limit' => $batchSize,
+                'limit' => min(100, max(1, $batchSize)),
                 'page_token' => $pageToken,
             ]);
 
@@ -126,6 +130,6 @@ class ProductsApi implements ProductsApiInterface
                 yield $item;
             }
 
-        } while (!empty($items) && $pageToken);
+        } while (! empty($items) && $pageToken);
     }
 }

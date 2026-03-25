@@ -6,7 +6,6 @@ use App\Http\Controllers\Controller;
 use App\Http\Requests\AutoSupplyPlan\StoreAutoSupplyPlanRequest;
 use App\Jobs\CalculateAutoSupplyPlanJob;
 use App\Models\AutoSupplyPlan;
-use App\Models\AutoSupplyPlanLine;
 use App\Models\Integration;
 use App\Models\OzonWarehouseCluster;
 use App\Models\Product;
@@ -42,7 +41,7 @@ class AutoSupplyPlanController extends Controller
             $integrationAccess = $this->integrationAccessService
                 ->ensureAccessibleIntegration($request, (int) $request->input('integration_id'));
 
-            if (!($integrationAccess['success'] ?? false)) {
+            if (! ($integrationAccess['success'] ?? false)) {
                 return response()->json([
                     'message' => $integrationAccess['message'] ?? 'Интеграция не найдена',
                 ], $integrationAccess['status'] ?? 404);
@@ -72,7 +71,7 @@ class AutoSupplyPlanController extends Controller
         $integrationAccess = $this->integrationAccessService
             ->ensureAccessibleIntegration($request, (int) $request->input('integration_id'));
 
-        if (!($integrationAccess['success'] ?? false)) {
+        if (! ($integrationAccess['success'] ?? false)) {
             return response()->json([
                 'message' => $integrationAccess['message'] ?? 'Интеграция не найдена',
             ], $integrationAccess['status'] ?? 404);
@@ -226,7 +225,7 @@ class AutoSupplyPlanController extends Controller
 
         $line = $query->first();
 
-        if (!$line) {
+        if (! $line) {
             return response()->json(['message' => 'Строка не найдена'], 404);
         }
 
@@ -246,6 +245,15 @@ class AutoSupplyPlanController extends Controller
     public function show(Request $request, string $id): JsonResponse
     {
         $plan = AutoSupplyPlan::with('integration')->findOrFail($id);
+
+        $integrationAccess = $this->integrationAccessService
+            ->ensureAccessibleIntegration($request, (int) $plan->integration_id);
+
+        if (! ($integrationAccess['success'] ?? false)) {
+            return response()->json([
+                'message' => $integrationAccess['message'] ?? 'Доступ запрещён',
+            ], $integrationAccess['status'] ?? 403);
+        }
 
         $perPage = $request->input('per_page', 50);
         // Агрегируем по SKU: одна строка на товар, qty суммируется по всем складам
@@ -360,7 +368,7 @@ class AutoSupplyPlanController extends Controller
         foreach ($lines as $line) {
             $cid = $line->cluster_id;
             if ($cid) {
-                if (!isset($clusters[$cid])) {
+                if (! isset($clusters[$cid])) {
                     $clusters[$cid] = [
                         'cluster_id' => $cid,
                         'cluster_name' => $line->cluster_name,
@@ -375,14 +383,14 @@ class AutoSupplyPlanController extends Controller
                 $clusters[$cid]['total_qty'] += $line->qty_rounded;
                 $clusters[$cid]['total_supply_cost'] += (float) ($line->supply_cost_estimate ?? 0);
                 $clusters[$cid]['skus'][$line->sku] = true;
-                if ($line->warehouse_name && !in_array($line->warehouse_name, $clusters[$cid]['warehouses'])) {
+                if ($line->warehouse_name && ! in_array($line->warehouse_name, $clusters[$cid]['warehouses'])) {
                     $clusters[$cid]['warehouses'][] = $line->warehouse_name;
                 }
             } else {
                 $unclustered['total_qty'] += $line->qty_rounded;
                 $unclustered['total_supply_cost'] += (float) ($line->supply_cost_estimate ?? 0);
                 $unclustered['skus'][$line->sku] = true;
-                if ($line->warehouse_name && !in_array($line->warehouse_name, $unclustered['warehouses'])) {
+                if ($line->warehouse_name && ! in_array($line->warehouse_name, $unclustered['warehouses'])) {
                     $unclustered['warehouses'][] = $line->warehouse_name;
                 }
             }
@@ -400,7 +408,7 @@ class AutoSupplyPlanController extends Controller
 
         // Sort by total_qty desc
         $result = array_values($clusters);
-        usort($result, fn($a, $b) => $b['total_qty'] <=> $a['total_qty']);
+        usort($result, fn ($a, $b) => $b['total_qty'] <=> $a['total_qty']);
 
         if ($unclustered['total_qty'] > 0) {
             $result[] = $unclustered;
@@ -430,7 +438,7 @@ class AutoSupplyPlanController extends Controller
         $integrationAccess = $this->integrationAccessService
             ->ensureAccessibleIntegration($request, (int) $request->input('integration_id'));
 
-        if (!($integrationAccess['success'] ?? false)) {
+        if (! ($integrationAccess['success'] ?? false)) {
             return response()->json([
                 'message' => $integrationAccess['message'] ?? 'Интеграция не найдена',
             ], $integrationAccess['status'] ?? 404);
@@ -462,7 +470,7 @@ class AutoSupplyPlanController extends Controller
             $clusterName = null;
             $region = null;
 
-            if (!empty($clusterMapping) && $wh->warehouse_name) {
+            if (! empty($clusterMapping) && $wh->warehouse_name) {
                 try {
                     $normalizedName = OzonWarehouseCluster::normalizeWarehouseName($wh->warehouse_name);
                     if (isset($clusterMapping[$normalizedName])) {
@@ -470,7 +478,8 @@ class AutoSupplyPlanController extends Controller
                         $clusterName = $clusterMapping[$normalizedName]['cluster_name'];
                         $region = $clusterMapping[$normalizedName]['region'];
                     }
-                } catch (\Exception $e) {}
+                } catch (\Exception $e) {
+                }
             }
 
             // Рассчитываем оборачиваемость
@@ -576,7 +585,7 @@ class AutoSupplyPlanController extends Controller
             if (empty($offerId) || $line->qty_rounded <= 0) {
                 continue;
             }
-            if (!isset($grouped[$offerId])) {
+            if (! isset($grouped[$offerId])) {
                 $grouped[$offerId] = [
                     'offer_id' => $offerId,
                     'name' => $line->product_name,
@@ -587,9 +596,9 @@ class AutoSupplyPlanController extends Controller
         }
 
         // Убираем строки с итоговым qty < 1
-        $grouped = array_filter($grouped, fn($item) => $item['qty'] >= 1);
+        $grouped = array_filter($grouped, fn ($item) => $item['qty'] >= 1);
 
-        $spreadsheet = new Spreadsheet();
+        $spreadsheet = new Spreadsheet;
         $sheet = $spreadsheet->getActiveSheet();
         $sheet->setTitle('Ozon Supply');
 
@@ -663,6 +672,7 @@ class AutoSupplyPlanController extends Controller
                     'product_name' => $line->product_name,
                     'error' => 'Баркод не найден',
                 ];
+
                 continue;
             }
 
@@ -674,10 +684,11 @@ class AutoSupplyPlanController extends Controller
                     'barcodes' => array_keys($skuToBarcodes[$line->sku]),
                     'error' => 'Несколько баркодов для одного SKU, нужна детализация',
                 ];
+
                 continue;
             }
 
-            if (!isset($grouped[$barcode])) {
+            if (! isset($grouped[$barcode])) {
                 $grouped[$barcode] = [
                     'barcode' => $barcode,
                     'qty' => 0,
@@ -687,10 +698,10 @@ class AutoSupplyPlanController extends Controller
         }
 
         // Убираем строки с итоговым qty < 1
-        $grouped = array_filter($grouped, fn($item) => $item['qty'] >= 1);
+        $grouped = array_filter($grouped, fn ($item) => $item['qty'] >= 1);
 
         // Сохраняем ошибки в план
-        if (!empty($errors)) {
+        if (! empty($errors)) {
             $plan->update(['export_errors' => $errors]);
         }
 
@@ -701,7 +712,7 @@ class AutoSupplyPlanController extends Controller
             ], 422);
         }
 
-        $spreadsheet = new Spreadsheet();
+        $spreadsheet = new Spreadsheet;
         $sheet = $spreadsheet->getActiveSheet();
         $sheet->setTitle('WB Supply');
 
@@ -747,7 +758,7 @@ class AutoSupplyPlanController extends Controller
         $warehouseMap = [];
         foreach ($lines as $line) {
             $whName = $line->warehouse_name ?: $line->warehouse_id ?: 'Неизвестный';
-            if (!isset($warehouseMap[$whName])) {
+            if (! isset($warehouseMap[$whName])) {
                 $warehouseMap[$whName] = $whName;
             }
         }
@@ -761,7 +772,7 @@ class AutoSupplyPlanController extends Controller
             $offerId = $line->offer_id ?? $line->sku;
             $whName = $line->warehouse_name ?: $line->warehouse_id ?: 'Неизвестный';
 
-            if (!isset($matrix[$offerId])) {
+            if (! isset($matrix[$offerId])) {
                 $matrix[$offerId] = [];
                 $offerMeta[$offerId] = $line->product_name;
             }
@@ -771,7 +782,7 @@ class AutoSupplyPlanController extends Controller
         // Сортируем артикулы
         ksort($matrix);
 
-        $spreadsheet = new Spreadsheet();
+        $spreadsheet = new Spreadsheet;
         $sheet = $spreadsheet->getActiveSheet();
         $sheet->setTitle('Поставка Ozon');
 
@@ -853,11 +864,11 @@ class AutoSupplyPlanController extends Controller
         $byWarehouse = [];
         foreach ($lines as $line) {
             $whName = $line->warehouse_name ?: $line->warehouse_id ?: 'Неизвестный';
-            if (!isset($byWarehouse[$whName])) {
+            if (! isset($byWarehouse[$whName])) {
                 $byWarehouse[$whName] = [];
             }
             $offerId = $line->offer_id ?? $line->sku;
-            if (!isset($byWarehouse[$whName][$offerId])) {
+            if (! isset($byWarehouse[$whName][$offerId])) {
                 $byWarehouse[$whName][$offerId] = [
                     'offer_id' => $offerId,
                     'name' => $line->product_name,
@@ -871,15 +882,17 @@ class AutoSupplyPlanController extends Controller
 
         // Создаём ZIP
         $tempFile = tempnam(sys_get_temp_dir(), 'supply_zip_');
-        $zip = new \ZipArchive();
+        $zip = new \ZipArchive;
         $zip->open($tempFile, \ZipArchive::CREATE | \ZipArchive::OVERWRITE);
 
         foreach ($byWarehouse as $whName => $items) {
             // Убираем строки с qty < 1
-            $items = array_filter($items, fn($item) => $item['qty'] >= 1);
-            if (empty($items)) continue;
+            $items = array_filter($items, fn ($item) => $item['qty'] >= 1);
+            if (empty($items)) {
+                continue;
+            }
 
-            $spreadsheet = new Spreadsheet();
+            $spreadsheet = new Spreadsheet;
             $sheet = $spreadsheet->getActiveSheet();
             $sheet->setTitle('Поставка');
 
@@ -924,7 +937,7 @@ class AutoSupplyPlanController extends Controller
         @unlink($tempFile);
 
         // Удаляем временные xlsx файлы
-        foreach (glob(sys_get_temp_dir() . '/xlsx_*') as $f) {
+        foreach (glob(sys_get_temp_dir().'/xlsx_*') as $f) {
             @unlink($f);
         }
 

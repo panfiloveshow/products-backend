@@ -3,15 +3,15 @@
 namespace App\Domains\YandexMarket;
 
 use App\Domains\Marketplace\Contracts\MarketplaceInterface;
-use App\Domains\YandexMarket\Api\YandexMarketClient;
-use App\Domains\YandexMarket\Api\ProductsApi;
 use App\Domains\YandexMarket\Api\InventoryApi;
+use App\Domains\YandexMarket\Api\ProductsApi;
 use App\Domains\YandexMarket\Api\SalesApi;
+use App\Domains\YandexMarket\Api\YandexMarketClient;
 use App\Models\Integration;
 
 /**
  * Фасад для работы с Yandex Market API
- * 
+ *
  * Объединяет все компоненты:
  * - ProductsApi — товары
  * - InventoryApi — остатки
@@ -20,14 +20,17 @@ use App\Models\Integration;
 class YandexMarketMarketplace implements MarketplaceInterface
 {
     private YandexMarketClient $client;
+
     private ProductsApi $products;
+
     private InventoryApi $inventory;
+
     private SalesApi $sales;
 
     public function __construct(array $credentials = [])
     {
-        $token = $credentials['token'] ?? config('services.yandex_market.token');
-        $campaignId = $credentials['campaign_id'] ?? config('services.yandex_market.campaign_id');
+        $token = $credentials['token'] ?? $credentials['api_key'] ?? config('services.yandex_market.token');
+        $campaignId = $credentials['campaign_id'] ?? $credentials['client_id'] ?? config('services.yandex_market.campaign_id');
         $businessId = $credentials['business_id'] ?? config('services.yandex_market.business_id');
 
         $this->client = new YandexMarketClient($token, $campaignId, $businessId);
@@ -51,7 +54,8 @@ class YandexMarketMarketplace implements MarketplaceInterface
     public function testConnection(Integration $integration): bool
     {
         try {
-            $products = $this->products->getProducts(1);
+            $this->products->getProducts($integration, ['limit' => 1]);
+
             return true;
         } catch (\Exception $e) {
             return false;
@@ -67,7 +71,70 @@ class YandexMarketMarketplace implements MarketplaceInterface
 
     public function getProducts(): array
     {
-        return $this->products->getProducts();
+        $products = [];
+        $pageToken = null;
+
+        do {
+            $result = $this->products->getProducts(null, [
+                'limit' => 100,
+                'page_token' => $pageToken,
+            ]);
+
+            $items = $result['items'] ?? [];
+            foreach ($items as $item) {
+                $products[] = $this->transformProduct($item);
+            }
+
+            $pageToken = $result['paging']['nextPageToken'] ?? null;
+        } while ($pageToken && count($products) < 100000);
+
+        return $products;
+    }
+
+    private function transformProduct(array $entry): array
+    {
+        $offer = $entry['offer'] ?? [];
+        $mapping = $entry['mapping'] ?? [];
+
+        // Получаем цену
+        $price = null;
+        if (isset($offer['price']['value'])) {
+            $price = (float) $offer['price']['value'];
+        }
+
+        $shopSku = trim((string) ($offer['shopSku'] ?? ''));
+        $vendorCode = trim((string) ($offer['vendorCode'] ?? ''));
+        $marketSku = $mapping['marketSku'] ?? null;
+        $sku = $shopSku !== '' ? $shopSku : ($vendorCode !== '' ? $vendorCode : (string) ($marketSku ?? ''));
+
+        return [
+            'sku' => $sku,
+            'name' => $offer['name'] ?? 'Без названия',
+            'barcode' => $offer['barcodes'][0] ?? null,
+            'price' => $price,
+            'old_price' => null,
+            'stock' => 0, // Остатки получаем отдельно
+            'description' => $offer['description'] ?? null,
+            'images' => $offer['pictures'] ?? $offer['urls'] ?? [],
+            'category' => $offer['category'] ?? $mapping['categoryId'] ?? null,
+            'brand' => $offer['vendor'] ?? null,
+            'rating' => null,
+            'reviews_count' => 0,
+            'marketplace' => 'yandex_market',
+            'marketplace_id' => (string) ($mapping['marketSku'] ?? $sku),
+            'url' => isset($mapping['marketSku'])
+                ? "https://market.yandex.ru/product/{$mapping['marketSku']}"
+                : null,
+            'yandex_data' => [
+                'shopSku' => $offer['shopSku'] ?? null,
+                'marketSku' => $mapping['marketSku'] ?? null,
+                'categoryId' => $mapping['categoryId'] ?? null,
+                'modelId' => $mapping['modelId'] ?? null,
+                'vendorCode' => $offer['vendorCode'] ?? null,
+                'availability' => $offer['availability'] ?? null,
+                'processingState' => $offer['processingState'] ?? null,
+            ],
+        ];
     }
 
     public function getProductPrices(): array

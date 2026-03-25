@@ -12,15 +12,20 @@ use Illuminate\Support\Facades\Log;
 class YandexMarketClient
 {
     private const BASE_URL = 'https://api.partner.market.yandex.ru';
-    
+
     private string $apiKey;
+
     private ?string $campaignId;
+
     private ?string $businessId;
+
+    private ?string $resolvedBusinessId = null;
+
     private int $timeout = 30;
 
     public function __construct(?string $token = null, ?string $campaignId = null, ?string $businessId = null)
     {
-        $this->apiKey = $token ?? config('services.yandex_market.token') ?? '';
+        $this->apiKey = $this->normalizeToken((string) ($token ?? config('services.yandex_market.token') ?? ''));
         $this->campaignId = $campaignId ?? config('services.yandex_market.campaign_id');
         $this->businessId = $businessId ?? config('services.yandex_market.business_id');
     }
@@ -31,6 +36,7 @@ class YandexMarketClient
     public static function fromIntegration(Integration $integration): self
     {
         $credentials = $integration->getDecryptedCredentials();
+
         return new self(
             $credentials['api_key'] ?? $credentials['token'] ?? null,
             $credentials['campaign_id'] ?? $credentials['client_id'] ?? '',
@@ -45,7 +51,7 @@ class YandexMarketClient
     {
         try {
             $url = $this->buildUrl($endpoint);
-            
+
             $response = Http::withHeaders($this->getHeaders())
                 ->timeout($this->timeout)
                 ->get($url, $params);
@@ -54,37 +60,48 @@ class YandexMarketClient
                 return $response->json();
             }
 
+            $message = $this->formatHttpError($endpoint, $response->status(), $response->body());
+
             Log::warning('Yandex Market API error', [
                 'endpoint' => $endpoint,
                 'status' => $response->status(),
                 'body' => $response->body(),
             ]);
 
-            return null;
+            throw new \RuntimeException($message);
         } catch (\Exception $e) {
             Log::error('Yandex Market API exception', [
                 'endpoint' => $endpoint,
                 'error' => $e->getMessage(),
             ]);
-            return null;
+            throw $e;
         }
     }
 
     /**
      * POST запрос к API
+     *
+     * @param  array<string, mixed>  $query  Query string (page_token, limit, …)
      */
-    public function post(string $endpoint, array $data = []): ?array
+    public function post(string $endpoint, array $data = [], array $query = []): ?array
     {
         try {
             $url = $this->buildUrl($endpoint);
-            
+            if ($query !== []) {
+                $url .= '?'.http_build_query($query);
+            }
+
+            $payload = $data === [] ? new \stdClass : $data;
+
             $response = Http::withHeaders($this->getHeaders())
                 ->timeout($this->timeout)
-                ->post($url, $data);
+                ->post($url, $payload);
 
             if ($response->successful()) {
                 return $response->json();
             }
+
+            $message = $this->formatHttpError($endpoint, $response->status(), $response->body());
 
             Log::warning('Yandex Market API error', [
                 'endpoint' => $endpoint,
@@ -92,14 +109,41 @@ class YandexMarketClient
                 'body' => $response->body(),
             ]);
 
-            return null;
+            throw new \RuntimeException($message);
         } catch (\Exception $e) {
             Log::error('Yandex Market API exception', [
                 'endpoint' => $endpoint,
                 'error' => $e->getMessage(),
             ]);
-            return null;
+            throw $e;
         }
+    }
+
+    /**
+     * ID кабинета для POST /v2/businesses/{businessId}/offer-mappings.
+     * Берётся из credentials или из GET /v2/campaigns/{campaignId}.
+     */
+    public function resolveBusinessId(): string
+    {
+        $configured = $this->businessId !== null ? trim((string) $this->businessId) : '';
+        if ($configured !== '') {
+            return $configured;
+        }
+        if ($this->resolvedBusinessId !== null) {
+            return $this->resolvedBusinessId;
+        }
+        $cid = trim((string) ($this->campaignId ?? ''));
+        if ($cid === '') {
+            throw new \RuntimeException('Yandex Market: укажите campaign_id или business_id');
+        }
+        $json = $this->get('/v2/campaigns/{campaignId}');
+        $id = data_get($json, 'result.campaign.business.id');
+        if ($id === null || $id === '') {
+            throw new \RuntimeException('Yandex Market: в ответе кампании нет result.campaign.business.id');
+        }
+        $this->resolvedBusinessId = (string) $id;
+
+        return $this->resolvedBusinessId;
     }
 
     /**
@@ -109,7 +153,7 @@ class YandexMarketClient
     {
         try {
             $url = $this->buildUrl($endpoint);
-            
+
             $response = Http::withHeaders($this->getHeaders())
                 ->timeout($this->timeout)
                 ->put($url, $data);
@@ -118,13 +162,21 @@ class YandexMarketClient
                 return $response->json();
             }
 
-            return null;
+            $message = $this->formatHttpError($endpoint, $response->status(), $response->body());
+
+            Log::warning('Yandex Market API error', [
+                'endpoint' => $endpoint,
+                'status' => $response->status(),
+                'body' => $response->body(),
+            ]);
+
+            throw new \RuntimeException($message);
         } catch (\Exception $e) {
             Log::error('Yandex Market API exception', [
                 'endpoint' => $endpoint,
                 'error' => $e->getMessage(),
             ]);
-            return null;
+            throw $e;
         }
     }
 
@@ -133,13 +185,13 @@ class YandexMarketClient
      */
     private function buildUrl(string $endpoint): string
     {
-        $url = self::BASE_URL . $endpoint;
-        
-        // Заменить {campaignId} на реальный ID
+        $url = self::BASE_URL.$endpoint;
+
         if (str_contains($endpoint, '{campaignId}')) {
-            $url = str_replace('{campaignId}', $this->campaignId, $url);
+            $cid = (string) ($this->campaignId ?? '');
+            $url = str_replace('{campaignId}', $cid, $url);
         }
-        
+
         return $url;
     }
 
@@ -149,7 +201,7 @@ class YandexMarketClient
     private function getHeaders(): array
     {
         return [
-            'Authorization' => 'Bearer ' . $this->apiKey,
+            'Authorization' => 'Bearer '.$this->apiKey,
             'Content-Type' => 'application/json',
             'Accept' => 'application/json',
         ];
@@ -160,7 +212,7 @@ class YandexMarketClient
      */
     public function getCampaignId(): string
     {
-        return $this->campaignId;
+        return (string) ($this->campaignId ?? '');
     }
 
     /**
@@ -169,6 +221,25 @@ class YandexMarketClient
     public function setTimeout(int $seconds): self
     {
         $this->timeout = $seconds;
+
         return $this;
+    }
+
+    private function normalizeToken(string $token): string
+    {
+        $token = trim($token);
+
+        if ($token === '') {
+            return '';
+        }
+
+        return preg_replace('/^(oauth|bearer)\s+/i', '', $token) ?? $token;
+    }
+
+    private function formatHttpError(string $endpoint, int $status, string $body): string
+    {
+        $snippet = trim(mb_substr($body, 0, 300));
+
+        return "Yandex Market API request failed: {$endpoint} [{$status}] {$snippet}";
     }
 }

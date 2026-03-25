@@ -2,28 +2,48 @@
 
 namespace App\Jobs;
 
+use App\Domains\Marketplace\MarketplaceFactory;
 use App\Models\InventoryWarehouse;
 use App\Models\Product;
 use App\Models\SyncLog;
-use App\Domains\Marketplace\MarketplaceFactory;
 use Illuminate\Bus\Queueable;
+use Illuminate\Contracts\Queue\ShouldBeUnique;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
-use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 
-class SyncInventoryJob implements ShouldQueue
+class SyncInventoryJob implements ShouldBeUnique, ShouldQueue
 {
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
 
     public int $tries = 3;
+
     public int $timeout = 600;
+
+    public int $uniqueFor = 3600;
 
     public function __construct(
         public SyncLog $syncLog
     ) {}
+
+    /**
+     * @return list<int>
+     */
+    public function backoff(): array
+    {
+        return [30, 120, 300];
+    }
+
+    public function uniqueId(): string
+    {
+        return implode(':', [
+            'inventory',
+            $this->syncLog->marketplace,
+            (string) ($this->syncLog->integration_id ?? '0'),
+        ]);
+    }
 
     public function handle(): void
     {
@@ -46,12 +66,12 @@ class SyncInventoryJob implements ShouldQueue
                 $inventory = [];
                 if (method_exists($marketplaceService, 'getInventoryPerWarehouse')) {
                     $fboInventory = $marketplaceService->getInventoryPerWarehouse();
-                    $inventory    = array_merge($inventory, $fboInventory);
+                    $inventory = array_merge($inventory, $fboInventory);
                     Log::info('Ozon FBO inventory loaded', ['skus' => count($fboInventory)]);
                 }
                 if (method_exists($marketplaceService, 'getInventoryFbsPerWarehouse')) {
                     $fbsInventory = $marketplaceService->getInventoryFbsPerWarehouse();
-                    $inventory    = array_merge($inventory, $fbsInventory);
+                    $inventory = array_merge($inventory, $fbsInventory);
                     Log::info('Ozon FBS inventory loaded', ['skus' => count($fbsInventory)]);
                 }
                 if (empty($inventory)) {
@@ -64,7 +84,7 @@ class SyncInventoryJob implements ShouldQueue
             // WB: дополнительно синхронизируем FBS-остатки (склады продавца)
             if ($this->syncLog->marketplace === 'wildberries' && method_exists($marketplaceService, 'getFbsStocks')) {
                 $fbsStocks = $marketplaceService->getFbsStocks();
-                if (!empty($fbsStocks)) {
+                if (! empty($fbsStocks)) {
                     $inventory = array_merge($inventory, $fbsStocks);
                     Log::info('WB FBS stocks merged', ['fbs_count' => count($fbsStocks)]);
                 }
@@ -81,10 +101,18 @@ class SyncInventoryJob implements ShouldQueue
             }
 
             if (empty($inventory)) {
-                Log::warning("No inventory returned from marketplace API", [
+                if ($this->shouldRejectEmptyInventoryResponse()) {
+                    throw new \RuntimeException(
+                        'Marketplace returned no inventory rows while local warehouse rows exist for this integration; refusing to treat as success.'
+                    );
+                }
+
+                Log::warning('No inventory returned from marketplace API', [
                     'marketplace' => $this->syncLog->marketplace,
+                    'integration_id' => $this->syncLog->integration_id,
                 ]);
                 $this->syncLog->complete(0, 0);
+
                 return;
             }
 
@@ -97,12 +125,14 @@ class SyncInventoryJob implements ShouldQueue
             $flatInventory = [];
             foreach ($inventory as $item) {
                 $sku = $item['sku'] ?? null;
-                if (empty($sku)) continue;
+                if (empty($sku)) {
+                    continue;
+                }
 
-                if (!empty($item['warehouses']) && is_array($item['warehouses'])) {
+                if (! empty($item['warehouses']) && is_array($item['warehouses'])) {
                     foreach ($item['warehouses'] as $wh) {
                         $flatInventory[] = array_merge($wh, [
-                            'sku'         => $sku,
+                            'sku' => $sku,
                             'marketplace' => $this->syncLog->marketplace,
                         ]);
                     }
@@ -123,6 +153,7 @@ class SyncInventoryJob implements ShouldQueue
                     ->get(['sku', 'wb_data'])
                     ->mapWithKeys(function ($p) {
                         $vendorCode = data_get($p->wb_data, 'vendorCode');
+
                         return $vendorCode ? [$vendorCode => $p->sku] : [];
                     })
                     ->toArray();
@@ -131,16 +162,16 @@ class SyncInventoryJob implements ShouldQueue
 
                 foreach ($flatInventory as &$stockData) {
                     // warehouse_id: заменяем "0" на хэш от названия склада
-                    $wid  = (string) ($stockData['warehouse_id'] ?? '');
+                    $wid = (string) ($stockData['warehouse_id'] ?? '');
                     $name = (string) ($stockData['warehouse_name'] ?? '');
                     if (($wid === '0' || $wid === '') && $name !== '') {
-                        $stockData['warehouse_id'] = 'wb_' . substr(md5($name), 0, 8);
+                        $stockData['warehouse_id'] = 'wb_'.substr(md5($name), 0, 8);
                     }
 
                     // sku: заменяем supplierArticle на реальный products.sku через vendorCode
                     $articleKey = $stockData['sku'] ?? '';
                     if ($articleKey && isset($vendorCodeMap[$articleKey])) {
-                        $stockData['sku']              = $vendorCodeMap[$articleKey];
+                        $stockData['sku'] = $vendorCodeMap[$articleKey];
                         $stockData['supplier_article'] = $articleKey;
                     }
                 }
@@ -151,10 +182,10 @@ class SyncInventoryJob implements ShouldQueue
             $integId = $this->syncLog->integration_id;
             if ($integId) {
                 foreach ($flatInventory as &$item) {
-                    $wid = (string)($item['warehouse_id'] ?? '');
+                    $wid = (string) ($item['warehouse_id'] ?? '');
                     // Статичные warehouse_id без привязки к конкретному складу — добавляем суффикс интеграции
                     if (in_array(strtolower($wid), ['fbs', 'fbo', 'ozon_fbs', 'ozon_fbo'], true)) {
-                        $item['warehouse_id'] = $wid . '_integ' . $integId;
+                        $item['warehouse_id'] = $wid.'_integ'.$integId;
                     }
                 }
                 unset($item);
@@ -166,7 +197,7 @@ class SyncInventoryJob implements ShouldQueue
                 $sku = $stockData['sku'] ?? null;
                 $wid = $stockData['warehouse_id'] ?? null;
                 if ($sku && $wid !== null && $wid !== '') {
-                    $apiPairs[] = $sku . '||' . $wid;
+                    $apiPairs[] = $sku.'||'.$wid;
                 }
             }
 
@@ -176,14 +207,14 @@ class SyncInventoryJob implements ShouldQueue
                     continue;
                 }
                 // Пропускаем записи без warehouse_id (но не отфильтровываем "0" — это может быть валидный ID)
-                if (!isset($stockData['warehouse_id']) || $stockData['warehouse_id'] === null || $stockData['warehouse_id'] === '') {
+                if (! isset($stockData['warehouse_id']) || $stockData['warehouse_id'] === null || $stockData['warehouse_id'] === '') {
                     continue;
                 }
 
                 try {
                     $result = $this->syncInventoryItem($stockData, $salesBySkuWarehouse);
                     $synced++;
-                    
+
                     if ($result === 'created') {
                         $created++;
                     } elseif ($result === 'updated') {
@@ -191,7 +222,7 @@ class SyncInventoryJob implements ShouldQueue
                     }
                 } catch (\Exception $e) {
                     $failed++;
-                    Log::error("Failed to sync inventory", [
+                    Log::error('Failed to sync inventory', [
                         'marketplace' => $this->syncLog->marketplace,
                         'sku' => $stockData['sku'] ?? 'unknown',
                         'error' => $e->getMessage(),
@@ -200,11 +231,11 @@ class SyncInventoryJob implements ShouldQueue
             }
 
             foreach ($flatInventory as $stockData) {
-                if (empty($stockData['sku']) || !isset($stockData['warehouse_id']) || $stockData['warehouse_id'] === null || $stockData['warehouse_id'] === '') {
+                if (empty($stockData['sku']) || ! isset($stockData['warehouse_id']) || $stockData['warehouse_id'] === null || $stockData['warehouse_id'] === '') {
                     continue;
                 }
 
-                if (!array_key_exists('warehouse_coefficient', $stockData) || $stockData['warehouse_coefficient'] === null) {
+                if (! array_key_exists('warehouse_coefficient', $stockData) || $stockData['warehouse_coefficient'] === null) {
                     continue;
                 }
 
@@ -222,14 +253,14 @@ class SyncInventoryJob implements ShouldQueue
 
             // Удаляем устаревшие записи — те что были в БД, но не пришли из API
             // Это исправляет накопление старых складов и завышенный суммарный остаток
-            if (!empty($apiPairs) && $this->syncLog->integration_id) {
+            if (! empty($apiPairs) && $this->syncLog->integration_id) {
                 $deleted = 0;
                 InventoryWarehouse::where('marketplace', $this->syncLog->marketplace)
                     ->where('integration_id', $this->syncLog->integration_id)
                     ->chunkById(500, function ($rows) use ($apiPairs, &$deleted) {
                         foreach ($rows as $row) {
-                            $key = $row->sku . '||' . $row->warehouse_id;
-                            if (!in_array($key, $apiPairs, true)) {
+                            $key = $row->sku.'||'.$row->warehouse_id;
+                            if (! in_array($key, $apiPairs, true)) {
                                 $row->delete();
                                 $deleted++;
                             }
@@ -238,9 +269,9 @@ class SyncInventoryJob implements ShouldQueue
 
                 if ($deleted > 0) {
                     Log::info('Deleted stale inventory records', [
-                        'marketplace'    => $this->syncLog->marketplace,
+                        'marketplace' => $this->syncLog->marketplace,
                         'integration_id' => $this->syncLog->integration_id,
-                        'deleted'        => $deleted,
+                        'deleted' => $deleted,
                     ]);
                 }
             }
@@ -254,10 +285,10 @@ class SyncInventoryJob implements ShouldQueue
                     'unchanged' => $synced - $created - $updated,
                 ],
             ]);
-            
+
             $this->syncLog->complete($synced, $failed);
 
-            Log::info("Inventory sync completed", [
+            Log::info('Inventory sync completed', [
                 'marketplace' => $this->syncLog->marketplace,
                 'synced' => $synced,
                 'created' => $created,
@@ -268,7 +299,7 @@ class SyncInventoryJob implements ShouldQueue
             // Для WB: после синхронизации остатков запускаем джоб сбора начислений за хранение
             if ($this->syncLog->marketplace === 'wildberries') {
                 $credentials = $this->syncLog->credentials ?? [];
-                if (!empty($credentials)) {
+                if (! empty($credentials)) {
                     SyncStorageFeesJob::dispatch($this->syncLog->integration_id, $credentials, 4)
                         ->delay(now()->addSeconds(10));
                     Log::info('SyncStorageFeesJob dispatched after inventory sync', [
@@ -279,7 +310,7 @@ class SyncInventoryJob implements ShouldQueue
         } catch (\Exception $e) {
             $this->syncLog->fail($e->getMessage());
 
-            Log::error("Inventory sync failed", [
+            Log::error('Inventory sync failed', [
                 'marketplace' => $this->syncLog->marketplace,
                 'error' => $e->getMessage(),
             ]);
@@ -290,7 +321,7 @@ class SyncInventoryJob implements ShouldQueue
 
     /**
      * Синхронизация одной записи остатков с оптимизацией
-     * 
+     *
      * @return string 'created'|'updated'|'unchanged'
      */
     private function syncInventoryItem(array $stockData, array $salesBySkuWarehouse = []): string
@@ -305,12 +336,12 @@ class SyncInventoryJob implements ShouldQueue
 
         // Продажи из API маркетплейса (WB Statistics / Ozon postings) + опционально из payload остатков
         $avgDailySales = $stockData['average_daily_sales'] ?? null;
-        $sales7        = null;
-        $sales14       = null;
-        $sales30       = null;
+        $sales7 = null;
+        $sales14 = null;
+        $sales30 = null;
 
-        if (!empty($salesBySkuWarehouse)) {
-            $sku             = $stockData['sku'];
+        if (! empty($salesBySkuWarehouse)) {
+            $sku = $stockData['sku'];
             $supplierArticle = $stockData['supplier_article'] ?? $sku;
 
             // Все склады этого SKU (приводим к строке для корректного поиска)
@@ -321,14 +352,14 @@ class SyncInventoryJob implements ShouldQueue
             if ($allWarehouses) {
                 // avg_daily_sales и sales_* — суммарно по всем складам SKU.
                 // Записываем одинаково на каждый склад, в matrix() используется MAX() для агрегации.
-                $totalAvg   = 0;
-                $totalS7    = 0;
-                $totalS14   = 0;
-                $totalS30   = 0;
+                $totalAvg = 0;
+                $totalS7 = 0;
+                $totalS14 = 0;
+                $totalS30 = 0;
                 foreach ($allWarehouses as $wData) {
                     if (is_array($wData)) {
                         $totalAvg += (float) ($wData['avg_daily_sales'] ?? 0);
-                        $totalS7  += (int) ($wData['sales_7_days'] ?? 0);
+                        $totalS7 += (int) ($wData['sales_7_days'] ?? 0);
                         $totalS14 += (int) ($wData['sales_14_days'] ?? 0);
                         $totalS30 += (int) ($wData['sales_30_days'] ?? 0);
                     }
@@ -337,11 +368,11 @@ class SyncInventoryJob implements ShouldQueue
                     $avgDailySales = round($totalAvg, 4);
                 }
                 if ($totalS7 > 0 || $totalS14 > 0 || $totalS30 > 0) {
-                    $sales7  = $totalS7;
+                    $sales7 = $totalS7;
                     $sales14 = $totalS14;
                     $sales30 = $totalS30;
                 } elseif ($totalAvg > 0) {
-                    $sales7  = (int) round($totalAvg * 7);
+                    $sales7 = (int) round($totalAvg * 7);
                     $sales14 = (int) round($totalAvg * 14);
                     $sales30 = (int) round($totalAvg * 30);
                 }
@@ -356,18 +387,18 @@ class SyncInventoryJob implements ShouldQueue
             $avgDailySales = round($sales7 / 7.0, 4);
         }
 
-        $qty         = (int) ($stockData['quantity'] ?? 0);
+        $qty = (int) ($stockData['quantity'] ?? 0);
         $daysOfStock = ($avgDailySales !== null && (float) $avgDailySales > 0)
             ? (int) round($qty / $avgDailySales)
             : null;
 
         $newData = [
-            'warehouse_name'   => $stockData['warehouse_name'],
-            'marketplace'      => $stockData['marketplace'],
-            'quantity'         => $qty,
+            'warehouse_name' => $stockData['warehouse_name'],
+            'marketplace' => $stockData['marketplace'],
+            'quantity' => $qty,
             'fulfillment_type' => $stockData['fulfillment_type'] ?? null,
-            'last_updated'     => now(),
-            'integration_id'   => $integrationId,
+            'last_updated' => now(),
+            'integration_id' => $integrationId,
         ];
 
         if (array_key_exists('warehouse_coefficient', $stockData) && $stockData['warehouse_coefficient'] !== null) {
@@ -376,45 +407,51 @@ class SyncInventoryJob implements ShouldQueue
 
         if ($avgDailySales !== null && (float) $avgDailySales > 0) {
             $newData['average_daily_sales'] = $avgDailySales;
-            $newData['days_of_stock']       = $daysOfStock;
-            $newData['turnover_days']       = $daysOfStock;
+            $newData['days_of_stock'] = $daysOfStock;
+            $newData['turnover_days'] = $daysOfStock;
         }
 
-        if ($sales7 !== null)  $newData['sales_7_days']  = $sales7;
-        if ($sales14 !== null) $newData['sales_14_days'] = $sales14;
-        if ($sales30 !== null) $newData['sales_30_days'] = $sales30;
+        if ($sales7 !== null) {
+            $newData['sales_7_days'] = $sales7;
+        }
+        if ($sales14 !== null) {
+            $newData['sales_14_days'] = $sales14;
+        }
+        if ($sales30 !== null) {
+            $newData['sales_30_days'] = $sales30;
+        }
 
-
-        if (!$existing) {
+        if (! $existing) {
             // Создаём новую запись
             $warehouse = InventoryWarehouse::create(array_merge([
-                'sku'            => $stockData['sku'],
-                'warehouse_id'   => $stockData['warehouse_id'],
+                'sku' => $stockData['sku'],
+                'warehouse_id' => $stockData['warehouse_id'],
                 'integration_id' => $integrationId,
             ], $newData));
-            
+
             $warehouse->stock_status = $warehouse->calculateStockStatus();
             $warehouse->save();
             $this->persistWarehouseCoefficient($stockData, $integrationId);
-            
+
             return 'created';
         }
 
         // Проверяем есть ли изменения
-        $hasChanges = $existing->quantity !== (int)$stockData['quantity']
+        $hasChanges = $existing->quantity !== (int) $stockData['quantity']
             || $existing->warehouse_name !== $stockData['warehouse_name']
-            || (string)$existing->integration_id !== (string)$integrationId
+            || (string) $existing->integration_id !== (string) $integrationId
             || (array_key_exists('warehouse_coefficient', $newData) && (float) ($existing->warehouse_coefficient ?? 1.0) !== (float) $newData['warehouse_coefficient'])
-            || ($sales7  !== null && (int)$existing->sales_7_days  !== $sales7)
-            || ($sales14 !== null && (int)$existing->sales_14_days !== $sales14)
-            || ($sales30 !== null && (int)$existing->sales_30_days !== $sales30)
-            || ($avgDailySales !== null && (float)$existing->average_daily_sales !== (float)$avgDailySales);
+            || ($sales7 !== null && (int) $existing->sales_7_days !== $sales7)
+            || ($sales14 !== null && (int) $existing->sales_14_days !== $sales14)
+            || ($sales30 !== null && (int) $existing->sales_30_days !== $sales30)
+            || ($avgDailySales !== null && (float) $existing->average_daily_sales !== (float) $avgDailySales);
 
         if ($hasChanges) {
             $existing->update($newData);
             $existing->stock_status = $existing->calculateStockStatus();
             $existing->save();
             $this->persistWarehouseCoefficient($stockData, $integrationId);
+
             return 'updated';
         }
 
@@ -427,7 +464,7 @@ class SyncInventoryJob implements ShouldQueue
 
     private function persistWarehouseCoefficient(array $stockData, ?int $integrationId): void
     {
-        if (!array_key_exists('warehouse_coefficient', $stockData) || $stockData['warehouse_coefficient'] === null) {
+        if (! array_key_exists('warehouse_coefficient', $stockData) || $stockData['warehouse_coefficient'] === null) {
             return;
         }
 
@@ -439,9 +476,29 @@ class SyncInventoryJob implements ShouldQueue
             ]);
     }
 
+    private function shouldRejectEmptyInventoryResponse(): bool
+    {
+        if (! $this->syncLog->integration_id) {
+            return false;
+        }
+
+        $integrationId = $this->syncLog->integration_id;
+        $mp = $this->syncLog->marketplace;
+
+        $query = InventoryWarehouse::query()->where('integration_id', $integrationId);
+
+        if (in_array($mp, ['yandex', 'yandex_market'], true)) {
+            $query->whereIn('marketplace', ['yandex', 'yandex_market']);
+        } else {
+            $query->where('marketplace', $mp);
+        }
+
+        return $query->exists();
+    }
+
     private function refreshWildberriesWarehouseCoefficients(object $marketplaceService): void
     {
-        if (!method_exists($marketplaceService, 'getInventory')) {
+        if (! method_exists($marketplaceService, 'getInventory')) {
             return;
         }
 
@@ -451,7 +508,7 @@ class SyncInventoryJob implements ShouldQueue
             $warehouseId = $item['warehouse_id'] ?? null;
             $warehouseCoefficient = $item['warehouse_coefficient'] ?? null;
 
-            if (!$sku || !$warehouseId || $warehouseCoefficient === null) {
+            if (! $sku || ! $warehouseId || $warehouseCoefficient === null) {
                 continue;
             }
 
@@ -468,7 +525,7 @@ class SyncInventoryJob implements ShouldQueue
     {
         $this->syncLog->fail($exception->getMessage());
 
-        Log::error("SyncInventoryJob failed", [
+        Log::error('SyncInventoryJob failed', [
             'marketplace' => $this->syncLog->marketplace,
             'error' => $exception->getMessage(),
         ]);

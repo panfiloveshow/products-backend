@@ -2,9 +2,9 @@
 
 namespace App\Console\Commands;
 
+use App\Models\InventoryWarehouse;
 use App\Models\Product;
 use App\Models\UnitEconomics;
-use App\Models\InventoryWarehouse;
 use App\Services\LocalizationIndexService;
 use App\Services\UnitEconomicsService;
 use Illuminate\Console\Command;
@@ -37,6 +37,7 @@ class SyncUnitEconomicsCommand extends Command
         }
 
         $this->error('Please specify --integration=ID, --marketplace=NAME, or --all');
+
         return 1;
     }
 
@@ -56,12 +57,12 @@ class SyncUnitEconomicsCommand extends Command
 
         foreach ($integrations as $int) {
             $this->line("Syncing integration_id={$int->integration_id} ({$int->marketplace})...");
-            
+
             $result = $this->syncProducts($service, $int->integration_id, $int->marketplace);
-            
+
             $totalSynced += $result['synced'];
             $totalErrors += $result['errors'];
-            
+
             $this->info("  Synced: {$result['synced']}, Errors: {$result['errors']}");
         }
 
@@ -74,16 +75,17 @@ class SyncUnitEconomicsCommand extends Command
     private function syncByIntegrationId(UnitEconomicsService $service, int $integrationId): int
     {
         $marketplace = Product::where('integration_id', $integrationId)->value('marketplace');
-        
-        if (!$marketplace) {
+
+        if (! $marketplace) {
             $this->error("No products found for integration_id={$integrationId}");
+
             return 1;
         }
 
         $this->info("Syncing integration_id={$integrationId} ({$marketplace})...");
-        
+
         $result = $this->syncProducts($service, $integrationId, $marketplace);
-        
+
         $this->info("Synced: {$result['synced']}, Errors: {$result['errors']}");
 
         return 0;
@@ -99,6 +101,7 @@ class SyncUnitEconomicsCommand extends Command
 
         if ($integrations->isEmpty()) {
             $this->error("No integrations found for marketplace={$marketplace}");
+
             return 1;
         }
 
@@ -109,9 +112,9 @@ class SyncUnitEconomicsCommand extends Command
 
         foreach ($integrations as $integrationId) {
             $this->line("Syncing integration_id={$integrationId}...");
-            
+
             $result = $this->syncProducts($service, $integrationId, $marketplace);
-            
+
             $totalSynced += $result['synced'];
             $totalErrors += $result['errors'];
         }
@@ -152,20 +155,20 @@ class SyncUnitEconomicsCommand extends Command
             ->keyBy('sku');
 
         // Карта vendor_code -> sku для поиска себестоимости по артикулу продавца
-        $vendorToSku = $products->filter(fn($p) => $p->vendor_code)->pluck('sku', 'vendor_code');
+        $vendorToSku = $products->filter(fn ($p) => $p->vendor_code)->pluck('sku', 'vendor_code');
 
         // Агрегируем данные по складам для каждого SKU
         $inventoryRaw = InventoryWarehouse::where('marketplace', $marketplace)
             ->where('integration_id', $integrationId)
             ->whereIn('sku', $skus)
             ->get();
-        
+
         $inventoryData = $inventoryRaw->groupBy('sku')->map(function ($items) use ($costPriceSettings, $vendorToSku) {
             // Определяем фактическую схему работы по остаткам (где больше товара)
             $byFulfillment = $items->groupBy('fulfillment_type');
             $maxStock = 0;
             $actualFulfillmentType = 'FBO';
-            
+
             foreach ($byFulfillment as $type => $typeItems) {
                 $stock = $typeItems->sum('quantity');
                 if ($stock > $maxStock) {
@@ -173,28 +176,28 @@ class SyncUnitEconomicsCommand extends Command
                     $actualFulfillmentType = strtoupper($type ?? 'FBO');
                 }
             }
-            
+
             // Если остатков нет, берём первую схему из записей
             if ($maxStock === 0 && $items->isNotEmpty()) {
                 $actualFulfillmentType = strtoupper($items->first()->fulfillment_type ?? 'FBO');
             }
-            
+
             $sku = $items->first()->sku;
             // Приоритет себестоимости: UnitEconomicsSettings > inventory_warehouses
             $costFromSettings = $costPriceSettings[$sku]->cost_price ?? null;
             // Также ищем по vendor_code (артикулу продавца)
-            if (!$costFromSettings) {
+            if (! $costFromSettings) {
                 $vendorCode = array_search($sku, $vendorToSku->toArray());
                 if ($vendorCode) {
                     $costFromSettings = $costPriceSettings[$vendorCode]->cost_price ?? null;
                 }
             }
             $costFromInventory = $items->max('cost_price');
-            $warehousesWithStock = $items->filter(fn($item) => (int) $item->quantity > 0);
+            $warehousesWithStock = $items->filter(fn ($item) => (int) $item->quantity > 0);
             $totalWarehouseQty = $warehousesWithStock->sum('quantity');
             $warehouseCoefficient = $totalWarehouseQty > 0
-                ? $warehousesWithStock->sum(fn($item) => (float) ($item->warehouse_coefficient ?? 1.0) * (int) $item->quantity) / $totalWarehouseQty
-                : (float) ($items->avg(fn($item) => (float) ($item->warehouse_coefficient ?? 1.0)) ?? 1.0);
+                ? $warehousesWithStock->sum(fn ($item) => (float) ($item->warehouse_coefficient ?? 1.0) * (int) $item->quantity) / $totalWarehouseQty
+                : (float) ($items->avg(fn ($item) => (float) ($item->warehouse_coefficient ?? 1.0)) ?? 1.0);
 
             return (object) [
                 'sku' => $sku,
@@ -206,7 +209,7 @@ class SyncUnitEconomicsCommand extends Command
                 'warehouse_coefficient' => round($warehouseCoefficient, 3),
             ];
         });
-        
+
         // Получаем фактические затраты и индекс локализации из API (если Ozon)
         $actualCosts = [];
         $localizationIndex = null;
@@ -219,50 +222,50 @@ class SyncUnitEconomicsCommand extends Command
                 // Приоритет: 1) локальная интеграция, 2) Sellico API, 3) глобальные из config/env
                 $clientId = null;
                 $apiKey = null;
-                
+
                 // 1. Пробуем локальную интеграцию
-                if ($integration && !empty($integration->credentials['client_id'])) {
+                if ($integration && ! empty($integration->credentials['client_id'])) {
                     $clientId = $integration->credentials['client_id'];
                     $apiKey = $integration->credentials['api_key'] ?? '';
                 }
-                
+
                 // 2. Пробуем Sellico API
                 if (empty($clientId)) {
-                    $sellicoService = new \App\Services\SellicoApiService();
+                    $sellicoService = new \App\Services\SellicoApiService;
                     $sellicoResult = $sellicoService->getIntegrationById($integrationId);
-                    
-                    if ($sellicoResult['success'] && !empty($sellicoResult['credentials'])) {
+
+                    if ($sellicoResult['success'] && ! empty($sellicoResult['credentials'])) {
                         $clientId = $sellicoResult['credentials']['client_id'] ?? '';
                         $apiKey = $sellicoResult['credentials']['api_key'] ?? '';
-                        $this->info("  Credentials получены из Sellico API");
+                        $this->info('  Credentials получены из Sellico API');
                     }
                 }
-                
+
                 // 3. Fallback на глобальные из config/env
                 if (empty($clientId)) {
                     $clientId = config('services.ozon.client_id') ?? '';
                     $apiKey = config('services.ozon.api_key') ?? '';
                 }
-                
-                if (!empty($clientId) && !empty($apiKey)) {
+
+                if (! empty($clientId) && ! empty($apiKey)) {
                     $ozonService = new \App\Domains\Ozon\OzonMarketplace(['client_id' => $clientId, 'api_key' => $apiKey]);
                     $actualCosts = $ozonService->getActualCostsBySku();
-                    
+
                     // Получаем актуальные цены (включая акционные marketing_seller_price)
                     $productPrices = $ozonService->getProductPrices();
-                    $promotionCount = count(array_filter($productPrices, fn($p) => $p['is_in_promotion'] ?? false));
-                    $this->info("  Цены: " . count($productPrices) . " товаров, " . $promotionCount . " в акциях");
-                    
+                    $promotionCount = count(array_filter($productPrices, fn ($p) => $p['is_in_promotion'] ?? false));
+                    $this->info('  Цены: '.count($productPrices).' товаров, '.$promotionCount.' в акциях');
+
                     // Логируем примеры товаров в акциях для диагностики
-                    $promotionExamples = array_filter($productPrices, fn($p) => $p['is_in_promotion'] ?? false);
+                    $promotionExamples = array_filter($productPrices, fn ($p) => $p['is_in_promotion'] ?? false);
                     $exampleSkus = array_slice(array_keys($promotionExamples), 0, 3);
                     foreach ($exampleSkus as $exSku) {
                         $ex = $promotionExamples[$exSku];
                         $this->info("    Пример акции: {$exSku} - базовая: {$ex['price']}₽, акционная: {$ex['actual_price']}₽ (-{$ex['promotion_discount']}%)");
                     }
-                    
+
                     // Получаем индекс локализации (среднее время доставки) из API с TTL 24ч
-                    if ($integration && !$integration->needsLocalizationCheck()) {
+                    if ($integration && ! $integration->needsLocalizationCheck()) {
                         // Используем кэшированные данные из settings
                         $localizationIndex = [
                             'average_delivery_time' => $integrationSettings['avg_delivery_time_hours'] ?? 29,
@@ -274,7 +277,7 @@ class SyncUnitEconomicsCommand extends Command
                     } else {
                         $localizationIndex = $ozonService->getLocalizationIndex();
                         $this->info("  Индекс локализации: {$localizationIndex['average_delivery_time']}ч, коэф: {$localizationIndex['tariff_coefficient']}, доп.%: {$localizationIndex['additional_fee_percent']} (API)");
-                        
+
                         // Сохраняем в settings интеграции
                         if ($integration) {
                             $newSettings = array_merge($integrationSettings, [
@@ -290,15 +293,15 @@ class SyncUnitEconomicsCommand extends Command
                             $integrationSettings = $newSettings;
                         }
                     }
-                    
+
                     // === ПРОВЕРКА PREMIUM СТАТУСА (TTL 24ч) ===
                     $isPremium = $integration?->is_premium ?? null;
                     $manualRedemptionRate = $integration?->manual_redemption_rate ?? null;
-                    
+
                     if ($integration && $integration->needsPremiumCheck()) {
                         $premiumStatus = $ozonService->checkPremiumStatus();
                         $isPremium = $premiumStatus['is_premium'] ?? false;
-                        
+
                         // Сохраняем статус в интеграцию (если она существует в локальной БД)
                         if ($integration) {
                             $integration->update([
@@ -306,12 +309,12 @@ class SyncUnitEconomicsCommand extends Command
                                 'premium_checked_at' => now(),
                             ]);
                         }
-                        
-                        $this->info("  Premium статус: " . ($isPremium ? '✓ Premium (авто-выкуп)' : '✗ Не Premium (ручной ввод)'));
+
+                        $this->info('  Premium статус: '.($isPremium ? '✓ Premium (авто-выкуп)' : '✗ Не Premium (ручной ввод)'));
                     } else {
-                        $this->info("  Premium статус: " . ($isPremium ? '✓ Premium' : '✗ Не Premium') . " (кэш)");
+                        $this->info('  Premium статус: '.($isPremium ? '✓ Premium' : '✗ Не Premium').' (кэш)');
                     }
-                    
+
                     // === ПОЛУЧЕНИЕ ПРОЦЕНТА ВЫКУПА ===
                     if ($isPremium) {
                         // Создаём маппинг ozon_sku -> offer_id для сопоставления данных из API
@@ -328,25 +331,25 @@ class SyncUnitEconomicsCommand extends Command
                                     // offer_id — артикул продавца, совпадает с product.sku
                                     $offerId = $ozonData['offer_id'] ?? $product->sku;
                                     if ($ozonSku) {
-                                        $ozonSkuToOfferIdMap[(string)$ozonSku] = $offerId;
+                                        $ozonSkuToOfferIdMap[(string) $ozonSku] = $offerId;
                                     }
                                 }
                             });
-                        
-                        $this->info("  Создан маппинг ozon_sku -> offer_id для " . count($ozonSkuToOfferIdMap) . " товаров");
-                        
+
+                        $this->info('  Создан маппинг ozon_sku -> offer_id для '.count($ozonSkuToOfferIdMap).' товаров');
+
                         // Premium: получаем данные автоматически из API аналитики с маппингом
                         $redemptionData = $ozonService->getRedemptionRateFromAnalytics(null, null, $ozonSkuToOfferIdMap);
-                        
-                        if (!empty($redemptionData)) {
-                            $fullDataCount = count(array_filter($redemptionData, fn($d) => ($d['has_full_data'] ?? false)));
-                            $this->info("  Получен выкуп для " . count($redemptionData) . " товаров (полных: {$fullDataCount})");
-                            
+
+                        if (! empty($redemptionData)) {
+                            $fullDataCount = count(array_filter($redemptionData, fn ($d) => ($d['has_full_data'] ?? false)));
+                            $this->info('  Получен выкуп для '.count($redemptionData)." товаров (полных: {$fullDataCount})");
+
                             // Логируем примеры для диагностики
                             $sampleKeys = array_slice(array_keys($redemptionData), 0, 5);
-                            $this->info("  Примеры ключей redemptionData: " . implode(', ', $sampleKeys));
+                            $this->info('  Примеры ключей redemptionData: '.implode(', ', $sampleKeys));
                         } else {
-                            $this->warn("  ⚠ API аналитики не вернул данных о выкупе");
+                            $this->warn('  ⚠ API аналитики не вернул данных о выкупе');
                         }
                     } else {
                         // Не Premium: используем ручной ввод или fallback через заказы/возвраты
@@ -355,18 +358,18 @@ class SyncUnitEconomicsCommand extends Command
                             // Ручной ввод будет применён в buildCalculationData
                         } else {
                             // Fallback: пробуем получить через заказы и возвраты
-                            $this->info("  Нет ручного выкупа, пробуем fallback через заказы/возвраты");
-                            
+                            $this->info('  Нет ручного выкупа, пробуем fallback через заказы/возвраты');
+
                             $dateFrom = now()->subDays(30)->format('Y-m-d');
                             $dateTo = now()->format('Y-m-d');
-                            
+
                             $ordersMap = $ozonService->getOrdersStatsBySku($dateFrom, $dateTo);
                             $returnsMap = $ozonService->getReturnsStatsBySku($dateFrom, $dateTo);
-                            
+
                             foreach ($ordersMap as $offerId => $ordersCount) {
                                 $returnsCount = $returnsMap[$offerId] ?? 0;
                                 $deliveredCount = $ordersCount - $returnsCount;
-                                
+
                                 if ($ordersCount > 0) {
                                     $redemptionRate = round(($deliveredCount / $ordersCount) * 100, 1);
                                     $redemptionData[$offerId] = [
@@ -379,26 +382,26 @@ class SyncUnitEconomicsCommand extends Command
                                     ];
                                 }
                             }
-                            
-                            if (!empty($redemptionData)) {
-                                $this->info("  Fallback: получен выкуп для " . count($redemptionData) . " товаров");
+
+                            if (! empty($redemptionData)) {
+                                $this->info('  Fallback: получен выкуп для '.count($redemptionData).' товаров');
                             } else {
-                                $this->warn("  ⚠ Нет данных о выкупе. Установите manual_redemption_rate в настройках интеграции.");
+                                $this->warn('  ⚠ Нет данных о выкупе. Установите manual_redemption_rate в настройках интеграции.');
                             }
                         }
                     }
-                    
+
                     // TODO: Эквайринг из финансовых транзакций отключён (слишком много данных, OOM)
                     // $acquiringData = $ozonService->getAcquiringBySku();
                     // Используем фиксированный 1.5% (стандартная ставка Ozon)
                 } else {
-                    $this->warn("  Нет credentials для Ozon API");
+                    $this->warn('  Нет credentials для Ozon API');
                 }
             } catch (\Exception $e) {
                 $this->warn("  Не удалось получить данные из API: {$e->getMessage()}");
             }
         }
-        
+
         // === WILDBERRIES API ===
         $wbSalesData = [];
         $wbStorageData = [];
@@ -407,35 +410,35 @@ class SyncUnitEconomicsCommand extends Command
         $wbRedemptionData = [];
         $wbLocalizationByNmId = [];
         $wbCommissionsData = [];
-        
+
         if ($marketplace === 'wildberries') {
             try {
                 $wbApiKey = null;
-                
+
                 // 1. Пробуем локальную интеграцию
-                if ($integration && !empty($integration->credentials['api_key'])) {
+                if ($integration && ! empty($integration->credentials['api_key'])) {
                     $wbApiKey = $integration->credentials['api_key'];
                 }
-                
+
                 // 2. Пробуем Sellico API
                 if (empty($wbApiKey)) {
-                    $sellicoService = new \App\Services\SellicoApiService();
+                    $sellicoService = new \App\Services\SellicoApiService;
                     $sellicoResult = $sellicoService->getIntegrationById($integrationId);
-                    
-                    if ($sellicoResult['success'] && !empty($sellicoResult['credentials'])) {
+
+                    if ($sellicoResult['success'] && ! empty($sellicoResult['credentials'])) {
                         $wbApiKey = $sellicoResult['credentials']['api_key'] ?? '';
-                        $this->info("  WB Credentials получены из Sellico API");
+                        $this->info('  WB Credentials получены из Sellico API');
                     }
                 }
-                
-                if (!empty($wbApiKey)) {
+
+                if (! empty($wbApiKey)) {
                     $wbService = new \App\Domains\Wildberries\WildberriesMarketplace(['api_key' => $wbApiKey], $integration);
 
                     if ($integration) {
                         $localizationService = app(LocalizationIndexService::class);
                         $localizationResult = $localizationService->calculateLocalizationIndex($integration);
 
-                        if (!empty($localizationResult['ktr_by_article'] ?? []) || (int) ($localizationResult['total_orders'] ?? 0) > 0) {
+                        if (! empty($localizationResult['ktr_by_article'] ?? []) || (int) ($localizationResult['total_orders'] ?? 0) > 0) {
                             $wbLocalizationByNmId = $localizationResult['ktr_by_article'] ?? [];
                             $wbLocalizationIndex = (float) ($localizationResult['localization_index'] ?? 1.0);
 
@@ -451,44 +454,44 @@ class SyncUnitEconomicsCommand extends Command
                             ]);
 
                             $integrationSettings = $newSettings;
-                            $this->info("  WB ИЛ: {$wbLocalizationIndex} (товаров: " . count($wbLocalizationByNmId) . ")");
+                            $this->info("  WB ИЛ: {$wbLocalizationIndex} (товаров: ".count($wbLocalizationByNmId).')');
                         } else {
-                            $this->warn("  WB ИЛ: нет новых данных, сохраняю текущее значение " . ($integrationSettings['wb_localization_index'] ?? $integration?->localization_index ?? 1));
+                            $this->warn('  WB ИЛ: нет новых данных, сохраняю текущее значение '.($integrationSettings['wb_localization_index'] ?? $integration?->localization_index ?? 1));
                         }
                     }
-                    
+
                     // Получаем продажи по SKU (7/14/30 дней)
                     $wbSalesData = $wbService->getSalesBySku();
-                    if (!empty($wbSalesData)) {
-                        $this->info("  WB Продажи: получено для " . count($wbSalesData) . " SKU");
+                    if (! empty($wbSalesData)) {
+                        $this->info('  WB Продажи: получено для '.count($wbSalesData).' SKU');
                     }
-                    
+
                     // Получаем стоимость хранения по SKU
                     $wbStorageData = $wbService->getStorageCostBySku();
-                    if (!empty($wbStorageData)) {
-                        $this->info("  WB Хранение: получено для " . count($wbStorageData) . " SKU");
+                    if (! empty($wbStorageData)) {
+                        $this->info('  WB Хранение: получено для '.count($wbStorageData).' SKU');
                     }
-                    
+
                     // Получаем тарифы на поставку (коэффициенты складов)
                     $wbTariffsData = $wbService->getSupplyTariffs();
-                    if (!empty($wbTariffsData)) {
-                        $this->info("  WB Тарифы: получено для " . count($wbTariffsData) . " складов");
+                    if (! empty($wbTariffsData)) {
+                        $this->info('  WB Тарифы: получено для '.count($wbTariffsData).' складов');
                     }
 
                     $wbCommissionsData = $wbService->getCommissions();
-                    if (!empty($wbCommissionsData)) {
-                        $this->info("  WB Комиссии: получено для " . count($wbCommissionsData) . " категорий");
+                    if (! empty($wbCommissionsData)) {
+                        $this->info('  WB Комиссии: получено для '.count($wbCommissionsData).' категорий');
                     }
-                    
+
                     // === ПОЛУЧАЕМ СПП ИЗ СТАТИСТИКИ ПРОДАЖ ===
                     $wbSppData = $wbService->getSppFromSales(30); // За последние 30 дней
-                    if (!empty($wbSppData)) {
-                        $this->info("  WB СПП: получено для " . count($wbSppData) . " товаров");
+                    if (! empty($wbSppData)) {
+                        $this->info('  WB СПП: получено для '.count($wbSppData).' товаров');
                     }
 
                     $wbRedemptionData = $wbService->getRedemptionStatsByNmId(30);
-                    if (!empty($wbRedemptionData)) {
-                        $this->info("  WB Выкуп: получено для " . count($wbRedemptionData) . " товаров");
+                    if (! empty($wbRedemptionData)) {
+                        $this->info('  WB Выкуп: получено для '.count($wbRedemptionData).' товаров');
                     }
                     // Ручной % выкупа из интеграции
                     $manualRedemptionRate = $integration?->manual_redemption_rate ?? null;
@@ -496,79 +499,80 @@ class SyncUnitEconomicsCommand extends Command
                         $this->info("  WB Ручной % выкупа: {$manualRedemptionRate}%");
                     }
                 } else {
-                    $this->warn("  Нет credentials для WB API");
+                    $this->warn('  Нет credentials для WB API');
                 }
             } catch (\Exception $e) {
                 $this->warn("  Не удалось получить данные из WB API: {$e->getMessage()}");
             }
         }
-        
+
         // === YANDEX MARKET API ===
         $yandexSalesData = [];
         $yandexPricesData = [];
         $yandexTariffsData = [];
-        
+
         if ($marketplace === 'yandex' || $marketplace === 'yandex_market') {
             try {
                 $yandexToken = null;
                 $yandexCampaignId = null;
                 $yandexBusinessId = null;
-                
+
                 // 1. Пробуем локальную интеграцию
-                if ($integration && !empty($integration->credentials['token'])) {
+                if ($integration && ! empty($integration->credentials['token'])) {
                     $yandexToken = $integration->credentials['token'];
                     $yandexCampaignId = $integration->credentials['campaign_id'] ?? $integration->credentials['client_id'] ?? null;
                     $yandexBusinessId = $integration->credentials['business_id'] ?? null;
                 }
-                
+
                 // 2. Пробуем Sellico API
                 if (empty($yandexToken)) {
-                    $sellicoService = new \App\Services\SellicoApiService();
+                    $sellicoService = new \App\Services\SellicoApiService;
                     $sellicoResult = $sellicoService->getIntegrationById($integrationId);
-                    
-                    if ($sellicoResult['success'] && !empty($sellicoResult['credentials'])) {
+
+                    if ($sellicoResult['success'] && ! empty($sellicoResult['credentials'])) {
                         $yandexToken = $sellicoResult['credentials']['token'] ?? '';
                         $yandexCampaignId = $sellicoResult['credentials']['campaign_id'] ?? '';
                         $yandexBusinessId = $sellicoResult['credentials']['business_id'] ?? null;
-                        $this->info("  Yandex Credentials получены из Sellico API");
+                        $this->info('  Yandex Credentials получены из Sellico API');
                     }
                 }
-                
-                if (!empty($yandexToken) && !empty($yandexCampaignId)) {
+
+                if (! empty($yandexToken) && ! empty($yandexCampaignId)) {
                     $yandexService = new \App\Domains\YandexMarket\YandexMarketMarketplace([
                         'token' => $yandexToken,
                         'campaign_id' => $yandexCampaignId,
                         'business_id' => $yandexBusinessId,
                     ]);
-                    
+
                     // Получаем продажи по SKU
                     $yandexSalesData = $yandexService->getSalesBySku();
-                    if (!empty($yandexSalesData)) {
-                        $this->info("  Yandex Продажи: получено для " . count($yandexSalesData) . " SKU");
+                    if (! empty($yandexSalesData)) {
+                        $this->info('  Yandex Продажи: получено для '.count($yandexSalesData).' SKU');
                     }
-                    
+
                     // Получаем актуальные цены
                     $yandexPricesData = $yandexService->getProductPrices();
-                    if (!empty($yandexPricesData)) {
-                        $this->info("  Yandex Цены: получено для " . count($yandexPricesData) . " товаров");
+                    if (! empty($yandexPricesData)) {
+                        $this->info('  Yandex Цены: получено для '.count($yandexPricesData).' товаров');
                     }
 
                     $yandexTariffService = new \App\Services\Marketplace\YandexMarketService(
                         $yandexToken,
-                        (string) $yandexCampaignId
+                        (string) $yandexCampaignId,
+                        $yandexBusinessId !== null ? (string) $yandexBusinessId : null
                     );
                     $yandexTariffsData = $this->loadYandexTariffsData($products, $yandexPricesData, $yandexTariffService, (string) $yandexCampaignId);
-                    if (!empty($yandexTariffsData)) {
-                        $this->info("  Yandex Тарифы: подготовлены для " . count($yandexTariffsData['FBY'] ?? []) . " товаров");
+                    if (! empty($yandexTariffsData)) {
+                        $this->info('  Yandex Тарифы: подготовлены для '.count($yandexTariffsData['FBY'] ?? []).' товаров');
                     }
-                    
+
                     // Ручной % выкупа из интеграции
                     $manualRedemptionRate = $integration?->manual_redemption_rate ?? null;
                     if ($manualRedemptionRate) {
                         $this->info("  Yandex Ручной % выкупа: {$manualRedemptionRate}%");
                     }
                 } else {
-                    $this->warn("  Нет credentials для Yandex API (token или campaign_id)");
+                    $this->warn('  Нет credentials для Yandex API (token или campaign_id)');
                 }
             } catch (\Exception $e) {
                 $this->warn("  Не удалось получить данные из Yandex API: {$e->getMessage()}");
@@ -577,7 +581,7 @@ class SyncUnitEconomicsCommand extends Command
 
         $synced = 0;
         $errors = 0;
-        
+
         // Схемы работы по маркетплейсам
         $fulfillmentTypes = match ($marketplace) {
             'ozon' => ['FBO', 'FBS', 'RFBS', 'EXPRESS'],
@@ -591,38 +595,38 @@ class SyncUnitEconomicsCommand extends Command
                 $inventory = $inventoryData->get($product->sku);
                 $productActualCosts = $actualCosts[$product->sku] ?? null;
                 $productAcquiring = $acquiringData[$product->sku] ?? null;
-                
+
                 // Получаем данные о выкупе по ozon_sku, offer_id или SKU
                 // API аналитики возвращает ozon_data['sku'] (числовой ID в Ozon)
                 $ozonData = $product->ozon_data ?? [];
                 $ozonSku = $ozonData['sku'] ?? null;
                 $offerId = $ozonData['offer_id'] ?? $product->sku; // offer_id = артикул продавца
-                
+
                 $productRedemption = null;
                 // Приоритет поиска: 1) по ozon_sku, 2) по offer_id, 3) по product.sku
-                if ($ozonSku && isset($redemptionData[(string)$ozonSku])) {
-                    $productRedemption = $redemptionData[(string)$ozonSku];
+                if ($ozonSku && isset($redemptionData[(string) $ozonSku])) {
+                    $productRedemption = $redemptionData[(string) $ozonSku];
                 } elseif ($offerId && isset($redemptionData[$offerId])) {
                     $productRedemption = $redemptionData[$offerId];
                 } elseif (isset($redemptionData[$product->sku])) {
                     $productRedemption = $redemptionData[$product->sku];
                 }
-                
+
                 // WB: данные из API
                 $productWbSales = $wbSalesData[$product->sku] ?? null;
                 $productWbStorage = $wbStorageData[$product->sku] ?? null;
-                
+
                 // Yandex: данные из API
                 $productYandexSales = $yandexSalesData[$product->sku] ?? null;
                 $productYandexPrice = $yandexPricesData[$product->sku] ?? null;
-                
+
                 // Определяем фактическую схему работы товара (из остатков API)
                 $defaultFulfillmentType = match ($marketplace) {
                     'yandex', 'yandex_market' => 'FBY',
                     default => 'FBO',
                 };
                 $actualFulfillmentType = strtoupper($inventory?->fulfillment_type ?? $defaultFulfillmentType);
-                
+
                 // Создаём/обновляем записи для ВСЕХ схем работы (для предварительного расчёта)
                 foreach ($fulfillmentTypes as $fulfillmentType) {
                     // WB: получаем СПП по nmId товара
@@ -631,19 +635,19 @@ class SyncUnitEconomicsCommand extends Command
                     $productWbRedemption = $nmId ? ($wbRedemptionData[$nmId] ?? null) : null;
                     $productWbLocalization = $nmId ? ($wbLocalizationByNmId[$nmId] ?? null) : null;
                     $productYandexTariffs = $yandexTariffsData[$fulfillmentType][$product->sku] ?? null;
-                    
+
                     // Ozon: получаем актуальные цены из API
                     $productPriceData = $productPrices[$product->sku] ?? null;
-                    
+
                     $data = $this->buildCalculationData(
-                        $product, 
-                        $inventory, 
-                        $marketplace, 
-                        $integrationSettings, 
-                        $productActualCosts, 
-                        $localizationIndex, 
-                        $productAcquiring, 
-                        $productRedemption, 
+                        $product,
+                        $inventory,
+                        $marketplace,
+                        $integrationSettings,
+                        $productActualCosts,
+                        $localizationIndex,
+                        $productAcquiring,
+                        $productRedemption,
                         $manualRedemptionRate,
                         $fulfillmentType, // Передаём конкретную схему
                         $productWbSales,  // WB: продажи
@@ -658,11 +662,11 @@ class SyncUnitEconomicsCommand extends Command
                         $productYandexTariffs,
                         $productYandexSales
                     );
-                    
+
                     if ($data['price'] <= 0) {
                         continue;
                     }
-                    
+
                     $currentFulfillmentType = $data['fulfillment_type'] ?? 'FBO';
 
                     // Ищем существующую запись по SKU, маркетплейсу, интеграции И схеме работы
@@ -671,37 +675,37 @@ class SyncUnitEconomicsCommand extends Command
                         ->where('integration_id', $integrationId)
                         ->where('fulfillment_type', $currentFulfillmentType)
                         ->first();
-                    
+
                     // Ищем записи с ручными значениями для этого SKU (для копирования между схемами)
                     $baseQuery = UnitEconomics::where('sku', $product->sku)
                         ->where('marketplace', $marketplace)
                         ->where('integration_id', $integrationId);
-                    
+
                     // Ищем отдельно для каждого поля
                     $costPriceRecord = (clone $baseQuery)->where('cost_price', '>', 0)->first();
                     $drrRecord = (clone $baseQuery)->where('drr_percent', '>', 0)->first();
                     $ourShareRecord = (clone $baseQuery)->where('our_share_percent', '>', 0)->first();
                     $acquiringRecord = (clone $baseQuery)->whereNotNull('acquiring_percent')->where('acquiring_percent', '>', 0)->first();
-                    
+
                     // Используем ручные значения: сначала из текущей схемы, потом из любой другой
                     if ($existing && $existing->cost_price > 0) {
                         $data['cost_price'] = (float) $existing->cost_price;
                     } elseif ($costPriceRecord) {
                         $data['cost_price'] = (float) $costPriceRecord->cost_price;
                     }
-                    
+
                     if ($existing && $existing->drr_percent > 0) {
                         $data['drr_percent'] = (float) $existing->drr_percent;
                     } elseif ($drrRecord) {
                         $data['drr_percent'] = (float) $drrRecord->drr_percent;
                     }
-                    
+
                     if ($existing && $existing->our_share_percent > 0) {
                         $data['our_share_percent'] = (float) $existing->our_share_percent;
                     } elseif ($ourShareRecord) {
                         $data['our_share_percent'] = (float) $ourShareRecord->our_share_percent;
                     }
-                    
+
                     if ($existing && $existing->acquiring_percent !== null && $existing->acquiring_percent > 0) {
                         $data['acquiring_percent'] = (float) $existing->acquiring_percent;
                     } elseif ($acquiringRecord) {
@@ -721,15 +725,15 @@ class SyncUnitEconomicsCommand extends Command
 
                     // Извлекаем детализированные данные
                     $detailed = $this->extractDetailedData($data, $calculated, $marketplace);
-                    
+
                     // Расчёт стоимости за единицу
                     $salesCount = max(1, $data['sales_count'] ?? 1);
                     $totalCostsPerUnit = round($calculated['total_costs'] / $salesCount, 2);
                     $netProfitPerUnit = round($calculated['net_profit'] / $salesCount, 2);
-                    
+
                     // Определяем, является ли эта схема фактической для товара
                     $isActualScheme = ($currentFulfillmentType === $actualFulfillmentType);
-                    
+
                     // Базовые данные для сохранения
                     // cost_price копируется между схемами, но не перезаписывается на 0
                     $saveData = [
@@ -752,7 +756,7 @@ class SyncUnitEconomicsCommand extends Command
                             'has_sales_data' => $data['sales_count'] > 0,
                         ]),
                     ];
-                    
+
                     // Копируем ручные значения между схемами (только если > 0)
                     if ($data['cost_price'] > 0) {
                         $saveData['cost_price'] = $data['cost_price'];
@@ -766,7 +770,7 @@ class SyncUnitEconomicsCommand extends Command
                     if (isset($data['acquiring_percent']) && $data['acquiring_percent'] > 0) {
                         $saveData['acquiring_percent'] = $data['acquiring_percent'];
                     }
-                    
+
                     $saveData = array_merge($saveData, $detailed);
 
                     if ($existing) {
@@ -804,8 +808,8 @@ class SyncUnitEconomicsCommand extends Command
     }
 
     private function buildCalculationData(
-        Product $product, 
-        ?object $inventory, 
+        Product $product,
+        ?object $inventory,
         string $marketplace,
         array $integrationSettings = [],
         ?array $actualCosts = null,
@@ -825,8 +829,7 @@ class SyncUnitEconomicsCommand extends Command
         ?array $productYandexPrice = null,
         ?array $productYandexTariffs = null,
         ?array $productYandexSales = null
-    ): array
-    {
+    ): array {
         // Актуальная цена: приоритет API (actual_price = marketing_seller_price если акция) > Product.price
         // actual_price уже рассчитан в getPrices() с учётом marketing_seller_price
         $price = (float) $product->price;
@@ -838,12 +841,12 @@ class SyncUnitEconomicsCommand extends Command
             }
         }
         $costPrice = $inventory?->cost_price ?? 0;
-        
+
         $salesCount = match ($marketplace) {
             'yandex', 'yandex_market' => $productYandexSales['sales_30_days'] ?? $inventory?->sales_30_days ?? 0,
             default => $wbSalesData['sales_30_days'] ?? $inventory?->sales_30_days ?? 0,
         };
-        
+
         // Хранение: приоритет WB API > inventory
         $storageCost = ($wbStorageData['storage_cost_per_month'] ?? null) ?? $inventory?->storage_cost_per_month ?? 0;
 
@@ -880,29 +883,29 @@ class SyncUnitEconomicsCommand extends Command
         switch ($marketplace) {
             case 'wildberries':
                 $wbData = $product->wb_data ?? [];
-                
+
                 // Определяем тип фулфилмента (принудительный или из inventory)
-                $fulfillmentType = $forceFulfillmentType 
-                    ? strtoupper($forceFulfillmentType) 
+                $fulfillmentType = $forceFulfillmentType
+                    ? strtoupper($forceFulfillmentType)
                     : strtoupper($inventory?->fulfillment_type ?? 'FBO');
                 $data['fulfillment_type'] = $fulfillmentType;
-                
+
                 // === ГАБАРИТЫ ИЗ ХАРАКТЕРИСТИК ===
                 $characteristics = $product->characteristics ?? [];
                 // Характеристики WB приходят в см — сохраняем как есть
                 $lengthCm = $this->extractNumericValue($characteristics['Длина упаковки'] ?? $wbData['length'] ?? null);
                 $widthCm = $this->extractNumericValue($characteristics['Ширина упаковки'] ?? $wbData['width'] ?? null);
                 $heightCm = $this->extractNumericValue($characteristics['Высота упаковки'] ?? $wbData['height'] ?? null);
-                
+
                 // Габариты в см (без конвертации)
                 $length = $lengthCm ?? 10; // fallback 10 см
                 $width = $widthCm ?? 10;
                 $height = $heightCm ?? 10;
-                
+
                 // Вес: ищем в разных форматах (г или кг)
                 $weightG = $this->extractNumericValue($characteristics['Вес товара без упаковки (г)'] ?? $characteristics['Вес'] ?? $characteristics['Вес товара'] ?? null);
                 $weightKg = $this->extractNumericValue($characteristics['Вес без упаковки (кг)'] ?? $characteristics['Вес (кг)'] ?? $characteristics['Вес товара (кг)'] ?? null);
-                
+
                 if ($weightG) {
                     $weight = $weightG; // уже в граммах
                 } elseif ($weightKg) {
@@ -910,28 +913,28 @@ class SyncUnitEconomicsCommand extends Command
                 } else {
                     $weight = $this->extractNumericValue($wbData['weight'] ?? null) ?? 500; // fallback
                 }
-                
+
                 // Объём в литрах (см³ -> л = /1000)
                 $volumeLiters = ($length * $width * $height) / 1000;
-                
+
                 // Если есть объём из API хранения — используем его
                 if ($wbStorageData && isset($wbStorageData['volume_liters']) && $wbStorageData['volume_liters'] > 0) {
                     $volumeLiters = $wbStorageData['volume_liters'];
                 }
-                
+
                 $data['volume_liters'] = round($volumeLiters, 2);
                 // Габариты WB в см (поля называются _mm для совместимости, но значения в см)
                 $data['length_mm'] = round($length, 2);
                 $data['width_mm'] = round($width, 2);
                 $data['height_mm'] = round($height, 2);
                 $data['weight_g'] = round($weight, 0);
-                
+
                 // Объёмный вес (объём / 5)
                 $data['volume_weight'] = round($volumeLiters / 5, 2);
-                
+
                 // Фактический вес в кг
                 $data['actual_weight'] = round($weight / 1000, 2);
-                
+
                 // === КОМИССИЯ ЗА ПРОДАЖУ (0.5% - 29.5% в зависимости от категории) ===
                 $wbCommissionScheme = match (strtoupper($fulfillmentType)) {
                     'FBS', 'DBS', 'EDBS', 'DBW' => 'fbs',
@@ -947,7 +950,7 @@ class SyncUnitEconomicsCommand extends Command
                     ?? $wbData['commission_percent']
                     ?? $integrationSettings['wb_commission_percent']
                     ?? 15;
-                
+
                 // === КОЭФФИЦИЕНТЫ ИЗ API ТАРИФОВ ===
                 // Если есть данные из API тарифов — используем их
                 $warehouseCoefficient = 1.0;
@@ -955,8 +958,8 @@ class SyncUnitEconomicsCommand extends Command
                 $deliveryBaseLiter = 46;
                 $deliveryAdditionalLiter = 14;
                 $storageBaseLiter = 0.08;
-                
-                if (!empty($wbTariffsData)) {
+
+                if (! empty($wbTariffsData)) {
                     // Берём средний коэффициент по всем складам или первый доступный
                     $firstTariff = reset($wbTariffsData);
                     if ($firstTariff) {
@@ -967,12 +970,12 @@ class SyncUnitEconomicsCommand extends Command
                         $storageBaseLiter = $firstTariff['storage_base_liter'] ?? 0.08;
                     }
                 }
-                
+
                 // Коэффициент склада (логистики) — приоритет: API > wb_data > settings > дефолт
                 $data['warehouse_coefficient'] = $wbData['warehouse_coefficient']
                     ?? $inventory?->warehouse_coefficient
                     ?? $warehouseCoefficient;
-                
+
                 // Индекс локализации (ИЛ) — влияет на КТР
                 $data['localization_index'] = $wbLocalizationData['ktr']
                     ?? $wbData['localization_index']
@@ -983,27 +986,27 @@ class SyncUnitEconomicsCommand extends Command
                 $data['local_orders'] = $wbLocalizationData['local_orders'] ?? null;
                 $data['local_orders_count'] = $wbLocalizationData['total_orders'] ?? null;
                 $data['orders_count'] = $wbRedemptionData['orders_count'] ?? null;
-                
+
                 // Коэффициент габаритов (штраф за превышение)
                 $data['dimensions_coefficient'] = $wbData['dimensions_coefficient'] ?? 1.0;
-                
+
                 // Коэффициент хранения — приоритет: API > wb_data > settings > дефолт
                 $data['storage_coefficient'] = $wbData['storage_coefficient'] ?? $storageCoefficient;
-                
+
                 // === ХРАНЕНИЕ (только FBO) ===
                 // Тариф хранения из API или дефолт
                 $data['storage_tariff'] = $storageBaseLiter;
                 $data['storage_days'] = $inventory?->turnover_days ?? 30;
-                
+
                 // Если есть фактическая стоимость хранения из API — используем её
                 if ($wbStorageData && isset($wbStorageData['storage_cost_per_day'])) {
                     $data['storage_cost_per_day'] = $wbStorageData['storage_cost_per_day'];
                     $data['storage_cost_per_month'] = $wbStorageData['storage_cost_per_month'] ?? null;
                 }
-                
+
                 // === ПРИЁМКА ===
                 $data['acceptance_cost'] = $wbData['acceptance_cost'] ?? 0;
-                
+
                 // === СПП (Скидка постоянного покупателя) ===
                 // Приоритет: 1) из статистики продаж API, 2) wb_data, 3) дефолт 0
                 if (is_numeric($wbSppData)) {
@@ -1016,7 +1019,7 @@ class SyncUnitEconomicsCommand extends Command
                 } else {
                     $data['spp_percent'] = $wbData['spp_percent'] ?? 0;
                 }
-                
+
                 // === ПРОЦЕНТ ВЫКУПА ===
                 // Приоритет: 1) расчёт из продаж API, 2) wb_data, 3) ручной ввод, 4) дефолт 80%
                 // Можно рассчитать из продаж/возвратов если есть данные
@@ -1044,7 +1047,7 @@ class SyncUnitEconomicsCommand extends Command
                     $data['redemption_rate'] = 80; // WB обычно ниже выкуп чем Ozon
                     $data['redemption_source'] = 'default';
                 }
-                
+
                 // === СВОЯ ДОСТАВКА (DBS) ===
                 if ($fulfillmentType === 'DBS') {
                     $data['own_delivery_cost'] = $wbData['own_delivery_cost'] ?? $integrationSettings['own_delivery_cost'] ?? 200;
@@ -1056,13 +1059,13 @@ class SyncUnitEconomicsCommand extends Command
                 $ozonData = $product->ozon_data ?? [];
                 $commissions = $ozonData['commissions'] ?? [];
                 $redemption = $ozonData['redemption'] ?? [];
-                
+
                 // Определяем тип фулфилмента (принудительный или из inventory)
-                $fulfillmentType = $forceFulfillmentType 
-                    ? strtoupper($forceFulfillmentType) 
+                $fulfillmentType = $forceFulfillmentType
+                    ? strtoupper($forceFulfillmentType)
                     : strtoupper($inventory?->fulfillment_type ?? 'FBO');
                 $data['fulfillment_type'] = $fulfillmentType;
-                
+
                 // === ИНДЕКС ЛОКАЛИЗАЦИИ (из API или настроек интеграции) ===
                 // Приоритет: API > настройки интеграции > дефолт
                 if ($localizationIndex && isset($localizationIndex['average_delivery_time'])) {
@@ -1073,34 +1076,34 @@ class SyncUnitEconomicsCommand extends Command
                 } else {
                     $data['avg_delivery_time_hours'] = $integrationSettings['avg_delivery_time_hours'] ?? 29;
                 }
-                
+
                 // === ГАБАРИТЫ ИЗ ХАРАКТЕРИСТИК ===
                 $characteristics = $product->characteristics ?? [];
                 $length = $this->extractNumericValue($characteristics['Глубина упаковки'] ?? null) ?? 100; // мм
                 $width = $this->extractNumericValue($characteristics['Ширина упаковки'] ?? null) ?? 100;
                 $height = $this->extractNumericValue($characteristics['Высота упаковки'] ?? null) ?? 100;
                 $weight = $this->extractNumericValue($characteristics['Вес'] ?? $characteristics['Вес товара, г'] ?? null) ?? 500; // г
-                
+
                 // Объём в литрах (мм³ -> л)
                 $volumeLiters = ($length * $width * $height) / 1000000;
                 $data['volume_liters'] = round($volumeLiters, 2);
-                
+
                 // Объёмный вес (объём / 5)
                 $data['volume_weight'] = round($volumeLiters / 5, 2);
-                
+
                 // Фактический вес в кг
                 $data['actual_weight'] = round($weight / 1000, 2);
-                
+
                 // === КОМИССИИ (приоритет: фактические > API цен > ozon_data > дефолт) ===
                 $schemaKey = strtolower($fulfillmentType);
                 $schemaCommission = $commissions[$schemaKey] ?? [];
-                
+
                 // Комиссии из API /v4/product/info/prices (sales_percent_fbo, sales_percent_fbs)
                 $priceCommissions = $productPriceData['commissions'] ?? [];
                 $fboCommissionFromApi = $priceCommissions['sales_percent_fbo'] ?? null;
                 $fbsCommissionFromApi = $priceCommissions['sales_percent_fbs'] ?? null;
                 $rfbsCommissionFromApi = $priceCommissions['sales_percent_rfbs'] ?? null;
-                
+
                 // Используем фактические затраты если есть И они > 0
                 if ($actualCosts && isset($actualCosts['avg_commission_per_unit']) && $actualCosts['avg_commission_per_unit'] > 0) {
                     $data['commission_value'] = $actualCosts['avg_commission_per_unit'];
@@ -1113,7 +1116,7 @@ class SyncUnitEconomicsCommand extends Command
                     $data['fbo_commission_percent'] = $fboCommissionFromApi ?? $commissions['fbo']['percent'] ?? 15;
                     $data['fbs_commission_percent'] = $fbsCommissionFromApi ?? $commissions['fbs']['percent'] ?? 21;
                     $data['rfbs_commission_percent'] = $rfbsCommissionFromApi ?? 20;
-                    
+
                     // Выбираем комиссию по текущей схеме
                     $data['commission_percent'] = match ($fulfillmentType) {
                         'FBO' => $data['fbo_commission_percent'],
@@ -1124,10 +1127,10 @@ class SyncUnitEconomicsCommand extends Command
                     };
                     $data['commission_value'] = $schemaCommission['value'] ?? null;
                 }
-                
+
                 // Стоимость возврата из API
                 $data['return_cost'] = $schemaCommission['return_amount'] ?? 100;
-                
+
                 // Эквайринг (приоритет: финансовые транзакции > фактические затраты > дефолт 1.5%)
                 if ($acquiringData && isset($acquiringData['avg_acquiring_percent']) && $acquiringData['avg_acquiring_percent'] > 0) {
                     // Из финансовых транзакций /v3/finance/transaction/list
@@ -1145,7 +1148,7 @@ class SyncUnitEconomicsCommand extends Command
                     // Дефолт
                     $data['acquiring_percent'] = 1.5;
                 }
-                
+
                 // === ПРОЦЕНТ ВЫКУПА ===
                 // Приоритет: 1) API аналитики (redemptionData), 2) ручной ввод (manualRedemptionRate), 3) ozon_data['redemption'], 4) дефолт 100%
                 if ($redemptionData && isset($redemptionData['redemption_rate']) && $redemptionData['redemption_rate'] !== null) {
@@ -1167,43 +1170,43 @@ class SyncUnitEconomicsCommand extends Command
                     $data['returns_count'] = $redemption['returns_count'] ?? null;
                     $data['redemption_source'] = 'default';
                 }
-                
+
                 // === ХРАНЕНИЕ (FBO) ===
                 $data['turnover_days'] = $inventory?->turnover_days ?? 30;
                 $data['litrobonus'] = $inventory?->litrobonus ?? 0;
-                
+
                 // === ОБРАБОТКА (FBS) с 10.12.2025 ===
                 // СЦ: 20₽, ПВЗ/ППЗ: 30₽, с доверительной приёмкой: 10₽
                 $data['processing_cost'] = 20; // Дефолт 20₽ (СЦ)
-                
+
                 // === ФАКТИЧЕСКИЕ ЗАТРАТЫ ИЗ API (если есть) ===
                 if ($actualCosts) {
                     $data['actual_logistics_per_unit'] = $actualCosts['avg_logistics_per_unit'] ?? null;
                     $data['actual_last_mile_per_unit'] = $actualCosts['avg_last_mile_per_unit'] ?? null;
                     $data['actual_acquiring_per_unit'] = $actualCosts['avg_acquiring_per_unit'] ?? null;
                 }
-                
+
                 // === СВОЯ ЛОГИСТИКА (realFBS/DBS) ===
                 $data['own_delivery_cost'] = $inventory?->own_delivery_cost ?? 200;
                 $data['ozon_compensation'] = $inventory?->ozon_compensation ?? 0;
-                
+
                 // === АКЦИИ (marketing_seller_price) ===
                 // Акция определяется ТОЛЬКО через API: marketing_seller_price < price
                 // old_price — это просто "зачёркнутая цена" для маркетинга, НЕ признак акции
-                $isInPromotion = $productPriceData['is_in_promotion'] 
-                    ?? $ozonData['is_in_promotion'] 
+                $isInPromotion = $productPriceData['is_in_promotion']
+                    ?? $ozonData['is_in_promotion']
                     ?? false;
-                $promotionDiscount = $productPriceData['promotion_discount'] 
-                    ?? $ozonData['promotion_discount'] 
+                $promotionDiscount = $productPriceData['promotion_discount']
+                    ?? $ozonData['promotion_discount']
                     ?? null;
-                
+
                 $data['is_in_promotion'] = $isInPromotion;
                 $data['promotion_discount'] = $promotionDiscount;
-                $data['seller_price'] = $productPriceData['price'] 
-                    ?? $commissions['seller_price'] 
+                $data['seller_price'] = $productPriceData['price']
+                    ?? $commissions['seller_price']
                     ?? null; // Цена без акции (из API)
-                $data['marketing_seller_price'] = $productPriceData['marketing_seller_price'] 
-                    ?? $commissions['marketing_seller_price'] 
+                $data['marketing_seller_price'] = $productPriceData['marketing_seller_price']
+                    ?? $commissions['marketing_seller_price']
                     ?? null; // Цена с акцией (из API)
                 break;
 
@@ -1252,31 +1255,31 @@ class SyncUnitEconomicsCommand extends Command
 
         return $data;
     }
-    
+
     /**
      * Извлечь детализированные данные для сохранения в БД
      */
     private function extractDetailedData(array $data, array $calculated, string $marketplace): array
     {
         $detailed = [];
-        
+
         if ($marketplace === 'ozon') {
             $salesCount = max(1, $data['sales_count'] ?? 1);
-            
+
             // Индекс локализации применяется ТОЛЬКО к FBO (склад Ozon)
             $fulfillmentType = $calculated['fulfillment_type'] ?? $data['fulfillment_type'] ?? 'FBO';
             $isFbo = strtoupper($fulfillmentType) === 'FBO';
-            
+
             $detailed = [
                 // Комиссия
                 'commission_percent' => $calculated['commission_percent'] ?? $data['commission_percent'] ?? null,
                 'commission_amount' => $calculated['commission_amount'] ?? null,
-                
+
                 // Габариты
                 'volume_liters' => $calculated['volume_liters'] ?? $data['volume_liters'] ?? null,
                 'volume_weight' => $calculated['volume_weight'] ?? $data['volume_weight'] ?? null,
                 'actual_weight' => $calculated['actual_weight'] ?? $data['actual_weight'] ?? null,
-                
+
                 // Логистика (декабрь 2025) + индекс локализации из API
                 'fulfillment_type' => $fulfillmentType,
                 'avg_delivery_time_hours' => $isFbo ? ($data['avg_delivery_time_hours'] ?? 29) : null,
@@ -1290,12 +1293,12 @@ class SyncUnitEconomicsCommand extends Command
                 'logistics_cost' => $calculated['logistics_cost'] ?? null,
                 'processing_cost' => $calculated['processing_cost'] ?? null,
                 'last_mile_cost' => $calculated['last_mile_cost'] ?? null,
-                
+
                 // Хранение
                 'storage_cost' => $calculated['storage_cost'] ?? $data['storage_cost'] ?? null,
                 'turnover_days' => (int) ($calculated['turnover_days'] ?? $data['turnover_days'] ?? 0),
                 'litrobonus' => $calculated['litrobonus'] ?? $data['litrobonus'] ?? null,
-                
+
                 // Возвраты
                 'redemption_rate' => $calculated['redemption_rate'] ?? $data['redemption_rate'] ?? null,
                 'redemption_source' => $data['redemption_source'] ?? 'default',
@@ -1306,39 +1309,39 @@ class SyncUnitEconomicsCommand extends Command
                 'expected_return_cost' => $calculated['expected_return_cost'] ?? null,
                 'effective_logistics' => $calculated['effective_logistics'] ?? null,
                 'delivery_cost' => $calculated['delivery_cost'] ?? null,
-                
+
                 // Эквайринг
                 'acquiring_percent' => $calculated['acquiring_percent'] ?? $data['acquiring_percent'] ?? null,
                 'acquiring_amount' => $calculated['acquiring_amount'] ?? null,
-                
+
                 // Своя логистика (realFBS/DBS)
                 'own_delivery_cost' => $calculated['own_delivery_cost'] ?? $data['own_delivery_cost'] ?? null,
                 'ozon_compensation' => $calculated['ozon_compensation'] ?? $data['ozon_compensation'] ?? null,
-                
+
                 // === СТОИМОСТЬ ЗА ЕДИНИЦУ ===
                 'logistics_per_unit' => $calculated['base_logistics_cost'] ?? null,
                 'last_mile_per_unit' => 25.00,
-                'commission_per_unit' => isset($calculated['commission_amount']) 
-                    ? round($calculated['commission_amount'] / $salesCount, 2) 
+                'commission_per_unit' => isset($calculated['commission_amount'])
+                    ? round($calculated['commission_amount'] / $salesCount, 2)
                     : null,
-                'acquiring_per_unit' => isset($calculated['acquiring_amount']) 
-                    ? round($calculated['acquiring_amount'] / $salesCount, 2) 
+                'acquiring_per_unit' => isset($calculated['acquiring_amount'])
+                    ? round($calculated['acquiring_amount'] / $salesCount, 2)
                     : null,
-                'storage_per_unit' => isset($calculated['storage_cost']) 
-                    ? round($calculated['storage_cost'] / $salesCount, 2) 
+                'storage_per_unit' => isset($calculated['storage_cost'])
+                    ? round($calculated['storage_cost'] / $salesCount, 2)
                     : null,
-                    
+
                 // === НА РС (На расчётный счёт) ===
                 'advertising_cost' => $calculated['advertising_cost'] ?? $data['advertising_cost'] ?? 0,
                 'to_settlement_account' => $calculated['to_settlement_account'] ?? null,
-                
+
                 // === НАЛОГИ (рассчитанные суммы) ===
                 // drr_percent и our_share_percent НЕ включаем — они вводятся вручную и не перезаписываются
                 'tax_amount' => $calculated['tax_amount'] ?? null,
                 'vat_amount' => $calculated['vat_amount'] ?? null,
                 'drr_amount' => $calculated['drr_amount'] ?? null,
                 'our_share_amount' => $calculated['our_share_amount'] ?? null,
-                
+
                 // === АКЦИИ (marketing_seller_price) ===
                 'is_in_promotion' => $data['is_in_promotion'] ?? false,
                 'promotion_discount' => $data['promotion_discount'] ?? null,
@@ -1347,7 +1350,7 @@ class SyncUnitEconomicsCommand extends Command
             ];
         } elseif ($marketplace === 'wildberries') {
             $salesCount = max(1, $data['sales_count'] ?? 1);
-            
+
             $detailed = [
                 // === ГАБАРИТЫ (мм, г, л) ===
                 'length_mm' => $calculated['length_mm'] ?? $data['length_mm'] ?? null,
@@ -1357,26 +1360,26 @@ class SyncUnitEconomicsCommand extends Command
                 'volume_liters' => $calculated['volume_liters'] ?? $data['volume_liters'] ?? null,
                 'volume_weight' => $calculated['volume_weight'] ?? $data['volume_weight'] ?? null,
                 'actual_weight' => $calculated['actual_weight'] ?? $data['actual_weight'] ?? null,
-                
+
                 // === НАЦЕНКА (множитель x) ===
                 'markup_multiplier' => $calculated['markup_multiplier'] ?? null,
-                
+
                 // === ЦЕНА ПОКУПАТЕЛЯ (с СПП) ===
                 'customer_price' => $calculated['customer_price'] ?? null,
-                
+
                 // === КОМИССИЯ ===
                 'commission_percent' => $calculated['commission_percent'] ?? $data['commission_percent'] ?? null,
                 'commission_amount' => $calculated['commission_amount'] ?? null,
-                
+
                 // === СПП (Скидка постоянного покупателя) ===
                 'spp_percent' => $calculated['spp_percent'] ?? $data['spp_percent'] ?? 0,
                 'spp_amount' => $calculated['spp_amount'] ?? null,
-                
+
                 // === КС (Коэффициент склада) ===
                 'warehouse_coefficient' => $calculated['warehouse_coefficient'] ?? $data['warehouse_coefficient'] ?? 1.0,
                 'warehouse_coefficient_percent' => $calculated['warehouse_coefficient_percent'] ?? null,
                 'warehouse_coefficient_amount' => $calculated['warehouse_coefficient_amount'] ?? null,
-                
+
                 // === ЛОГИСТИКА ===
                 'base_logistics_cost' => $calculated['base_logistics_cost'] ?? null,
                 'localization_index' => $calculated['localization_index'] ?? $data['localization_index'] ?? 1.0,
@@ -1384,49 +1387,49 @@ class SyncUnitEconomicsCommand extends Command
                 'dimensions_coefficient' => $calculated['dimensions_coefficient'] ?? 1.0,
                 'logistics_cost' => $calculated['logistics_cost'] ?? null,
                 'logistics_with_warehouse' => $calculated['logistics_with_warehouse'] ?? null,
-                
+
                 // === СХЕМА РАБОТЫ ===
                 'fulfillment_type' => $calculated['fulfillment_type'] ?? $data['fulfillment_type'] ?? 'FBO',
-                
+
                 // === % ВЫКУПА 28д ===
                 'redemption_rate' => $calculated['redemption_rate'] ?? $data['redemption_rate'] ?? 80,
                 'redemption_source' => $data['redemption_source'] ?? 'default',
                 'orders_count' => $data['orders_count'] ?? null,
                 'returns_count' => $data['returns_count'] ?? null,
-                
+
                 // === ХРАНЕНИЕ (FBO) ===
                 'storage_tariff' => $calculated['storage_tariff'] ?? $data['storage_tariff'] ?? 0.08,
                 'storage_coefficient' => $calculated['storage_coefficient'] ?? 1.0,
                 'storage_days' => (int) ($calculated['storage_days'] ?? $data['storage_days'] ?? 30),
                 'storage_cost' => $calculated['storage_cost'] ?? null,
                 'turnover_days' => (int) ($data['turnover_days'] ?? $data['storage_days'] ?? 30),
-                
+
                 // === ЭКВАЙРИНГ (WB: 0%) ===
                 'acquiring_percent' => $calculated['acquiring_percent'] ?? $data['acquiring_percent'] ?? 1.5,
                 'acquiring_amount' => $calculated['acquiring_amount'] ?? null,
-                
+
                 // === ИТОГОВЫЙ % РАСХОДОВ ===
                 'total_expenses_percent' => $calculated['total_expenses_percent'] ?? null,
-                
+
                 // === ВОЗВРАТЫ ===
                 'return_logistics_cost' => $calculated['return_logistics_cost'] ?? null,
                 'expected_return_cost' => $calculated['expected_return_cost'] ?? null,
                 'effective_logistics' => $calculated['effective_logistics'] ?? null,
                 'delivery_cost' => $calculated['delivery_cost'] ?? null,
-                
+
                 // === ПРИЁМКА ===
                 'acceptance_cost' => $calculated['acceptance_cost'] ?? null,
-                
+
                 // === ШТРАФЫ ===
                 'penalty_cost' => $calculated['penalty_cost'] ?? null,
-                
+
                 // === СВОЯ ДОСТАВКА (DBS) ===
                 'own_delivery_cost' => $calculated['own_delivery_cost'] ?? null,
-                
+
                 // === НА РС (На расчётный счёт) ===
                 'advertising_cost' => $calculated['advertising_cost'] ?? $data['advertising_cost'] ?? 0,
                 'to_settlement_account' => $calculated['to_settlement_account'] ?? null,
-                
+
                 // === НАЛОГИ ===
                 'tax_amount' => $calculated['tax_amount'] ?? null,
                 'vat_amount' => $calculated['vat_amount'] ?? null,
@@ -1435,7 +1438,7 @@ class SyncUnitEconomicsCommand extends Command
             ];
         } elseif ($marketplace === 'yandex' || $marketplace === 'yandex_market') {
             $salesCount = max(1, $data['sales_count'] ?? 1);
-            
+
             $detailed = [
                 // === ГАБАРИТЫ ===
                 'length_mm' => $calculated['length_mm'] ?? $data['length_mm'] ?? null,
@@ -1443,17 +1446,17 @@ class SyncUnitEconomicsCommand extends Command
                 'height_mm' => $calculated['height_mm'] ?? $data['height_mm'] ?? null,
                 'weight_g' => $calculated['weight_g'] ?? $data['weight_g'] ?? null,
                 'volume_liters' => $calculated['volume_liters'] ?? $data['volume_liters'] ?? null,
-                
+
                 // === СХЕМА РАБОТЫ ===
                 'fulfillment_type' => $calculated['fulfillment_type'] ?? $data['fulfillment_type'] ?? 'FBY',
-                
+
                 // === КОМИССИЯ (реферальный сбор) ===
                 'referral_fee_percent' => $calculated['referral_fee_percent'] ?? $data['referral_fee_percent'] ?? 5,
                 'commission_percent' => $calculated['commission_percent'] ?? $data['referral_fee_percent'] ?? 5,
                 'commission_amount' => $calculated['commission_amount'] ?? null,
                 'acquiring_percent' => $calculated['acquiring_percent'] ?? $data['acquiring_percent'] ?? 0,
                 'acquiring_amount' => $calculated['acquiring_amount'] ?? null,
-                
+
                 // === ЛОГИСТИКА ===
                 'fby_delivery' => $calculated['fby_delivery'] ?? $data['fby_delivery'] ?? 50,
                 'fbs_delivery' => $calculated['fbs_delivery'] ?? $data['fbs_delivery'] ?? 40,
@@ -1464,23 +1467,23 @@ class SyncUnitEconomicsCommand extends Command
                 'sorting' => $calculated['sorting'] ?? null,
                 'logistics_cost' => $calculated['logistics_cost'] ?? null,
                 'delivery_cost' => $calculated['delivery_cost'] ?? null,
-                
+
                 // === % ВЫКУПА ===
                 'redemption_rate' => $calculated['redemption_rate'] ?? $data['redemption_rate'] ?? 95,
-                
+
                 // === ХРАНЕНИЕ ===
                 'storage_cost' => $calculated['storage_cost'] ?? null,
                 'turnover_days' => (int) ($data['turnover_days'] ?? 30),
-                
+
                 // === ВОЗВРАТЫ ===
                 'return_logistics_cost' => $calculated['return_logistics_cost'] ?? null,
                 'expected_return_cost' => $calculated['expected_return_cost'] ?? null,
                 'effective_logistics' => $calculated['effective_logistics'] ?? null,
-                
+
                 // === НА РС ===
                 'advertising_cost' => $calculated['advertising_cost'] ?? $data['advertising_cost'] ?? 0,
                 'to_settlement_account' => $calculated['to_settlement_account'] ?? null,
-                
+
                 // === НАЛОГИ ===
                 'tax_amount' => $calculated['tax_amount'] ?? null,
                 'vat_amount' => $calculated['vat_amount'] ?? null,
@@ -1488,7 +1491,7 @@ class SyncUnitEconomicsCommand extends Command
                 'our_share_amount' => $calculated['our_share_amount'] ?? null,
             ];
         }
-        
+
         return $detailed;
     }
 
@@ -1524,7 +1527,7 @@ class SyncUnitEconomicsCommand extends Command
 
                 foreach ($skuKeys as $index => $sku) {
                     $responseItem = $responseValues[$index] ?? null;
-                    if (!is_array($responseItem)) {
+                    if (! is_array($responseItem)) {
                         continue;
                     }
 
@@ -1587,7 +1590,7 @@ class SyncUnitEconomicsCommand extends Command
         $normalized = [];
 
         foreach ($items as $item) {
-            if (!is_array($item)) {
+            if (! is_array($item)) {
                 continue;
             }
 
@@ -1606,7 +1609,7 @@ class SyncUnitEconomicsCommand extends Command
 
         return $normalized;
     }
-    
+
     /**
      * Извлечь числовое значение из строки с единицами измерения
      */
@@ -1615,21 +1618,21 @@ class SyncUnitEconomicsCommand extends Command
         if ($value === null) {
             return null;
         }
-        
+
         // Если уже число — возвращаем как float
         if (is_numeric($value)) {
             return (float) $value;
         }
-        
+
         // Если не строка — пробуем привести
-        if (!is_string($value)) {
+        if (! is_string($value)) {
             $value = (string) $value;
         }
-        
+
         // Убираем всё кроме цифр, точки и запятой
         $numeric = preg_replace('/[^\d.,]/', '', $value);
         $numeric = str_replace(',', '.', $numeric);
-        
-        return $numeric !== '' ? (float)$numeric : null;
+
+        return $numeric !== '' ? (float) $numeric : null;
     }
 }

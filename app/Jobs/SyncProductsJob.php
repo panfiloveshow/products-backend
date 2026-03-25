@@ -4,8 +4,10 @@ namespace App\Jobs;
 
 use App\Models\Product;
 use App\Models\SyncLog;
+use App\Services\InventoryService;
 use App\Services\Marketplace\MarketplaceFactory;
 use Illuminate\Bus\Queueable;
+use Illuminate\Contracts\Queue\ShouldBeUnique;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
@@ -13,34 +15,90 @@ use Illuminate\Queue\SerializesModels;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 
-class SyncProductsJob implements ShouldQueue
+class SyncProductsJob implements ShouldBeUnique, ShouldQueue
 {
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
 
+    private const SUSPICIOUS_EMPTY_API_THRESHOLD = 30;
+
+    private const DB_CHUNK_SIZE = 100;
+
+    private const PROGRESS_FLUSH_EVERY = 75;
+
     public int $tries = 3;
+
     public int $timeout = 600;
+
+    public int $uniqueFor = 3600;
 
     public function __construct(
         public SyncLog $syncLog
     ) {}
 
-    public function handle(): void
+    /**
+     * @return list<int>
+     */
+    public function backoff(): array
+    {
+        return [30, 120, 300];
+    }
+
+    public function uniqueId(): string
+    {
+        return implode(':', [
+            'products',
+            $this->syncLog->marketplace,
+            (string) ($this->syncLog->integration_id ?? '0'),
+        ]);
+    }
+
+    public function handle(InventoryService $inventoryService): void
     {
         $this->syncLog->start();
 
         try {
             // Получаем credentials из SyncLog (зашифрованы в БД)
             $credentials = $this->syncLog->credentials ?? [];
-            
+
             // Создаём сервис маркетплейса с credentials
             $marketplace = MarketplaceFactory::create($this->syncLog->marketplace, $credentials);
             $products = $marketplace->getProducts();
 
-            if (empty($products)) {
-                Log::warning("No products returned from marketplace API", [
+            $beforeFilter = count($products);
+            $products = array_values(array_filter(
+                $products,
+                static fn (array $p): bool => trim((string) ($p['sku'] ?? '')) !== ''
+            ));
+            if ($beforeFilter !== count($products)) {
+                Log::warning('SyncProductsJob: skipped rows without sku', [
                     'marketplace' => $this->syncLog->marketplace,
+                    'dropped' => $beforeFilter - count($products),
+                ]);
+            }
+
+            $totalFromApi = count($products);
+            $this->syncLog->update([
+                'metadata' => array_merge($this->syncLog->metadata ?? [], [
+                    'total_from_api' => $totalFromApi,
+                    'phase' => 'products',
+                ]),
+            ]);
+
+            if (empty($products)) {
+                $previousCatalogSize = $this->lastCompletedProductsApiTotal();
+                if ($previousCatalogSize >= self::SUSPICIOUS_EMPTY_API_THRESHOLD) {
+                    throw new \RuntimeException(
+                        "Marketplace returned zero products while previous successful syncs reported {$previousCatalogSize} items; refusing to treat as success."
+                    );
+                }
+
+                Log::warning('No products returned from marketplace API', [
+                    'marketplace' => $this->syncLog->marketplace,
+                    'integration_id' => $this->syncLog->integration_id,
+                    'previous_catalog_total_from_api' => $previousCatalogSize,
                 ]);
                 $this->syncLog->complete(0, 0);
+
                 return;
             }
 
@@ -54,45 +112,60 @@ class SyncProductsJob implements ShouldQueue
             $updated = 0;
             $created = 0;
 
-            // Каждый товар — в своей транзакции.
-            // Одна общая транзакция на весь цикл нельзя использовать в PostgreSQL:
-            // первая ошибка переводит транзакцию в сломанное состояние (25P02),
-            // и все последующие запросы падают с тем же кодом.
-            foreach ($products as $productData) {
+            // Чанки по DB_CHUNK_SIZE: одна внешняя транзакция, внутри SAVEPOINT на товар —
+            // меньше накладных расходов, чем отдельная транзакция на каждый SKU, при этом
+            // ошибка по одному товару не откатывает остальные в чанке.
+            foreach (array_chunk($products, self::DB_CHUNK_SIZE) as $chunk) {
+                DB::beginTransaction();
                 try {
-                    $result = DB::transaction(function () use ($productData) {
-                        return $this->syncProduct($productData);
-                    });
-                    $synced++;
+                    foreach ($chunk as $i => $productData) {
+                        $savepoint = 'sync_sp_'.$i;
+                        try {
+                            DB::statement('SAVEPOINT '.$savepoint);
+                            $result = $this->syncProduct($productData);
+                            DB::statement('RELEASE SAVEPOINT '.$savepoint);
+                            $synced++;
 
-                    if ($result === 'created') {
-                        $created++;
-                    } elseif ($result === 'updated') {
-                        $updated++;
+                            if ($result === 'created') {
+                                $created++;
+                            } elseif ($result === 'updated') {
+                                $updated++;
+                            }
+
+                            if ($synced % self::PROGRESS_FLUSH_EVERY === 0) {
+                                $this->syncLog->update(['items_synced' => $synced]);
+                            }
+                        } catch (\Exception $e) {
+                            DB::statement('ROLLBACK TO SAVEPOINT '.$savepoint);
+                            $failed++;
+                            Log::error('Failed to sync product', [
+                                'marketplace' => $this->syncLog->marketplace,
+                                'sku' => $productData['sku'] ?? 'unknown',
+                                'error' => $e->getMessage(),
+                            ]);
+                        }
                     }
-                } catch (\Exception $e) {
-                    $failed++;
-                    Log::error("Failed to sync product", [
-                        'marketplace' => $this->syncLog->marketplace,
-                        'sku' => $productData['sku'] ?? 'unknown',
-                        'error' => $e->getMessage(),
-                    ]);
+                    DB::commit();
+                } catch (\Throwable $e) {
+                    DB::rollBack();
+                    throw $e;
                 }
             }
 
             // Сохраняем метаданные о синхронизации
             $this->syncLog->update([
-                'metadata' => [
+                'metadata' => array_merge($this->syncLog->metadata ?? [], [
                     'total_from_api' => count($products),
                     'created' => $created,
                     'updated' => $updated,
                     'unchanged' => $synced - $created - $updated,
-                ],
+                    'phase' => 'products_done',
+                ]),
             ]);
 
             $this->syncLog->complete($synced, $failed);
 
-            Log::info("Products sync completed", [
+            Log::info('Products sync completed', [
                 'marketplace' => $this->syncLog->marketplace,
                 'synced' => $synced,
                 'created' => $created,
@@ -100,21 +173,17 @@ class SyncProductsJob implements ShouldQueue
                 'failed' => $failed,
             ]);
 
-            // Автоматически запускаем синхронизацию остатков после товаров
+            // Автоматически запускаем синхронизацию остатков после товаров (через сервис: lock + дедуп)
             $credentials = $this->syncLog->credentials ?? [];
-            if (!empty($credentials)) {
-                $inventorySyncLog = \App\Models\SyncLog::create([
-                    'marketplace' => $this->syncLog->marketplace,
-                    'integration_id' => $this->syncLog->integration_id,
-                    'sync_type' => 'inventory',
-                    'status' => \App\Models\SyncLog::STATUS_PENDING,
-                    'credentials' => $credentials,
-                ]);
+            if (! empty($credentials)) {
+                $inventorySyncLog = $inventoryService->startSync(
+                    $this->syncLog->marketplace,
+                    $credentials,
+                    $this->syncLog->integration_id,
+                    5
+                );
 
-                \App\Jobs\SyncInventoryJob::dispatch($inventorySyncLog)
-                    ->delay(now()->addSeconds(5));
-
-                Log::info("Inventory sync dispatched after products sync", [
+                Log::info('Inventory sync dispatched after products sync', [
                     'marketplace' => $this->syncLog->marketplace,
                     'inventory_sync_id' => $inventorySyncLog->id,
                 ]);
@@ -122,7 +191,7 @@ class SyncProductsJob implements ShouldQueue
         } catch (\Exception $e) {
             $this->syncLog->fail($e->getMessage());
 
-            Log::error("Products sync failed", [
+            Log::error('Products sync failed', [
                 'marketplace' => $this->syncLog->marketplace,
                 'error' => $e->getMessage(),
             ]);
@@ -135,7 +204,7 @@ class SyncProductsJob implements ShouldQueue
      * Синхронизация одного товара с оптимизацией:
      * - Создаёт новый товар если не существует
      * - Обновляет только если есть изменения
-     * 
+     *
      * @return string 'created'|'updated'|'unchanged'
      */
     private function syncProduct(array $productData): string
@@ -145,12 +214,13 @@ class SyncProductsJob implements ShouldQueue
 
         $existingProduct = $this->findExistingProduct($marketplace, $integrationId, $productData);
 
-        if (!$existingProduct) {
+        if (! $existingProduct) {
             // Создаём новый товар
             Product::create(array_merge($productData, [
-                'marketplace'    => $marketplace,
+                'marketplace' => $marketplace,
                 'integration_id' => $integrationId,
             ]));
+
             return 'created';
         }
 
@@ -162,10 +232,10 @@ class SyncProductsJob implements ShouldQueue
         if ($hasChanges) {
             // Не перезаписываем цену нулём/null если уже есть реальная цена
             $updateData = $productData;
-            if (empty($updateData['price']) && !empty($existingProduct->price)) {
+            if (empty($updateData['price']) && ! empty($existingProduct->price)) {
                 unset($updateData['price']);
             }
-            if (empty($updateData['old_price']) && !empty($existingProduct->old_price)) {
+            if (empty($updateData['old_price']) && ! empty($existingProduct->old_price)) {
                 unset($updateData['old_price']);
             }
 
@@ -183,6 +253,7 @@ class SyncProductsJob implements ShouldQueue
                 $updateData['integration_id'] = $integrationId;
             }
             $existingProduct->update($updateData);
+
             return 'updated';
         }
 
@@ -192,7 +263,7 @@ class SyncProductsJob implements ShouldQueue
     private function findExistingProduct(string $marketplace, ?int $integrationId, array $productData): ?Product
     {
         $sku = $productData['sku'] ?? null;
-        if (!$sku) {
+        if (! $sku) {
             return null;
         }
 
@@ -245,7 +316,7 @@ class SyncProductsJob implements ShouldQueue
         ];
 
         foreach ($fieldsToCompare as $field) {
-            if (!isset($newData[$field])) {
+            if (! isset($newData[$field])) {
                 continue;
             }
 
@@ -257,14 +328,16 @@ class SyncProductsJob implements ShouldQueue
                 if (json_encode($existingValue) !== json_encode($newValue)) {
                     return true;
                 }
+
                 continue;
             }
 
             // Для decimal полей сравниваем с округлением
             if (in_array($field, ['price', 'old_price', 'rating'])) {
-                if (round((float)$existingValue, 2) !== round((float)$newValue, 2)) {
+                if (round((float) $existingValue, 2) !== round((float) $newValue, 2)) {
                     return true;
                 }
+
                 continue;
             }
 
@@ -293,11 +366,34 @@ class SyncProductsJob implements ShouldQueue
         return false;
     }
 
+    private function lastCompletedProductsApiTotal(): int
+    {
+        $query = SyncLog::query()
+            ->where('sync_type', 'products')
+            ->where('status', SyncLog::STATUS_COMPLETED)
+            ->where('id', '!=', $this->syncLog->id);
+
+        $mp = $this->syncLog->marketplace;
+        if (in_array($mp, ['yandex', 'yandex_market'], true)) {
+            $query->whereIn('marketplace', ['yandex', 'yandex_market']);
+        } else {
+            $query->where('marketplace', $mp);
+        }
+
+        if ($this->syncLog->integration_id !== null) {
+            $query->where('integration_id', $this->syncLog->integration_id);
+        }
+
+        $last = $query->orderByDesc('completed_at')->orderByDesc('created_at')->first();
+
+        return (int) ($last?->metadata['total_from_api'] ?? 0);
+    }
+
     public function failed(\Throwable $exception): void
     {
         $this->syncLog->fail($exception->getMessage());
 
-        Log::error("SyncProductsJob failed", [
+        Log::error('SyncProductsJob failed', [
             'marketplace' => $this->syncLog->marketplace,
             'error' => $exception->getMessage(),
         ]);
