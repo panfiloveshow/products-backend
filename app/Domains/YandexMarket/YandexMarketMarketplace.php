@@ -73,6 +73,10 @@ class YandexMarketMarketplace implements MarketplaceInterface
     {
         $products = [];
         $pageToken = null;
+        $iterations = 0;
+        $maxIterations = 100; // Максимум 100 страниц (10,000 товаров)
+
+        \Illuminate\Support\Facades\Log::info('YM starting products sync');
 
         do {
             $result = $this->products->getProducts(null, [
@@ -81,27 +85,27 @@ class YandexMarketMarketplace implements MarketplaceInterface
             ]);
 
             $items = $result['items'] ?? [];
+            if (empty($items)) {
+                break;
+            }
+            
             foreach ($items as $item) {
                 $products[] = $this->transformProduct($item);
             }
 
             $pageToken = $result['paging']['nextPageToken'] ?? null;
-        } while ($pageToken && count($products) < 100000);
-
-        // Получаем цены для всех товаров и обогащаем
-        $prices = $this->getProductPricesWithPagination();
-        if (! empty($prices)) {
-            \Illuminate\Support\Facades\Log::info('YM enriching products with prices', ['count' => count($prices)]);
-            foreach ($products as &$product) {
-                $sku = $product['sku'] ?? null;
-                if ($sku && isset($prices[$sku])) {
-                    $priceData = $prices[$sku];
-                    $product['price'] = $priceData['price'] ?? $product['price'];
-                    $product['old_price'] = $priceData['old_price'] ?? null;
-                }
+            $iterations++;
+            
+            if ($iterations >= $maxIterations) {
+                \Illuminate\Support\Facades\Log::warning('YM products pagination limit reached', [
+                    'iterations' => $iterations,
+                    'products_count' => count($products),
+                ]);
+                break;
             }
-            unset($product);
-        }
+        } while ($pageToken);
+
+        \Illuminate\Support\Facades\Log::info('YM products loaded', ['count' => count($products)]);
 
         // Получаем остатки и обогащаем
         $inventory = $this->getInventory();
@@ -131,17 +135,23 @@ class YandexMarketMarketplace implements MarketplaceInterface
 
     /**
      * Получить цены с пагинацией
+     * Ограничено 5 страницами для предотвращения зависания
      */
     private function getProductPricesWithPagination(): array
     {
         $allPrices = [];
         $pageToken = null;
+        $iterations = 0;
+        $maxIterations = 5; // Ограничение для предотвращения бесконечного цикла
 
         do {
             $result = $this->products->getPricesWithPagination($pageToken);
             $items = $result['items'] ?? [];
-            $pageToken = $result['paging']['nextPageToken'] ?? null;
-
+            
+            if (empty($items)) {
+                break;
+            }
+            
             foreach ($items as $item) {
                 $offerId = $item['offerId'] ?? $item['shopSku'] ?? null;
                 if (! $offerId) {
@@ -166,6 +176,18 @@ class YandexMarketMarketplace implements MarketplaceInterface
                         'old_price' => $oldPrice,
                     ];
                 }
+            }
+            
+            $pageToken = $result['paging']['nextPageToken'] ?? null;
+            $iterations++;
+            
+            // Защита от бесконечного цикла
+            if ($iterations >= $maxIterations) {
+                \Illuminate\Support\Facades\Log::warning('YM prices pagination limit reached', [
+                    'iterations' => $iterations,
+                    'prices_loaded' => count($allPrices),
+                ]);
+                break;
             }
         } while ($pageToken);
 
