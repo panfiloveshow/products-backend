@@ -137,9 +137,10 @@ class YandexMarketClient
             throw new \RuntimeException('Yandex Market: укажите campaign_id или business_id');
         }
         $json = $this->get('/v2/campaigns/{campaignId}');
-        $id = data_get($json, 'result.campaign.business.id');
+        $id = data_get($json, 'campaign.business.id')
+            ?? data_get($json, 'result.campaign.business.id');
         if ($id === null || $id === '') {
-            throw new \RuntimeException('Yandex Market: в ответе кампании нет result.campaign.business.id');
+            throw new \RuntimeException('Yandex Market: в ответе кампании нет business.id');
         }
         $this->resolvedBusinessId = (string) $id;
 
@@ -201,7 +202,7 @@ class YandexMarketClient
     private function getHeaders(): array
     {
         return [
-            'Authorization' => 'Bearer '.$this->apiKey,
+            'Api-Key' => $this->apiKey,
             'Content-Type' => 'application/json',
             'Accept' => 'application/json',
         ];

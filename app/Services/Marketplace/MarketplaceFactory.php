@@ -15,8 +15,8 @@ class MarketplaceFactory
                 $credentials['api_key'] ?? null
             ),
             'yandex', 'yandex_market' => new YandexMarketService(
-                $credentials['token'] ?: ($credentials['api_key'] ?? null),
-                $credentials['campaign_id'] ?: ($credentials['client_id'] ?? null),
+                ($credentials['token'] ?? null) ?: ($credentials['api_key'] ?? null),
+                ($credentials['campaign_id'] ?? null) ?: ($credentials['client_id'] ?? null),
                 $credentials['business_id'] ?? null
             ),
             default => throw new InvalidArgumentException("Unknown marketplace: {$marketplace}"),

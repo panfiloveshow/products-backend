@@ -508,6 +508,15 @@ class WildberriesMarketplace implements MarketplaceInterface
         return $this->inventory->getStocks($this->getIntegration());
     }
 
+    /**
+     * Получить остатки только с FBS складов продавца
+     * Используется в SyncInventoryJob для явной синхронизации FBS
+     */
+    public function getFbsStocks(): array
+    {
+        return $this->inventory->getStocksFromFbsWarehousesDirect($this->getIntegration());
+    }
+
     public function getWarehouses(): array
     {
         return $this->inventory->getWarehouses($this->getIntegration());

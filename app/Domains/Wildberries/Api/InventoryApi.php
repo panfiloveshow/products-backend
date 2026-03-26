@@ -232,6 +232,15 @@ class InventoryApi implements InventoryApiInterface
     }
 
     /**
+     * Публичный метод для получения FBS остатков (используется в WildberriesMarketplace::getFbsStocks())
+     * Возвращает только FBS склады продавца
+     */
+    public function getStocksFromFbsWarehousesDirect(?Integration $integration = null): array
+    {
+        return $this->getStocksFromFbsWarehouses($integration, []);
+    }
+
+    /**
      * Получить список складов продавца (FBS)
      *
      * GET /api/v3/warehouses

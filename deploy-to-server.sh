@@ -9,7 +9,7 @@
 
 set -euo pipefail
 
-DEPLOY_USER="root"
+DEPLOY_USER="danya_user"
 DEPLOY_HOST="194.87.104.42"
 HOST="${DEPLOY_USER}@${DEPLOY_HOST}"
 REMOTE_PATH="${REMOTE_PATH:-/var/www/products-backend}"
@@ -18,21 +18,32 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 echo "Локально:  $SCRIPT_DIR"
 echo "Сервер:    $HOST:$REMOTE_PATH"
 echo ""
-
-rsync -avz --delete \
-  --exclude '.git/' \
-  --exclude 'node_modules/' \
-  --exclude 'vendor/' \
-  --exclude '.env' \
-  --exclude 'storage/logs/' \
-  --exclude 'storage/framework/cache/data/' \
-  --exclude 'storage/framework/sessions/' \
-  --exclude 'storage/framework/views/' \
-  -e "ssh -o StrictHostKeyChecking=accept-new" \
-  "$SCRIPT_DIR/" "${HOST}:${REMOTE_PATH}/"
-
+echo "Изменения отправлены в репозиторий. Теперь pulling на сервере..."
 echo ""
-echo "Rsync готов. Обновление зависимостей и миграции на сервере..."
+
+# Сначала пытаемся сделать git pull на сервере
+ssh -o StrictHostKeyChecking=accept-new "$HOST" "cd ${REMOTE_PATH} && git config --global --add safe.directory ${REMOTE_PATH} && git pull origin main" || {
+  echo ""
+  echo "Git pull не удался. Пробуем rsync..."
+  echo ""
+  
+  rsync -avz --delete \
+    --exclude '.git/' \
+    --exclude 'node_modules/' \
+    --exclude 'vendor/' \
+    --exclude '.env' \
+    --exclude 'storage/logs/' \
+    --exclude 'storage/framework/cache/data/' \
+    --exclude 'storage/framework/sessions/' \
+    --exclude 'storage/framework/views/' \
+    -e "ssh -o StrictHostKeyChecking=accept-new" \
+    "$SCRIPT_DIR/" "${HOST}:${REMOTE_PATH}/"
+  
+  echo ""
+  echo "Rsync готов. Обновление зависимостей и миграции на сервере..."
+}
+
+# Выполняем команды на сервере независимо от метода доставки
 ssh -o StrictHostKeyChecking=accept-new "$HOST" "cd ${REMOTE_PATH} && composer install --no-dev --optimize-autoloader && php artisan migrate --force && php artisan config:cache && php artisan route:cache && php artisan view:cache"
 
 echo ""
