@@ -117,6 +117,41 @@ class WildberriesClient
     }
 
     /**
+     * GET запрос к API с Bearer авторизацией
+     * 
+     * Некоторые эндпоинты Wildberries (особенно новые Marketplace API v3)
+     * требуют формат авторизации: "Bearer {api_key}"
+     * 
+     * @see https://dev.wildberries.ru/openapi/api-information
+     */
+    public function getWithBearer(string $endpoint, array $params = [], string $baseUrl = self::BASE_URL): ?array
+    {
+        try {
+            $response = Http::withHeaders($this->getBearerHeaders())
+                ->timeout($this->timeout)
+                ->get($baseUrl . $endpoint, $params);
+
+            if ($response->successful()) {
+                return $response->json();
+            }
+
+            Log::warning('WB API error (Bearer)', [
+                'endpoint' => $endpoint,
+                'status' => $response->status(),
+                'body' => $response->body(),
+            ]);
+
+            return null;
+        } catch (\Exception $e) {
+            Log::error('WB API exception (Bearer)', [
+                'endpoint' => $endpoint,
+                'error' => $e->getMessage(),
+            ]);
+            return null;
+        }
+    }
+
+    /**
      * POST запрос к API
      */
     public function post(string $endpoint, array $data = [], string $baseUrl = self::BASE_URL): ?array
@@ -403,6 +438,22 @@ class WildberriesClient
     {
         return [
             'Authorization' => $this->apiKey,
+            'Content-Type' => 'application/json',
+            'Accept' => 'application/json',
+        ];
+    }
+
+    /**
+     * Заголовки запроса с Bearer авторизацией
+     * 
+     * Новые эндпоинты Marketplace API v3 требуют Bearer формат.
+     * 
+     * @see https://dev.wildberries.ru/openapi/api-information
+     */
+    private function getBearerHeaders(): array
+    {
+        return [
+            'Authorization' => 'Bearer ' . $this->apiKey,
             'Content-Type' => 'application/json',
             'Accept' => 'application/json',
         ];

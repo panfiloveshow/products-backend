@@ -258,7 +258,8 @@ class InventoryApi implements InventoryApiInterface
      */
     public function getWarehouses(?Integration $integration = null): array
     {
-        $response = $this->client->get('/api/v3/warehouses');
+        // /api/v3/warehouses требует Bearer авторизацию
+        $response = $this->client->getWithBearer('/api/v3/warehouses');
 
         return $response ?? [];
     }
