@@ -111,6 +111,35 @@ class ProductsApi implements ProductsApiInterface
     }
 
     /**
+     * Получить цены товаров с полной пагинацией (для getProducts)
+     * Возвращает items + paging для ручной обработки
+     */
+    public function getPricesWithPagination(?string $pageToken = null): array
+    {
+        $params = ['limit' => 200];
+        if ($pageToken) {
+            $params['page_token'] = $pageToken;
+        }
+
+        $response = $this->client->get(
+            '/v2/campaigns/{campaignId}/offer-prices',
+            $params
+        );
+
+        if (! $response) {
+            return [
+                'items' => [],
+                'paging' => null,
+            ];
+        }
+
+        return [
+            'items' => $response['result']['offers'] ?? [],
+            'paging' => $response['result']['paging'] ?? null,
+        ];
+    }
+
+    /**
      * Получить все товары с пагинацией
      */
     public function getAllProducts(Integration $integration, int $batchSize = 100): \Generator

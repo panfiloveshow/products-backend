@@ -150,23 +150,28 @@ class YandexMarketService implements MarketplaceInterface
         $offer = $entry['offer'] ?? [];
         $mapping = $entry['mapping'] ?? [];
 
-        // Получаем цену
+        // Получаем цену (basicPrice — актуальное поле, price — fallback)
         $price = null;
-        if (isset($offer['price']['value'])) {
+        $oldPrice = null;
+        if (isset($offer['basicPrice']['value'])) {
+            $price = (float) $offer['basicPrice']['value'];
+            $oldPrice = isset($offer['basicPrice']['discountBase']) ? (float) $offer['basicPrice']['discountBase'] : null;
+        } elseif (isset($offer['price']['value'])) {
             $price = (float) $offer['price']['value'];
         }
 
+        $offerId = trim((string) ($offer['offerId'] ?? ''));
         $shopSku = trim((string) ($offer['shopSku'] ?? ''));
         $vendorCode = trim((string) ($offer['vendorCode'] ?? ''));
         $marketSku = $mapping['marketSku'] ?? null;
-        $sku = $shopSku !== '' ? $shopSku : ($vendorCode !== '' ? $vendorCode : (string) ($marketSku ?? ''));
+        $sku = $offerId !== '' ? $offerId : ($shopSku !== '' ? $shopSku : ($vendorCode !== '' ? $vendorCode : (string) ($marketSku ?? '')));
 
         return [
             'sku' => $sku,
             'name' => $offer['name'] ?? 'Без названия',
             'barcode' => $offer['barcodes'][0] ?? null,
             'price' => $price,
-            'old_price' => null,
+            'old_price' => $oldPrice,
             'stock' => 0, // Остатки получаем отдельно
             'description' => $offer['description'] ?? null,
             'images' => $offer['pictures'] ?? $offer['urls'] ?? [],
@@ -180,6 +185,7 @@ class YandexMarketService implements MarketplaceInterface
                 ? "https://market.yandex.ru/product/{$mapping['marketSku']}"
                 : null,
             'yandex_data' => [
+                'offerId' => $offer['offerId'] ?? null,
                 'shopSku' => $offer['shopSku'] ?? null,
                 'marketSku' => $mapping['marketSku'] ?? null,
                 'categoryId' => $mapping['categoryId'] ?? null,

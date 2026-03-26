@@ -88,7 +88,88 @@ class YandexMarketMarketplace implements MarketplaceInterface
             $pageToken = $result['paging']['nextPageToken'] ?? null;
         } while ($pageToken && count($products) < 100000);
 
+        // Получаем цены для всех товаров и обогащаем
+        $prices = $this->getProductPricesWithPagination();
+        if (! empty($prices)) {
+            \Illuminate\Support\Facades\Log::info('YM enriching products with prices', ['count' => count($prices)]);
+            foreach ($products as &$product) {
+                $sku = $product['sku'] ?? null;
+                if ($sku && isset($prices[$sku])) {
+                    $priceData = $prices[$sku];
+                    $product['price'] = $priceData['price'] ?? $product['price'];
+                    $product['old_price'] = $priceData['old_price'] ?? null;
+                }
+            }
+            unset($product);
+        }
+
+        // Получаем остатки и обогащаем
+        $inventory = $this->getInventory();
+        if (! empty($inventory)) {
+            \Illuminate\Support\Facades\Log::info('YM enriching products with stocks', ['count' => count($inventory)]);
+            $stocksBySku = [];
+            foreach ($inventory as $item) {
+                $sku = $item['sku'] ?? null;
+                if ($sku) {
+                    if (! isset($stocksBySku[$sku])) {
+                        $stocksBySku[$sku] = 0;
+                    }
+                    $stocksBySku[$sku] += (int) ($item['quantity'] ?? 0);
+                }
+            }
+            foreach ($products as &$product) {
+                $sku = $product['sku'] ?? null;
+                if ($sku && isset($stocksBySku[$sku])) {
+                    $product['stock'] = $stocksBySku[$sku];
+                }
+            }
+            unset($product);
+        }
+
         return $products;
+    }
+
+    /**
+     * Получить цены с пагинацией
+     */
+    private function getProductPricesWithPagination(): array
+    {
+        $allPrices = [];
+        $pageToken = null;
+
+        do {
+            $result = $this->products->getPricesWithPagination($pageToken);
+            $items = $result['items'] ?? [];
+            $pageToken = $result['paging']['nextPageToken'] ?? null;
+
+            foreach ($items as $item) {
+                $offerId = $item['offerId'] ?? $item['shopSku'] ?? null;
+                if (! $offerId) {
+                    continue;
+                }
+
+                // basicPrice — актуальное поле, price — fallback
+                $price = null;
+                $oldPrice = null;
+                if (isset($item['basicPrice']['value'])) {
+                    $price = (float) $item['basicPrice']['value'];
+                    $oldPrice = isset($item['basicPrice']['discountBase']) 
+                        ? (float) $item['basicPrice']['discountBase'] 
+                        : null;
+                } elseif (isset($item['price']['value'])) {
+                    $price = (float) $item['price']['value'];
+                }
+
+                if ($price !== null) {
+                    $allPrices[$offerId] = [
+                        'price' => $price,
+                        'old_price' => $oldPrice,
+                    ];
+                }
+            }
+        } while ($pageToken);
+
+        return $allPrices;
     }
 
     private function transformProduct(array $entry): array
@@ -96,24 +177,29 @@ class YandexMarketMarketplace implements MarketplaceInterface
         $offer = $entry['offer'] ?? [];
         $mapping = $entry['mapping'] ?? [];
 
-        // Получаем цену
+        // Получаем цену (basicPrice — актуальное поле, price — fallback)
         $price = null;
-        if (isset($offer['price']['value'])) {
+        $oldPrice = null;
+        if (isset($offer['basicPrice']['value'])) {
+            $price = (float) $offer['basicPrice']['value'];
+            $oldPrice = isset($offer['basicPrice']['discountBase']) ? (float) $offer['basicPrice']['discountBase'] : null;
+        } elseif (isset($offer['price']['value'])) {
             $price = (float) $offer['price']['value'];
         }
 
+        $offerId = trim((string) ($offer['offerId'] ?? ''));
         $shopSku = trim((string) ($offer['shopSku'] ?? ''));
         $vendorCode = trim((string) ($offer['vendorCode'] ?? ''));
         $marketSku = $mapping['marketSku'] ?? null;
-        $sku = $shopSku !== '' ? $shopSku : ($vendorCode !== '' ? $vendorCode : (string) ($marketSku ?? ''));
+        $sku = $offerId !== '' ? $offerId : ($shopSku !== '' ? $shopSku : ($vendorCode !== '' ? $vendorCode : (string) ($marketSku ?? '')));
 
         return [
             'sku' => $sku,
             'name' => $offer['name'] ?? 'Без названия',
             'barcode' => $offer['barcodes'][0] ?? null,
             'price' => $price,
-            'old_price' => null,
-            'stock' => 0, // Остатки получаем отдельно
+            'old_price' => $oldPrice,
+            'stock' => 0, // Остатки получаем отдельно и обогащаем потом
             'description' => $offer['description'] ?? null,
             'images' => $offer['pictures'] ?? $offer['urls'] ?? [],
             'category' => $offer['category'] ?? $mapping['categoryId'] ?? null,
@@ -126,6 +212,7 @@ class YandexMarketMarketplace implements MarketplaceInterface
                 ? "https://market.yandex.ru/product/{$mapping['marketSku']}"
                 : null,
             'yandex_data' => [
+                'offerId' => $offer['offerId'] ?? null,
                 'shopSku' => $offer['shopSku'] ?? null,
                 'marketSku' => $mapping['marketSku'] ?? null,
                 'categoryId' => $mapping['categoryId'] ?? null,
