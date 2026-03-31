@@ -36,15 +36,15 @@ class SalesApi
      * Продажи по SKU. В v2 метод stats/skus требует непустой shopSkus (до 500).
      * Если $shopSkus пуст — собираем SKU из первых страниц offer-mappings.
      *
+     * Делаем три отдельных запроса (7, 14, 30 дней) чтобы получить реальные данные
+     * вместо линейной интерполяции — EWMA-прогноз автопланирования чувствителен к тренду.
+     *
      * @param  list<string>  $shopSkus
      * @return array<string, array<string, mixed>>
      */
     public function getSalesBySku(int $days = 30, array $shopSkus = []): array
     {
         try {
-            $dateFrom = now()->subDays($days)->format('Y-m-d');
-            $dateTo = now()->format('Y-m-d');
-
             if ($shopSkus === []) {
                 $shopSkus = $this->collectShopSkusFromCatalog(500);
             }
@@ -52,33 +52,66 @@ class SalesApi
                 return [];
             }
 
-            $response = $this->client->post('/v2/campaigns/{campaignId}/stats/skus', [
-                'shopSkus' => array_values(array_slice($shopSkus, 0, 500)),
-                'dateFrom' => $dateFrom,
-                'dateTo' => $dateTo,
-            ]);
+            $skuSlice = array_values(array_slice($shopSkus, 0, 500));
+            $today = now()->format('Y-m-d');
+
+            // BUG FIX: получаем реальные данные за каждый период вместо интерполяции
+            $raw30 = $this->fetchStatsSkus($skuSlice, now()->subDays(30)->format('Y-m-d'), $today);
+            $raw14 = $this->fetchStatsSkus($skuSlice, now()->subDays(14)->format('Y-m-d'), $today);
+            $raw7  = $this->fetchStatsSkus($skuSlice, now()->subDays(7)->format('Y-m-d'), $today);
 
             $salesData = [];
-            foreach ($response['result']['shopSkus'] ?? [] as $item) {
-                $sku = $item['shopSku'] ?? null;
-                if (! $sku) {
-                    continue;
-                }
+            foreach ($raw30 as $sku => $orders30) {
+                $orders14 = $raw14[$sku] ?? (int) round($orders30 * 14 / 30);
+                $orders7  = $raw7[$sku]  ?? (int) round($orders30 * 7  / 30);
 
-                $orders = (int) ($item['orderCount'] ?? 0);
-
-                $salesData[$sku] = [
-                    'sales_30_days' => $orders,
-                    'sales_14_days' => (int) ($orders * 14 / max(1, $days)),
-                    'sales_7_days' => (int) ($orders * 7 / max(1, $days)),
-                    'avg_daily_sales' => round($orders / max(1, $days), 2),
-                    'revenue' => (float) ($item['revenue'] ?? 0),
+                $salesData[(string) $sku] = [
+                    'sales_30_days' => $orders30,
+                    'sales_14_days' => $orders14,
+                    'sales_7_days'  => $orders7,
+                    'avg_daily_sales' => round($orders30 / 30, 2),
+                    'revenue' => 0,
                 ];
             }
 
             return $salesData;
         } catch (\Exception $e) {
             Log::error('YandexMarket getSalesBySku error', ['error' => $e->getMessage()]);
+
+            return [];
+        }
+    }
+
+    /**
+     * Один запрос /stats/skus за указанный период.
+     *
+     * @param  list<string>  $shopSkus
+     * @return array<string, int>  sku => orderCount
+     */
+    private function fetchStatsSkus(array $shopSkus, string $dateFrom, string $dateTo): array
+    {
+        try {
+            $response = $this->client->post('/v2/campaigns/{campaignId}/stats/skus', [
+                'shopSkus' => $shopSkus,
+                'dateFrom' => $dateFrom,
+                'dateTo'   => $dateTo,
+            ]);
+
+            $result = [];
+            foreach ($response['result']['shopSkus'] ?? [] as $item) {
+                $sku = $item['shopSku'] ?? null;
+                if ($sku) {
+                    $result[(string) $sku] = (int) ($item['orderCount'] ?? 0);
+                }
+            }
+
+            return $result;
+        } catch (\Exception $e) {
+            Log::warning('YandexMarket fetchStatsSkus error', [
+                'dateFrom' => $dateFrom,
+                'dateTo'   => $dateTo,
+                'error'    => $e->getMessage(),
+            ]);
 
             return [];
         }

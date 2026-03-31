@@ -51,8 +51,12 @@ class InventoryApi implements InventoryApiInterface
      *
      * @see https://yandex.ru/dev/market/partner-api/doc/en/reference/stocks
      */
-    public function getStocks(?Integration $integration = null, array $skus = []): array
+    /**
+     * @param  string  $scheme  FBY|FBS|DBS|EXPRESS — схема исполнения для этой кампании
+     */
+    public function getStocks(?Integration $integration = null, array $skus = [], string $scheme = 'FBY'): array
     {
+        // allStocks[sku][warehouseId] => агрегированные данные склада
         $allStocks = [];
         $pageToken = null;
 
@@ -76,7 +80,12 @@ class InventoryApi implements InventoryApiInterface
             $pageToken = $response['result']['paging']['nextPageToken'] ?? null;
 
             foreach ($warehouses as $warehouse) {
-                $warehouseId = $warehouse['warehouseId'] ?? 'unknown';
+                $warehouseId = (string) ($warehouse['warehouseId'] ?? 'unknown');
+                $warehouseName = $warehouse['name']
+                    ?? $warehouse['warehouseName']
+                    ?? $warehouse['title']
+                    ?? null;
+                $warehouseName = $warehouseName !== null && $warehouseName !== '' ? (string) $warehouseName : null;
 
                 foreach ($warehouse['offers'] ?? [] as $offer) {
                     $sku = $offer['offerId'] ?? $offer['shopSku'] ?? null;
@@ -97,23 +106,39 @@ class InventoryApi implements InventoryApiInterface
                         ];
                     }
 
+                    // Агрегируем все типы остатков в одну запись на склад
+                    // (BUG FIX: раньше каждый тип создавал отдельную строку, которую следующий перезаписывал)
+                    if (! isset($allStocks[$sku]['warehouses'][$warehouseId])) {
+                        $whRow = [
+                            'warehouse_id' => $warehouseId,
+                            'quantity' => 0,
+                            'fulfillment_type' => $scheme,
+                        ];
+                        if ($warehouseName !== null) {
+                            $whRow['warehouse_name'] = $warehouseName;
+                        }
+                        $allStocks[$sku]['warehouses'][$warehouseId] = $whRow;
+                    }
+
                     foreach ($offer['stocks'] ?? [] as $stock) {
                         $quantity = (int) ($stock['count'] ?? 0);
                         $type = $stock['type'] ?? 'FIT';
 
-                        $allStocks[$sku]['warehouses'][] = [
-                            'warehouse_id' => $warehouseId,
-                            'type' => $type,
-                            'quantity' => $quantity,
-                        ];
-
+                        // Суммируем только доступные к продаже остатки (FIT + AVAILABLE)
                         if (in_array($type, ['FIT', 'AVAILABLE'], true)) {
+                            $allStocks[$sku]['warehouses'][$warehouseId]['quantity'] += $quantity;
                             $allStocks[$sku]['total'] += $quantity;
                         }
                     }
                 }
             }
         } while ($pageToken);
+
+        // Преобразуем ассоциативный массив складов в индексированный
+        foreach ($allStocks as &$item) {
+            $item['warehouses'] = array_values($item['warehouses']);
+        }
+        unset($item);
 
         return array_values($allStocks);
     }

@@ -19,7 +19,7 @@ class UpdateIntegrationRequest extends FormRequest
         
         $rules = [
             'name' => 'sometimes|string|max:255',
-            'marketplace' => 'sometimes|string|in:wildberries,ozon,yandex',
+            'marketplace' => 'sometimes|string|in:wildberries,ozon,yandex_market',
             'credentials' => 'sometimes|array',
             'is_active' => 'sometimes|boolean',
             'auto_sync_enabled' => 'sometimes|boolean',
@@ -36,10 +36,11 @@ class UpdateIntegrationRequest extends FormRequest
                     'credentials.client_id' => 'sometimes|string',
                     'credentials.api_key' => 'sometimes|string',
                 ],
-                'yandex' => [
+                'yandex_market' => [
                     'credentials.token' => 'sometimes|string',
                     'credentials.campaign_id' => 'sometimes|string',
                     'credentials.business_id' => 'nullable|string',
+                    'credentials.scheme' => 'nullable|string|in:FBY,FBS,DBS,EXPRESS',
                 ],
                 default => [],
             };

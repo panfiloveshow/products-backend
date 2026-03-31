@@ -80,7 +80,12 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
         // SKU включается если есть остаток > 0 ИЛИ продажи за 30 дней > 0
         // Это исключает "мёртвые" товары которых давно нет и которые засоряют план
         $activeSKUs = InventoryWarehouse::where('integration_id', $integrationId)
-            ->where('marketplace', $marketplace)
+            ->when(
+                in_array($marketplace, ['yandex', 'yandex_market'], true),
+                // BUG FIX: исторически записи могут хранить и 'yandex', и 'yandex_market' — ищем оба варианта
+                fn ($q) => $q->whereIn('marketplace', ['yandex', 'yandex_market']),
+                fn ($q) => $q->where('marketplace', $marketplace)
+            )
             ->where(function ($q) {
                 $q->where('quantity', '>', 0)
                   ->orWhere('sales_30_days', '>', 0);
@@ -90,7 +95,11 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
             ->toArray();
 
         $warehouseQuery = InventoryWarehouse::where('integration_id', $integrationId)
-            ->where('marketplace', $marketplace)
+            ->when(
+                in_array($marketplace, ['yandex', 'yandex_market'], true),
+                fn ($q) => $q->whereIn('marketplace', ['yandex', 'yandex_market']),
+                fn ($q) => $q->where('marketplace', $marketplace)
+            )
             ->whereIn('sku', $activeSKUs);
 
         $selectedWarehouseIds = $plan->params['warehouse_ids'] ?? null;
@@ -220,6 +229,19 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
             $wbFbsStockMap = array_map('intval', $fbsRows);
         }
 
+        // Yandex: FBS-остатки на складах продавца (аналогично WB)
+        $yandexFbsStockMap = [];
+        if (in_array($marketplace, ['yandex', 'yandex_market'], true)) {
+            $fbsRows = InventoryWarehouse::where('integration_id', $integrationId)
+                ->whereIn('marketplace', ['yandex', 'yandex_market'])
+                ->where('fulfillment_type', 'FBS')
+                ->selectRaw('sku, SUM(quantity) as total_qty')
+                ->groupBy('sku')
+                ->pluck('total_qty', 'sku')
+                ->toArray();
+            $yandexFbsStockMap = array_map('intval', $fbsRows);
+        }
+
         // v2: Загружаем in-transit из активных заявок на поставку
         $supplyInTransit = $service->getInTransitFromSupplies($integrationId);
 
@@ -341,6 +363,16 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
                 if ($wbFbsStock > 0) {
                     // FBS = уже на складе продавца, учитываем как in-transit с коэффициентом 1.0
                     $inTransit = $inTransit + $wbFbsStock;
+                }
+            }
+
+            // Yandex: FBS-остатки продавца — аналогично WB
+            $yandexFbsStock = 0;
+            if (in_array($marketplace, ['yandex', 'yandex_market'], true)) {
+                $yandexFbsStock = $yandexFbsStockMap[$wh->sku] ?? 0;
+                if ($yandexFbsStock > 0) {
+                    // FBS = уже на складе продавца, учитываем как in-transit
+                    $inTransit = $inTransit + $yandexFbsStock;
                 }
             }
 
@@ -613,7 +645,9 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
                     'in_transit_api' => $inTransitApi,
                     'in_transit_supplies' => $inTransitSupplies,
                     'in_way_from_client' => $inWayFromClient,
-                    'fbs_stock' => $wbFbsStock,
+                    'fbs_stock' => $wbFbsStock + $yandexFbsStock,
+                    'fbs_stock_wb' => $wbFbsStock,
+                    'fbs_stock_yandex' => $yandexFbsStock,
                     'in_transit_total' => $inTransit,
                     'daily_demand' => round($dailyDemand, 4),
                     'demand_source' => $demandSource,

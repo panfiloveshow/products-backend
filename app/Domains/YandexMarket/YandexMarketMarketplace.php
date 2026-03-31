@@ -27,11 +27,15 @@ class YandexMarketMarketplace implements MarketplaceInterface
 
     private SalesApi $sales;
 
+    private string $scheme;
+
     public function __construct(array $credentials = [])
     {
         $token = $credentials['token'] ?? $credentials['api_key'] ?? config('services.yandex_market.token');
         $campaignId = $credentials['campaign_id'] ?? $credentials['client_id'] ?? config('services.yandex_market.campaign_id');
         $businessId = $credentials['business_id'] ?? config('services.yandex_market.business_id');
+        // Схема FBY/FBS/DBS/EXPRESS — задаётся в настройках интеграции, по умолчанию FBY
+        $this->scheme = strtoupper((string) ($credentials['scheme'] ?? $credentials['fulfillment_type'] ?? 'FBY'));
 
         $this->client = new YandexMarketClient($token, $campaignId, $businessId);
         $this->products = new ProductsApi($this->client);
@@ -90,7 +94,7 @@ class YandexMarketMarketplace implements MarketplaceInterface
             }
             
             foreach ($items as $item) {
-                $products[] = $this->transformProduct($item);
+                $products[] = $this->transformProduct($item, null);
             }
 
             $pageToken = $result['paging']['nextPageToken'] ?? null;
@@ -118,7 +122,8 @@ class YandexMarketMarketplace implements MarketplaceInterface
                     if (! isset($stocksBySku[$sku])) {
                         $stocksBySku[$sku] = 0;
                     }
-                    $stocksBySku[$sku] += (int) ($item['quantity'] ?? 0);
+                    // BUG FIX: getInventory() возвращает {sku, warehouses, total} — поле quantity отсутствует на верхнем уровне
+                    $stocksBySku[$sku] += (int) ($item['total'] ?? 0);
                 }
             }
             foreach ($products as &$product) {
@@ -194,7 +199,7 @@ class YandexMarketMarketplace implements MarketplaceInterface
         return $allPrices;
     }
 
-    private function transformProduct(array $entry): array
+    private function transformProduct(array $entry, ?int $integrationId = null): array
     {
         $offer = $entry['offer'] ?? [];
         $mapping = $entry['mapping'] ?? [];
@@ -230,6 +235,7 @@ class YandexMarketMarketplace implements MarketplaceInterface
             'reviews_count' => 0,
             'marketplace' => 'yandex_market',
             'marketplace_id' => (string) ($mapping['marketSku'] ?? $sku),
+            'integration_id' => $integrationId, // Добавляем integration_id
             'url' => isset($mapping['marketSku'])
                 ? "https://market.yandex.ru/product/{$mapping['marketSku']}"
                 : null,
@@ -255,7 +261,7 @@ class YandexMarketMarketplace implements MarketplaceInterface
 
     public function getInventory(): array
     {
-        return $this->inventory->getStocks();
+        return $this->inventory->getStocks(null, [], $this->scheme);
     }
 
     public function getWarehouses(): array

@@ -90,7 +90,7 @@ class SyncInventoryJob implements ShouldBeUnique, ShouldQueue
                 }
             }
 
-            // WB / Ozon: продажи по складам для average_daily_sales и sales_* (в matrix используется MAX)
+            // Yandex: получаем продажи для расчета average_daily_sales
             $salesBySkuWarehouse = [];
             if ($this->syncLog->marketplace === 'wildberries' && method_exists($marketplaceService, 'getSalesByWarehouse')) {
                 $salesBySkuWarehouse = $marketplaceService->getSalesByWarehouse(30);
@@ -98,6 +98,40 @@ class SyncInventoryJob implements ShouldBeUnique, ShouldQueue
             } elseif ($this->syncLog->marketplace === 'ozon' && method_exists($marketplaceService, 'getSalesBySkuAndWarehouse')) {
                 $salesBySkuWarehouse = $marketplaceService->getSalesBySkuAndWarehouse(30);
                 Log::info('Ozon sales by warehouse loaded', ['skus' => count($salesBySkuWarehouse)]);
+            } elseif (in_array($this->syncLog->marketplace, ['yandex', 'yandex_market'], true) && method_exists($marketplaceService, 'getSalesBySku')) {
+                $salesBySku = $marketplaceService->getSalesBySku();
+
+                // BUG FIX: getSalesBySku() ключует по shopSku, а getInventory() ключует по offerId ?? shopSku.
+                // Строим маппинг shopSku → offerId из products.yandex_data чтобы соединить продажи с остатками.
+                $shopSkuToOfferId = Product::whereIn('marketplace', ['yandex', 'yandex_market'])
+                    ->where('integration_id', $this->syncLog->integration_id)
+                    ->whereNotNull('yandex_data')
+                    ->get(['sku', 'yandex_data'])
+                    ->flatMap(function ($p) {
+                        $offerId  = data_get($p->yandex_data, 'offerId');
+                        $shopSku  = data_get($p->yandex_data, 'shopSku');
+                        if ($shopSku && $offerId && $shopSku !== $offerId) {
+                            return [$shopSku => $offerId];
+                        }
+                        return [];
+                    })
+                    ->toArray();
+
+                // Нормализуем формат для Yandex продаж, дублируем запись под offerId-ключ если нужно
+                foreach ($salesBySku as $sku => $salesData) {
+                    $entry = [[
+                        'avg_daily_sales' => ($salesData['sales_30_days'] ?? 0) / 30,
+                        'sales_7_days'    => $salesData['sales_7_days']  ?? 0,
+                        'sales_14_days'   => $salesData['sales_14_days'] ?? 0,
+                        'sales_30_days'   => $salesData['sales_30_days'] ?? 0,
+                    ]];
+                    $salesBySkuWarehouse[(string) $sku] = $entry;
+                    // Добавляем alias по offerId если он отличается от shopSku
+                    if (isset($shopSkuToOfferId[(string) $sku])) {
+                        $salesBySkuWarehouse[$shopSkuToOfferId[(string) $sku]] = $entry;
+                    }
+                }
+                Log::info('Yandex sales loaded', ['skus' => count($salesBySku), 'aliases' => count($shopSkuToOfferId)]);
             }
 
             if (empty($inventory)) {
@@ -392,8 +426,13 @@ class SyncInventoryJob implements ShouldBeUnique, ShouldQueue
             ? (int) round($qty / $avgDailySales)
             : null;
 
+        $resolvedWarehouseName = trim((string) ($stockData['warehouse_name'] ?? ''));
+        if ($resolvedWarehouseName === '') {
+            $resolvedWarehouseName = (string) ($stockData['warehouse_id'] ?? 'unknown');
+        }
+
         $newData = [
-            'warehouse_name' => $stockData['warehouse_name'],
+            'warehouse_name' => $resolvedWarehouseName,
             'marketplace' => $stockData['marketplace'],
             'quantity' => $qty,
             'fulfillment_type' => $stockData['fulfillment_type'] ?? null,
@@ -438,7 +477,7 @@ class SyncInventoryJob implements ShouldBeUnique, ShouldQueue
 
         // Проверяем есть ли изменения
         $hasChanges = $existing->quantity !== (int) $stockData['quantity']
-            || $existing->warehouse_name !== $stockData['warehouse_name']
+            || ($existing->warehouse_name ?? '') !== $resolvedWarehouseName
             || (string) $existing->integration_id !== (string) $integrationId
             || (array_key_exists('warehouse_coefficient', $newData) && (float) ($existing->warehouse_coefficient ?? 1.0) !== (float) $newData['warehouse_coefficient'])
             || ($sales7 !== null && (int) $existing->sales_7_days !== $sales7)
