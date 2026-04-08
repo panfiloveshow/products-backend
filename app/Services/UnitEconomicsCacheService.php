@@ -350,16 +350,12 @@ class UnitEconomicsCacheService
             $markupRuleReasonLabel = $marketplaceData['markup_rule_reason_label']
                 ?? $existingMarketplaceData['markup_rule_reason_label']
                 ?? null;
-            // Приоритет: свежие данные из inventory > marketplace_data > кеш
-            $inventorySales7Days = \App\Models\InventoryWarehouse::where('integration_id', $product->integration_id)
+            // Seller-level total FBO sales in 7 days (Ozon rule applies per-seller, not per-SKU)
+            $sellerFboSales7Days = \App\Models\InventoryWarehouse::where('integration_id', $product->integration_id)
                 ->where('marketplace', $marketplace)
-                ->where('sku', $product->sku)
+                ->where('fulfillment_type', 'FBO')
                 ->sum('sales_7_days');
-            $sales7Days = $inventorySales7Days > 0
-                ? (int) $inventorySales7Days
-                : (isset($marketplaceData['sales_7_days'])
-                    ? (int) $marketplaceData['sales_7_days']
-                    : (isset($existingMarketplaceData['sales_7_days']) ? (int) $existingMarketplaceData['sales_7_days'] : null));
+            $sales7Days = (int) $sellerFboSales7Days;
             $profileDataSources = is_array($marketplaceData['profile_data_sources'] ?? null)
                 ? $marketplaceData['profile_data_sources']
                 : (is_array($existingMarketplaceData['profile_data_sources'] ?? null) ? $existingMarketplaceData['profile_data_sources'] : []);

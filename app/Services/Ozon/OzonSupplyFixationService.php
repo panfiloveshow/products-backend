@@ -37,7 +37,28 @@ class OzonSupplyFixationService
             $supplyCreated = Carbon::parse($createdAt);
             $tariffVersion = $this->pricing->getVersionForDate($supplyCreated->toDateString());
             $announcementDate = Carbon::parse($this->pricing->getAnnouncementDateForVersion($tariffVersion));
-            $fixationBaseDate = $announcementDate->lte($supplyCreated) ? $announcementDate->copy() : $supplyCreated->copy();
+
+            // Transitional period: supplies created between announcement and effective date
+            // use the new tariff version but calculate fixation from supply creation date
+            $transitionalPeriods = config('ozon_unit_economics.transitional_periods', []);
+            $isTransitional = false;
+            foreach ($transitionalPeriods as $period) {
+                $periodStart = Carbon::parse($period['start']);
+                $periodEnd = Carbon::parse($period['end']);
+                if ($supplyCreated->between($periodStart, $periodEnd)) {
+                    $tariffVersion = $period['tariff_version'];
+                    $announcementDate = Carbon::parse($this->pricing->getAnnouncementDateForVersion($tariffVersion));
+                    // For transitional period, fixation starts from supply creation date
+                    $fixationBaseDate = $supplyCreated->copy();
+                    $isTransitional = true;
+                    break;
+                }
+            }
+
+            if (!$isTransitional) {
+                $fixationBaseDate = $announcementDate->lte($supplyCreated) ? $announcementDate->copy() : $supplyCreated->copy();
+            }
+
             $fixedUntil = $fixationBaseDate->copy()->addDays(60);
             $isActive = $fixedUntil->isFuture() || $fixedUntil->isToday();
 

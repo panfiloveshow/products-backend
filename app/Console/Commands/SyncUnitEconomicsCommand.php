@@ -352,11 +352,15 @@ class SyncUnitEconomicsCommand extends Command
 
                     $ozonStockProfiles = $this->buildOzonStockProfiles($inventoryRaw, $ozonDirectSalesProfiles);
 
+                    // Seller-level total FBO sales in 7 days (Ozon rule applies per-seller, not per-SKU)
+                    $sellerFboSales7Days = (int) $inventoryRaw->where('fulfillment_type', 'FBO')->sum('sales_7_days');
+
                     try {
                         $deliveryAnalyticsApi = new \App\Domains\Ozon\Api\DeliveryAnalyticsApi($ozonService->api());
                         $deliveryProfiles = $this->buildOzonDeliveryProfiles(
                             $deliveryAnalyticsApi->getSupplyRecommendations([], 'ALL', 'EIGHT_WEEKS'),
-                            $ozonStockProfiles
+                            $ozonStockProfiles,
+                            $sellerFboSales7Days
                         );
                         $this->info('  Профили доставки SKU: '.count($deliveryProfiles));
                     } catch (\Throwable $deliveryException) {
@@ -1934,7 +1938,7 @@ class SyncUnitEconomicsCommand extends Command
         return $normalized;
     }
 
-    private function buildOzonDeliveryProfiles(array $recommendations, array $stockProfiles = []): array
+    private function buildOzonDeliveryProfiles(array $recommendations, array $stockProfiles = [], int $sellerFboSales7Days = 0): array
     {
         $profiles = [];
         $pricing = new OzonPricingMatrix();
@@ -1970,8 +1974,7 @@ class SyncUnitEconomicsCommand extends Command
             $weightedNonLocalMarkupPercent = 0.0;
             $hasWeightedMarkup = false;
             $clustersSummary = [];
-            $sales7Days = (int) ($stockProfile['total_sales_7_days'] ?? 0);
-            $markupAllowed = (string) ($item['delivery_schema'] ?? 'ALL') !== 'FBO' || $sales7Days >= 50;
+            $markupAllowed = (string) ($item['delivery_schema'] ?? 'ALL') !== 'FBO' || $sellerFboSales7Days >= 50;
             $markupRuleReason = $markupAllowed ? null : 'fbo_lt_50_orders_7d';
 
             foreach ($clusters as $cluster) {

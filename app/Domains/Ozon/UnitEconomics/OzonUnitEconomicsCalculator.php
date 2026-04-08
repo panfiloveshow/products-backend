@@ -380,6 +380,17 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
             'fixation_id' => $input->fixationId,
             'fixation_base_date' => $input->fixationBaseDate,
             'fixed_until' => $input->fixedUntil,
+            // Non-local markup exemptions (6 total):
+            // 1. [IMPLEMENTED] local_cluster — shipping and destination clusters match (local sale)
+            // 2. [IMPLEMENTED] cancelled_order — order was cancelled
+            // 3. [IMPLEMENTED] not_redeemed — order was not picked up (STATUS_NOT_ACCEPTED)
+            // 4. [IMPLEMENTED] fbo_lt_50_orders_7d — seller has fewer than 50 FBO orders in 7 days
+            // 5. [NOT IMPLEMENTABLE] unavailable_ozon_reroute — Ozon shipped from non-local cluster
+            //    when local stock was available (requires Ozon internal routing data, not available via API)
+            // 6. [NOT IMPLEMENTABLE] unavailable_cluster_blocked — product cannot be placed in buyer's
+            //    cluster warehouse (requires warehouse restriction data, not available via API)
+            // 7. [NOT IMPLEMENTABLE] unavailable_select_only — product sold only on Select platform
+            //    (requires Select platform detection, not available via current integration)
             'markup_applied' => $input->markupApplied,
             'markup_reason_code' => $input->markupReasonCode,
             'markup_reason_label' => $input->markupReasonLabel,

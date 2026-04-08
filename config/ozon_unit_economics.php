@@ -4,7 +4,14 @@ return [
     'effective_from' => '2026-04-06',
     'version' => '2026-04-06',
     'announcement_dates' => [
-        '2026-04-06' => '2026-04-06',
+        '2026-04-06' => '2026-02-05', // Tariffs announced Feb 5, effective Apr 6
+    ],
+    'transitional_periods' => [
+        [
+            'start' => '2026-02-05',
+            'end' => '2026-04-05',
+            'tariff_version' => '2026-04-06',
+        ],
     ],
     'version_history' => [
         // Each entry: version => effective_from date
@@ -244,11 +251,11 @@ return [
     ],
     'scheme_costs' => [
         'FBO' => [
-            'last_mile' => 25.0,
+            'last_mile' => 25.0, // Макс. стоимость: партнёры — до 25₽, Ozon — ровно 25₽
             'return_processing' => 15.0,
         ],
         'FBS' => [
-            'last_mile' => 25.0,
+            'last_mile' => 25.0, // Макс. стоимость: партнёры — до 25₽, Ozon — ровно 25₽
             'processing_fee' => 20.0,
             'return_processing' => 15.0,
         ],
