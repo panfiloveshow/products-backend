@@ -536,14 +536,15 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
 
     private function resolveWeightedProfileMetrics(string $scheme, CalculationInput $input, float $volume): ?array
     {
-        // Используем clusters_summary (из Delivery Analytics API) как основной источник.
-        // Если данных мало (< 10 заказов), а в sales_profile (из реальных отгрузок) больше —
-        // конвертируем sales_profile в формат clusters_summary и используем его.
+        // Используем наиболее полный источник данных о спросе.
+        // clusters_summary (Delivery Analytics API) может содержать неполные данные,
+        // а sales_profile (реальные отгрузки за 30 дней) отражает фактическое распределение.
+        // Берём тот источник, где БОЛЬШЕ заказов — он статистически надёжнее.
         $demandClusters = $input->clustersSummary;
         if (!empty($input->salesProfile)) {
             $analyticsTotal = array_sum(array_column($demandClusters, 'orders_count'));
             $salesTotal = array_sum(array_column($input->salesProfile, 'sales_30_days'));
-            if ($salesTotal > $analyticsTotal && $analyticsTotal < 10) {
+            if ($salesTotal > $analyticsTotal) {
                 $demandClusters = array_map(fn(array $sp) => [
                     'cluster_id' => $sp['cluster_id'] ?? null,
                     'cluster_name' => $sp['cluster_name'] ?? null,
