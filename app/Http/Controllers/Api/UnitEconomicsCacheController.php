@@ -27,6 +27,7 @@ use PhpOffice\PhpSpreadsheet\Style\Border;
 use PhpOffice\PhpSpreadsheet\Style\Color;
 use PhpOffice\PhpSpreadsheet\Style\Fill;
 use PhpOffice\PhpSpreadsheet\Style\NumberFormat;
+use PhpOffice\PhpSpreadsheet\Worksheet\Drawing;
 use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
 use Symfony\Component\HttpFoundation\StreamedResponse;
 
@@ -562,62 +563,78 @@ class UnitEconomicsCacheController extends Controller
         $sheet = $spreadsheet->getActiveSheet();
         $sheet->setTitle('Юнит-экономика');
 
-        // ── Определения колонок ──
+        // ── Определения колонок (A-Y, 25 колонок) ──
         $columns = [
-            'A' => ['header' => 'Артикул', 'width' => 15],
-            'B' => ['header' => 'Наименование', 'width' => 40],
-            'C' => ['header' => 'Цена, ₽', 'width' => 12],
-            'D' => ['header' => 'Себестоимость, ₽', 'width' => 14],
-            'E' => ['header' => 'Наценка, x', 'width' => 12],
-            'F' => ['header' => 'Комиссия, %', 'width' => 12],
-            'G' => ['header' => 'Комиссия, ₽', 'width' => 12],
-            'H' => ['header' => 'Логистика, ₽', 'width' => 12],
-            'I' => ['header' => 'Последняя миля, ₽', 'width' => 14],
-            'J' => ['header' => 'Доставка, ₽', 'width' => 12],
-            'K' => ['header' => 'Нелок. наценка, %', 'width' => 14],
-            'L' => ['header' => 'Кластер поставки', 'width' => 20],
-            'M' => ['header' => 'Локальность', 'width' => 14],
-            'N' => ['header' => 'Эквайринг, ₽', 'width' => 12],
-            'O' => ['header' => 'Хранение, ₽', 'width' => 12],
-            'P' => ['header' => 'РК, ₽', 'width' => 10],
-            'Q' => ['header' => 'Налог, ₽', 'width' => 10],
-            'R' => ['header' => 'НДС, ₽', 'width' => 10],
-            'S' => ['header' => 'Итого затраты, ₽', 'width' => 14],
-            'T' => ['header' => 'Прибыль, ₽', 'width' => 12],
-            'U' => ['header' => 'Маржа, %', 'width' => 10],
-            'V' => ['header' => 'ROI, %', 'width' => 10],
-            'W' => ['header' => 'На р/с, ₽', 'width' => 12],
+            'A' => ['header' => 'Артикул', 'width' => 15, 'field' => 'sku', 'format' => '@'],
+            'B' => ['header' => 'Наименование', 'width' => 40, 'field' => 'product_name', 'format' => '@'],
+            'C' => ['header' => 'Цена, ₽', 'width' => 12, 'field' => 'price', 'format' => '#,##0.00'],
+            'D' => ['header' => 'Себестоимость, ₽', 'width' => 14, 'field' => 'cost_price', 'format' => '#,##0.00'],
+            'E' => ['header' => 'Наценка, x', 'width' => 11, 'field' => 'markup_percent', 'format' => '0.00'],
+            'F' => ['header' => 'Комиссия, %', 'width' => 11, 'field' => 'commission_percent', 'format' => '0.00"%"'],
+            'G' => ['header' => 'Комиссия, ₽', 'width' => 12, 'field' => 'commission_amount', 'format' => '#,##0.00'],
+            'H' => ['header' => 'Логистика, ₽', 'width' => 12, 'field' => 'logistics_cost', 'format' => '#,##0.00'],
+            'I' => ['header' => 'Посл. миля, ₽', 'width' => 12, 'field' => 'last_mile_cost', 'format' => '#,##0.00'],
+            'J' => ['header' => 'Доставка, ₽', 'width' => 12, 'field' => 'formula_delivery', 'format' => '#,##0.00'],
+            'K' => ['header' => 'Кластер поставки', 'width' => 20, 'field' => 'cluster', 'format' => '@'],
+            'L' => ['header' => 'Локальность', 'width' => 14, 'field' => 'locality', 'format' => '@'],
+            'M' => ['header' => 'Нелок. наценка, %', 'width' => 15, 'field' => 'non_local_markup_percent', 'format' => '0.00"%"'],
+            'N' => ['header' => '% выкупа', 'width' => 10, 'field' => 'redemption_rate', 'format' => '0.00"%"'],
+            'O' => ['header' => 'Эквайринг, %', 'width' => 12, 'field' => 'acquiring_percent', 'format' => '0.00"%"'],
+            'P' => ['header' => 'РК, %', 'width' => 8, 'field' => 'drr_percent', 'format' => '0.00"%"'],
+            'Q' => ['header' => 'Наша часть, %', 'width' => 12, 'field' => 'our_share_percent', 'format' => '0.00"%"'],
+            'R' => ['header' => 'Налог, %', 'width' => 9, 'field' => 'tax_percent', 'format' => '0.00"%"'],
+            'S' => ['header' => 'НДС, %', 'width' => 8, 'field' => 'vat_percent', 'format' => '0.00"%"'],
+            'T' => ['header' => 'Хранение, ₽', 'width' => 12, 'field' => 'storage_cost', 'format' => '#,##0.00'],
+            'U' => ['header' => 'Итого затраты, ₽', 'width' => 14, 'field' => 'total_costs', 'format' => '#,##0.00'],
+            'V' => ['header' => 'Прибыль, ₽', 'width' => 12, 'field' => 'net_profit', 'format' => '#,##0.00'],
+            'W' => ['header' => 'Маржа, %', 'width' => 10, 'field' => 'margin_percent', 'format' => '0.00"%"'],
+            'X' => ['header' => 'ROI, %', 'width' => 10, 'field' => 'roi_percent', 'format' => '0.00"%"'],
+            'Y' => ['header' => 'На р/с, ₽', 'width' => 12, 'field' => 'to_settlement_account', 'format' => '#,##0.00'],
         ];
 
-        $lastCol = 'W';
+        $lastCol = 'Y';
 
         // ── Ширины колонок ──
         foreach ($columns as $col => $def) {
             $sheet->getColumnDimension($col)->setWidth($def['width']);
         }
 
-        // ── Row 1: Заголовок "SELLICO — Юнит-экономика" ──
-        $sheet->setCellValue('A1', 'SELLICO — Юнит-экономика');
-        $sheet->mergeCells("A1:{$lastCol}1");
-        $sheet->getStyle('A1')->applyFromArray([
+        // ── Logo ──
+        $logoPath = storage_path('app/sellico-logo.png');
+        if (file_exists($logoPath)) {
+            $drawing = new Drawing();
+            $drawing->setName('Sellico');
+            $drawing->setDescription('Sellico Logo');
+            $drawing->setPath($logoPath);
+            $drawing->setHeight(36);
+            $drawing->setCoordinates('A1');
+            $drawing->setOffsetX(5);
+            $drawing->setOffsetY(5);
+            $drawing->setWorksheet($sheet);
+        }
+
+        // ── Row 1: Заголовок "SELLICO — Юнит-экономика" (B1, A1 занята логотипом) ──
+        $sheet->setCellValue('B1', 'SELLICO — Юнит-экономика');
+        $sheet->mergeCells("B1:{$lastCol}1");
+        $sheet->getStyle('B1')->applyFromArray([
             'font' => [
                 'bold' => true,
-                'size' => 16,
-                'color' => ['rgb' => '1e3a5f'],
+                'size' => 18,
+                'color' => ['rgb' => '16a34a'],
             ],
             'alignment' => [
                 'horizontal' => Alignment::HORIZONTAL_LEFT,
                 'vertical' => Alignment::VERTICAL_CENTER,
             ],
         ]);
-        $sheet->getRowDimension(1)->setRowHeight(30);
+        $sheet->getRowDimension(1)->setRowHeight(45);
 
         // ── Row 2: Мета-информация ──
         $fulfillmentLabel = strtoupper($fulfillmentType);
         $date = now()->format('d.m.Y');
-        $sheet->setCellValue('A2', "Магазин: {$integrationName} | Маркетплейс: {$marketplace} | Схема: {$fulfillmentLabel} | Дата: {$date}");
-        $sheet->mergeCells("A2:{$lastCol}2");
-        $sheet->getStyle('A2')->applyFromArray([
+        $sheet->setCellValue('B2', "Магазин: {$integrationName} | Маркетплейс: {$marketplace} | Схема: {$fulfillmentLabel} | Дата: {$date}");
+        $sheet->mergeCells("B2:{$lastCol}2");
+        $sheet->getStyle('B2')->applyFromArray([
             'font' => [
                 'size' => 10,
                 'color' => ['rgb' => '6b7280'],
@@ -644,7 +661,7 @@ class UnitEconomicsCacheController extends Controller
             ],
             'fill' => [
                 'fillType' => Fill::FILL_SOLID,
-                'startColor' => ['rgb' => '1e3a5f'],
+                'startColor' => ['rgb' => '16a34a'],
             ],
             'alignment' => [
                 'horizontal' => Alignment::HORIZONTAL_CENTER,
@@ -661,80 +678,55 @@ class UnitEconomicsCacheController extends Controller
         $dataStartRow = 5;
         $currentRow = $dataStartRow;
 
+        // Текстовые колонки (формат '@')
+        $textColumns = ['A', 'B', 'K', 'L'];
+
         foreach ($items as $item) {
             $isEvenRow = ($currentRow - $dataStartRow) % 2 === 1;
 
-            // A: Артикул
-            $sheet->setCellValue("A{$currentRow}", $item['sku'] ?? '');
-            // B: Наименование
-            $sheet->setCellValue("B{$currentRow}", $item['product_name'] ?? '');
-            // C: Цена
-            $sheet->setCellValue("C{$currentRow}", (float) ($item['price'] ?? 0));
-            // D: Себестоимость
-            $sheet->setCellValue("D{$currentRow}", (float) ($item['cost_price'] ?? 0));
-            // E: Наценка, x
-            $sheet->setCellValue("E{$currentRow}", (float) ($item['markup_percent'] ?? 0));
-            // F: Комиссия, %
-            $sheet->setCellValue("F{$currentRow}", (float) ($item['commission_percent'] ?? 0));
-            // G: Комиссия, ₽
-            $sheet->setCellValue("G{$currentRow}", (float) ($item['commission_amount'] ?? 0));
-            // H: Логистика
-            $sheet->setCellValue("H{$currentRow}", (float) ($item['logistics_cost'] ?? 0));
-            // I: Последняя миля
-            $sheet->setCellValue("I{$currentRow}", (float) ($item['last_mile_cost'] ?? 0));
-            // J: Доставка — FORMULA
-            $sheet->setCellValue("J{$currentRow}", "=H{$currentRow}+I{$currentRow}");
-            // K: Нелок. наценка, %
-            $sheet->setCellValue("K{$currentRow}", (float) ($item['non_local_markup_percent'] ?? 0));
-            // L: Кластер поставки
-            $clusterLabel = $item['shipping_cluster_name'] ?? $item['route_label'] ?? '';
-            $sheet->setCellValue("L{$currentRow}", $clusterLabel);
-            // M: Локальность
-            $localityLabel = $this->resolveLocalityLabel($item);
-            $sheet->setCellValue("M{$currentRow}", $localityLabel);
-            // N: Эквайринг
-            $sheet->setCellValue("N{$currentRow}", (float) ($item['acquiring_amount'] ?? 0));
-            // O: Хранение
-            $sheet->setCellValue("O{$currentRow}", (float) ($item['storage_cost'] ?? 0));
-            // P: РК (рекламные кампании)
-            $sheet->setCellValue("P{$currentRow}", (float) ($item['drr_amount'] ?? 0));
-            // Q: Налог
-            $sheet->setCellValue("Q{$currentRow}", (float) ($item['tax_amount'] ?? 0));
-            // R: НДС
-            $sheet->setCellValue("R{$currentRow}", (float) ($item['vat_amount'] ?? 0));
-            // S: Итого затраты
-            $sheet->setCellValue("S{$currentRow}", (float) ($item['total_costs'] ?? 0));
-            // T: Прибыль
-            $netProfit = (float) ($item['net_profit'] ?? 0);
-            $sheet->setCellValue("T{$currentRow}", $netProfit);
-            // U: Маржа, %
-            $marginPercent = (float) ($item['margin_percent'] ?? 0);
-            $sheet->setCellValue("U{$currentRow}", $marginPercent);
-            // V: ROI, %
-            $sheet->setCellValue("V{$currentRow}", (float) ($item['roi_percent'] ?? 0));
-            // W: На р/с
-            $sheet->setCellValue("W{$currentRow}", (float) ($item['to_settlement_account'] ?? 0));
+            foreach ($columns as $col => $def) {
+                $field = $def['field'];
 
-            // Чередование цвета строк
+                if ($col === 'J') {
+                    // J: Доставка — Excel-формула =H+I
+                    $sheet->setCellValue("J{$currentRow}", "=H{$currentRow}+I{$currentRow}");
+                } elseif ($col === 'K') {
+                    // K: Кластер поставки
+                    $sheet->setCellValue("K{$currentRow}", $item['shipping_cluster_name'] ?? $item['route_label'] ?? '');
+                } elseif ($col === 'L') {
+                    // L: Локальность
+                    $sheet->setCellValue("L{$currentRow}", $this->resolveLocalityLabel($item));
+                } elseif (in_array($col, $textColumns)) {
+                    // Текстовые поля (A, B)
+                    $sheet->setCellValue("{$col}{$currentRow}", $item[$field] ?? '');
+                } else {
+                    // Числовые поля
+                    $sheet->setCellValue("{$col}{$currentRow}", (float) ($item[$field] ?? 0));
+                }
+            }
+
+            // Чередование цвета строк: белый / светло-зелёный
             if ($isEvenRow) {
                 $sheet->getStyle("A{$currentRow}:{$lastCol}{$currentRow}")->applyFromArray([
                     'fill' => [
                         'fillType' => Fill::FILL_SOLID,
-                        'startColor' => ['rgb' => 'f8fafc'],
+                        'startColor' => ['rgb' => 'f0fdf4'],
                     ],
                 ]);
             }
 
-            // Красный цвет для отрицательной прибыли
+            // Красный цвет для отрицательной прибыли (V)
+            $netProfit = (float) ($item['net_profit'] ?? 0);
             if ($netProfit < 0) {
-                $sheet->getStyle("T{$currentRow}")->applyFromArray([
+                $sheet->getStyle("V{$currentRow}")->applyFromArray([
                     'font' => ['color' => ['rgb' => 'dc2626']],
                 ]);
             }
 
-            // Красный цвет для отрицательной маржи
+            // Красный цвет для отрицательной маржи (W)
+            $marginPercent = (float) ($item['margin_percent'] ?? 0);
             if ($marginPercent < 0) {
-                $sheet->getStyle("U{$currentRow}")->applyFromArray([
+                $sheet->getStyle("W{$currentRow}")->applyFromArray([
                     'font' => ['color' => ['rgb' => 'dc2626']],
                 ]);
             }
@@ -744,19 +736,13 @@ class UnitEconomicsCacheController extends Controller
 
         $dataEndRow = $currentRow - 1;
 
-        // ── Форматы ячеек ──
+        // ── Форматы ячеек (по определению колонок) ──
         if ($dataEndRow >= $dataStartRow) {
-            // Числовые форматы
-            $sheet->getStyle("C{$dataStartRow}:D{$dataEndRow}")->getNumberFormat()->setFormatCode('#,##0.00');
-            $sheet->getStyle("E{$dataStartRow}:E{$dataEndRow}")->getNumberFormat()->setFormatCode('0.00');
-            $sheet->getStyle("F{$dataStartRow}:F{$dataEndRow}")->getNumberFormat()->setFormatCode('0.00"%"');
-            $sheet->getStyle("G{$dataStartRow}:J{$dataEndRow}")->getNumberFormat()->setFormatCode('#,##0.00');
-            $sheet->getStyle("K{$dataStartRow}:K{$dataEndRow}")->getNumberFormat()->setFormatCode('0.00"%"');
-            $sheet->getStyle("N{$dataStartRow}:S{$dataEndRow}")->getNumberFormat()->setFormatCode('#,##0.00');
-            $sheet->getStyle("T{$dataStartRow}:T{$dataEndRow}")->getNumberFormat()->setFormatCode('#,##0.00');
-            $sheet->getStyle("U{$dataStartRow}:U{$dataEndRow}")->getNumberFormat()->setFormatCode('0.00"%"');
-            $sheet->getStyle("V{$dataStartRow}:V{$dataEndRow}")->getNumberFormat()->setFormatCode('0.00"%"');
-            $sheet->getStyle("W{$dataStartRow}:W{$dataEndRow}")->getNumberFormat()->setFormatCode('#,##0.00');
+            foreach ($columns as $col => $def) {
+                $sheet->getStyle("{$col}{$dataStartRow}:{$col}{$dataEndRow}")
+                    ->getNumberFormat()
+                    ->setFormatCode($def['format']);
+            }
         }
 
         // ── Строка ИТОГО ──
@@ -764,7 +750,7 @@ class UnitEconomicsCacheController extends Controller
         $sheet->setCellValue("A{$summaryRow}", 'ИТОГО');
 
         // SUM формулы для денежных колонок
-        $sumCols = ['C', 'G', 'H', 'I', 'J', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'W'];
+        $sumCols = ['C', 'G', 'H', 'I', 'J', 'T', 'U', 'V', 'Y'];
         foreach ($sumCols as $col) {
             if ($dataEndRow >= $dataStartRow) {
                 $sheet->setCellValue("{$col}{$summaryRow}", "=SUM({$col}{$dataStartRow}:{$col}{$dataEndRow})");
@@ -773,8 +759,8 @@ class UnitEconomicsCacheController extends Controller
             }
         }
 
-        // AVERAGE формулы для процентных колонок
-        $avgCols = ['E', 'F', 'K', 'U', 'V'];
+        // AVERAGE формулы для процентных/относительных колонок
+        $avgCols = ['E', 'F', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'W', 'X'];
         foreach ($avgCols as $col) {
             if ($dataEndRow >= $dataStartRow) {
                 $sheet->setCellValue("{$col}{$summaryRow}", "=AVERAGE({$col}{$dataStartRow}:{$col}{$dataEndRow})");
@@ -788,20 +774,16 @@ class UnitEconomicsCacheController extends Controller
             'font' => ['bold' => true, 'size' => 10],
             'fill' => [
                 'fillType' => Fill::FILL_SOLID,
-                'startColor' => ['rgb' => 'e5e7eb'],
+                'startColor' => ['rgb' => 'dcfce7'],
             ],
         ]);
 
-        // Форматы для ИТОГО
-        $sheet->getStyle("C{$summaryRow}")->getNumberFormat()->setFormatCode('#,##0.00');
-        foreach (['G', 'H', 'I', 'J', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'W'] as $col) {
-            $sheet->getStyle("{$col}{$summaryRow}")->getNumberFormat()->setFormatCode('#,##0.00');
+        // Форматы для строки ИТОГО (по определению колонок)
+        foreach ($columns as $col => $def) {
+            $sheet->getStyle("{$col}{$summaryRow}")
+                ->getNumberFormat()
+                ->setFormatCode($def['format']);
         }
-        $sheet->getStyle("E{$summaryRow}")->getNumberFormat()->setFormatCode('0.00');
-        $sheet->getStyle("F{$summaryRow}")->getNumberFormat()->setFormatCode('0.00"%"');
-        $sheet->getStyle("K{$summaryRow}")->getNumberFormat()->setFormatCode('0.00"%"');
-        $sheet->getStyle("U{$summaryRow}")->getNumberFormat()->setFormatCode('0.00"%"');
-        $sheet->getStyle("V{$summaryRow}")->getNumberFormat()->setFormatCode('0.00"%"');
 
         // ── Границы для всей таблицы (row 4 до ИТОГО) ──
         $sheet->getStyle("A{$headerRow}:{$lastCol}{$summaryRow}")->applyFromArray([
