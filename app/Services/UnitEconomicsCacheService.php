@@ -562,6 +562,7 @@ class UnitEconomicsCacheService
             'calculation_mode' => $activeFixation['calculation_mode'] ?? null,
             'tariff_breakdown' => is_array($tariffBreakdown) ? $tariffBreakdown : [],
             'stock_profile' => $stockProfile ?? [],
+            'sales_profile' => $salesProfile ?? [],
             'sales_7_days' => $sales7Days,
             'markup_applied' => $marketplaceData['markup_applied'] ?? null,
             'weighted_logistics_cost' => isset($deliveryProfile) ? ($deliveryProfile->weighted_logistics_cost ?? null) : null,

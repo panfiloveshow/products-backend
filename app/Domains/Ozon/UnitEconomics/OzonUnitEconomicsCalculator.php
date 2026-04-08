@@ -536,7 +536,24 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
 
     private function resolveWeightedProfileMetrics(string $scheme, CalculationInput $input, float $volume): ?array
     {
-        if (empty($input->clustersSummary)) {
+        // Используем clusters_summary (из Delivery Analytics API) как основной источник.
+        // Если данных мало (< 10 заказов), а в sales_profile (из реальных отгрузок) больше —
+        // конвертируем sales_profile в формат clusters_summary и используем его.
+        $demandClusters = $input->clustersSummary;
+        if (!empty($input->salesProfile)) {
+            $analyticsTotal = array_sum(array_column($demandClusters, 'orders_count'));
+            $salesTotal = array_sum(array_column($input->salesProfile, 'sales_30_days'));
+            if ($salesTotal > $analyticsTotal && $analyticsTotal < 10) {
+                $demandClusters = array_map(fn(array $sp) => [
+                    'cluster_id' => $sp['cluster_id'] ?? null,
+                    'cluster_name' => $sp['cluster_name'] ?? null,
+                    'orders_count' => (int) ($sp['sales_30_days'] ?? 0),
+                    'orders_percent' => (float) ($sp['sales_share_percent'] ?? 0),
+                ], $input->salesProfile);
+            }
+        }
+
+        if (empty($demandClusters)) {
             return null;
         }
 
@@ -556,7 +573,7 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
         $localityShare = 0.0;
         $hasDemand = false;
 
-        foreach ($input->clustersSummary as $cluster) {
+        foreach ($demandClusters as $cluster) {
             $share = (float) ($cluster['orders_percent'] ?? 0);
             if ($share <= 0) {
                 continue;
