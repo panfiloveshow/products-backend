@@ -563,6 +563,9 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
         $dominantSourceCluster = $fixedShippingCluster
             ?? $stockClusters[0]['cluster_name']
             ?? $this->pricing->resolveClusterName($input->routeLabel);
+        // Локальная продажа: 100% стока в одном кластере.
+        // Если сток размазан по кластерам — всегда нелокальная.
+        $singleStockCluster = count($stockClusterNames) === 1 ? $stockClusterNames[0] : null;
         $markupAllowed = !($scheme === 'FBO' && $input->sales7Days !== null && $input->sales7Days < 50);
         $redemptionFactor = $input->redemptionRate !== null
             ? max(0.0, min(100.0, $input->redemptionRate)) / 100
@@ -586,11 +589,10 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
                 ?? null
             );
 
-            $isLocalCluster = $fixedShippingCluster !== null
-                ? ($destinationCluster !== null && $destinationCluster === $fixedShippingCluster)
-                : (array_key_exists('is_local_cluster', $cluster)
-                    ? (bool) $cluster['is_local_cluster']
-                    : ($destinationCluster !== null && in_array($destinationCluster, $stockClusterNames, true)));
+            // Локальная продажа = весь сток в одном кластере И destination = этот кластер
+            $isLocalCluster = $destinationCluster !== null
+                && $singleStockCluster !== null
+                && $destinationCluster === $singleStockCluster;
 
             if ($isLocalCluster) {
                 $localityShare += $share;
