@@ -164,6 +164,11 @@ Route::prefix('unit-economics')->middleware('sellico.permission')->group(functio
         ->whereIn('marketplace', ['wildberries', 'ozon', 'yandex_market'])
         ->name('unit-economics.calculate');
 
+    // Export
+    Route::get('/{marketplace}/export/excel', [UnitEconomicsCacheController::class, 'exportExcel'])
+        ->whereIn('marketplace', ['wildberries', 'ozon', 'yandex_market'])
+        ->name('unit-economics.export.excel');
+
     // By marketplace (main listing — использует кеш)
     Route::get('/{marketplace}', [UnitEconomicsCacheController::class, 'index'])
         ->whereIn('marketplace', ['wildberries', 'ozon', 'yandex_market'])
