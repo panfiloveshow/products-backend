@@ -25,7 +25,6 @@ ENDSSH
 sshpass -e rsync -avz \
   --exclude 'node_modules/' \
   --exclude 'vendor/' \
-  --exclude '.env' \
   --exclude 'storage/logs/' \
   -e "ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10" \
   "$SCRIPT_DIR/" "${DEPLOY_USER}@${DEPLOY_HOST}:${TEMP_DIR}/"
@@ -39,6 +38,8 @@ echo "⚙️  Копирование файлов в проект с sudo..."
 sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 "${DEPLOY_USER}@${DEPLOY_HOST}" << ENDSSH
 echo "$DEPLOY_PASS" | sudo -S cp -r ${TEMP_DIR}/* ${REMOTE_PATH}/
 echo "$DEPLOY_PASS" | sudo -S chown -R www-data:www-data ${REMOTE_PATH}/app ${REMOTE_PATH}/bootstrap ${REMOTE_PATH}/routes
+echo "$DEPLOY_PASS" | sudo -S chmod 640 ${REMOTE_PATH}/.env
+echo "$DEPLOY_PASS" | sudo -S chown www-data:www-data ${REMOTE_PATH}/.env
 rm -rf $TEMP_DIR
 ENDSSH
 
@@ -56,6 +57,14 @@ echo "$DEPLOY_PASS" | sudo -S php artisan config:clear
 echo "$DEPLOY_PASS" | sudo -S php artisan cache:clear
 echo "$DEPLOY_PASS" | sudo -S php artisan config:cache
 echo "$DEPLOY_PASS" | sudo -S php artisan route:cache
+
+# Перезапуск PHP-FPM — сброс opcache, подхват нового кода
+echo "$DEPLOY_PASS" | sudo -S systemctl restart php8.2-fpm 2>/dev/null || true
+echo "  ✅ PHP-FPM restarted (opcache cleared)"
+
+# Перезапуск queue worker — подхват нового кода для jobs
+echo "$DEPLOY_PASS" | sudo -S supervisorctl restart products-backend-worker:products-backend-worker_00 2>/dev/null || true
+echo "  ✅ Queue worker restarted"
 ENDSSH
 
 echo ""
