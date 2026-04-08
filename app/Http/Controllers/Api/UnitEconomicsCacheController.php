@@ -816,21 +816,25 @@ class UnitEconomicsCacheController extends Controller
             $data['logistics_markup_percent'] = $data['weighted_non_local_markup_percent'];
             $data['non_local_markup_amount'] = round((float) $cache->price * ((float) $data['non_local_markup_percent'] / 100), 2);
             $data['logistics_markup_amount'] = $data['non_local_markup_amount'];
-            $data['markup_allowed'] = $marketplaceData['markup_allowed']
-                ?? $ozonData['markup_allowed']
-                ?? ($data['weighted_non_local_markup_percent'] !== null);
-            $data['markup_rule_reason'] = $marketplaceData['markup_rule_reason']
-                ?? $ozonData['markup_rule_reason']
-                ?? null;
             $data['sales_7_days'] = isset($marketplaceData['sales_7_days'])
                 ? (int) $marketplaceData['sales_7_days']
                 : (isset($ozonData['sales_7_days']) ? (int) $ozonData['sales_7_days'] : null);
-            if ($data['markup_rule_reason'] === null && ($data['weighted_non_local_markup_percent'] === null || (float) $data['weighted_non_local_markup_percent'] == 0.0)) {
-                if (($data['expected_locality_rate'] ?? null) !== null && (float) $data['expected_locality_rate'] >= 99.99) {
-                    $data['markup_rule_reason'] = 'local_cluster';
-                } elseif (($data['markup_allowed'] ?? true) === false) {
-                    $data['markup_rule_reason'] = 'fbo_lt_50_orders_7d';
-                }
+            // Пересчитываем markup_allowed на основе актуальных sales_7_days,
+            // а не используем stale значение из кеша
+            $isFboScheme = strtoupper($cache->fulfillment_type ?? '') === 'FBO';
+            $sellerSales7Days = $data['sales_7_days'];
+            $data['markup_allowed'] = !($isFboScheme && $sellerSales7Days !== null && $sellerSales7Days < 50);
+            $data['markup_rule_reason'] = null; // Сбрасываем — пересчитаем ниже
+            // Определяем причину нулевой наценки
+            if ($data['markup_allowed'] === false) {
+                $data['markup_rule_reason'] = 'fbo_lt_50_orders_7d';
+                // Обнуляем наценку для отображения — Ozon не начисляет
+                $data['non_local_markup_percent'] = 0;
+                $data['logistics_markup_percent'] = 0;
+                $data['non_local_markup_amount'] = 0;
+                $data['logistics_markup_amount'] = 0;
+            } elseif (($data['expected_locality_rate'] ?? null) !== null && (float) $data['expected_locality_rate'] >= 99.99) {
+                $data['markup_rule_reason'] = 'local_cluster';
             }
             $data['markup_rule_reason_label'] = $this->humanizeOzonMarkupReason(
                 is_string($data['markup_rule_reason'] ?? null) ? $data['markup_rule_reason'] : null,
