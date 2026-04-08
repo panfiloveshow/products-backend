@@ -6,8 +6,7 @@ use App\Domains\UnitEconomics\Contracts\UnitEconomicsCalculatorInterface;
 use App\Domains\UnitEconomics\DTO\CalculationInput;
 use App\Domains\UnitEconomics\DTO\UnitEconomicsResult;
 use App\Domains\UnitEconomics\DTO\CostBreakdown;
-use App\Domains\Ozon\Tariffs\OzonTariffs;
-use App\Domains\Ozon\Tariffs\CommissionCalculator;
+use App\Domains\Ozon\Tariffs\OzonPricingMatrix;
 
 /**
  * Калькулятор юнит-экономики для Ozon
@@ -16,13 +15,11 @@ use App\Domains\Ozon\Tariffs\CommissionCalculator;
  */
 class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
 {
-    private OzonTariffs $tariffs;
-    private CommissionCalculator $commissions;
+    private OzonPricingMatrix $pricing;
 
     public function __construct()
     {
-        $this->tariffs = new OzonTariffs();
-        $this->commissions = new CommissionCalculator();
+        $this->pricing = new OzonPricingMatrix();
     }
 
     /**
@@ -48,34 +45,43 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
     {
         $price = $input->price;
         $volume = $input->getVolumeInLiters();
+        $context = $this->resolveMarketplaceContext('FBO', $input, $volume);
 
-        // Комиссия
-        $commissionRate = $input->commissionRate 
-            ?? $this->commissions->getCommissionRate($input->categoryId ?? 'default');
-        $commission = $price * ($commissionRate / 100);
+        $returnCosts = $this->calculateExpectedReturnCosts('FBO', $context['base_logistics'], $input->redemptionRate);
 
-        // Эквайринг
-        $acquiringRate = $input->acquiringPercent ?? $this->commissions->getAcquiringRate();
-        $acquiring = $price * ($acquiringRate / 100);
-
-        // Логистика FBO
-        $deliveryCoefficient = $input->deliveryCoefficient ?? 1.0;
-        $additionalPercent = $input->additionalCommissionPercent ?? $this->getAdditionalPercent($price, $deliveryCoefficient);
-        
-        $logistics = $this->tariffs->calculateLogisticsCost('FBO', $volume, $input->weight, [
-            'delivery_coefficient' => $deliveryCoefficient,
-            'additional_percent' => $additionalPercent,
-            'price' => $price,
-        ]);
-
-        // Последняя миля
-        $lastMile = $this->tariffs->getLastMileCost('FBO');
-
-        $returnCosts = $this->calculateExpectedReturnCosts('FBO', $volume, $input->redemptionRate);
-
-        return $this->buildResult($input, $commission, $commissionRate, $acquiring, $acquiringRate, 
-            $logistics, $lastMile, 0, $returnCosts['expected'], $deliveryCoefficient, $additionalPercent, 0, 0,
-            $returnCosts['logistics'], $returnCosts['processing']);
+        return $this->buildResult(
+            $input,
+            commission: $context['commission'],
+            commissionRate: $context['commission_rate'],
+            acquiring: $context['acquiring'],
+            acquiringRate: $context['acquiring_rate'],
+            logistics: $context['logistics'],
+            baseLogistics: $context['base_logistics'],
+            lastMile: $context['last_mile'],
+            processingFee: 0,
+            expectedReturnCost: $returnCosts['expected'],
+            routeKey: $context['route_key'],
+            routeLabel: $context['route_label'],
+            priceSegment: $context['price_segment'],
+            tariffSource: $context['tariff_source'],
+            tariffEffectiveFrom: $context['tariff_effective_from'],
+            isLocalSale: $context['is_local_sale'],
+            nonLocalMarkupPercent: $context['non_local_markup_percent'],
+            salesFeePercent: $context['commission_rate'],
+            agentFee: 0,
+            integrationFee: 0,
+            returnLogistics: $returnCosts['logistics'],
+            returnProcessing: $returnCosts['processing'],
+            routeResolutionStatus: $context['route_resolution_status'],
+            localityResolutionStatus: $context['locality_resolution_status'],
+            calculationConfidence: $context['calculation_confidence'],
+            profileSource: $context['profile_source'],
+            dominantClusterId: $context['dominant_cluster_id'],
+            dominantClusterShare: $context['dominant_cluster_share'],
+            expectedLocalityRate: $context['expected_locality_rate'],
+            weightedNonLocalMarkupPercent: $context['weighted_non_local_markup_percent'],
+            clustersSummary: $context['clusters_summary']
+        );
     }
 
     /**
@@ -85,28 +91,44 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
     {
         $price = $input->price;
         $volume = $input->getVolumeInLiters();
+        $context = $this->resolveMarketplaceContext('FBS', $input, $volume);
+        $schemeCosts = $this->pricing->getSchemeCosts('FBS');
+        $processingFee = (float) ($schemeCosts['processing_fee'] ?? 0);
+        $returnCosts = $this->calculateExpectedReturnCosts('FBS', $context['base_logistics'], $input->redemptionRate);
 
-        // Комиссия
-        $commissionRate = $input->commissionRate 
-            ?? $this->commissions->getCommissionRate($input->categoryId ?? 'default');
-        $commission = $price * ($commissionRate / 100);
-
-        // Эквайринг
-        $acquiringRate = $input->acquiringPercent ?? $this->commissions->getAcquiringRate();
-        $acquiring = $price * ($acquiringRate / 100);
-
-        // Логистика FBS
-        $logistics = $this->tariffs->calculateLogisticsCost('FBS', $volume, $input->weight);
-        
-        $processingFee = $this->tariffs->getProcessingFee('FBS', $volume);
-        
-        $lastMile = $this->tariffs->getLastMileCost('FBS');
-
-        $returnCosts = $this->calculateExpectedReturnCosts('FBS', $volume, $input->redemptionRate);
-
-        return $this->buildResult($input, $commission, $commissionRate, $acquiring, $acquiringRate,
-            $logistics, $lastMile, $processingFee, $returnCosts['expected'], null, null, 0, 0,
-            $returnCosts['logistics'], $returnCosts['processing']);
+        return $this->buildResult(
+            $input,
+            commission: $context['commission'],
+            commissionRate: $context['commission_rate'],
+            acquiring: $context['acquiring'],
+            acquiringRate: $context['acquiring_rate'],
+            logistics: $context['logistics'],
+            baseLogistics: $context['base_logistics'],
+            lastMile: $context['last_mile'],
+            processingFee: $processingFee,
+            expectedReturnCost: $returnCosts['expected'],
+            routeKey: $context['route_key'],
+            routeLabel: $context['route_label'],
+            priceSegment: $context['price_segment'],
+            tariffSource: $context['tariff_source'],
+            tariffEffectiveFrom: $context['tariff_effective_from'],
+            isLocalSale: $context['is_local_sale'],
+            nonLocalMarkupPercent: $context['non_local_markup_percent'],
+            salesFeePercent: $context['commission_rate'],
+            agentFee: 0,
+            integrationFee: 0,
+            returnLogistics: $returnCosts['logistics'],
+            returnProcessing: $returnCosts['processing'],
+            routeResolutionStatus: $context['route_resolution_status'],
+            localityResolutionStatus: $context['locality_resolution_status'],
+            calculationConfidence: $context['calculation_confidence'],
+            profileSource: $context['profile_source'],
+            dominantClusterId: $context['dominant_cluster_id'],
+            dominantClusterShare: $context['dominant_cluster_share'],
+            expectedLocalityRate: $context['expected_locality_rate'],
+            weightedNonLocalMarkupPercent: $context['weighted_non_local_markup_percent'],
+            clustersSummary: $context['clusters_summary']
+        );
     }
 
     /**
@@ -115,18 +137,9 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
     private function calculateRfbs(CalculationInput $input): UnitEconomicsResult
     {
         $price = $input->price;
-
-        // Комиссия
-        $commissionRate = $input->commissionRate 
-            ?? $this->commissions->getCommissionRate($input->categoryId ?? 'default');
-        $commission = $price * ($commissionRate / 100);
-
-        // Эквайринг
-        $acquiringRate = $input->acquiringPercent ?? $this->commissions->getAcquiringRate();
-        $acquiring = $price * ($acquiringRate / 100);
-
-        // Агентское вознаграждение
-        $agentFee = $this->tariffs->getAgentFee('RFBS');
+        $context = $this->resolveMarketplaceContext('RFBS', $input, $input->getVolumeInLiters());
+        $schemeCosts = $this->pricing->getSchemeCosts('RFBS');
+        $agentFee = (float) ($schemeCosts['agent_fee'] ?? 0);
 
         // Своя доставка (из настроек пользователя)
         $ownDeliveryCost = $input->ownDeliveryCost ?? 0;
@@ -134,8 +147,39 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
         $returnRate = $input->redemptionRate !== null ? max(0, (100 - $input->redemptionRate) / 100) : 0;
         $expectedReturnCost = ($input->ownReturnCost ?? 0) * $returnRate;
 
-        return $this->buildResult($input, $commission, $commissionRate, $acquiring, $acquiringRate,
-            $ownDeliveryCost, 0, 0, $expectedReturnCost, null, null, $agentFee, 0, 0, 0);
+        return $this->buildResult(
+            $input,
+            commission: $context['commission'],
+            commissionRate: $context['commission_rate'],
+            acquiring: $context['acquiring'],
+            acquiringRate: $context['acquiring_rate'],
+            logistics: $ownDeliveryCost,
+            baseLogistics: $ownDeliveryCost,
+            lastMile: 0,
+            processingFee: 0,
+            expectedReturnCost: $expectedReturnCost,
+            routeKey: $context['route_key'],
+            routeLabel: $context['route_label'],
+            priceSegment: $context['price_segment'],
+            tariffSource: $context['tariff_source'],
+            tariffEffectiveFrom: $context['tariff_effective_from'],
+            isLocalSale: $context['is_local_sale'],
+            nonLocalMarkupPercent: 0,
+            salesFeePercent: $context['commission_rate'],
+            agentFee: $agentFee,
+            integrationFee: 0,
+            returnLogistics: 0,
+            returnProcessing: 0,
+            routeResolutionStatus: $context['route_resolution_status'],
+            localityResolutionStatus: $context['locality_resolution_status'],
+            calculationConfidence: $context['calculation_confidence'],
+            profileSource: $context['profile_source'],
+            dominantClusterId: $context['dominant_cluster_id'],
+            dominantClusterShare: $context['dominant_cluster_share'],
+            expectedLocalityRate: $context['expected_locality_rate'],
+            weightedNonLocalMarkupPercent: $context['weighted_non_local_markup_percent'],
+            clustersSummary: $context['clusters_summary']
+        );
     }
 
     /**
@@ -144,21 +188,10 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
     private function calculateExpress(CalculationInput $input): UnitEconomicsResult
     {
         $price = $input->price;
-
-        // Комиссия
-        $commissionRate = $input->commissionRate 
-            ?? $this->commissions->getCommissionRate($input->categoryId ?? 'default');
-        $commission = $price * ($commissionRate / 100);
-
-        // Эквайринг
-        $acquiringRate = $input->acquiringPercent ?? $this->commissions->getAcquiringRate();
-        $acquiring = $price * ($acquiringRate / 100);
-
-        // Агентское вознаграждение
-        $agentFee = $this->tariffs->getAgentFee('EXPRESS');
-        
-        // Возмещение за экспресс (своя служба)
-        $expressCompensation = $input->marketplaceCompensation ?? $this->tariffs->getExpressCompensation();
+        $context = $this->resolveMarketplaceContext('EXPRESS', $input, $input->getVolumeInLiters());
+        $schemeCosts = $this->pricing->getSchemeCosts('EXPRESS');
+        $agentFee = (float) ($schemeCosts['agent_fee'] ?? 0);
+        $expressCompensation = $input->marketplaceCompensation ?? (float) ($schemeCosts['express_compensation'] ?? 0);
 
         // Своя доставка
         $ownDeliveryCost = $input->ownDeliveryCost ?? 0;
@@ -166,8 +199,39 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
         $returnRate = $input->redemptionRate !== null ? max(0, (100 - $input->redemptionRate) / 100) : 0;
         $expectedReturnCost = ($input->ownReturnCost ?? 0) * $returnRate;
 
-        return $this->buildResult($input, $commission, $commissionRate, $acquiring, $acquiringRate,
-            $ownDeliveryCost, 0, 0, $expectedReturnCost, null, null, $agentFee, -$expressCompensation, 0, 0);
+        return $this->buildResult(
+            $input,
+            commission: $context['commission'],
+            commissionRate: $context['commission_rate'],
+            acquiring: $context['acquiring'],
+            acquiringRate: $context['acquiring_rate'],
+            logistics: $ownDeliveryCost,
+            baseLogistics: $ownDeliveryCost,
+            lastMile: 0,
+            processingFee: 0,
+            expectedReturnCost: $expectedReturnCost,
+            routeKey: $context['route_key'],
+            routeLabel: $context['route_label'],
+            priceSegment: $context['price_segment'],
+            tariffSource: $context['tariff_source'],
+            tariffEffectiveFrom: $context['tariff_effective_from'],
+            isLocalSale: true,
+            nonLocalMarkupPercent: 0,
+            salesFeePercent: $context['commission_rate'],
+            agentFee: $agentFee,
+            integrationFee: -$expressCompensation,
+            returnLogistics: 0,
+            returnProcessing: 0,
+            routeResolutionStatus: $context['route_resolution_status'],
+            localityResolutionStatus: $context['locality_resolution_status'],
+            calculationConfidence: $context['calculation_confidence'],
+            profileSource: $context['profile_source'],
+            dominantClusterId: $context['dominant_cluster_id'],
+            dominantClusterShare: $context['dominant_cluster_share'],
+            expectedLocalityRate: $context['expected_locality_rate'],
+            weightedNonLocalMarkupPercent: $context['weighted_non_local_markup_percent'],
+            clustersSummary: $context['clusters_summary']
+        );
     }
 
     /**
@@ -180,15 +244,31 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
         float $acquiring,
         float $acquiringRate,
         float $logistics,
+        ?float $baseLogistics = null,
         float $lastMile = 0,
         float $processingFee = 0,
         float $expectedReturnCost = 0,
-        ?float $deliveryCoefficient = null,
-        ?float $additionalPercent = null,
+        ?string $routeKey = null,
+        ?string $routeLabel = null,
+        ?string $priceSegment = null,
+        ?string $tariffSource = null,
+        ?string $tariffEffectiveFrom = null,
+        ?bool $isLocalSale = null,
+        float $nonLocalMarkupPercent = 0,
+        ?float $salesFeePercent = null,
         float $agentFee = 0,
         float $integrationFee = 0,
         float $returnLogistics = 0,
-        float $returnProcessing = 0
+        float $returnProcessing = 0,
+        ?string $routeResolutionStatus = null,
+        ?string $localityResolutionStatus = null,
+        ?string $calculationConfidence = null,
+        ?string $profileSource = null,
+        ?string $dominantClusterId = null,
+        ?float $dominantClusterShare = null,
+        ?float $expectedLocalityRate = null,
+        ?float $weightedNonLocalMarkupPercent = null,
+        array $clustersSummary = []
     ): UnitEconomicsResult {
         $price = $input->price;
         
@@ -222,8 +302,8 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
             integrationFee: $integrationFee,
             acceptanceCost: $acceptanceCost,
             penaltyCost: $penaltyCost,
-            deliveryCoefficient: $deliveryCoefficient,
-            additionalPercent: $additionalPercent,
+            deliveryCoefficient: null,
+            additionalPercent: null,
         );
 
         // Финансовые метрики
@@ -231,6 +311,20 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
         $netProfit = $price - $totalCosts;
         $marginPercent = $price > 0 ? ($netProfit / $price) * 100 : 0;
         $toSettlementAccount = $price - $costs->getMarketplaceCosts();
+        $scenarioRange = $this->calculateScenarioRange($input, [
+            'commission' => $commission,
+            'acquiring' => $acquiring,
+            'last_mile' => $lastMile,
+            'processing_fee' => $processingFee,
+            'storage_cost' => $storageCost,
+            'cost_price' => $costPrice,
+            'packaging_cost' => $packagingCost,
+            'additional_costs' => $additionalCosts,
+            'agent_fee' => $agentFee,
+            'integration_fee' => $integrationFee,
+            'acceptance_cost' => $acceptanceCost,
+            'penalty_cost' => $penaltyCost,
+        ]);
 
         $result = new UnitEconomicsResult(
             sku: $input->sku,
@@ -254,7 +348,7 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
         );
 
         $result->metadata = [
-            'base_logistics' => round($logistics, 2),
+            'base_logistics' => round($baseLogistics ?? $logistics, 2),
             'last_mile' => round($lastMile, 2),
             'processing_fee' => round($processingFee, 2),
             'storage_cost' => round($storageCost, 2),
@@ -267,6 +361,42 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
             'to_settlement_account' => round($toSettlementAccount, 2),
             'own_delivery_cost' => round($input->ownDeliveryCost ?? 0, 2),
             'marketplace_compensation' => round($input->marketplaceCompensation ?? 0, 2),
+            'route_key' => $routeKey,
+            'route_label' => $routeLabel,
+            'price_segment' => $priceSegment,
+            'tariff_source' => $tariffSource,
+            'tariff_effective_from' => $tariffEffectiveFrom,
+            'tariff_version' => $input->tariffVersionUsed ?? $this->pricing->getVersion(),
+            'markup_version_used' => $input->markupVersionUsed ?? $this->pricing->getVersion(),
+            'is_local_sale' => $isLocalSale,
+            'non_local_markup_percent' => round($nonLocalMarkupPercent, 2),
+            'non_local_markup_amount' => round($input->price * ($nonLocalMarkupPercent / 100), 2),
+            'sales_fee_percent' => round((float) ($salesFeePercent ?? $commissionRate), 2),
+            'shipping_cluster_id' => $input->shippingClusterId,
+            'shipping_cluster_name' => $input->shippingClusterName,
+            'destination_cluster_id' => $input->destinationClusterId,
+            'destination_cluster_name' => $input->destinationClusterName,
+            'fixation_applied' => $input->fixationApplied,
+            'fixation_id' => $input->fixationId,
+            'fixation_base_date' => $input->fixationBaseDate,
+            'fixed_until' => $input->fixedUntil,
+            'markup_applied' => $input->markupApplied,
+            'markup_reason_code' => $input->markupReasonCode,
+            'markup_reason_label' => $input->markupReasonLabel,
+            'markup_exception_status' => $input->markupExceptionStatus,
+            'calculation_mode' => $input->calculationMode,
+            'route_resolution_status' => $routeResolutionStatus,
+            'locality_resolution_status' => $localityResolutionStatus,
+            'calculation_confidence' => $calculationConfidence,
+            'profile_source' => $profileSource,
+            'dominant_cluster_id' => $dominantClusterId,
+            'dominant_cluster_share' => $dominantClusterShare !== null ? round($dominantClusterShare, 2) : null,
+            'expected_locality_rate' => $expectedLocalityRate !== null ? round($expectedLocalityRate, 2) : null,
+            'weighted_non_local_markup_percent' => $weightedNonLocalMarkupPercent !== null ? round($weightedNonLocalMarkupPercent, 2) : null,
+            'profit_min' => round($scenarioRange['profit_min'], 2),
+            'profit_base' => round($netProfit, 2),
+            'profit_max' => round($scenarioRange['profit_max'], 2),
+            'clusters_summary' => $clustersSummary,
         ];
 
         return $result;
@@ -275,7 +405,7 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
     /**
      * Рассчитать ожидаемые расходы на возвраты
      */
-    private function calculateExpectedReturnCosts(string $scheme, float $volume, ?float $redemptionRate): array
+    private function calculateExpectedReturnCosts(string $scheme, float $baseLogistics, ?float $redemptionRate): array
     {
         if ($redemptionRate === null || $redemptionRate >= 100) {
             return [
@@ -285,8 +415,9 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
             ];
         }
 
-        $returnLogistics = $this->tariffs->calculateReturnLogisticsCost($scheme, $volume);
-        $returnProcessing = $this->tariffs->getReturnProcessingFee($scheme);
+        $schemeCosts = $this->pricing->getSchemeCosts($scheme);
+        $returnLogistics = $baseLogistics;
+        $returnProcessing = (float) ($schemeCosts['return_processing'] ?? 0);
         $returnRate = (100 - $redemptionRate) / 100;
 
         return [
@@ -296,19 +427,286 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
         ];
     }
 
-    /**
-     * Получить дополнительный % от цены для FBO
-     * Зависит от коэффициента времени доставки
-     */
-    private function getAdditionalPercent(float $price, float $coefficient): float
+    private function resolveMarketplaceContext(string $scheme, CalculationInput $input, float $volume): array
     {
-        // Для дешёвых товаров или высокого коэффициента
-        if ($coefficient >= 1.4) {
-            return 2.0;
-        } elseif ($coefficient >= 1.2) {
-            return 1.0;
+        $commissionData = $this->pricing->resolveCommission($scheme, $input->categoryId, $input->price);
+        $hasExactClusters = $input->shippingClusterName !== null || $input->destinationClusterName !== null;
+        $clusterLogisticsData = $hasExactClusters
+            ? $this->pricing->resolveClusterLogistics(
+                $scheme,
+                $volume,
+                $input->price,
+                $input->shippingClusterName,
+                $input->destinationClusterName
+            )
+            : null;
+        $logisticsData = $clusterLogisticsData ?? $this->pricing->resolveLogistics($scheme, $volume, $input->routeKey, $input->routeLabel);
+        $schemeCosts = $this->pricing->getSchemeCosts($scheme);
+        $commissionRate = $input->commissionRate ?? (float) $commissionData['sales_fee_percent'];
+        $acquiringRate = $input->acquiringPercent ?? 1.5;
+        $dominantClusterId = $input->dominantClusterId;
+        $dominantClusterShare = $input->dominantClusterShare;
+        $dominantClusterName = null;
+        if (($dominantClusterId === null || $dominantClusterShare === null) && !empty($input->clustersSummary)) {
+            $dominant = $this->resolveDominantCluster($input->clustersSummary);
+            $dominantClusterId ??= $dominant['cluster_id'];
+            $dominantClusterShare ??= $dominant['cluster_share'];
+            $dominantClusterName = $dominant['cluster_name'];
         }
-        return 0;
+
+        $routeWasProvided = !empty($input->routeKey) || !empty($input->routeLabel) || !empty($input->shippingClusterName) || !empty($input->destinationClusterName);
+        $hasProfile = !empty($input->clustersSummary) || !empty($dominantClusterId);
+        $routeResolutionStatus = $input->routeResolutionStatus ?? ($routeWasProvided ? 'resolved' : ($hasProfile ? 'estimated' : 'unknown'));
+        $localityResolutionStatus = $input->localityResolutionStatus ?? (($input->isLocalSale !== null || $input->expectedLocalityRate !== null) ? 'resolved' : ($hasProfile ? 'estimated' : 'unknown'));
+        $calculationConfidence = $input->calculationConfidence ?? $this->resolveConfidence($dominantClusterShare, $routeResolutionStatus);
+        $profileMetrics = $this->resolveWeightedProfileMetrics($scheme, $input, $volume);
+        $expectedLocalityRate = $profileMetrics['expected_locality_rate'] ?? $input->expectedLocalityRate ?? null;
+        if ($expectedLocalityRate === null && $input->isLocalSale !== null && $localityResolutionStatus === 'resolved') {
+            $expectedLocalityRate = $input->isLocalSale ? 100.0 : 0.0;
+        }
+
+        $isFullyLocalByProfile = $expectedLocalityRate !== null && $expectedLocalityRate >= 99.99;
+        $isLocalSale = $routeResolutionStatus === 'resolved'
+            ? ($input->isLocalSale ?? ($isFullyLocalByProfile ? true : (bool) $logisticsData['is_local_sale']))
+            : null;
+        $weightedNonLocalMarkupPercent = $profileMetrics['weighted_markup_percent'] ?? $input->weightedNonLocalMarkupPercent ?? null;
+        if ($weightedNonLocalMarkupPercent === null && $expectedLocalityRate !== null) {
+            $weightedNonLocalMarkupPercent = (100 - $expectedLocalityRate) / 100 * (float) $logisticsData['non_local_markup_percent'];
+        }
+        if ($input->markupApplied === false) {
+            $weightedNonLocalMarkupPercent = 0.0;
+        }
+        $configMarkupPercent = (float) $logisticsData['non_local_markup_percent'];
+        $nonLocalMarkupPercent = $isLocalSale === true
+            ? 0.0
+            : ($weightedNonLocalMarkupPercent ?? $input->nonLocalMarkupPercent ?? $configMarkupPercent);
+        if ($input->markupApplied === false) {
+            $nonLocalMarkupPercent = 0.0;
+        }
+        $baseLogistics = $profileMetrics['base_logistics']
+            ?? $input->weightedLogisticsCost
+            ?? (float) $logisticsData['base_cost'];
+        $nonLocalMarkupAmount = $input->price * ($nonLocalMarkupPercent / 100);
+        $displayRouteKey = $routeResolutionStatus === 'resolved' ? ($logisticsData['route_key'] ?? null) : null;
+        $displayRouteLabel = match ($routeResolutionStatus) {
+            'resolved' => $input->shippingClusterName ?? $input->routeLabel ?? $profileMetrics['dominant_source_cluster'] ?? ($logisticsData['route_label'] ?? null),
+            'estimated' => $dominantClusterName ?? ($dominantClusterId ? "Кластер {$dominantClusterId} (оценка)" : 'Оценка по истории'),
+            default => null,
+        };
+
+        return [
+            'commission_rate' => $commissionRate,
+            'commission' => $input->price * ($commissionRate / 100),
+            'acquiring_rate' => $acquiringRate,
+            'acquiring' => $input->price * ($acquiringRate / 100),
+            'base_logistics' => $baseLogistics,
+            'logistics' => round($baseLogistics + $nonLocalMarkupAmount, 2),
+            'last_mile' => (float) ($schemeCosts['last_mile'] ?? 0),
+            'route_key' => $displayRouteKey,
+            'route_label' => $displayRouteLabel,
+            'price_segment' => $input->priceSegment ?? $commissionData['price_segment'],
+            'tariff_source' => $input->tariffSource ?? (($logisticsData['tariff_source'] ?? null) === 'repo_fallback' || $commissionData['tariff_source'] === 'repo_fallback'
+                ? 'repo_fallback'
+                : (($clusterLogisticsData['tariff_source'] ?? null) === 'universal' ? 'universal' : 'official')),
+            'tariff_effective_from' => $input->tariffEffectiveFrom ?? $this->pricing->getEffectiveFrom(),
+            'is_local_sale' => $isLocalSale,
+            'non_local_markup_percent' => $nonLocalMarkupPercent,
+            'route_resolution_status' => $routeResolutionStatus,
+            'locality_resolution_status' => $localityResolutionStatus,
+            'calculation_confidence' => $calculationConfidence,
+            'profile_source' => $input->profileSource ?? ($hasProfile ? 'delivery_analytics' : 'repo_fallback'),
+            'dominant_cluster_id' => $dominantClusterId,
+            'dominant_cluster_share' => $dominantClusterShare,
+            'expected_locality_rate' => $expectedLocalityRate,
+            'weighted_non_local_markup_percent' => $weightedNonLocalMarkupPercent ?? $nonLocalMarkupPercent,
+            'clusters_summary' => $input->clustersSummary,
+        ];
+    }
+
+    private function resolveWeightedProfileMetrics(string $scheme, CalculationInput $input, float $volume): ?array
+    {
+        if (empty($input->clustersSummary)) {
+            return null;
+        }
+
+        $stockClusters = $this->normalizeStockClusters($input->stockProfile);
+        $stockClusterNames = array_column($stockClusters, 'cluster_name');
+        $fixedShippingCluster = $this->pricing->resolveClusterName($input->shippingClusterName);
+        $dominantSourceCluster = $fixedShippingCluster
+            ?? $stockClusters[0]['cluster_name']
+            ?? $this->pricing->resolveClusterName($input->routeLabel);
+        $markupAllowed = !($scheme === 'FBO' && $input->sales7Days !== null && $input->sales7Days < 50);
+        $redemptionFactor = $input->redemptionRate !== null
+            ? max(0.0, min(100.0, $input->redemptionRate)) / 100
+            : 1.0;
+
+        $weightedBaseLogistics = 0.0;
+        $weightedMarkupPercent = 0.0;
+        $localityShare = 0.0;
+        $hasDemand = false;
+
+        foreach ($input->clustersSummary as $cluster) {
+            $share = (float) ($cluster['orders_percent'] ?? 0);
+            if ($share <= 0) {
+                continue;
+            }
+
+            $hasDemand = true;
+            $destinationCluster = $this->pricing->resolveClusterName(
+                $cluster['cluster_name']
+                ?? $cluster['route_label']
+                ?? null
+            );
+
+            $isLocalCluster = $fixedShippingCluster !== null
+                ? ($destinationCluster !== null && $destinationCluster === $fixedShippingCluster)
+                : (array_key_exists('is_local_cluster', $cluster)
+                    ? (bool) $cluster['is_local_cluster']
+                    : ($destinationCluster !== null && in_array($destinationCluster, $stockClusterNames, true)));
+
+            if ($isLocalCluster) {
+                $localityShare += $share;
+            }
+
+            $sourceCluster = $fixedShippingCluster
+                ?? ($isLocalCluster ? $destinationCluster : $dominantSourceCluster);
+
+            $clusterLogistics = $this->pricing->resolveClusterLogistics(
+                $scheme,
+                $volume,
+                $input->price,
+                $sourceCluster,
+                $destinationCluster
+            );
+
+            $weightedBaseLogistics += ($share / 100) * (float) $clusterLogistics['base_cost'];
+
+            if (! $isLocalCluster && $markupAllowed) {
+                $weightedMarkupPercent += ($share / 100)
+                    * $this->pricing->resolveDestinationMarkupPercent($destinationCluster)
+                    * $redemptionFactor;
+            }
+        }
+
+        if (! $hasDemand) {
+            return null;
+        }
+
+        return [
+            'base_logistics' => round($weightedBaseLogistics, 2),
+            'weighted_markup_percent' => round($weightedMarkupPercent, 2),
+            'expected_locality_rate' => round(min(100.0, $localityShare), 2),
+            'dominant_source_cluster' => $dominantSourceCluster,
+        ];
+    }
+
+    private function normalizeStockClusters(array $stockProfile): array
+    {
+        $normalized = [];
+
+        foreach ($stockProfile as $cluster) {
+            if (! is_array($cluster)) {
+                continue;
+            }
+
+            $clusterName = $this->pricing->resolveClusterName($cluster['cluster_name'] ?? null);
+            if ($clusterName === null) {
+                continue;
+            }
+
+            $normalized[] = [
+                'cluster_name' => $clusterName,
+                'share_percent' => (float) ($cluster['share_percent'] ?? 0),
+            ];
+        }
+
+        usort($normalized, static fn (array $left, array $right): int => ($right['share_percent'] <=> $left['share_percent']));
+
+        return $normalized;
+    }
+
+    private function resolveDominantCluster(array $clustersSummary): array
+    {
+        $dominantClusterId = null;
+        $dominantClusterName = null;
+        $dominantClusterShare = null;
+
+        foreach ($clustersSummary as $cluster) {
+            $share = (float) ($cluster['orders_percent'] ?? $cluster['sales_percent'] ?? 0);
+            if ($dominantClusterShare === null || $share > $dominantClusterShare) {
+                $dominantClusterShare = $share;
+                $dominantClusterId = (string) ($cluster['cluster_id'] ?? $cluster['delivery_cluster_id'] ?? '');
+                $dominantClusterName = $cluster['cluster_name'] ?? $cluster['delivery_cluster_name'] ?? null;
+            }
+        }
+
+        return [
+            'cluster_id' => $dominantClusterId ?: null,
+            'cluster_name' => $dominantClusterName,
+            'cluster_share' => $dominantClusterShare,
+        ];
+    }
+
+    private function resolveConfidence(?float $dominantClusterShare, string $routeResolutionStatus): string
+    {
+        if ($routeResolutionStatus === 'resolved') {
+            return 'high';
+        }
+
+        if ($dominantClusterShare === null) {
+            return 'low';
+        }
+
+        return match (true) {
+            $dominantClusterShare >= 70 => 'high',
+            $dominantClusterShare >= 45 => 'medium',
+            default => 'low',
+        };
+    }
+
+    private function calculateScenarioRange(CalculationInput $input, array $fixedCosts): array
+    {
+        $volume = $input->getVolumeInLiters();
+        $scheme = strtoupper($input->fulfillmentType);
+        $routes = $this->pricing->getConfig()['routes'] ?? [];
+        $profits = [];
+
+        foreach (array_keys($routes) as $routeKey) {
+            $logisticsData = $this->pricing->resolveLogistics($scheme, $volume, $routeKey, null);
+            $schemeCosts = $this->pricing->getSchemeCosts($scheme);
+            $markupPercent = (float) ($logisticsData['is_local_sale'] ? 0 : ($logisticsData['non_local_markup_percent'] ?? 0));
+            $logistics = (float) $logisticsData['base_cost'] + $input->price * ($markupPercent / 100);
+            $returnCosts = $this->calculateExpectedReturnCosts($scheme, (float) $logisticsData['base_cost'], $input->redemptionRate);
+
+            $totalCosts = $fixedCosts['commission']
+                + $fixedCosts['acquiring']
+                + $logistics
+                + (float) ($schemeCosts['last_mile'] ?? $fixedCosts['last_mile'] ?? 0)
+                + ($fixedCosts['processing_fee'] ?? 0)
+                + ($fixedCosts['storage_cost'] ?? 0)
+                + ($returnCosts['expected'] ?? 0)
+                + ($fixedCosts['cost_price'] ?? 0)
+                + ($fixedCosts['packaging_cost'] ?? 0)
+                + ($fixedCosts['additional_costs'] ?? 0)
+                + ($fixedCosts['agent_fee'] ?? 0)
+                + ($fixedCosts['acceptance_cost'] ?? 0)
+                + ($fixedCosts['penalty_cost'] ?? 0)
+                + ($fixedCosts['integration_fee'] ?? 0);
+
+            $profits[] = $input->price - $totalCosts;
+        }
+
+        if (empty($profits)) {
+            return [
+                'profit_min' => $input->price - array_sum($fixedCosts),
+                'profit_max' => $input->price - array_sum($fixedCosts),
+            ];
+        }
+
+        return [
+            'profit_min' => min($profits),
+            'profit_max' => max($profits),
+        ];
     }
 
     /**
