@@ -2,15 +2,30 @@
 
 namespace App\Services;
 
+use App\Domains\UnitEconomics\DTO\CalculationInput;
+use App\Domains\UnitEconomics\UnitEconomicsOrchestrator;
+use App\Models\OzonSupplyFixation;
+use App\Models\OzonSkuDeliveryProfile;
 use App\Models\UnitEconomics;
 use Illuminate\Support\Facades\Cache;
 
 class UnitEconomicsService
 {
+    private UnitEconomicsOrchestrator $orchestrator;
+
+    public function __construct(?UnitEconomicsOrchestrator $orchestrator = null)
+    {
+        $this->orchestrator = $orchestrator ?? new UnitEconomicsOrchestrator();
+    }
+
     public function calculate(string $marketplace, array $data): array
     {
         if ($marketplace === 'yandex') {
             $marketplace = 'yandex_market';
+        }
+
+        if ($marketplace === 'ozon') {
+            $data = $this->enrichOzonInputWithProfile($data);
         }
 
         $price = $data['price'];
@@ -47,7 +62,7 @@ class UnitEconomicsService
         $netProfit = $grossProfit;
         $marginPercent = $revenue > 0 ? ($netProfit / $revenue) * 100 : 0;
         $totalCostPrice = $costPrice * $salesCount;
-        $markupPercent = $totalCostPrice > 0 ? ($netProfit / $totalCostPrice) * 100 : 0;
+        $markupPercent = $costPrice > 0 ? round($price / $costPrice, 2) : 0;
         $roiPercent = $totalCosts > 0 ? ($netProfit / $totalCosts) * 100 : 0;
         $toSettlementAccount = $calculator['details']['to_settlement_account']
             ?? ($revenue - $calculator['total_fees']);
@@ -59,6 +74,7 @@ class UnitEconomicsService
             'net_profit' => round($netProfit, 2),
             'margin_percent' => round($marginPercent, 2),
             'markup_percent' => round($markupPercent, 2),
+            'markup_multiplier' => round($markupPercent, 2),
             'roi_percent' => round($roiPercent, 2),
             'to_settlement_account' => round($toSettlementAccount, 2),
             'drr_percent' => round($drrPercent, 2),
@@ -158,103 +174,217 @@ class UnitEconomicsService
 
     private function calculateOzon(array $data): array
     {
-        $price = $data['price'];
-        $salesCount = $data['sales_count'] ?? 1;
-        $fulfillmentType = strtoupper((string) ($data['fulfillment_type'] ?? 'FBO'));
-
-        $commissionPercent = $data['commission_percent'] ?? match ($fulfillmentType) {
-            'FBO' => ($data['fbo_commission_percent'] ?? 15),
-            default => ($data['fbs_commission_percent'] ?? 12),
-        };
-        $commissionAmount = ($price * $commissionPercent / 100) * $salesCount;
-
+        $salesCount = max(1, (int) ($data['sales_count'] ?? 1));
         $volumeLiters = (float) ($data['volume_liters'] ?? 0);
-        $storageCost = (float) ($data['storage_cost'] ?? 0);
-        $ownDeliveryCost = (float) ($data['own_delivery_cost'] ?? 0);
-        $ozonCompensation = (float) ($data['ozon_compensation'] ?? 0);
+        $sideCm = $volumeLiters > 0 ? pow($volumeLiters * 1000, 1 / 3) : 0;
 
-        $avgDeliveryTimeHours = (int) ($data['avg_delivery_time_hours'] ?? 29);
-        $logisticsCoefficient = $fulfillmentType === 'FBO'
-            ? (float) ($data['localization_index'] ?? $data['logistics_coefficient'] ?? $this->getOzonDeliveryCoefficient($avgDeliveryTimeHours))
-            : 1.0;
-        $additionalCommissionPercent = $fulfillmentType === 'FBO'
-            ? (float) ($data['localization_additional_percent'] ?? $data['additional_commission_percent'] ?? $this->getOzonAdditionalPercent($avgDeliveryTimeHours))
-            : 0.0;
+        $input = CalculationInput::fromArray([
+            'sku' => $data['sku'] ?? 'preview',
+            'integration_id' => (int) ($data['integration_id'] ?? 0),
+            'marketplace' => 'ozon',
+            'fulfillment_type' => strtoupper((string) ($data['fulfillment_type'] ?? 'FBO')),
+            'price' => (float) ($data['price'] ?? 0),
+            'cost_price' => (float) ($data['cost_price'] ?? 0),
+            'length' => (float) ($data['length'] ?? $sideCm),
+            'width' => (float) ($data['width'] ?? $sideCm),
+            'height' => (float) ($data['height'] ?? $sideCm),
+            'weight' => (float) ($data['weight'] ?? 0),
+            'category_id' => $data['category_id'] ?? 'default',
+            'commission_rate' => isset($data['commission_percent']) ? (float) $data['commission_percent'] : null,
+            'redemption_rate' => isset($data['redemption_rate']) ? (float) $data['redemption_rate'] : null,
+            'acquiring_percent' => isset($data['acquiring_percent']) ? (float) $data['acquiring_percent'] : 1.5,
+            'storage_cost' => isset($data['storage_cost']) ? (float) $data['storage_cost'] : 0,
+            'packaging_cost' => isset($data['packaging_cost']) ? (float) $data['packaging_cost'] : 0,
+            'own_delivery_cost' => isset($data['own_delivery_cost']) ? (float) $data['own_delivery_cost'] : 0,
+            'own_return_cost' => isset($data['own_return_cost']) ? (float) $data['own_return_cost'] : (isset($data['return_cost']) ? (float) $data['return_cost'] : 0),
+            'marketplace_compensation' => isset($data['ozon_compensation']) ? (float) $data['ozon_compensation'] : (isset($data['marketplace_compensation']) ? (float) $data['marketplace_compensation'] : null),
+            'sales_7_days' => isset($data['sales_7_days']) ? (int) $data['sales_7_days'] : null,
+            'route_key' => $data['route_key'] ?? null,
+            'route_label' => $data['route_label'] ?? null,
+            'is_local_sale' => $data['is_local_sale'] ?? null,
+            'non_local_markup_percent' => $data['non_local_markup_percent'] ?? null,
+            'route_resolution_status' => $data['route_resolution_status'] ?? null,
+            'locality_resolution_status' => $data['locality_resolution_status'] ?? null,
+            'calculation_confidence' => $data['calculation_confidence'] ?? null,
+            'profile_source' => $data['profile_source'] ?? null,
+            'dominant_cluster_id' => $data['dominant_cluster_id'] ?? null,
+            'dominant_cluster_share' => $data['dominant_cluster_share'] ?? null,
+            'expected_locality_rate' => $data['expected_locality_rate'] ?? null,
+            'weighted_non_local_markup_percent' => $data['weighted_non_local_markup_percent'] ?? null,
+            'clusters_summary' => isset($data['clusters_summary']) && is_array($data['clusters_summary']) ? $data['clusters_summary'] : [],
+            'stock_profile' => isset($data['stock_profile']) && is_array($data['stock_profile']) ? $data['stock_profile'] : [],
+            'weighted_logistics_cost' => isset($data['weighted_logistics_cost']) ? (float) $data['weighted_logistics_cost'] : null,
+            'order_date' => $data['order_date'] ?? null,
+            'shipping_cluster_id' => $data['shipping_cluster_id'] ?? null,
+            'shipping_cluster_name' => $data['shipping_cluster_name'] ?? null,
+            'destination_cluster_id' => $data['destination_cluster_id'] ?? null,
+            'destination_cluster_name' => $data['destination_cluster_name'] ?? null,
+            'fixation_applied' => $data['fixation_applied'] ?? null,
+            'fixation_id' => $data['fixation_id'] ?? null,
+            'fixation_base_date' => $data['fixation_base_date'] ?? null,
+            'fixed_until' => $data['fixed_until'] ?? null,
+            'tariff_version_used' => $data['tariff_version_used'] ?? null,
+            'markup_version_used' => $data['markup_version_used'] ?? null,
+            'markup_applied' => $data['markup_applied'] ?? null,
+            'markup_reason_code' => $data['markup_reason_code'] ?? null,
+            'markup_reason_label' => $data['markup_reason_label'] ?? null,
+            'markup_exception_status' => $data['markup_exception_status'] ?? null,
+            'calculation_mode' => $data['calculation_mode'] ?? null,
+        ]);
 
-        $baseLogisticsPerUnit = $this->getOzonBaseLogistics($fulfillmentType, $volumeLiters);
-        $logisticsPerUnit = match ($fulfillmentType) {
-            'RFBS', 'EXPRESS' => $ownDeliveryCost,
-            'FBO' => ($baseLogisticsPerUnit * $logisticsCoefficient) + ($price * $additionalCommissionPercent / 100),
-            default => $data['logistics_cost'] ?? $baseLogisticsPerUnit,
-        };
-        $logisticsCost = $logisticsPerUnit * $salesCount;
-
-        $lastMilePerUnit = in_array($fulfillmentType, ['FBO', 'FBS'], true)
-            ? (float) ($data['last_mile_cost'] ?? 40)
-            : 0.0;
-        $lastMileCost = $lastMilePerUnit * $salesCount;
-
-        $processingPerUnit = $fulfillmentType === 'FBS'
-            ? (float) ($data['processing_cost'] ?? 20)
-            : 0.0;
-        $processingCost = $processingPerUnit * $salesCount;
-
-        $returnPerUnit = in_array($fulfillmentType, ['RFBS', 'EXPRESS'], true)
-            ? (float) ($data['own_return_cost'] ?? 0)
-            : (float) ($data['return_cost'] ?? $data['return_logistics_cost'] ?? 0);
-        $redemptionRate = (float) ($data['redemption_rate'] ?? 100);
-        $expectedReturnCost = ($returnPerUnit * $salesCount) * ((100 - $redemptionRate) / 100);
-
-        $acquiringPercent = $data['acquiring_percent'] ?? 1.5;
-        $acquiringAmount = ($price * $acquiringPercent / 100) * $salesCount;
-
-        $packagingCost = ($data['packaging_cost'] ?? 5) * $salesCount;
-
-        $agentFee = in_array($fulfillmentType, ['RFBS', 'EXPRESS'], true) ? (float) ($data['agent_fee'] ?? 20 * $salesCount) : 0;
-        $additionalCommissionAmount = ($price * $additionalCommissionPercent / 100) * $salesCount;
-
-        $totalFees = $commissionAmount
-            + $logisticsCost
-            + $lastMileCost
-            + $processingCost
-            + $expectedReturnCost
-            + $storageCost
-            + $acquiringAmount
-            + $packagingCost
-            + $agentFee
-            - $ozonCompensation;
-
-        $toSettlementAccount = $revenue = ($price * $salesCount) - $totalFees;
+        $result = $this->orchestrator->calculate($input)->toArray();
+        $costs = $result['costs'] ?? [];
+        $price = (float) ($data['price'] ?? 0);
+        $commissionPercent = (float) ($result['sales_fee_percent'] ?? $result['commission_percent'] ?? 0);
+        $acquiringPercent = (float) ($result['acquiring_percent'] ?? 0);
+        $commissionAmount = $price * ($commissionPercent / 100) * $salesCount;
+        $acquiringAmount = $price * ($acquiringPercent / 100) * $salesCount;
+        $logisticsBasePerUnit = (float) ($result['base_logistics'] ?? $costs['logistics'] ?? 0);
+        $nonLocalMarkupAmount = (float) ($result['non_local_markup_amount'] ?? 0);
+        $logisticsCost = ($logisticsBasePerUnit + $nonLocalMarkupAmount) * $salesCount;
+        $lastMileCost = (float) ($result['last_mile'] ?? $costs['last_mile'] ?? 0) * $salesCount;
+        $processingCost = (float) ($result['processing_fee'] ?? $costs['processing_fee'] ?? 0) * $salesCount;
+        $expectedReturnCost = (float) ($result['expected_return_cost'] ?? $costs['expected_return_cost'] ?? 0) * $salesCount;
+        $storageCost = (float) ($result['storage_cost'] ?? $costs['storage_cost'] ?? ($data['storage_cost'] ?? 0)) * $salesCount;
+        $packagingCost = (float) ($data['packaging_cost'] ?? 0) * $salesCount;
+        $agentFee = (float) ($costs['agent_fee'] ?? 0) * $salesCount;
+        $marketplaceCompensation = (float) ($result['marketplace_compensation'] ?? $data['ozon_compensation'] ?? $data['marketplace_compensation'] ?? 0) * $salesCount;
+        $totalFees = $commissionAmount + $logisticsCost + $lastMileCost + $processingCost + $expectedReturnCost + $storageCost + $acquiringAmount + $packagingCost + $agentFee - $marketplaceCompensation;
+        $toSettlementAccount = ($price * $salesCount) - $totalFees;
 
         return [
             'total_fees' => $totalFees,
             'details' => [
-                'fulfillment_type' => $fulfillmentType,
-                'commission_percent' => round($commissionPercent, 2),
-                'fbo_commission_percent' => $data['fbo_commission_percent'] ?? 15,
-                'fbs_commission_percent' => $data['fbs_commission_percent'] ?? 12,
+                'fulfillment_type' => $result['fulfillment_type'],
+                'commission_percent' => round((float) ($result['commission_percent'] ?? 0), 2),
                 'commission_amount' => round($commissionAmount, 2),
-                'avg_delivery_time_hours' => $avgDeliveryTimeHours,
-                'logistics_coefficient' => round($logisticsCoefficient, 2),
-                'additional_commission_percent' => round($additionalCommissionPercent, 2),
-                'additional_commission_amount' => round($additionalCommissionAmount, 2),
-                'base_logistics_cost' => round($baseLogisticsPerUnit, 2),
+                'sales_fee_percent' => round($commissionPercent, 2),
+                'price_segment' => $result['price_segment'] ?? null,
+                'shipping_cluster_id' => $result['shipping_cluster_id'] ?? null,
+                'shipping_cluster_name' => $result['shipping_cluster_name'] ?? null,
+                'destination_cluster_id' => $result['destination_cluster_id'] ?? null,
+                'destination_cluster_name' => $result['destination_cluster_name'] ?? null,
+                'route_key' => $result['route_key'] ?? null,
+                'route_label' => $result['route_label'] ?? null,
+                'tariff_source' => $result['tariff_source'] ?? null,
+                'tariff_effective_from' => $result['tariff_effective_from'] ?? null,
+                'tariff_version' => $result['tariff_version'] ?? null,
+                'markup_version_used' => $result['markup_version_used'] ?? null,
+                'fixation_applied' => $result['fixation_applied'] ?? null,
+                'fixation_id' => $result['fixation_id'] ?? null,
+                'fixation_base_date' => $result['fixation_base_date'] ?? null,
+                'fixed_until' => $result['fixed_until'] ?? null,
+                'is_local_sale' => $result['is_local_sale'] ?? null,
+                'non_local_markup_percent' => round((float) ($result['non_local_markup_percent'] ?? 0), 2),
+                'markup_applied' => $result['markup_applied'] ?? null,
+                'markup_reason_code' => $result['markup_reason_code'] ?? null,
+                'markup_reason_label' => $result['markup_reason_label'] ?? null,
+                'markup_exception_status' => $result['markup_exception_status'] ?? null,
+                'calculation_mode' => $result['calculation_mode'] ?? null,
+                'route_resolution_status' => $result['route_resolution_status'] ?? null,
+                'locality_resolution_status' => $result['locality_resolution_status'] ?? null,
+                'calculation_confidence' => $result['calculation_confidence'] ?? null,
+                'profile_source' => $result['profile_source'] ?? null,
+                'dominant_cluster_id' => $result['dominant_cluster_id'] ?? null,
+                'dominant_cluster_share' => isset($result['dominant_cluster_share']) ? round((float) $result['dominant_cluster_share'], 2) : null,
+                'expected_locality_rate' => isset($result['expected_locality_rate']) ? round((float) $result['expected_locality_rate'], 2) : null,
+                'weighted_non_local_markup_percent' => isset($result['weighted_non_local_markup_percent']) ? round((float) $result['weighted_non_local_markup_percent'], 2) : null,
+                'profit_min' => isset($result['profit_min']) ? round((float) $result['profit_min'] * $salesCount, 2) : null,
+                'profit_base' => isset($result['profit_base']) ? round((float) $result['profit_base'] * $salesCount, 2) : null,
+                'profit_max' => isset($result['profit_max']) ? round((float) $result['profit_max'] * $salesCount, 2) : null,
+                'clusters_summary' => $result['clusters_summary'] ?? [],
+                'non_local_markup_amount' => round($nonLocalMarkupAmount * $salesCount, 2),
+                'base_logistics_cost' => round($logisticsBasePerUnit * $salesCount, 2),
                 'logistics_cost' => round($logisticsCost, 2),
                 'last_mile_cost' => round($lastMileCost, 2),
                 'processing_cost' => round($processingCost, 2),
-                'return_cost' => round($returnPerUnit * $salesCount, 2),
+                'return_cost' => round((float) (($data['own_return_cost'] ?? $data['return_cost'] ?? 0) * $salesCount), 2),
+                'return_logistics_cost' => round((float) (($result['return_logistics'] ?? 0) * $salesCount), 2),
+                'return_processing_cost' => round((float) (($result['return_processing'] ?? 0) * $salesCount), 2),
                 'expected_return_cost' => round($expectedReturnCost, 2),
                 'effective_logistics' => round($logisticsCost + $lastMileCost + $processingCost + $expectedReturnCost, 2),
                 'storage_cost' => round($storageCost, 2),
-                'acquiring_percent' => $acquiringPercent,
+                'acquiring_percent' => round($acquiringPercent, 2),
                 'acquiring_amount' => round($acquiringAmount, 2),
                 'packaging_cost' => round($packagingCost, 2),
-                'own_delivery_cost' => round($ownDeliveryCost, 2),
-                'ozon_compensation' => round($ozonCompensation, 2),
+                'own_delivery_cost' => round((float) ($data['own_delivery_cost'] ?? 0), 2),
+                'ozon_compensation' => round($marketplaceCompensation, 2),
                 'agent_fee' => round($agentFee, 2),
                 'to_settlement_account' => round($toSettlementAccount, 2),
             ],
         ];
+    }
+
+    public function enrichOzonInputWithProfile(array $data): array
+    {
+        $integrationId = (int) ($data['integration_id'] ?? 0);
+        $sku = (string) ($data['sku'] ?? '');
+        if ($integrationId <= 0 || $sku === '') {
+            return $data;
+        }
+
+        if (empty($data['shipping_cluster_name']) && empty($data['fixed_until'])) {
+            $fixations = OzonSupplyFixation::query()
+                ->where('integration_id', $integrationId)
+                ->where('sku', $sku)
+                ->activeWindow()
+                ->orderByDesc('fixation_base_date')
+                ->get();
+
+            if ($fixations->count() === 1) {
+                $fixation = $fixations->first();
+                $data['shipping_cluster_id'] ??= $fixation?->shipping_cluster_id;
+                $data['shipping_cluster_name'] ??= $fixation?->shipping_cluster_name;
+                $data['fixation_applied'] ??= true;
+                $data['fixation_id'] ??= $fixation?->id;
+                $data['fixation_base_date'] ??= optional($fixation?->fixation_base_date)?->toDateString();
+                $data['fixed_until'] ??= optional($fixation?->fixed_until)?->toDateString();
+                $data['tariff_version_used'] ??= $fixation?->tariff_version;
+                $data['markup_version_used'] ??= $fixation?->markup_version;
+                $data['calculation_mode'] ??= 'preview';
+            } elseif ($fixations->count() > 1) {
+                $data['calculation_mode'] ??= 'estimate';
+                $data['calculation_confidence'] ??= 'medium';
+            }
+        }
+
+        $scheme = strtoupper((string) ($data['fulfillment_type'] ?? 'FBO'));
+        $profile = OzonSkuDeliveryProfile::findForProduct($integrationId, $sku, $scheme)
+            ?? OzonSkuDeliveryProfile::findForProduct($integrationId, $sku, 'ALL');
+
+        if (! $profile) {
+            return $data;
+        }
+
+        $stockProfile = is_array($profile->stock_profile ?? null) ? $profile->stock_profile : [];
+        $clusterProfile = is_array($profile->cluster_profile ?? null) ? $profile->cluster_profile : [];
+        $clustersSummary = is_array($clusterProfile['clusters_summary'] ?? null)
+            ? $clusterProfile['clusters_summary']
+            : [];
+
+        $data['route_key'] ??= $stockProfile['route_key'] ?? null;
+        $data['route_label'] ??= $stockProfile['route_label'] ?? null;
+        if (! array_key_exists('is_local_sale', $data) && array_key_exists('is_local_sale', $stockProfile)) {
+            $data['is_local_sale'] = $stockProfile['is_local_sale'];
+        }
+        $data['route_resolution_status'] ??= $profile->route_resolution_status;
+        $data['locality_resolution_status'] ??= $profile->locality_resolution_status;
+        $data['calculation_confidence'] ??= $profile->calculation_confidence;
+        $data['profile_source'] ??= $profile->profile_source;
+        $data['dominant_cluster_id'] ??= $profile->dominant_demand_cluster_id ?? ($clusterProfile['dominant_cluster_id'] ?? null);
+        $data['dominant_cluster_share'] ??= $profile->dominant_demand_cluster_share ?? ($clusterProfile['dominant_cluster_share'] ?? null);
+        $data['expected_locality_rate'] ??= $profile->expected_locality_rate;
+        $data['weighted_non_local_markup_percent'] ??= $profile->weighted_non_local_markup_percent;
+        $data['weighted_logistics_cost'] ??= $profile->weighted_logistics_cost;
+        $data['shipping_cluster_name'] ??= $stockProfile['route_label'] ?? null;
+        if (empty($data['stock_profile'])) {
+            $data['stock_profile'] = $stockProfile['clusters'] ?? [];
+        }
+        if (empty($data['clusters_summary'])) {
+            $data['clusters_summary'] = $clustersSummary;
+        }
+
+        return $data;
     }
 
     private function calculateYandex(array $data): array
@@ -310,7 +440,27 @@ class UnitEconomicsService
 
         $logisticsTotal = ($deliveryPerUnit + $sortingPerUnit) * $salesCount;
         $storageCost = (float) ($data['storage_cost'] ?? 0);
-        $totalFees = $referralFeeAmount + $acquiringAmount + $logisticsTotal + $storageCost;
+
+        // Хранение: рассчитываем по тарифу если не задано
+        if ($storageCost <= 0) {
+            $volumeLiters = (float) ($data['volume_liters'] ?? 0);
+            $turnoverDays = (int) ($data['turnover_days'] ?? 30);
+            if ($volumeLiters > 0) {
+                $tariffs = new \App\Domains\YandexMarket\Tariffs\YandexMarketTariffs();
+                $storageCost = $tariffs->calculateStorageCost($volumeLiters, $turnoverDays);
+            }
+        }
+
+        // Возвраты
+        $weightKg = (float) ($data['weight_g'] ?? 0) / 1000;
+        $tariffs = $tariffs ?? new \App\Domains\YandexMarket\Tariffs\YandexMarketTariffs();
+        $returnLogisticsCost = $tariffs->calculateReturnLogisticsCost($fulfillmentType, $weightKg);
+        $returnProcessingCost = $tariffs->getReturnProcessingFee();
+        $redemptionRate = (float) ($data['redemption_rate'] ?? 95);
+        $returnRate = ($redemptionRate >= 100) ? 0 : (100 - $redemptionRate) / 100;
+        $expectedReturnCost = ($returnLogisticsCost + $returnProcessingCost) * $returnRate;
+
+        $totalFees = $referralFeeAmount + $acquiringAmount + $logisticsTotal + $storageCost + $expectedReturnCost;
         $toSettlementAccount = ($price * $salesCount) - $totalFees;
 
         return [
@@ -343,47 +493,14 @@ class UnitEconomicsService
                 'logistics_cost' => round($logisticsTotal, 2),
                 'delivery_cost' => round($logisticsTotal, 2),
                 'storage_cost' => round($storageCost, 2),
+                'return_logistics_cost' => round($returnLogisticsCost, 2),
+                'return_processing_cost' => round($returnProcessingCost, 2),
+                'expected_return_cost' => round($expectedReturnCost, 2),
+                'effective_logistics' => round($logisticsTotal + $expectedReturnCost, 2),
+                'packaging_cost' => round((float) ($data['packaging_cost'] ?? 0), 2),
                 'to_settlement_account' => round($toSettlementAccount, 2),
             ],
         ];
-    }
-
-    private function getOzonDeliveryCoefficient(int $avgDeliveryTimeHours): float
-    {
-        return match (true) {
-            $avgDeliveryTimeHours >= 38 => 1.44,
-            $avgDeliveryTimeHours >= 34 => 1.34,
-            $avgDeliveryTimeHours >= 30 => 1.24,
-            default => 1.00,
-        };
-    }
-
-    private function getOzonAdditionalPercent(int $avgDeliveryTimeHours): float
-    {
-        return match (true) {
-            $avgDeliveryTimeHours >= 38 => 2.2,
-            $avgDeliveryTimeHours >= 34 => 1.4,
-            $avgDeliveryTimeHours >= 30 => 0.7,
-            default => 0.0,
-        };
-    }
-
-    private function getOzonBaseLogistics(string $fulfillmentType, float $volumeLiters): float
-    {
-        $volumeLiters = max(0.0, $volumeLiters);
-
-        return match (strtoupper($fulfillmentType)) {
-            'FBO' => $volumeLiters <= 1
-                ? 46.77
-                : 46.77 + (max(0, ceil($volumeLiters) - 1) * 10.17),
-            'FBS' => match (true) {
-                $volumeLiters <= 1 => 81.34,
-                $volumeLiters <= 2 => 99.64,
-                $volumeLiters <= 3 => 117.94,
-                default => 117.94 + (max(0, $volumeLiters - 3) * 23.39),
-            },
-            default => 0.0,
-        };
     }
 
     private function normalizeYandexTariffBreakdown(array $items): array
@@ -547,8 +664,10 @@ class UnitEconomicsService
                     'acceptance' => ['per_item' => 2],
                 ],
                 'ozon' => [
-                    'last_mile' => ['base' => 40],
-                    'storage' => ['per_liter_per_day' => 0.4],
+                    'routing' => ['mode' => 'route_matrix'],
+                    'last_mile' => ['base' => 25],
+                    'sales_fee' => ['price_segments' => config('ozon_unit_economics.price_segments', [])],
+                    'routes' => config('ozon_unit_economics.routes', []),
                     'acquiring' => ['percent' => 1.5],
                 ],
                 'yandex_market' => [

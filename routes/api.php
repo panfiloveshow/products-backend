@@ -25,8 +25,10 @@ use Illuminate\Support\Facades\Route;
 Route::prefix('integrations')->middleware('sellico.permission')->group(function () {
     Route::get('/', [IntegrationController::class, 'index'])->name('integrations.index');
     Route::get('/{id}/premium-status', [IntegrationController::class, 'getPremiumStatus'])->name('integrations.premiumStatus');
+    Route::put('/{id}/manual-redemption-rate', [IntegrationController::class, 'setManualRedemptionRate'])->name('integrations.manualRedemptionRate');
     Route::post('/{id}/sync', [IntegrationController::class, 'sync'])->name('integrations.sync');
     Route::get('/{id}/sync-status', [IntegrationController::class, 'syncStatus'])->name('integrations.syncStatus');
+    Route::get('/{id}/status', [IntegrationController::class, 'checkStatus'])->name('integrations.status');
 });
 
 /*
@@ -54,7 +56,7 @@ Route::prefix('products')->middleware('sellico.permission')->group(function () {
     Route::get('/', [ProductController::class, 'index'])->name('products.index');
     Route::get('/sync/status', [ProductController::class, 'syncStatus'])->name('products.syncStatus');
     Route::post('/sync/{marketplace}', [ProductController::class, 'sync'])
-        ->whereIn('marketplace', ['wildberries', 'ozon', 'yandex'])
+        ->whereIn('marketplace', ['wildberries', 'ozon', 'yandex_market'])
         ->name('products.sync');
     Route::get('/cost-price', [CostPriceController::class, 'index'])->name('products.cost-price.index');
     Route::post('/cost-price/upload', [CostPriceController::class, 'upload'])->name('products.cost-price.upload');
@@ -80,7 +82,7 @@ Route::prefix('inventory')->middleware('sellico.permission')->group(function () 
     Route::get('/redistribution', [InventoryController::class, 'redistribution'])->name('inventory.redistribution');
     Route::get('/stats', [InventoryController::class, 'stats'])->name('inventory.stats');
     Route::post('/sync/{marketplace}', [InventoryController::class, 'sync'])
-        ->whereIn('marketplace', ['wildberries', 'ozon', 'yandex'])
+        ->whereIn('marketplace', ['wildberries', 'ozon', 'yandex_market'])
         ->name('inventory.sync');
     Route::post('/sync-storage-fees', [InventoryController::class, 'syncStorageFees'])->name('inventory.syncStorageFees');
     Route::get('/{sku}', [InventoryController::class, 'show'])->name('inventory.show');

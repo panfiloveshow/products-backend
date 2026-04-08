@@ -251,13 +251,28 @@ class UnitEconomicsCacheController extends Controller
             ->where('sku', $sku)
             ->first();
 
+        $data = $cache->toArray();
+        if ($marketplace === 'ozon') {
+            unset($data['avg_delivery_time_hours'], $data['logistics_coefficient'], $data['additional_commission_percent']);
+        }
+
+        $allSchemes = UnitEconomicsCache::where('integration_id', $validated['integration_id'])
+            ->where('sku', $sku)
+            ->get()
+            ->map(function (UnitEconomicsCache $item) use ($marketplace) {
+                $row = $item->toArray();
+                if ($marketplace === 'ozon') {
+                    unset($row['avg_delivery_time_hours'], $row['logistics_coefficient'], $row['additional_commission_percent']);
+                }
+
+                return $row;
+            })
+            ->keyBy('fulfillment_type');
+
         return response()->json([
-            'data' => $cache,
+            'data' => $data,
             'settings' => $settings,
-            'all_schemes' => UnitEconomicsCache::where('integration_id', $validated['integration_id'])
-                ->where('sku', $sku)
-                ->get()
-                ->keyBy('fulfillment_type'),
+            'all_schemes' => $allSchemes,
         ]);
     }
 
@@ -700,8 +715,166 @@ class UnitEconomicsCacheController extends Controller
             $effectiveLogistics = $deliveryCost + $expectedReturnCost;
         }
         $data['effective_logistics'] = round($effectiveLogistics, 2);
-        $data['logistics_with_coefficient'] = round((float) $cache->logistics_cost, 2);
-        $data['additional_commission_amount'] = round((float) $cache->price * (float) $cache->additional_commission_percent / 100, 2);
+
+        if ($cache->marketplace === 'ozon') {
+            $ozonData = is_array($product?->ozon_data ?? null) ? $product->ozon_data : [];
+            $marketplaceData = is_array($data['marketplace_data'] ?? null) ? $data['marketplace_data'] : [];
+
+            unset(
+                $data['avg_delivery_time_hours'],
+                $data['logistics_coefficient'],
+                $data['additional_commission_percent'],
+                $data['tariff_status'],
+                $data['logistics_with_coefficient'],
+                $data['additional_commission_amount']
+            );
+
+            $data['tariff_version'] = $cache->tariff_version;
+            $data['tariff_effective_from'] = optional($cache->tariff_effective_from)?->toDateString();
+            $data['tariff_source'] = $cache->tariff_source;
+            $activeFixation = is_array($ozonData['active_fixation'] ?? null) ? $ozonData['active_fixation'] : [];
+            $orderEconomicsSummary = is_array($ozonData['order_economics_summary'] ?? null) ? $ozonData['order_economics_summary'] : [];
+            $data['route_key'] = $cache->route_key
+                ?? $marketplaceData['route_key']
+                ?? ($activeFixation['shipping_cluster_id'] ?? null)
+                ?? ($ozonData['route_key'] ?? null);
+            $data['route_label'] = $cache->route_label
+                ?? $marketplaceData['route_label']
+                ?? ($activeFixation['shipping_cluster_name'] ?? null)
+                ?? ($ozonData['route_label'] ?? null);
+            $data['shipping_cluster_id'] = $marketplaceData['shipping_cluster_id']
+                ?? ($activeFixation['shipping_cluster_id'] ?? null);
+            $data['shipping_cluster_name'] = $marketplaceData['shipping_cluster_name']
+                ?? ($activeFixation['shipping_cluster_name'] ?? null);
+            $data['destination_cluster_id'] = $marketplaceData['destination_cluster_id']
+                ?? null;
+            $data['destination_cluster_name'] = $marketplaceData['destination_cluster_name']
+                ?? null;
+            $data['fixation_applied'] = $marketplaceData['fixation_applied']
+                ?? ($activeFixation['fixation_applied'] ?? false);
+            $data['fixation_id'] = $marketplaceData['fixation_id']
+                ?? ($activeFixation['fixation_id'] ?? null);
+            $data['fixation_base_date'] = $marketplaceData['fixation_base_date']
+                ?? ($activeFixation['fixation_base_date'] ?? null);
+            $data['fixed_until'] = $marketplaceData['fixed_until']
+                ?? ($activeFixation['fixed_until'] ?? null);
+            $data['tariff_version_used'] = $marketplaceData['tariff_version_used']
+                ?? ($activeFixation['tariff_version_used'] ?? $data['tariff_version']);
+            $data['markup_version_used'] = $marketplaceData['markup_version_used']
+                ?? ($activeFixation['markup_version_used'] ?? $data['tariff_version']);
+            $data['calculation_mode'] = $marketplaceData['calculation_mode']
+                ?? ($activeFixation['calculation_mode'] ?? 'preview');
+            $data['is_local_sale'] = $cache->is_local_sale;
+            if ($data['is_local_sale'] === null && array_key_exists('is_local_sale', $marketplaceData)) {
+                $data['is_local_sale'] = $marketplaceData['is_local_sale'];
+            }
+            if ($data['is_local_sale'] === null && array_key_exists('is_local_sale', $ozonData)) {
+                $data['is_local_sale'] = $ozonData['is_local_sale'];
+            }
+            $rawNonLocalMarkupPercent = $cache->non_local_markup_percent !== null
+                ? round((float) $cache->non_local_markup_percent, 2)
+                : null;
+            $data['raw_non_local_markup_percent'] = $rawNonLocalMarkupPercent ?? 0;
+            $data['price_segment'] = $cache->price_segment;
+            $data['sales_fee_percent'] = round((float) ($cache->sales_fee_percent ?? $cache->commission_percent), 2);
+            $data['route_resolution_status'] = $marketplaceData['route_resolution_status']
+                ?? $ozonData['route_resolution_status']
+                ?? ($data['route_key'] ? 'resolved' : 'unknown');
+            $data['locality_resolution_status'] = $marketplaceData['locality_resolution_status']
+                ?? $ozonData['locality_resolution_status']
+                ?? ($data['is_local_sale'] !== null ? 'resolved' : 'unknown');
+            $data['calculation_confidence'] = $marketplaceData['calculation_confidence']
+                ?? $ozonData['calculation_confidence']
+                ?? ($data['route_key'] ? 'high' : 'low');
+            $data['profile_source'] = $marketplaceData['profile_source']
+                ?? $ozonData['profile_source']
+                ?? ($data['route_key'] ? 'api' : 'repo_fallback');
+            $data['dominant_cluster_id'] = $marketplaceData['dominant_cluster_id']
+                ?? $ozonData['dominant_cluster_id']
+                ?? null;
+            $data['dominant_cluster_share'] = isset($marketplaceData['dominant_cluster_share'])
+                ? round((float) $marketplaceData['dominant_cluster_share'], 2)
+                : (isset($ozonData['dominant_cluster_share'])
+                    ? round((float) $ozonData['dominant_cluster_share'], 2)
+                    : null);
+            $cacheDerivedLocalityRate = $data['is_local_sale'] === null ? null : ($data['is_local_sale'] ? 100.0 : 0.0);
+            $data['expected_locality_rate'] = $cacheDerivedLocalityRate
+                ?? (isset($marketplaceData['expected_locality_rate'])
+                    ? round((float) $marketplaceData['expected_locality_rate'], 2)
+                    : (isset($ozonData['expected_locality_rate'])
+                        ? round((float) $ozonData['expected_locality_rate'], 2)
+                        : null));
+            $data['weighted_non_local_markup_percent'] = $rawNonLocalMarkupPercent;
+            if ($data['weighted_non_local_markup_percent'] === null) {
+                $data['weighted_non_local_markup_percent'] = isset($marketplaceData['weighted_non_local_markup_percent'])
+                    ? round((float) $marketplaceData['weighted_non_local_markup_percent'], 2)
+                    : (isset($ozonData['weighted_non_local_markup_percent'])
+                        ? round((float) $ozonData['weighted_non_local_markup_percent'], 2)
+                        : $rawNonLocalMarkupPercent);
+            }
+            $data['non_local_markup_percent'] = $data['weighted_non_local_markup_percent'];
+            $data['logistics_markup_percent'] = $data['weighted_non_local_markup_percent'];
+            $data['non_local_markup_amount'] = round((float) $cache->price * ((float) $data['non_local_markup_percent'] / 100), 2);
+            $data['logistics_markup_amount'] = $data['non_local_markup_amount'];
+            $data['markup_allowed'] = $marketplaceData['markup_allowed']
+                ?? $ozonData['markup_allowed']
+                ?? ($data['weighted_non_local_markup_percent'] !== null);
+            $data['markup_rule_reason'] = $marketplaceData['markup_rule_reason']
+                ?? $ozonData['markup_rule_reason']
+                ?? null;
+            $data['sales_7_days'] = isset($marketplaceData['sales_7_days'])
+                ? (int) $marketplaceData['sales_7_days']
+                : (isset($ozonData['sales_7_days']) ? (int) $ozonData['sales_7_days'] : null);
+            if ($data['markup_rule_reason'] === null && ($data['weighted_non_local_markup_percent'] === null || (float) $data['weighted_non_local_markup_percent'] == 0.0)) {
+                if (($data['expected_locality_rate'] ?? null) !== null && (float) $data['expected_locality_rate'] >= 99.99) {
+                    $data['markup_rule_reason'] = 'local_cluster';
+                } elseif (($data['markup_allowed'] ?? true) === false) {
+                    $data['markup_rule_reason'] = 'fbo_lt_50_orders_7d';
+                }
+            }
+            $data['markup_rule_reason_label'] = $this->humanizeOzonMarkupReason(
+                is_string($data['markup_rule_reason'] ?? null) ? $data['markup_rule_reason'] : null,
+                $data['sales_7_days'] ?? null
+            );
+            $data['profit_min'] = isset($marketplaceData['profit_min'])
+                ? round((float) $marketplaceData['profit_min'], 2)
+                : round((float) $cache->net_profit, 2);
+            $data['profit_base'] = isset($marketplaceData['profit_base'])
+                ? round((float) $marketplaceData['profit_base'], 2)
+                : round((float) $cache->net_profit, 2);
+            $data['profit_max'] = isset($marketplaceData['profit_max'])
+                ? round((float) $marketplaceData['profit_max'], 2)
+                : round((float) $cache->net_profit, 2);
+            $data['clusters_summary'] = is_array($marketplaceData['clusters_summary'] ?? null)
+                ? $marketplaceData['clusters_summary']
+                : (is_array($ozonData['clusters_summary'] ?? null)
+                    ? $ozonData['clusters_summary']
+                    : []);
+            $data['stock_profile'] = is_array($marketplaceData['stock_profile'] ?? null)
+                ? $marketplaceData['stock_profile']
+                : (is_array($ozonData['stock_profile'] ?? null)
+                    ? $ozonData['stock_profile']
+                    : []);
+            $data['sales_profile'] = is_array($marketplaceData['sales_profile'] ?? null)
+                ? $marketplaceData['sales_profile']
+                : (is_array($ozonData['sales_profile'] ?? null)
+                    ? $ozonData['sales_profile']
+                    : []);
+            $data['route_details'] = is_array($marketplaceData['route_details'] ?? null)
+                ? $marketplaceData['route_details']
+                : (is_array($ozonData['route_details'] ?? null)
+                    ? $ozonData['route_details']
+                    : []);
+            $data['profile_data_sources'] = [
+                'demand' => 'Ozon Delivery Analytics API',
+                'stocks' => 'Ozon Stocks API',
+                'sales' => 'Ozon postings / sales by warehouse',
+            ];
+            $data['order_economics_summary'] = $orderEconomicsSummary;
+        } else {
+            $data['logistics_with_coefficient'] = round((float) $cache->logistics_cost, 2);
+            $data['additional_commission_amount'] = round((float) $cache->price * (float) $cache->additional_commission_percent / 100, 2);
+        }
 
         // Флаги схемы — сравниваем с реальной схемой товара из UnitEconomics
         $data['is_actual_scheme'] = strtoupper($realScheme) === strtoupper($cache->fulfillment_type);
@@ -902,25 +1075,36 @@ class UnitEconomicsCacheController extends Controller
                 'parameters' => $yandexData['parameters'] ?? [],
             ];
 
-            $data['agency_commission'] = round((float) ($data['agency_commission'] ?? 0), 2);
-            $data['payment_transfer'] = round((float) ($data['payment_transfer'] ?? 0), 2);
-            $data['delivery_to_customer'] = round((float) ($data['delivery_to_customer'] ?? $cache->logistics_cost), 2);
-            $data['crossregional_delivery'] = round((float) ($data['crossregional_delivery'] ?? 0), 2);
-            $data['middle_mile'] = round((float) ($data['middle_mile'] ?? 0), 2);
-            $data['express_delivery'] = round((float) ($data['express_delivery'] ?? 0), 2);
-            $data['sorting'] = round((float) ($data['sorting'] ?? $cache->processing_cost), 2);
+            // Разбивка тарифов из yandex_data['tariffs'] — только для отображения детализации
+            // Итоговые суммы (commission, acquiring, logistics, total_costs, net_profit) берём из кэша —
+            // они уже корректно рассчитаны калькулятором через tariffBreakdown
+            $tariffBreakdown = [];
+            foreach ($yandexData['tariffs'] ?? [] as $t) {
+                $type = strtoupper((string) ($t['type'] ?? ''));
+                $amount = (float) ($t['amount'] ?? 0);
+                if ($type !== '' && ! isset($tariffBreakdown[$type])) {
+                    $tariffBreakdown[$type] = $amount;
+                }
+            }
 
-            $data['referral_fee_percent'] = round((float) ($data['referral_fee_percent'] ?? $cache->commission_percent), 2);
-            $data['commission_percent'] = round((float) ($data['commission_percent'] ?? $cache->commission_percent), 2);
-            $data['commission_amount'] = round((float) ($data['commission_amount'] ?? $cache->commission_amount), 2);
-            $data['acquiring_percent'] = round((float) ($data['acquiring_percent'] ?? $cache->acquiring_percent), 2);
-            $data['acquiring_amount'] = round((float) ($data['acquiring_amount'] ?? $cache->acquiring_amount), 2);
+            // Детализация тарифов для фронта
+            $data['agency_commission'] = round($tariffBreakdown['AGENCY_COMMISSION'] ?? 0, 2);
+            $data['payment_transfer'] = round($tariffBreakdown['PAYMENT_TRANSFER'] ?? 0, 2);
+            $data['delivery_to_customer'] = round($tariffBreakdown['DELIVERY_TO_CUSTOMER'] ?? (float) $cache->logistics_cost, 2);
+            $data['crossregional_delivery'] = round($tariffBreakdown['CROSSREGIONAL_DELIVERY'] ?? 0, 2);
+            $data['middle_mile'] = round($tariffBreakdown['MIDDLE_MILE'] ?? 0, 2);
+            $data['express_delivery'] = round($tariffBreakdown['EXPRESS_DELIVERY'] ?? 0, 2);
+            $data['sorting'] = round($tariffBreakdown['SORTING'] ?? (float) $cache->processing_cost, 2);
 
-            $data['fby_delivery'] = round((float) ($data['fby_delivery'] ?? $data['delivery_to_customer']), 2);
-            $data['fbs_delivery'] = round((float) ($data['fbs_delivery'] ?? $data['delivery_to_customer']), 2);
+            // Комиссия и acquiring — из кэша (уже рассчитаны калькулятором)
+            $data['referral_fee_percent'] = round((float) $cache->commission_percent, 2);
+            $data['fby_delivery'] = round($data['delivery_to_customer'] + ($tariffBreakdown['MIDDLE_MILE'] ?? 0), 2);
+            $data['fbs_delivery'] = round($data['delivery_to_customer'], 2);
             $data['return_logistics'] = round((float) $cache->return_logistics_cost, 2);
+            $data['return_processing'] = round((float) $cache->return_processing_cost, 2);
+            $data['packaging_cost'] = round((float) $cache->packaging_cost, 2);
             $data['to_settlement_account'] = round(
-                (float) ($data['to_settlement_account'] ?? ($price - (float) $cache->commission_amount - (float) $cache->acquiring_amount - (float) $cache->logistics_cost)),
+                $price - (float) $cache->commission_amount - (float) $cache->acquiring_amount - (float) $cache->logistics_cost - $expectedReturnCost - (float) $cache->storage_cost,
                 2
             );
         }
@@ -1069,6 +1253,9 @@ class UnitEconomicsCacheController extends Controller
             'yandex_market' => 'FBY',
             default => 'FBO',
         };
+        if ($marketplace === 'ozon') {
+            $validated = $this->unitEconomicsService->enrichOzonInputWithProfile($validated);
+        }
 
         try {
             $input = CalculationInput::fromArray($validated);
@@ -1490,6 +1677,18 @@ class UnitEconomicsCacheController extends Controller
         return match (strtolower($marketplace)) {
             'yandex', 'yandex_market' => 'yandex_market',
             default => strtolower($marketplace),
+        };
+    }
+
+    private function humanizeOzonMarkupReason(?string $reason, ?int $sales7Days = null): ?string
+    {
+        return match ($reason) {
+            'local_cluster' => 'Надбавка не применяется: товар продаётся в локальном кластере',
+            'fbo_lt_50_orders_7d' => 'Надбавка не применяется: за 7 дней по FBO меньше 50 заказов'
+                .($sales7Days !== null ? " ({$sales7Days})" : ''),
+            'no_markup_for_cluster' => 'Надбавка не применяется: для этого кластера ставка Ozon равна 0%',
+            'non_local_markup_applied' => 'Надбавка применяется: продажа идёт вне локального кластера',
+            default => null,
         };
     }
 }

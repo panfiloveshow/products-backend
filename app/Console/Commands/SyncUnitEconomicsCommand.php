@@ -2,12 +2,19 @@
 
 namespace App\Console\Commands;
 
+use App\Domains\Ozon\Tariffs\OzonPricingMatrix;
+use App\Models\OzonSkuDeliveryProfile;
 use App\Models\InventoryWarehouse;
 use App\Models\Product;
 use App\Models\UnitEconomics;
 use App\Services\LocalizationIndexService;
+use App\Services\Ozon\OzonOrderUnitEconomicsService;
+use App\Services\Ozon\OzonSupplyFixationService;
+use App\Services\Ozon\OzonSupplySyncService;
+use App\Services\PostingService;
 use App\Services\UnitEconomicsService;
 use Illuminate\Console\Command;
+use Illuminate\Support\Facades\Cache;
 
 class SyncUnitEconomicsCommand extends Command
 {
@@ -18,22 +25,28 @@ class SyncUnitEconomicsCommand extends Command
 
     protected $description = 'Sync unit economics from real product data';
 
-    public function handle(UnitEconomicsService $service): int
+    public function handle(
+        UnitEconomicsService $service,
+        OzonSupplyFixationService $fixationService,
+        OzonOrderUnitEconomicsService $orderUnitEconomicsService,
+        OzonSupplySyncService $supplySyncService,
+        PostingService $postingService
+    ): int
     {
         $integrationId = $this->option('integration');
         $marketplace = $this->option('marketplace');
         $syncAll = $this->option('all');
 
         if ($syncAll) {
-            return $this->syncAll($service);
+            return $this->syncAll($service, $fixationService, $orderUnitEconomicsService, $supplySyncService, $postingService);
         }
 
         if ($integrationId) {
-            return $this->syncByIntegrationId($service, (int) $integrationId);
+            return $this->syncByIntegrationId($service, $fixationService, $orderUnitEconomicsService, $supplySyncService, $postingService, (int) $integrationId);
         }
 
         if ($marketplace) {
-            return $this->syncByMarketplace($service, $marketplace);
+            return $this->syncByMarketplace($service, $fixationService, $orderUnitEconomicsService, $supplySyncService, $postingService, $marketplace);
         }
 
         $this->error('Please specify --integration=ID, --marketplace=NAME, or --all');
@@ -41,7 +54,13 @@ class SyncUnitEconomicsCommand extends Command
         return 1;
     }
 
-    private function syncAll(UnitEconomicsService $service): int
+    private function syncAll(
+        UnitEconomicsService $service,
+        OzonSupplyFixationService $fixationService,
+        OzonOrderUnitEconomicsService $orderUnitEconomicsService,
+        OzonSupplySyncService $supplySyncService,
+        PostingService $postingService
+    ): int
     {
         $integrations = Product::select('integration_id', 'marketplace')
             ->whereNotNull('integration_id')
@@ -58,7 +77,7 @@ class SyncUnitEconomicsCommand extends Command
         foreach ($integrations as $int) {
             $this->line("Syncing integration_id={$int->integration_id} ({$int->marketplace})...");
 
-            $result = $this->syncProducts($service, $int->integration_id, $int->marketplace);
+            $result = $this->syncProducts($service, $fixationService, $orderUnitEconomicsService, $supplySyncService, $postingService, $int->integration_id, $int->marketplace);
 
             $totalSynced += $result['synced'];
             $totalErrors += $result['errors'];
@@ -72,7 +91,14 @@ class SyncUnitEconomicsCommand extends Command
         return 0;
     }
 
-    private function syncByIntegrationId(UnitEconomicsService $service, int $integrationId): int
+    private function syncByIntegrationId(
+        UnitEconomicsService $service,
+        OzonSupplyFixationService $fixationService,
+        OzonOrderUnitEconomicsService $orderUnitEconomicsService,
+        OzonSupplySyncService $supplySyncService,
+        PostingService $postingService,
+        int $integrationId
+    ): int
     {
         $marketplace = Product::where('integration_id', $integrationId)->value('marketplace');
 
@@ -82,16 +108,27 @@ class SyncUnitEconomicsCommand extends Command
             return 1;
         }
 
+        if ($marketplace === 'yandex') {
+            $marketplace = 'yandex_market';
+        }
+
         $this->info("Syncing integration_id={$integrationId} ({$marketplace})...");
 
-        $result = $this->syncProducts($service, $integrationId, $marketplace);
+        $result = $this->syncProducts($service, $fixationService, $orderUnitEconomicsService, $supplySyncService, $postingService, $integrationId, $marketplace);
 
         $this->info("Synced: {$result['synced']}, Errors: {$result['errors']}");
 
         return 0;
     }
 
-    private function syncByMarketplace(UnitEconomicsService $service, string $marketplace): int
+    private function syncByMarketplace(
+        UnitEconomicsService $service,
+        OzonSupplyFixationService $fixationService,
+        OzonOrderUnitEconomicsService $orderUnitEconomicsService,
+        OzonSupplySyncService $supplySyncService,
+        PostingService $postingService,
+        string $marketplace
+    ): int
     {
         $integrations = Product::where('marketplace', $marketplace)
             ->whereNotNull('integration_id')
@@ -113,7 +150,7 @@ class SyncUnitEconomicsCommand extends Command
         foreach ($integrations as $integrationId) {
             $this->line("Syncing integration_id={$integrationId}...");
 
-            $result = $this->syncProducts($service, $integrationId, $marketplace);
+            $result = $this->syncProducts($service, $fixationService, $orderUnitEconomicsService, $supplySyncService, $postingService, $integrationId, $marketplace);
 
             $totalSynced += $result['synced'];
             $totalErrors += $result['errors'];
@@ -124,7 +161,15 @@ class SyncUnitEconomicsCommand extends Command
         return 0;
     }
 
-    private function syncProducts(UnitEconomicsService $service, int $integrationId, string $marketplace): array
+    private function syncProducts(
+        UnitEconomicsService $service,
+        OzonSupplyFixationService $fixationService,
+        OzonOrderUnitEconomicsService $orderUnitEconomicsService,
+        OzonSupplySyncService $supplySyncService,
+        PostingService $postingService,
+        int $integrationId,
+        string $marketplace
+    ): array
     {
         $products = Product::where('integration_id', $integrationId)
             ->where('marketplace', $marketplace)
@@ -202,6 +247,7 @@ class SyncUnitEconomicsCommand extends Command
             return (object) [
                 'sku' => $sku,
                 'cost_price' => $costFromSettings ?? $costFromInventory, // Берём из настроек или из inventory
+                'sales_7_days' => $items->sum('sales_7_days'),
                 'sales_30_days' => $items->sum('sales_30_days'), // Суммируем продажи по всем складам
                 'storage_cost_per_month' => $items->sum('storage_cost_per_month'), // Суммируем хранение
                 'fulfillment_type' => $actualFulfillmentType, // Схема с наибольшими остатками
@@ -209,6 +255,7 @@ class SyncUnitEconomicsCommand extends Command
                 'warehouse_coefficient' => round($warehouseCoefficient, 3),
             ];
         });
+        $ozonStockProfiles = [];
 
         // Получаем фактические затраты и индекс локализации из API (если Ozon)
         $actualCosts = [];
@@ -216,6 +263,10 @@ class SyncUnitEconomicsCommand extends Command
         $acquiringData = [];
         $redemptionData = [];
         $productPrices = []; // Актуальные цены из API (включая акционные)
+        $deliveryProfiles = [];
+        $ozonDirectSalesProfiles = [];
+        $previewFixationMap = [];
+        $orderEconomicsPreview = [];
         $manualRedemptionRate = null; // Инициализируем для всех маркетплейсов
         if ($marketplace === 'ozon') {
             try {
@@ -224,9 +275,10 @@ class SyncUnitEconomicsCommand extends Command
                 $apiKey = null;
 
                 // 1. Пробуем локальную интеграцию
-                if ($integration && ! empty($integration->credentials['client_id'])) {
-                    $clientId = $integration->credentials['client_id'];
-                    $apiKey = $integration->credentials['api_key'] ?? '';
+                $localCredentials = $this->getIntegrationCredentialsSafely($integration);
+                if (! empty($localCredentials['client_id'] ?? null)) {
+                    $clientId = $localCredentials['client_id'];
+                    $apiKey = $localCredentials['api_key'] ?? '';
                 }
 
                 // 2. Пробуем Sellico API
@@ -238,6 +290,13 @@ class SyncUnitEconomicsCommand extends Command
                         $clientId = $sellicoResult['credentials']['client_id'] ?? '';
                         $apiKey = $sellicoResult['credentials']['api_key'] ?? '';
                         $this->info('  Credentials получены из Sellico API');
+
+                        if ($integration && ! empty($clientId) && ! empty($apiKey)) {
+                            $this->persistIntegrationCredentials($integration, [
+                                'client_id' => $clientId,
+                                'api_key' => $apiKey,
+                            ]);
+                        }
                     }
                 }
 
@@ -249,6 +308,22 @@ class SyncUnitEconomicsCommand extends Command
 
                 if (! empty($clientId) && ! empty($apiKey)) {
                     $ozonService = new \App\Domains\Ozon\OzonMarketplace(['client_id' => $clientId, 'api_key' => $apiKey]);
+                    $operationalSince = now()->subDays(120)->format('Y-m-d');
+
+                    try {
+                        $suppliesSyncResult = $supplySyncService->syncForIntegration($integrationId);
+                        $this->info('  Ozon supplies synced: '.json_encode($suppliesSyncResult, JSON_UNESCAPED_UNICODE));
+                    } catch (\Throwable $supplySyncException) {
+                        $this->warn('  Не удалось синхронизировать Ozon supplies: '.$supplySyncException->getMessage());
+                    }
+
+                    try {
+                        $postingsSyncResult = $postingService->sync((string) $integrationId, null, $operationalSince);
+                        $this->info('  Ozon postings synced: '.json_encode($postingsSyncResult, JSON_UNESCAPED_UNICODE));
+                    } catch (\Throwable $postingSyncException) {
+                        $this->warn('  Не удалось синхронизировать Ozon postings: '.$postingSyncException->getMessage());
+                    }
+
                     $actualCosts = $ozonService->getActualCostsBySku();
 
                     // Получаем актуальные цены (включая акционные marketing_seller_price)
@@ -262,6 +337,31 @@ class SyncUnitEconomicsCommand extends Command
                     foreach ($exampleSkus as $exSku) {
                         $ex = $promotionExamples[$exSku];
                         $this->info("    Пример акции: {$exSku} - базовая: {$ex['price']}₽, акционная: {$ex['actual_price']}₽ (-{$ex['promotion_discount']}%)");
+                    }
+
+                    try {
+                        $ozonDirectSalesProfiles = $this->mergeOzonSalesByWarehouse(
+                            $ozonService->getSalesBySkuAndWarehouse(28),
+                            $ozonService->getSalesBySkuAndWarehouseFbs(28)
+                        );
+                        $this->info('  Прямые продажи по складам SKU: '.count($ozonDirectSalesProfiles));
+                    } catch (\Throwable $salesByWarehouseException) {
+                        $this->warn('  Не удалось получить прямые продажи по складам: '.$salesByWarehouseException->getMessage());
+                        $ozonDirectSalesProfiles = [];
+                    }
+
+                    $ozonStockProfiles = $this->buildOzonStockProfiles($inventoryRaw, $ozonDirectSalesProfiles);
+
+                    try {
+                        $deliveryAnalyticsApi = new \App\Domains\Ozon\Api\DeliveryAnalyticsApi($ozonService->api());
+                        $deliveryProfiles = $this->buildOzonDeliveryProfiles(
+                            $deliveryAnalyticsApi->getSupplyRecommendations([], 'ALL', 'EIGHT_WEEKS'),
+                            $ozonStockProfiles
+                        );
+                        $this->info('  Профили доставки SKU: '.count($deliveryProfiles));
+                    } catch (\Throwable $deliveryException) {
+                        $this->warn('  Не удалось получить профили доставки SKU: '.$deliveryException->getMessage());
+                        $deliveryProfiles = [];
                     }
 
                     // Получаем индекс локализации (среднее время доставки) из API с TTL 24ч
@@ -295,12 +395,40 @@ class SyncUnitEconomicsCommand extends Command
                     }
 
                     // === ПРОВЕРКА PREMIUM СТАТУСА (TTL 24ч) ===
-                    $isPremium = $integration?->is_premium ?? null;
+                    $storedPremium = $integration?->is_premium;
+                    $isPremium = $storedPremium ?? null;
                     $manualRedemptionRate = $integration?->manual_redemption_rate ?? null;
 
-                    if ($integration && $integration->needsPremiumCheck()) {
+                    if ($integration && ($storedPremium === null || $integration->needsPremiumCheck())) {
                         $premiumStatus = $ozonService->checkPremiumStatus();
-                        $isPremium = $premiumStatus['is_premium'] ?? false;
+                        $detectedPremium = $premiumStatus['is_premium'] ?? null;
+                        $reason = (string) ($premiumStatus['reason'] ?? '');
+
+                        if ($storedPremium === true && $detectedPremium !== true) {
+                            // Track consecutive non-premium detections
+                            $nonPremiumCount = (int) ($integration->non_premium_detection_count ?? 0) + 1;
+                            $integration->update(['non_premium_detection_count' => $nonPremiumCount]);
+
+                            if ($nonPremiumCount >= 3) {
+                                // Downgrade after 3 consecutive non-premium detections
+                                $isPremium = false;
+                                $integration->update([
+                                    'is_premium' => false,
+                                    'non_premium_detection_count' => 0,
+                                ]);
+                                $this->warn("Integration {$integrationId}: Premium downgraded after {$nonPremiumCount} consecutive non-premium API results");
+                            } else {
+                                $isPremium = true;
+                                $this->info("Integration {$integrationId}: Preserving Premium status (non-premium detection {$nonPremiumCount}/3)");
+                            }
+                        } else {
+                            $isPremium = $detectedPremium ?? ($storedPremium ?? false);
+
+                            // Reset non-premium counter when premium IS detected
+                            if ($detectedPremium === true && ($integration->non_premium_detection_count ?? 0) > 0) {
+                                $integration->update(['non_premium_detection_count' => 0]);
+                            }
+                        }
 
                         // Сохраняем статус в интеграцию (если она существует в локальной БД)
                         if ($integration) {
@@ -310,9 +438,9 @@ class SyncUnitEconomicsCommand extends Command
                             ]);
                         }
 
-                        $this->info('  Premium статус: '.($isPremium ? '✓ Premium (авто-выкуп)' : '✗ Не Premium (ручной ввод)'));
+                        $this->info('  Premium статус: '.($isPremium ? '✓ Premium (точная аналитика)' : '✗ Не Premium (fallback-модель)'));
                     } else {
-                        $this->info('  Premium статус: '.($isPremium ? '✓ Premium' : '✗ Не Premium').' (кэш)');
+                        $this->info('  Premium статус: '.($isPremium ? '✓ Premium' : '✗ Не Premium').' (из сохранённого статуса)');
                     }
 
                     // === ПОЛУЧЕНИЕ ПРОЦЕНТА ВЫКУПА ===
@@ -400,6 +528,11 @@ class SyncUnitEconomicsCommand extends Command
             } catch (\Exception $e) {
                 $this->warn("  Не удалось получить данные из API: {$e->getMessage()}");
             }
+
+            $fixationService->syncForIntegration($integrationId);
+            $previewFixationMap = $fixationService->getPreviewFixationMap($integrationId, $ozonStockProfiles);
+            $orderUnitEconomicsService->syncForIntegration($integrationId);
+            $orderEconomicsPreview = $orderUnitEconomicsService->summarizeForPreview($integrationId);
         }
 
         // === WILDBERRIES API ===
@@ -517,30 +650,80 @@ class SyncUnitEconomicsCommand extends Command
                 $yandexCampaignId = null;
                 $yandexBusinessId = null;
 
+                // Хелпер: извлечь Yandex credentials из массива (Sellico может хранить api_key+client_id)
+                $extractYandexCreds = function (array $creds) use (&$yandexToken, &$yandexCampaignId, &$yandexBusinessId): bool {
+                    $token = $creds['token'] ?? $creds['api_key'] ?? null;
+                    $campaignId = $creds['campaign_id'] ?? $creds['client_id'] ?? null;
+                    $businessId = $creds['business_id'] ?? null;
+                    if (! empty($token) && ! empty($campaignId)) {
+                        $yandexToken = $token;
+                        $yandexCampaignId = $campaignId;
+                        $yandexBusinessId = $businessId;
+                        return true;
+                    }
+                    return false;
+                };
+
                 // 1. Пробуем локальную интеграцию
-                if ($integration && ! empty($integration->credentials['token'])) {
-                    $yandexToken = $integration->credentials['token'];
-                    $yandexCampaignId = $integration->credentials['campaign_id'] ?? $integration->credentials['client_id'] ?? null;
-                    $yandexBusinessId = $integration->credentials['business_id'] ?? null;
+                if ($integration) {
+                    $extractYandexCreds($integration->credentials ?? []);
                 }
 
-                // 2. Пробуем Sellico API
+                // 2. Пробуем Sellico API (сервис-аккаунт)
                 if (empty($yandexToken)) {
                     $sellicoService = new \App\Services\SellicoApiService;
+                    \Illuminate\Support\Facades\Cache::forget("sellico_integration_{$integrationId}");
                     $sellicoResult = $sellicoService->getIntegrationById($integrationId);
 
                     if ($sellicoResult['success'] && ! empty($sellicoResult['credentials'])) {
-                        $yandexToken = $sellicoResult['credentials']['token'] ?? '';
-                        $yandexCampaignId = $sellicoResult['credentials']['campaign_id'] ?? '';
-                        $yandexBusinessId = $sellicoResult['credentials']['business_id'] ?? null;
-                        $this->info('  Yandex Credentials получены из Sellico API');
+                        if ($extractYandexCreds($sellicoResult['credentials'])) {
+                            $this->info('  Yandex Credentials получены из Sellico API (service account)');
+                        }
+                    }
+                }
+
+                // 3. Пробуем кешированный токен пользователя (из веб-запросов через middleware)
+                if (empty($yandexToken)) {
+                    $workspaceId = $integration?->work_space_id;
+                    if ($workspaceId) {
+                        $cachedUserToken = \Illuminate\Support\Facades\Cache::get("workspace_user_token:{$workspaceId}");
+                        if ($cachedUserToken) {
+                            $sellicoService2 = new \App\Services\SellicoApiService;
+                            $sellicoService2->setAccessToken($cachedUserToken);
+                            \Illuminate\Support\Facades\Cache::forget("sellico_integration_{$integrationId}");
+                            $sellicoResult2 = $sellicoService2->getIntegrationById($integrationId);
+
+                            if ($sellicoResult2['success'] && ! empty($sellicoResult2['credentials'])) {
+                                if ($extractYandexCreds($sellicoResult2['credentials'])) {
+                                    $this->info("  Yandex Credentials получены через workspace user token (workspace={$workspaceId})");
+                                }
+                            }
+                        } else {
+                            $this->warn("  Нет кешированного токена пользователя для workspace={$workspaceId}");
+                        }
+                    }
+                }
+
+                // Сохраняем credentials локально для следующих синков (без Sellico)
+                if (! empty($yandexToken) && ! empty($yandexCampaignId) && $integration) {
+                    $existingCreds = $integration->credentials ?? [];
+                    $existingKey = $existingCreds['token'] ?? $existingCreds['api_key'] ?? null;
+                    $existingCampaign = $existingCreds['campaign_id'] ?? $existingCreds['client_id'] ?? null;
+                    if (empty($existingKey) || empty($existingCampaign)) {
+                        $integration->credentials = array_merge($existingCreds, [
+                            'api_key'     => $yandexToken,
+                            'client_id'   => $yandexCampaignId,
+                            'business_id' => $yandexBusinessId,
+                        ]);
+                        $integration->save();
+                        $this->info('  Yandex Credentials сохранены локально');
                     }
                 }
 
                 if (! empty($yandexToken) && ! empty($yandexCampaignId)) {
                     $yandexService = new \App\Domains\YandexMarket\YandexMarketMarketplace([
-                        'token' => $yandexToken,
-                        'campaign_id' => $yandexCampaignId,
+                        'api_key'     => $yandexToken,
+                        'client_id'   => $yandexCampaignId,
                         'business_id' => $yandexBusinessId,
                     ]);
 
@@ -585,7 +768,7 @@ class SyncUnitEconomicsCommand extends Command
         // Схемы работы по маркетплейсам
         $fulfillmentTypes = match ($marketplace) {
             'ozon' => ['FBO', 'FBS', 'RFBS', 'EXPRESS'],
-            'wildberries' => ['FBO', 'FBS', 'DBS'],
+            'wildberries' => ['FBO', 'FBS', 'DBS', 'EDBS', 'DBW'],
             'yandex', 'yandex_market' => ['FBY', 'FBS', 'DBS', 'EXPRESS'],
             default => [null],
         };
@@ -627,6 +810,24 @@ class SyncUnitEconomicsCommand extends Command
                 };
                 $actualFulfillmentType = strtoupper($inventory?->fulfillment_type ?? $defaultFulfillmentType);
 
+                if ($marketplace === 'ozon') {
+                    $this->persistOzonDeliveryProfile(
+                        $integrationId,
+                        $product,
+                        $deliveryProfiles[$product->sku] ?? null
+                    );
+                    $fixationService->appendPreviewFixationToProduct(
+                        $product,
+                        $previewFixationMap[$product->sku] ?? null
+                    );
+                    if (!empty($orderEconomicsPreview[$product->sku]['order_economics_summary'] ?? null)) {
+                        $currentOzonData = is_array($product->ozon_data ?? null) ? $product->ozon_data : [];
+                        $currentOzonData['order_economics_summary'] = $orderEconomicsPreview[$product->sku]['order_economics_summary'];
+                        $product->forceFill(['ozon_data' => $currentOzonData])->saveQuietly();
+                        $product->setAttribute('ozon_data', $currentOzonData);
+                    }
+                }
+
                 // Создаём/обновляем записи для ВСЕХ схем работы (для предварительного расчёта)
                 foreach ($fulfillmentTypes as $fulfillmentType) {
                     // WB: получаем СПП по nmId товара
@@ -658,6 +859,7 @@ class SyncUnitEconomicsCommand extends Command
                         $productWbLocalization,
                         $wbCommissionsData,
                         $productPriceData, // Ozon: актуальные цены из API
+                        $deliveryProfiles[$product->sku] ?? null,
                         $productYandexPrice,
                         $productYandexTariffs,
                         $productYandexSales
@@ -800,8 +1002,13 @@ class SyncUnitEconomicsCommand extends Command
 
         // Пересчитываем кэш юнит-экономики после синхронизации
         if ($synced > 0) {
-            \App\Jobs\RecalculateUnitEconomicsCacheJob::dispatch($integrationId);
-            $this->info("  Запущен пересчёт кэша для integration_id={$integrationId}");
+            $lockKey = "ue_recalculate_{$integrationId}";
+            if (Cache::lock($lockKey, 900)->get()) {
+                \App\Jobs\RecalculateUnitEconomicsCacheJob::dispatch($integrationId);
+                $this->info("  Запущен пересчёт кэша для integration_id={$integrationId}");
+            } else {
+                $this->info("  Пересчёт кэша для integration_id={$integrationId} уже выполняется, пропускаем");
+            }
         }
 
         return ['synced' => $synced, 'errors' => $errors];
@@ -826,6 +1033,7 @@ class SyncUnitEconomicsCommand extends Command
         ?array $wbLocalizationData = null,
         ?array $wbCommissionsData = null,
         ?array $productPriceData = null,
+        ?array $ozonDeliveryProfile = null,
         ?array $productYandexPrice = null,
         ?array $productYandexTariffs = null,
         ?array $productYandexSales = null
@@ -852,6 +1060,7 @@ class SyncUnitEconomicsCommand extends Command
 
         $sales7Days = match ($marketplace) {
             'yandex', 'yandex_market' => $productYandexSales['sales_7_days'] ?? null,
+            'ozon' => $inventory?->sales_7_days ?? null,
             default => $wbSalesData['sales_7_days'] ?? null,
         };
         $sales14Days = match ($marketplace) {
@@ -1066,17 +1275,6 @@ class SyncUnitEconomicsCommand extends Command
                     : strtoupper($inventory?->fulfillment_type ?? 'FBO');
                 $data['fulfillment_type'] = $fulfillmentType;
 
-                // === ИНДЕКС ЛОКАЛИЗАЦИИ (из API или настроек интеграции) ===
-                // Приоритет: API > настройки интеграции > дефолт
-                if ($localizationIndex && isset($localizationIndex['average_delivery_time'])) {
-                    $data['avg_delivery_time_hours'] = $localizationIndex['average_delivery_time'];
-                    $data['localization_index'] = $localizationIndex['tariff_coefficient'];
-                    $data['localization_additional_percent'] = $localizationIndex['additional_fee_percent'];
-                    $data['localization_status'] = $localizationIndex['tariff_status'];
-                } else {
-                    $data['avg_delivery_time_hours'] = $integrationSettings['avg_delivery_time_hours'] ?? 29;
-                }
-
                 // === ГАБАРИТЫ ИЗ ХАРАКТЕРИСТИК ===
                 $characteristics = $product->characteristics ?? [];
                 $length = $this->extractNumericValue($characteristics['Глубина упаковки'] ?? null) ?? 100; // мм
@@ -1093,6 +1291,94 @@ class SyncUnitEconomicsCommand extends Command
 
                 // Фактический вес в кг
                 $data['actual_weight'] = round($weight / 1000, 2);
+
+                // === НОВАЯ МОДЕЛЬ ТАРИФОВ Ozon (route/locality + price segment) ===
+                $data['category_id'] = $ozonData['category_name']
+                    ?? $ozonData['category']
+                    ?? $product->category
+                    ?? 'default';
+                $data['route_key'] = $inventory?->route_key
+                    ?? $ozonDeliveryProfile['route_key']
+                    ?? $ozonData['route_key']
+                    ?? ($ozonData['active_fixation']['shipping_cluster_id'] ?? null)
+                    ?? $integrationSettings['ozon_route_key']
+                    ?? $integrationSettings['route_key']
+                    ?? null;
+                $data['route_label'] = $inventory?->route_label
+                    ?? $ozonDeliveryProfile['route_label']
+                    ?? $ozonData['route_label']
+                    ?? ($ozonData['active_fixation']['shipping_cluster_name'] ?? null)
+                    ?? $integrationSettings['ozon_route_label']
+                    ?? $integrationSettings['route_label']
+                    ?? null;
+                $data['shipping_cluster_id'] = $ozonData['active_fixation']['shipping_cluster_id'] ?? null;
+                $data['shipping_cluster_name'] = $ozonData['active_fixation']['shipping_cluster_name'] ?? null;
+                $data['fixation_applied'] = $ozonData['active_fixation']['fixation_applied'] ?? null;
+                $data['fixation_id'] = $ozonData['active_fixation']['fixation_id'] ?? null;
+                $data['fixation_base_date'] = $ozonData['active_fixation']['fixation_base_date'] ?? null;
+                $data['fixed_until'] = $ozonData['active_fixation']['fixed_until'] ?? null;
+                $data['tariff_version_used'] = $ozonData['active_fixation']['tariff_version_used'] ?? null;
+                $data['markup_version_used'] = $ozonData['active_fixation']['markup_version_used'] ?? null;
+                $data['calculation_mode'] = $ozonData['active_fixation']['calculation_mode'] ?? null;
+                $data['is_local_sale'] = $ozonDeliveryProfile['is_local_sale']
+                    ?? $ozonData['is_local_sale']
+                    ?? $inventory?->is_local_sale
+                    ?? null;
+                // Stale $ozonData['non_local_markup_percent'] removed from fallback chain —
+                // it may contain persisted data from a previous sync and cause incorrect calculations.
+                // Prefer delivery profile or inventory data; fall back to null rather than stale values.
+                $data['non_local_markup_percent'] = $ozonDeliveryProfile['weighted_non_local_markup_percent']
+                    ?? $ozonDeliveryProfile['non_local_markup_percent']
+                    ?? $inventory?->non_local_markup_percent
+                    ?? null;
+                $data['tariff_source'] = $inventory?->tariff_source
+                    ?? $ozonData['tariff_source']
+                    ?? null;
+                $data['tariff_effective_from'] = $inventory?->tariff_effective_from
+                    ?? $ozonData['tariff_effective_from']
+                    ?? null;
+                $data['price_segment'] = $inventory?->price_segment
+                    ?? $ozonData['price_segment']
+                    ?? null;
+                $data['route_resolution_status'] = $ozonDeliveryProfile['route_resolution_status']
+                    ?? $ozonData['route_resolution_status']
+                    ?? null;
+                $data['locality_resolution_status'] = $ozonDeliveryProfile['locality_resolution_status']
+                    ?? $ozonData['locality_resolution_status']
+                    ?? null;
+                $data['calculation_confidence'] = $ozonDeliveryProfile['calculation_confidence']
+                    ?? $ozonData['calculation_confidence']
+                    ?? null;
+                $data['profile_source'] = $ozonDeliveryProfile['profile_source']
+                    ?? $ozonData['profile_source']
+                    ?? null;
+                $data['dominant_cluster_id'] = $ozonDeliveryProfile['dominant_cluster_id']
+                    ?? $ozonData['dominant_cluster_id']
+                    ?? null;
+                $data['dominant_cluster_share'] = $ozonDeliveryProfile['dominant_cluster_share']
+                    ?? $ozonData['dominant_cluster_share']
+                    ?? null;
+                $data['expected_locality_rate'] = $ozonDeliveryProfile['expected_locality_rate']
+                    ?? $ozonData['expected_locality_rate']
+                    ?? null;
+                $data['weighted_non_local_markup_percent'] = $ozonDeliveryProfile['weighted_non_local_markup_percent']
+                    ?? $ozonData['weighted_non_local_markup_percent']
+                    ?? null;
+                $data['weighted_logistics_cost'] = $ozonDeliveryProfile['weighted_logistics_cost']
+                    ?? $ozonData['weighted_logistics_cost']
+                    ?? null;
+                $data['clusters_summary'] = $ozonDeliveryProfile['clusters_summary']
+                    ?? $ozonData['clusters_summary']
+                    ?? [];
+                $data['stock_profile'] = $ozonDeliveryProfile['stock_profile']
+                    ?? $ozonData['stock_profile']
+                    ?? [];
+                $data['markup_rule_reason'] = $ozonDeliveryProfile['markup_rule_reason']
+                    ?? $ozonData['markup_rule_reason']
+                    ?? null;
+                $data['markup_rule_reason_label'] = $ozonData['markup_rule_reason_label']
+                    ?? null;
+                $data['order_economics_summary'] = $ozonData['order_economics_summary'] ?? [];
 
                 // === КОМИССИИ (приоритет: фактические > API цен > ozon_data > дефолт) ===
                 $schemaKey = strtolower($fulfillmentType);
@@ -1188,7 +1474,10 @@ class SyncUnitEconomicsCommand extends Command
 
                 // === СВОЯ ЛОГИСТИКА (realFBS/DBS) ===
                 $data['own_delivery_cost'] = $inventory?->own_delivery_cost ?? 200;
-                $data['ozon_compensation'] = $inventory?->ozon_compensation ?? 0;
+                $data['marketplace_compensation'] = $inventory?->ozon_compensation
+                    ?? $inventory?->marketplace_compensation
+                    ?? 0;
+                $data['ozon_compensation'] = $data['marketplace_compensation'];
 
                 // === АКЦИИ (marketing_seller_price) ===
                 // Акция определяется ТОЛЬКО через API: marketing_seller_price < price
@@ -1238,7 +1527,18 @@ class SyncUnitEconomicsCommand extends Command
                 $data['volume_weight'] = round($volumeLiters / 5, 2);
                 $data['actual_weight'] = round($weightG / 1000, 2);
                 $data['category_id'] = $yandexData['categoryId'] ?? $product->category ?? 'default';
-                $data['redemption_rate'] = $manualRedemptionRate ?? ($yandexData['redemption_rate'] ?? 95);
+                // Приоритет % выкупа: ручной → из API продаж → дефолт
+                $apiRedemptionRate = $productYandexSales['redemption_rate'] ?? null;
+                if ($manualRedemptionRate !== null) {
+                    $data['redemption_rate'] = $manualRedemptionRate;
+                    $data['redemption_source'] = 'manual';
+                } elseif ($apiRedemptionRate !== null) {
+                    $data['redemption_rate'] = $apiRedemptionRate;
+                    $data['redemption_source'] = 'api';
+                } else {
+                    $data['redemption_rate'] = $yandexData['redemption_rate'] ?? 95;
+                    $data['redemption_source'] = 'default';
+                }
                 $data['tariff_breakdown'] = $productYandexTariffs ?? [];
 
                 $normalizedTariffs = $this->normalizeYandexTariffBreakdown($data['tariff_breakdown']);
@@ -1265,14 +1565,11 @@ class SyncUnitEconomicsCommand extends Command
 
         if ($marketplace === 'ozon') {
             $salesCount = max(1, $data['sales_count'] ?? 1);
-
-            // Индекс локализации применяется ТОЛЬКО к FBO (склад Ozon)
             $fulfillmentType = $calculated['fulfillment_type'] ?? $data['fulfillment_type'] ?? 'FBO';
-            $isFbo = strtoupper($fulfillmentType) === 'FBO';
 
             $detailed = [
                 // Комиссия
-                'commission_percent' => $calculated['commission_percent'] ?? $data['commission_percent'] ?? null,
+                'commission_percent' => $calculated['sales_fee_percent'] ?? $calculated['commission_percent'] ?? $data['commission_percent'] ?? null,
                 'commission_amount' => $calculated['commission_amount'] ?? null,
 
                 // Габариты
@@ -1280,19 +1577,40 @@ class SyncUnitEconomicsCommand extends Command
                 'volume_weight' => $calculated['volume_weight'] ?? $data['volume_weight'] ?? null,
                 'actual_weight' => $calculated['actual_weight'] ?? $data['actual_weight'] ?? null,
 
-                // Логистика (декабрь 2025) + индекс локализации из API
+                // Логистика и объяснимые тарифные метаданные
                 'fulfillment_type' => $fulfillmentType,
-                'avg_delivery_time_hours' => $isFbo ? ($data['avg_delivery_time_hours'] ?? 29) : null,
-                'localization_index' => $isFbo ? ($data['localization_index'] ?? null) : null,
-                'tariff_status' => $isFbo ? ($data['localization_status'] ?? 'UNKNOWN') : null,
+                'avg_delivery_time_hours' => null,
+                'localization_index' => null,
+                'tariff_status' => null,
                 'base_logistics_cost' => $calculated['base_logistics_cost'] ?? null,
-                'logistics_coefficient' => $isFbo ? ($data['localization_index'] ?? $calculated['logistics_coefficient'] ?? 1.0) : 1.0,
-                'additional_commission_percent' => $isFbo ? ($data['localization_additional_percent'] ?? $calculated['additional_commission_percent'] ?? 0) : 0,
-                'additional_commission_amount' => $calculated['additional_commission_amount'] ?? null,
-                'logistics_with_coefficient' => $calculated['logistics_with_coefficient'] ?? null,
+                'logistics_coefficient' => 1.0,
+                'additional_commission_percent' => 0.0,
+                'additional_commission_amount' => $calculated['non_local_markup_amount'] ?? null,
+                'logistics_with_coefficient' => $calculated['logistics_cost'] ?? null,
                 'logistics_cost' => $calculated['logistics_cost'] ?? null,
                 'processing_cost' => $calculated['processing_cost'] ?? null,
                 'last_mile_cost' => $calculated['last_mile_cost'] ?? null,
+                'tariff_version' => $calculated['tariff_version'] ?? null,
+                'tariff_effective_from' => $calculated['tariff_effective_from'] ?? $data['tariff_effective_from'] ?? null,
+                'tariff_source' => $calculated['tariff_source'] ?? $data['tariff_source'] ?? null,
+                'route_key' => $calculated['route_key'] ?? $data['route_key'] ?? null,
+                'route_label' => $calculated['route_label'] ?? $data['route_label'] ?? null,
+                'is_local_sale' => $calculated['is_local_sale'] ?? $data['is_local_sale'] ?? null,
+                'non_local_markup_percent' => $calculated['non_local_markup_percent'] ?? $data['non_local_markup_percent'] ?? 0,
+                'price_segment' => $calculated['price_segment'] ?? $data['price_segment'] ?? null,
+                'sales_fee_percent' => $calculated['sales_fee_percent'] ?? $calculated['commission_percent'] ?? $data['commission_percent'] ?? null,
+                'route_resolution_status' => $calculated['route_resolution_status'] ?? $data['route_resolution_status'] ?? 'unknown',
+                'locality_resolution_status' => $calculated['locality_resolution_status'] ?? $data['locality_resolution_status'] ?? 'unknown',
+                'calculation_confidence' => $calculated['calculation_confidence'] ?? $data['calculation_confidence'] ?? 'low',
+                'profile_source' => $calculated['profile_source'] ?? $data['profile_source'] ?? null,
+                'dominant_cluster_id' => $calculated['dominant_cluster_id'] ?? $data['dominant_cluster_id'] ?? null,
+                'dominant_cluster_share' => $calculated['dominant_cluster_share'] ?? $data['dominant_cluster_share'] ?? null,
+                'expected_locality_rate' => $calculated['expected_locality_rate'] ?? $data['expected_locality_rate'] ?? null,
+                'weighted_non_local_markup_percent' => $calculated['weighted_non_local_markup_percent'] ?? $data['weighted_non_local_markup_percent'] ?? null,
+                'profit_min' => $calculated['profit_min'] ?? null,
+                'profit_base' => $calculated['profit_base'] ?? null,
+                'profit_max' => $calculated['profit_max'] ?? null,
+                'clusters_summary' => $calculated['clusters_summary'] ?? $data['clusters_summary'] ?? [],
 
                 // Хранение
                 'storage_cost' => $calculated['storage_cost'] ?? $data['storage_cost'] ?? null,
@@ -1316,11 +1634,12 @@ class SyncUnitEconomicsCommand extends Command
 
                 // Своя логистика (realFBS/DBS)
                 'own_delivery_cost' => $calculated['own_delivery_cost'] ?? $data['own_delivery_cost'] ?? null,
-                'ozon_compensation' => $calculated['ozon_compensation'] ?? $data['ozon_compensation'] ?? null,
+                'ozon_compensation' => $calculated['marketplace_compensation'] ?? $calculated['ozon_compensation'] ?? $data['ozon_compensation'] ?? null,
+                'marketplace_compensation' => $calculated['marketplace_compensation'] ?? $data['marketplace_compensation'] ?? null,
 
                 // === СТОИМОСТЬ ЗА ЕДИНИЦУ ===
                 'logistics_per_unit' => $calculated['base_logistics_cost'] ?? null,
-                'last_mile_per_unit' => 25.00,
+                'last_mile_per_unit' => $calculated['last_mile_cost'] ?? null,
                 'commission_per_unit' => isset($calculated['commission_amount'])
                     ? round($calculated['commission_amount'] / $salesCount, 2)
                     : null,
@@ -1470,6 +1789,7 @@ class SyncUnitEconomicsCommand extends Command
 
                 // === % ВЫКУПА ===
                 'redemption_rate' => $calculated['redemption_rate'] ?? $data['redemption_rate'] ?? 95,
+                'redemption_source' => $data['redemption_source'] ?? 'default',
 
                 // === ХРАНЕНИЕ ===
                 'storage_cost' => $calculated['storage_cost'] ?? null,
@@ -1477,8 +1797,12 @@ class SyncUnitEconomicsCommand extends Command
 
                 // === ВОЗВРАТЫ ===
                 'return_logistics_cost' => $calculated['return_logistics_cost'] ?? null,
+                'return_processing_cost' => $calculated['return_processing_cost'] ?? null,
                 'expected_return_cost' => $calculated['expected_return_cost'] ?? null,
                 'effective_logistics' => $calculated['effective_logistics'] ?? null,
+
+                // === УПАКОВКА ===
+                'packaging_cost' => $calculated['packaging_cost'] ?? $data['packaging_cost'] ?? null,
 
                 // === НА РС ===
                 'advertising_cost' => $calculated['advertising_cost'] ?? $data['advertising_cost'] ?? 0,
@@ -1608,6 +1932,485 @@ class SyncUnitEconomicsCommand extends Command
         }
 
         return $normalized;
+    }
+
+    private function buildOzonDeliveryProfiles(array $recommendations, array $stockProfiles = []): array
+    {
+        $profiles = [];
+        $pricing = new OzonPricingMatrix();
+        $clusterDirectory = \App\Models\OzonWarehouseCluster::query()
+            ->select('cluster_id', 'cluster_name', 'region')
+            ->get()
+            ->groupBy(fn ($item) => (string) $item->cluster_id)
+            ->map(function ($rows): array {
+                $first = $rows->first();
+
+                return [
+                    'cluster_name' => $first?->cluster_name,
+                    'region' => $first?->region,
+                ];
+            })
+            ->all();
+
+        foreach ($recommendations as $item) {
+            $sku = (string) ($item['sku'] ?? '');
+            if ($sku === '') {
+                continue;
+            }
+
+            $clusters = array_values($item['clusters'] ?? []);
+            $stockProfile = $stockProfiles[$sku] ?? [];
+            $stockClusterIds = array_map('strval', array_keys($stockProfile['cluster_distribution'] ?? []));
+            $dominantClusterId = null;
+            $dominantClusterShare = 0.0;
+            $expectedLocalityRate = null;
+            $localDemandShare = 0.0;
+            $demandShareTotal = 0.0;
+            $weightedLogisticsCost = null;
+            $weightedNonLocalMarkupPercent = 0.0;
+            $hasWeightedMarkup = false;
+            $clustersSummary = [];
+            $sales7Days = (int) ($stockProfile['total_sales_7_days'] ?? 0);
+            $markupAllowed = (string) ($item['delivery_schema'] ?? 'ALL') !== 'FBO' || $sales7Days >= 50;
+            $markupRuleReason = $markupAllowed ? null : 'fbo_lt_50_orders_7d';
+
+            foreach ($clusters as $cluster) {
+                $share = (float) ($cluster['orders_percent'] ?? 0);
+                if ($share > $dominantClusterShare) {
+                    $dominantClusterShare = $share;
+                    $dominantClusterId = (string) ($cluster['cluster_id'] ?? '');
+                }
+
+                if ($share <= 0) {
+                    continue;
+                }
+
+                $demandShareTotal += $share;
+
+                $clusterId = (string) ($cluster['cluster_id'] ?? '');
+                $isLocalCluster = $clusterId !== '' && in_array($clusterId, $stockClusterIds, true);
+                if ($isLocalCluster) {
+                    $localDemandShare += $share;
+                }
+
+                $clusterMeta = $clusterDirectory[$clusterId] ?? [];
+                $clusterName = $cluster['cluster_name'] ?? $clusterMeta['cluster_name'] ?? "Кластер {$clusterId}";
+                $clusterRegion = $cluster['region'] ?? $clusterMeta['region'] ?? null;
+                $route = $pricing->resolveRoute(null, $clusterName);
+                $clusterMarkupPercent = $pricing->resolveDestinationMarkupPercent($clusterName);
+                $effectiveClusterMarkupPercent = (!$markupAllowed || $isLocalCluster) ? 0.0 : $clusterMarkupPercent;
+                $markupReason = !$markupAllowed
+                    ? $markupRuleReason
+                    : ($isLocalCluster ? 'local_cluster' : ($clusterMarkupPercent > 0 ? 'non_local_markup_applied' : 'no_markup_for_cluster'));
+
+                if ($stockClusterIds !== []) {
+                    $weightedNonLocalMarkupPercent += ($share / 100) * $effectiveClusterMarkupPercent;
+                    $hasWeightedMarkup = true;
+                }
+                $clustersSummary[] = [
+                    'cluster_id' => $clusterId !== '' ? $clusterId : null,
+                    'cluster_name' => $clusterName,
+                    'region' => $clusterRegion,
+                    'orders_count' => $cluster['orders_count'] ?? 0,
+                    'orders_percent' => $share,
+                    'delivery_time_fbo' => $cluster['delivery_time_fbo'] ?? null,
+                    'delivery_time_fbs' => $cluster['delivery_time_fbs'] ?? null,
+                    'is_local_cluster' => $isLocalCluster,
+                    'route_key' => $route['route_key'] ?? null,
+                    'route_label' => $route['route_label'] ?? null,
+                    'non_local_markup_percent' => $clusterMarkupPercent,
+                    'effective_markup_percent' => $effectiveClusterMarkupPercent,
+                    'markup_reason' => $markupReason,
+                ];
+            }
+
+            if ($stockClusterIds !== [] && $demandShareTotal > 0) {
+                $expectedLocalityRate = round(min(100.0, $localDemandShare), 2);
+            }
+
+            if ($clusters !== []) {
+                $weightedLogisticsCost = round($this->estimateWeightedLogisticsCost(
+                    (string) ($item['delivery_schema'] ?? 'ALL'),
+                    $clusters
+                ), 2);
+            }
+
+            $isSingleDemandCluster = count(array_filter($clusters, fn (array $cluster): bool => (float) ($cluster['orders_percent'] ?? 0) > 0)) === 1;
+            $isSingleStockCluster = count($stockClusterIds) === 1;
+            $localityResolved = $isSingleDemandCluster && $isSingleStockCluster;
+            $routeResolutionStatus = !empty($stockProfile['dominant_cluster_id'])
+                ? 'resolved'
+                : (!empty($clusters) ? 'estimated' : 'unknown');
+            $localityResolutionStatus = $localityResolved
+                ? 'resolved'
+                : (($expectedLocalityRate !== null || !empty($clusters)) ? 'estimated' : 'unknown');
+            $calculationConfidence = match (true) {
+                $routeResolutionStatus === 'resolved' && $dominantClusterShare >= 70 => 'high',
+                $routeResolutionStatus === 'resolved' && $dominantClusterShare >= 45 => 'medium',
+                $dominantClusterShare >= 70 => 'medium',
+                !empty($clusters) => 'low',
+                default => 'low',
+            };
+
+            $profiles[$sku] = [
+                'route_key' => $stockProfile['route_key'] ?? null,
+                'route_label' => $stockProfile['route_label'] ?? null,
+                'route_resolution_status' => $routeResolutionStatus,
+                'locality_resolution_status' => $localityResolutionStatus,
+                'calculation_confidence' => $calculationConfidence,
+                'profile_source' => 'delivery_analytics',
+                'dominant_cluster_id' => $dominantClusterId ?: null,
+                'dominant_cluster_share' => $dominantClusterShare > 0 ? round($dominantClusterShare, 2) : null,
+                'expected_locality_rate' => $expectedLocalityRate,
+                'weighted_non_local_markup_percent' => $hasWeightedMarkup ? round($weightedNonLocalMarkupPercent, 2) : null,
+                'weighted_logistics_cost' => $weightedLogisticsCost,
+                'markup_allowed' => $markupAllowed,
+                'markup_rule_reason' => $markupRuleReason,
+                'sales_7_days' => $sales7Days,
+                'is_local_sale' => $localityResolved
+                    ? ($expectedLocalityRate !== null ? $expectedLocalityRate >= 100.0 : null)
+                    : null,
+                'clusters_summary' => $clustersSummary,
+                'stock_profile' => $stockProfile['stock_profile'] ?? [],
+                'sales_profile' => $stockProfile['sales_profile'] ?? [],
+                'route_details' => [
+                    'stock_clusters' => $stockProfile['stock_profile'] ?? [],
+                    'sales_clusters' => $stockProfile['sales_profile'] ?? [],
+                    'demand_clusters' => $clustersSummary,
+                ],
+            ];
+        }
+
+        return $profiles;
+    }
+
+    private function buildOzonStockProfiles(\Illuminate\Support\Collection $inventoryRaw, array $directSalesByWarehouse = []): array
+    {
+        $profiles = [];
+
+        // Pre-load all warehouse clusters to avoid N*M queries per SKU
+        $warehouseClusterMap = \App\Models\OzonWarehouseCluster::all()
+            ->keyBy(fn($c) => $c->warehouse_name_normalized);
+
+        foreach ($inventoryRaw->groupBy('sku') as $sku => $items) {
+            $stockItems = $items->filter(fn ($item) => (int) ($item->quantity ?? 0) > 0);
+            if ($stockItems->isEmpty()) {
+                $stockItems = $items;
+            }
+
+            $clusterDistribution = [];
+            $clusterNames = [];
+            $totalQuantity = 0;
+            $salesDistribution = [];
+            $totalSales = 0;
+            $warehouseBuckets = [];
+
+            foreach ($stockItems as $item) {
+                $warehouseName = (string) ($item->warehouse_name ?? '');
+                if ($warehouseName === '') {
+                    continue;
+                }
+
+                $normalizedName = \App\Models\OzonWarehouseCluster::normalizeWarehouseName($warehouseName);
+                $cluster = $warehouseClusterMap[$normalizedName] ?? null;
+                if (! $cluster) {
+                    continue;
+                }
+
+                $clusterId = (string) $cluster->cluster_id;
+                $quantity = max(0, (int) ($item->quantity ?? 0));
+                if ($quantity <= 0) {
+                    continue;
+                }
+                $clusterDistribution[$clusterId] = ($clusterDistribution[$clusterId] ?? 0) + $quantity;
+                $clusterNames[$clusterId] = $cluster->cluster_name;
+                $totalQuantity += $quantity;
+                $warehouseKey = $clusterId.'|'.$warehouseName;
+                $warehouseBuckets[$warehouseKey] = [
+                    'warehouse_name' => $warehouseName,
+                    'cluster_id' => $clusterId,
+                    'cluster_name' => $cluster->cluster_name,
+                    'region' => $cluster->region,
+                    'quantity' => $quantity,
+                    'sales_7_days' => 0,
+                    'sales_30_days' => 0,
+                ];
+
+                if (empty($directSalesByWarehouse[(string) $sku])) {
+                    $sales7 = max(0, (int) ($item->sales_7_days ?? 0));
+                    $sales = max(0, (int) ($item->sales_30_days ?? 0));
+                    $salesDistribution[$clusterId] = ($salesDistribution[$clusterId] ?? 0) + $sales;
+                    $totalSales += $sales;
+                    $warehouseBuckets[$warehouseKey]['sales_7_days'] = $sales7;
+                    $warehouseBuckets[$warehouseKey]['sales_30_days'] = $sales;
+                }
+            }
+
+            if (!empty($directSalesByWarehouse[(string) $sku])) {
+                foreach ($directSalesByWarehouse[(string) $sku] as $warehouseSales) {
+                    $warehouseName = (string) ($warehouseSales['warehouse_name'] ?? '');
+                    if ($warehouseName === '') {
+                        continue;
+                    }
+
+                    $normalizedName = \App\Models\OzonWarehouseCluster::normalizeWarehouseName($warehouseName);
+                    $cluster = $warehouseClusterMap[$normalizedName] ?? null;
+                    if (! $cluster) {
+                        continue;
+                    }
+
+                    $clusterId = (string) $cluster->cluster_id;
+                    $clusterNames[$clusterId] = $cluster->cluster_name;
+                    $sales7 = max(0, (int) ($warehouseSales['sales_7_days'] ?? 0));
+                    $sales = max(0, (int) ($warehouseSales['sales_30_days'] ?? 0));
+                    $salesDistribution[$clusterId] = ($salesDistribution[$clusterId] ?? 0) + $sales;
+                    $totalSales += $sales;
+                    $warehouseKey = $clusterId.'|'.$warehouseName;
+                    if (isset($warehouseBuckets[$warehouseKey])) {
+                        $warehouseBuckets[$warehouseKey]['sales_7_days'] = $sales7;
+                        $warehouseBuckets[$warehouseKey]['sales_30_days'] = $sales;
+                    }
+                }
+            }
+
+            if ($clusterDistribution === []) {
+                continue;
+            }
+
+            arsort($clusterDistribution);
+            arsort($salesDistribution);
+            $dominantClusterId = (string) array_key_first($clusterDistribution);
+            $dominantClusterQuantity = (float) ($clusterDistribution[$dominantClusterId] ?? 0);
+            $dominantClusterShare = $totalQuantity > 0
+                ? round(($dominantClusterQuantity / $totalQuantity) * 100, 2)
+                : null;
+            $dominantSalesClusterId = $salesDistribution !== [] ? (string) array_key_first($salesDistribution) : null;
+            $dominantSalesClusterUnits = $dominantSalesClusterId !== null
+                ? (float) ($salesDistribution[$dominantSalesClusterId] ?? 0)
+                : 0.0;
+            $dominantSalesClusterShare = $totalSales > 0
+                ? round(($dominantSalesClusterUnits / $totalSales) * 100, 2)
+                : null;
+
+            $stockProfile = [];
+            foreach ($clusterDistribution as $clusterId => $qty) {
+                $warehouses = array_values(array_filter(
+                    $warehouseBuckets,
+                    fn (array $bucket): bool => (string) ($bucket['cluster_id'] ?? '') === (string) $clusterId
+                ));
+                $stockProfile[] = [
+                    'cluster_id' => $clusterId,
+                    'cluster_name' => $clusterNames[$clusterId] ?? null,
+                    'quantity' => $qty,
+                    'share_percent' => $totalQuantity > 0 ? round(($qty / $totalQuantity) * 100, 2) : null,
+                    'warehouses' => $warehouses,
+                ];
+            }
+
+            $salesProfile = [];
+            foreach ($salesDistribution as $clusterId => $sales) {
+                $salesProfile[] = [
+                    'cluster_id' => $clusterId,
+                    'cluster_name' => $clusterNames[$clusterId] ?? null,
+                    'sales_30_days' => $sales,
+                    'sales_share_percent' => $totalSales > 0 ? round(($sales / $totalSales) * 100, 2) : null,
+                ];
+            }
+
+            $profiles[(string) $sku] = [
+                'route_key' => null,
+                'route_label' => $clusterNames[$dominantClusterId] ?? null,
+                'dominant_cluster_id' => $dominantClusterId,
+                'dominant_cluster_share' => $dominantClusterShare,
+                'cluster_distribution' => $clusterDistribution,
+                'cluster_names' => $clusterNames,
+                'stock_profile' => $stockProfile,
+                'sales_profile' => $salesProfile,
+                'total_sales_7_days' => $warehouseBuckets !== [] ? array_sum(array_map(static fn (array $bucket): int => (int) ($bucket['sales_7_days'] ?? 0), $warehouseBuckets)) : 0,
+                'dominant_sales_cluster_id' => $dominantSalesClusterId,
+                'dominant_sales_cluster_share' => $dominantSalesClusterShare,
+            ];
+        }
+
+        return $profiles;
+    }
+
+    private function mergeOzonSalesByWarehouse(array $fboSalesByWarehouse, array $fbsSalesByWarehouse): array
+    {
+        $result = [];
+
+        foreach ([['source' => $fboSalesByWarehouse, 'default_type' => 'FBO'], ['source' => $fbsSalesByWarehouse, 'default_type' => 'FBS']] as $entry) {
+            foreach ($entry['source'] as $sku => $warehouses) {
+                foreach ($warehouses as $warehouseId => $data) {
+                    $fulfillmentType = $data['fulfillment_type'] ?? $entry['default_type'];
+                    $key = $warehouseId . '_' . $fulfillmentType;
+                    $result[$sku][$key] = [
+                        'warehouse_name' => $data['warehouse_name'] ?? $warehouseId,
+                        'sales_7_days' => (int) ($data['sales_7_days'] ?? 0),
+                        'sales_14_days' => (int) ($data['sales_14_days'] ?? 0),
+                        'sales_30_days' => (int) ($data['sales_30_days'] ?? 0),
+                        'avg_daily_sales' => (float) ($data['avg_daily_sales'] ?? 0),
+                        'ordered_units_total' => (int) ($data['ordered_units_total'] ?? 0),
+                        'fulfillment_type' => $fulfillmentType,
+                    ];
+                }
+            }
+        }
+
+        return $result;
+    }
+
+    private function getIntegrationCredentialsSafely(?\App\Models\Integration $integration): array
+    {
+        if (! $integration) {
+            return [];
+        }
+
+        try {
+            $credentials = $integration->getDecryptedCredentials();
+            return is_array($credentials) ? $credentials : [];
+        } catch (\Throwable $e) {
+            $this->warn("  Не удалось расшифровать локальные credentials integration_id={$integration->id}: {$e->getMessage()}");
+            return [];
+        }
+    }
+
+    private function persistIntegrationCredentials(\App\Models\Integration $integration, array $patch): void
+    {
+        $current = $this->getIntegrationCredentialsSafely($integration);
+        $merged = array_merge($current, array_filter($patch, static fn ($value) => $value !== null && $value !== ''));
+
+        if ($merged === $current || $merged === []) {
+            return;
+        }
+
+        $integration->forceFill(['credentials' => $merged])->saveQuietly();
+        $integration->setAttribute('credentials', $merged);
+    }
+
+    private function persistOzonDeliveryProfile(int $integrationId, Product $product, ?array $deliveryProfile): void
+    {
+        if ($deliveryProfile === null) {
+            return;
+        }
+
+        $current = is_array($product->ozon_data ?? null) ? $product->ozon_data : [];
+        $patch = array_filter([
+            'route_key' => $deliveryProfile['route_key'] ?? null,
+            'route_label' => $deliveryProfile['route_label'] ?? null,
+            'route_resolution_status' => $deliveryProfile['route_resolution_status'] ?? null,
+            'locality_resolution_status' => $deliveryProfile['locality_resolution_status'] ?? null,
+            'calculation_confidence' => $deliveryProfile['calculation_confidence'] ?? null,
+            'profile_source' => $deliveryProfile['profile_source'] ?? null,
+            'dominant_cluster_id' => $deliveryProfile['dominant_cluster_id'] ?? null,
+            'dominant_cluster_share' => $deliveryProfile['dominant_cluster_share'] ?? null,
+            'expected_locality_rate' => $deliveryProfile['expected_locality_rate'] ?? null,
+            'weighted_non_local_markup_percent' => $deliveryProfile['weighted_non_local_markup_percent'] ?? null,
+            'weighted_logistics_cost' => $deliveryProfile['weighted_logistics_cost'] ?? null,
+            'is_local_sale' => $deliveryProfile['is_local_sale'] ?? null,
+            'clusters_summary' => $deliveryProfile['clusters_summary'] ?? [],
+            'stock_profile' => $deliveryProfile['stock_profile'] ?? [],
+            'sales_profile' => $deliveryProfile['sales_profile'] ?? [],
+            'route_details' => $deliveryProfile['route_details'] ?? [],
+            'delivery_profile_synced_at' => now()->toIso8601String(),
+        ], static fn ($value, string $key): bool => $value !== null || in_array($key, ['clusters_summary', 'stock_profile', 'sales_profile', 'route_details'], true), ARRAY_FILTER_USE_BOTH);
+
+        if ($patch === []) {
+            return;
+        }
+
+        $merged = array_merge($current, $patch);
+        if ($merged === $current) {
+            $this->upsertOzonDeliveryProfileRecord($integrationId, $product, $deliveryProfile);
+            return;
+        }
+
+        $product->forceFill(['ozon_data' => $merged])->saveQuietly();
+        $product->setAttribute('ozon_data', $merged);
+        $this->upsertOzonDeliveryProfileRecord($integrationId, $product, $deliveryProfile);
+    }
+
+    private function upsertOzonDeliveryProfileRecord(int $integrationId, Product $product, array $deliveryProfile): void
+    {
+        $clustersSummary = is_array($deliveryProfile['clusters_summary'] ?? null)
+            ? $deliveryProfile['clusters_summary']
+            : [];
+        $stockProfile = [
+            'route_key' => $deliveryProfile['route_key'] ?? null,
+            'route_label' => $deliveryProfile['route_label'] ?? null,
+            'is_local_sale' => $deliveryProfile['is_local_sale'] ?? null,
+            'clusters' => $deliveryProfile['stock_profile'] ?? [],
+        ];
+        $salesProfile = [
+            'clusters' => $deliveryProfile['sales_profile'] ?? [],
+        ];
+        $clusterProfile = [
+            'dominant_cluster_id' => $deliveryProfile['dominant_cluster_id'] ?? null,
+            'dominant_cluster_share' => $deliveryProfile['dominant_cluster_share'] ?? null,
+            'clusters_summary' => $clustersSummary,
+        ];
+
+        OzonSkuDeliveryProfile::updateOrCreate(
+            [
+                'integration_id' => $integrationId,
+                'sku' => $product->sku,
+                'scheme' => 'ALL',
+            ],
+            [
+                'offer_id' => $product->sku,
+                'ozon_sku' => (string) (($product->ozon_data['sku'] ?? null) ?: ''),
+                'stock_profile' => $stockProfile,
+                'sales_profile' => $salesProfile,
+                'cluster_profile' => $clusterProfile,
+                'dominant_stock_cluster_id' => $deliveryProfile['stock_profile'][0]['cluster_id'] ?? null,
+                'dominant_stock_cluster_share' => $deliveryProfile['stock_profile'][0]['share_percent'] ?? null,
+                'dominant_sales_cluster_id' => $deliveryProfile['dominant_sales_cluster_id'] ?? null,
+                'dominant_sales_cluster_share' => $deliveryProfile['dominant_sales_cluster_share'] ?? null,
+                'dominant_demand_cluster_id' => $deliveryProfile['dominant_cluster_id'] ?? null,
+                'dominant_demand_cluster_share' => $deliveryProfile['dominant_cluster_share'] ?? null,
+                'expected_locality_rate' => $deliveryProfile['expected_locality_rate'] ?? null,
+                'weighted_non_local_markup_percent' => $deliveryProfile['weighted_non_local_markup_percent'] ?? null,
+                'weighted_logistics_cost' => $deliveryProfile['weighted_logistics_cost'] ?? null,
+                'profile_source' => $deliveryProfile['profile_source'] ?? 'delivery_analytics',
+                'route_resolution_status' => $deliveryProfile['route_resolution_status'] ?? 'unknown',
+                'locality_resolution_status' => $deliveryProfile['locality_resolution_status'] ?? 'unknown',
+                'calculation_confidence' => $deliveryProfile['calculation_confidence'] ?? 'low',
+                'calculated_at' => now(),
+            ]
+        );
+    }
+
+    private function estimateWeightedLogisticsCost(string $deliverySchema, array $clusters): float
+    {
+        $scheme = strtoupper($deliverySchema) === 'FBS' ? 'FBS' : 'FBO';
+        $routeConfig = config('ozon_unit_economics.routes', []);
+        $aliases = config('ozon_unit_economics.route_aliases', []);
+        $defaultRouteKey = config('ozon_unit_economics.default_route.key', 'cluster_msk');
+
+        $resolveRouteKey = function (?string $clusterId) use ($aliases, $defaultRouteKey): string {
+            $needle = mb_strtolower((string) $clusterId);
+            foreach ($aliases as $fragment => $routeKey) {
+                if ($needle !== '' && str_contains($needle, (string) $fragment)) {
+                    return (string) $routeKey;
+                }
+            }
+
+            return $defaultRouteKey;
+        };
+
+        $sum = 0.0;
+        foreach ($clusters as $cluster) {
+            $share = ((float) ($cluster['orders_percent'] ?? 0)) / 100;
+            if ($share <= 0) {
+                continue;
+            }
+
+            $routeKey = $resolveRouteKey((string) ($cluster['cluster_id'] ?? ''));
+            $base = (float) (($routeConfig[$routeKey][$scheme]['up_to_1l'] ?? 0));
+            $sum += $share * $base;
+        }
+
+        return $sum;
     }
 
     /**

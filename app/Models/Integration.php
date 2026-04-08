@@ -27,11 +27,15 @@ class Integration extends Model
         'last_sync_error',
         'settings',
         'is_premium',
+        'non_premium_detection_count',
         'premium_checked_at',
         'manual_redemption_rate',
         'localization_index',
         'localization_checked_at',
         'redemption_checked_at',
+        'last_validation_at',
+        'last_validation_status',
+        'last_validation_error',
     ];
 
     protected $casts = [
@@ -41,11 +45,13 @@ class Integration extends Model
         'auto_sync_enabled' => 'boolean',
         'last_sync_at' => 'datetime',
         'is_premium' => 'boolean',
+        'non_premium_detection_count' => 'integer',
         'premium_checked_at' => 'datetime',
         'manual_redemption_rate' => 'decimal:2',
         'localization_index' => 'decimal:2',
         'localization_checked_at' => 'datetime',
         'redemption_checked_at' => 'datetime',
+        'last_validation_at' => 'datetime',
     ];
 
     const CACHE_TTL_HOURS = 24;

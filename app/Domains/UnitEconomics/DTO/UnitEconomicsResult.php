@@ -60,16 +60,19 @@ class UnitEconomicsResult
     public function toArray(): array
     {
         return [
+            // Дополнительные поля маркетплейса (spread первым, чтобы явные поля ниже имели приоритет)
+            ...$this->metadata,
+
             // Идентификаторы
             'sku' => $this->sku,
             'marketplace' => $this->marketplace,
             'fulfillment_type' => $this->fulfillmentType,
             'product_name' => $this->productName,
-            
+
             // Цены
             'price' => round($this->price, 2),
             'old_price' => $this->oldPrice ? round($this->oldPrice, 2) : null,
-            
+
             // Финансовые метрики
             'revenue' => round($this->revenue, 2),
             'total_costs' => round($this->totalCosts, 2),
@@ -77,24 +80,21 @@ class UnitEconomicsResult
             'margin_percent' => round($this->marginPercent, 2),
             'margin_absolute' => round($this->marginAbsolute, 2),
             'roi' => $this->getRoi() ? round($this->getRoi(), 2) : null,
-            
+
             // Комиссии
             'commission_percent' => round($this->commissionPercent, 2),
             'acquiring_percent' => round($this->acquiringPercent, 2),
-            
+
             // Разбивка расходов
             'costs' => $this->costs->toArray(),
-            
+
             // Флаги
             'is_profitable' => $this->isProfitable,
             'has_cost_price' => $this->hasCostPrice,
             'is_actual_scheme' => $this->isActualScheme,
-            
+
             // Мета
             'calculated_at' => $this->calculatedAt ?? now()->toIso8601String(),
-            
-            // Дополнительные поля маркетплейса
-            ...$this->metadata,
         ];
     }
 

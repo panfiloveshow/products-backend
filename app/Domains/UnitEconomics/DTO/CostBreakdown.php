@@ -13,7 +13,7 @@ class CostBreakdown
         public readonly float $acquiring = 0,            // Эквайринг
         
         // Логистика
-        public readonly float $logistics = 0,            // Базовая логистика
+        public readonly float $logistics = 0,            // Итоговая логистика (включает нелокальную наценку если применимо)
         public readonly float $lastMile = 0,             // Последняя миля
         public readonly float $processingFee = 0,        // Обработка отправления (FBS)
         public readonly float $deliveryCost = 0,         // Итого стоимость доставки
