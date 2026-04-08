@@ -9,6 +9,7 @@
         "php": "^8.2",
         "laravel/framework": "^12.0",
         "laravel/tinker": "^2.10.1",
+        "maennchen/zipstream-php": "^2.1",
         "phpoffice/phpspreadsheet": "^1.29"
     },
     "require-dev": {
