@@ -476,10 +476,19 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
             $expectedLocalityRate = $input->isLocalSale ? 100.0 : 0.0;
         }
 
+        // Локальная продажа определяется ТОЛЬКО по expected_locality_rate из weighted profile metrics.
+        // НЕ используем $input->isLocalSale — он может содержать stale значение из stock_profile.
         $isFullyLocalByProfile = $expectedLocalityRate !== null && $expectedLocalityRate >= 99.99;
-        $isLocalSale = $routeResolutionStatus === 'resolved'
-            ? ($input->isLocalSale ?? ($isFullyLocalByProfile ? true : (bool) $logisticsData['is_local_sale']))
-            : null;
+        // Приоритет: expected_locality_rate из weighted profile → route-based (без profile данных)
+        if ($expectedLocalityRate !== null) {
+            $isLocalSale = $isFullyLocalByProfile;
+        } elseif ($profileMetrics === null) {
+            // Нет profile данных — используем input или route config
+            $isLocalSale = $input->isLocalSale ?? (bool) $logisticsData['is_local_sale'];
+        } else {
+            // Profile есть, но expected_locality не рассчитан — не локальная
+            $isLocalSale = false;
+        }
         $weightedNonLocalMarkupPercent = $profileMetrics['weighted_markup_percent'] ?? $input->weightedNonLocalMarkupPercent ?? null;
         if ($weightedNonLocalMarkupPercent === null && $expectedLocalityRate !== null) {
             $weightedNonLocalMarkupPercent = (100 - $expectedLocalityRate) / 100 * (float) $logisticsData['non_local_markup_percent'];
