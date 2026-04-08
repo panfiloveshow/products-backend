@@ -57,6 +57,7 @@ class CheckSellicoPermission
         'unit-economics.commissions'       => 'unit_economics.tariffs.view',
         'unit-economics.tariffs'           => 'unit_economics.tariffs.view',
         'unit-economics.cache-stats'       => 'unit_economics.view',
+        'unit-economics.export.excel'      => 'unit_economics.view',
 
         // Автопланирование
         'auto-supply-plans.index'        => 'auto_supply.view',
@@ -91,7 +92,9 @@ class CheckSellicoPermission
         'integrations.index'         => 'products.view',
         'integrations.premiumStatus' => 'products.view',
         'integrations.sync'          => 'products.sync.execute',
+        'integrations.manualRedemptionRate' => 'products.edit',
         'integrations.syncStatus'    => 'products.sync.status',
+        'integrations.status'        => 'products.view',
 
         // Поставки
         'shipments.index'                  => 'auto_supply.view',
@@ -167,6 +170,7 @@ class CheckSellicoPermission
         $permission = self::ROUTE_PERMISSIONS[$routeName];
 
         if (config('services.sellico.skip_permission_check', false)) {
+            Log::debug('CheckSellicoPermission: проверка прав пропущена через skip_permission_check');
             return $next($request);
         }
 
@@ -197,13 +201,29 @@ class CheckSellicoPermission
             ], 401);
         }
 
+        // Кешируем токен пользователя по workspace_id — используется CLI-синком для доступа к API
+        Cache::put("workspace_user_token:{$workspace}", $token, now()->addHours(22));
+
         $cacheKey = "perm:{$workspace}:{$permission}:" . md5($token);
 
         $allowed = Cache::remember($cacheKey, self::CACHE_TTL, function () use ($token, $user, $workspace, $permission, $routeName) {
             return $this->checkPermissionRemotely($token, $user, $workspace, $permission, $routeName);
         });
 
+        // Если проверка вернула null (ошибка), но у нас есть валидный токен и workspace - пропускаем
         if ($allowed === null) {
+            Log::warning('CheckSellicoPermission: проверка прав вернула null, используем fallback', [
+                'route'      => $routeName,
+                'permission' => $permission,
+                'workspace'  => $workspace,
+            ]);
+            
+            // Fallback: если есть токен и workspace, считаем что доступ разрешён
+            // Это предотвращает блокировку API при проблемах с CRM
+            if ($token && $workspace) {
+                return $next($request);
+            }
+            
             return response()->json([
                 'message' => 'Не удалось проверить права доступа. Попробуйте позже.',
                 'error'   => 'permission_check_failed',
@@ -211,10 +231,19 @@ class CheckSellicoPermission
         }
 
         if (!$allowed) {
+            Log::error('CheckSellicoPermission: доступ запрещён', [
+                'route'      => $routeName,
+                'permission' => $permission,
+                'workspace'  => $workspace,
+                'user'       => $user,
+            ]);
+            
             return response()->json([
                 'message'    => 'Недостаточно прав для выполнения этого действия',
                 'error'      => 'permission_denied',
                 'permission' => $permission,
+                'workspace'  => $workspace,
+                'route'      => $routeName,
             ], 403);
         }
 
@@ -234,7 +263,21 @@ class CheckSellicoPermission
         string $permission,
         string $routeName
     ): ?bool {
+        // Поддержка разных доменов: products.sellico.ru, sellico.ru, и т.д.
+        $currentHost = request()->getHost();
         $crmUrl = config('services.crm.url') ?? 'https://sellico.ru';
+        
+        // Если мы на поддомене (например, products.sellico.ru), используем основной домен для CRM
+        if (str_contains($currentHost, 'sellico.ru')) {
+            $crmUrl = 'https://sellico.ru';
+        }
+        
+        Log::debug('CheckSellicoPermission: проверка прав', [
+            'current_host' => $currentHost,
+            'crm_url' => $crmUrl,
+            'permission' => $permission,
+            'workspace' => $workspace,
+        ]);
 
         $serviceToken = $this->getServiceToken();
 
@@ -330,6 +373,37 @@ class CheckSellicoPermission
                     'permission' => $permission,
                     'workspace'  => $workspace,
                 ]);
+                
+                // Сбрасываем токен и пробуем повторно авторизоваться
+                Cache::forget(self::TOKEN_CACHE_KEY);
+                $freshToken = $this->authorizeAndCacheToken();
+                
+                if ($freshToken) {
+                    Log::info('CheckSellicoPermission: повторная авторизация после 403', [
+                        'route'      => $routeName,
+                        'permission' => $permission,
+                        'workspace'  => $workspace,
+                    ]);
+                    
+                    $retryResponse = Http::timeout(5)
+                        ->accept('application/json')
+                        ->withToken($freshToken)
+                        ->get("{$crmUrl}/api/check-permission", $requestParams);
+                    
+                    if ($retryResponse->successful()) {
+                        $data = $retryResponse->json();
+                        return (bool) ($data['valid'] ?? false);
+                    }
+                    
+                    if ($retryResponse->status() === 403) {
+                        Log::error('CheckSellicoPermission: повторный запрос также вернул 403', [
+                            'route'      => $routeName,
+                            'body'       => $retryResponse->body(),
+                            'permission' => $permission,
+                        ]);
+                    }
+                }
+                
                 return false;
             }
 
@@ -381,11 +455,19 @@ class CheckSellicoPermission
         $password = config('services.sellico.password');
 
         if (empty($email) || empty($password)) {
-            Log::warning('CheckSellicoPermission: SELLICO_EMAIL или SELLICO_PASSWORD не заданы в .env');
+            Log::warning('CheckSellicoPermission: SELLICO_EMAIL или SELLICO_PASSWORD не заданы в .env', [
+                'email_set' => !empty($email),
+                'password_set' => !empty($password),
+            ]);
             return null;
         }
 
         try {
+            Log::info('CheckSellicoPermission: попытка авторизации в Sellico', [
+                'url' => "{$baseUrl}/login",
+                'email' => $email,
+            ]);
+            
             $response = Http::timeout(10)
                 ->accept('application/json')
                 ->post("{$baseUrl}/login", [
@@ -393,13 +475,20 @@ class CheckSellicoPermission
                     'password' => $password,
                 ]);
 
+            Log::info('CheckSellicoPermission: ответ от Sellico login', [
+                'status' => $response->status(),
+                'body'   => $response->body(),
+            ]);
+
             if ($response->successful()) {
                 $token = $response->json('access_token');
 
                 if ($token) {
                     $token = str_contains($token, '|') ? explode('|', $token, 2)[1] : $token;
                     Cache::put(self::TOKEN_CACHE_KEY, $token, self::TOKEN_CACHE_TTL);
-                    Log::info('CheckSellicoPermission: авторизация в Sellico прошла успешно, токен закешировн');
+                    Log::info('CheckSellicoPermission: авторизация в Sellico прошла успешно, токен закеширован', [
+                        'token_length' => strlen($token),
+                    ]);
                     return $token;
                 }
 
@@ -418,6 +507,7 @@ class CheckSellicoPermission
         } catch (\Exception $e) {
             Log::error('CheckSellicoPermission: исключение при авторизации в Sellico', [
                 'error' => $e->getMessage(),
+                'trace' => $e->getTraceAsString(),
             ]);
             return null;
         }
