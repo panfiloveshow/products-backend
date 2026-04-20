@@ -69,6 +69,9 @@ Route::prefix('auth')->group(function () {
 Route::prefix('products')->middleware('sellico.permission')->group(function () {
     Route::get('/', [ProductController::class, 'index'])->name('products.index');
     Route::get('/sync/status', [ProductController::class, 'syncStatus'])->name('products.syncStatus');
+    // Без integration.access: метод поддерживает запуск без integration_id
+    // для sync всех интеграций workspace (см. test_products_sync_without_integration_id_*).
+    // Проверка доступа — в ProductService::startSync / контроллере по workspace-заголовку.
     Route::post('/sync/{marketplace}', [ProductController::class, 'sync'])
         ->whereIn('marketplace', ['wildberries', 'ozon', 'yandex_market'])
         ->name('products.sync');
@@ -95,10 +98,15 @@ Route::prefix('inventory')->middleware('sellico.permission')->group(function () 
     Route::get('/recommendations', [InventoryController::class, 'recommendations'])->name('inventory.recommendations');
     Route::get('/redistribution', [InventoryController::class, 'redistribution'])->name('inventory.redistribution');
     Route::get('/stats', [InventoryController::class, 'stats'])->name('inventory.stats');
+    // integration.access: integration_id обязательно приходит в body,
+    // проверяем доступ пользователя до вызова контроллера (закрывает IDOR).
     Route::post('/sync/{marketplace}', [InventoryController::class, 'sync'])
         ->whereIn('marketplace', ['wildberries', 'ozon', 'yandex_market'])
+        ->middleware('integration.access')
         ->name('inventory.sync');
-    Route::post('/sync-storage-fees', [InventoryController::class, 'syncStorageFees'])->name('inventory.syncStorageFees');
+    Route::post('/sync-storage-fees', [InventoryController::class, 'syncStorageFees'])
+        ->middleware('integration.access')
+        ->name('inventory.syncStorageFees');
     Route::get('/{sku}', [InventoryController::class, 'show'])->name('inventory.show');
     Route::get('/{sku}/history', [InventoryController::class, 'history'])->name('inventory.history');
     Route::get('/{sku}/forecast', [InventoryController::class, 'forecast'])->name('inventory.forecast');
@@ -168,10 +176,14 @@ Route::prefix('unit-economics')->middleware('sellico.permission')->group(functio
     Route::put('/settings/{sku}', [UnitEconomicsCacheController::class, 'updateSettings'])
         ->name('unit-economics.settings.update');
 
-    // Recalculate
+    // Recalculate — закрываем IDOR: middleware проверяет доступ к integrationId
+    // до вызова контроллера (раньше любой мог запустить пересчёт чужой интеграции).
     Route::post('/recalculate/{integrationId}', [UnitEconomicsCacheController::class, 'recalculate'])
+        ->middleware('integration.access')
         ->name('unit-economics.recalculate');
-    Route::get('/cache-stats/{integrationId}', [UnitEconomicsCacheController::class, 'cacheStats'])->name('unit-economics.cache-stats');
+    Route::get('/cache-stats/{integrationId}', [UnitEconomicsCacheController::class, 'cacheStats'])
+        ->middleware('integration.access')
+        ->name('unit-economics.cache-stats');
 
     // Calculate
     Route::post('/calculate/{marketplace}', [UnitEconomicsCacheController::class, 'calculate'])

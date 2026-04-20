@@ -159,21 +159,20 @@ class UnitEconomicsCacheService
         if (!$integration) {
             return ['error' => 'Integration not found'];
         }
-        
-        // Удаляем старый кэш для данной интеграции
-        $deletedCount = UnitEconomicsCache::where('integration_id', $integrationId)->delete();
-        Log::info('UnitEconomicsCache cleared for integration', [
-            'integration_id' => $integrationId,
-            'deleted_count' => $deletedCount,
-        ]);
-        
+
+        // Shadow-update вместо delete→insert: фиксируем timestamp старта,
+        // пересчитываем через updateOrCreate (обновляет existing, создаёт новые),
+        // в конце удаляем только те записи, что не были тронуты (updated_at < startedAt).
+        // Так фронт не получит пустой кэш в окне между delete и первым insert.
+        $startedAt = now();
+
         $stats = [
             'total' => 0,
             'success' => 0,
             'errors' => 0,
             'schemes' => [],
         ];
-        
+
         $schemes = $this->getSchemesForMarketplace($integration->marketplace);
 
         // Batch-загрузка per-SKU locality из реальных заказов (Ozon)
@@ -190,7 +189,7 @@ class UnitEconomicsCacheService
             ->chunkById(100, function ($products) use (&$stats, $schemes) {
                 foreach ($products as $product) {
                     $stats['total']++;
-                    
+
                     try {
                         foreach ($schemes as $scheme) {
                             $this->calculateAndCache($product, $scheme);
@@ -207,14 +206,21 @@ class UnitEconomicsCacheService
                     }
                 }
             });
-        
+
+        // Зачищаем "устаревшие" записи — те, что не были тронуты этим пересчётом
+        // (SKU пропали из products, или не вернули результат из калькулятора).
+        $stalePruned = UnitEconomicsCache::where('integration_id', $integrationId)
+            ->where('updated_at', '<', $startedAt)
+            ->delete();
+
         Log::info('UnitEconomicsCache recalculated for integration', [
             'integration_id' => $integrationId,
             'stats' => $stats,
+            'stale_pruned' => $stalePruned,
         ]);
 
         $this->forgetStatsCache($integrationId, $integration->marketplace, $schemes);
-        
+
         return $stats;
     }
 

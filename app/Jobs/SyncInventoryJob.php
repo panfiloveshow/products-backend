@@ -310,25 +310,38 @@ class SyncInventoryJob implements ShouldBeUnique, ShouldQueue
                 $this->refreshWildberriesWarehouseCoefficients($marketplaceService);
             }
 
-            // Удаляем устаревшие записи — те что были в БД, но не пришли из API
-            // Это исправляет накопление старых складов и завышенный суммарный остаток
+            // Удаляем устаревшие записи — те что были в БД, но не пришли из API.
+            // Фикс: раньше использовался chunkById + row->delete() внутри итерации.
+            // Это пропускает до ~половины записей из-за сдвига курсора по id,
+            // если в одном chunk'е удаляется часть данных. Теперь собираем id
+            // в буфер, потом одним whereIn-delete.
             if (! empty($apiPairs) && $this->syncLog->integration_id) {
-                $deleted = 0;
+                $apiPairsLookup = array_flip($apiPairs); // O(1) поиск вместо O(N)
+                $idsToDelete = [];
+
                 InventoryWarehouse::when(
                         in_array($this->syncLog->marketplace, ['yandex', 'yandex_market'], true),
                         fn ($q) => $q->whereIn('marketplace', ['yandex', 'yandex_market']),
                         fn ($q) => $q->where('marketplace', $this->syncLog->marketplace)
                     )
                     ->where('integration_id', $this->syncLog->integration_id)
-                    ->chunkById(500, function ($rows) use ($apiPairs, &$deleted) {
+                    ->select(['id', 'sku', 'warehouse_id'])
+                    ->chunkById(500, function ($rows) use ($apiPairsLookup, &$idsToDelete) {
                         foreach ($rows as $row) {
                             $key = $row->sku.'||'.$row->warehouse_id;
-                            if (! in_array($key, $apiPairs, true)) {
-                                $row->delete();
-                                $deleted++;
+                            if (! isset($apiPairsLookup[$key])) {
+                                $idsToDelete[] = $row->id;
                             }
                         }
                     });
+
+                $deleted = 0;
+                if (! empty($idsToDelete)) {
+                    // Батч-удаление по id — безопасно, не зависит от курсора.
+                    foreach (array_chunk($idsToDelete, 1000) as $idBatch) {
+                        $deleted += InventoryWarehouse::whereIn('id', $idBatch)->delete();
+                    }
+                }
 
                 if ($deleted > 0) {
                     Log::info('Deleted stale inventory records', [

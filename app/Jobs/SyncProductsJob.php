@@ -248,6 +248,15 @@ class SyncProductsJob implements ShouldBeUnique, ShouldQueue
         }
     }
 
+    /**
+     * Если API ответил подозрительно маленьким списком по сравнению
+     * с тем, что лежит в БД — НЕ удаляем «стейл». Это страховка от
+     * частичных ответов маркетплейса (rate-limit на середине пагинации),
+     * которые раньше могли снести 90% каталога магазина.
+     */
+    private const PRUNE_MIN_PRODUCT_RATIO = 0.7;
+    private const PRUNE_MIN_PRODUCTS_TO_SKIP_GUARD = 100;
+
     private function pruneMissingMarketplaceProducts(array $products): int
     {
         if (($this->syncLog->marketplace ?? '') !== 'ozon') {
@@ -267,6 +276,31 @@ class SyncProductsJob implements ShouldBeUnique, ShouldQueue
             ->values();
 
         if ($currentSkus->isEmpty()) {
+            return 0;
+        }
+
+        // Threshold-guard: если текущий ответ API содержит существенно меньше
+        // товаров, чем уже есть в БД — возможно пагинация упала на середине.
+        // В таком случае отказываемся удалять «недостающие» и логируем warning.
+        $existingCount = Product::query()
+            ->where('integration_id', $integrationId)
+            ->where('marketplace', $this->syncLog->marketplace)
+            ->count();
+
+        $currentCount = $currentSkus->count();
+
+        if (
+            $existingCount >= self::PRUNE_MIN_PRODUCTS_TO_SKIP_GUARD
+            && $currentCount < $existingCount * self::PRUNE_MIN_PRODUCT_RATIO
+        ) {
+            Log::warning('Pruning skipped: suspicious drop in API response size', [
+                'marketplace' => $this->syncLog->marketplace,
+                'integration_id' => $integrationId,
+                'current_count' => $currentCount,
+                'existing_count' => $existingCount,
+                'ratio' => $existingCount > 0 ? round($currentCount / $existingCount, 3) : null,
+                'threshold' => self::PRUNE_MIN_PRODUCT_RATIO,
+            ]);
             return 0;
         }
 
@@ -314,6 +348,8 @@ class SyncProductsJob implements ShouldBeUnique, ShouldQueue
             'integration_id' => $integrationId,
             'stale_skus_count' => count($staleSkuValues),
             'deleted_products' => $deletedProducts,
+            'api_response_count' => $currentCount,
+            'db_existing_count' => $existingCount,
         ]);
 
         return $deletedProducts;

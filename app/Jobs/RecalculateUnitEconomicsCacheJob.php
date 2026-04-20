@@ -4,6 +4,7 @@ namespace App\Jobs;
 
 use App\Services\UnitEconomicsCacheService;
 use Illuminate\Bus\Queueable;
+use Illuminate\Contracts\Queue\ShouldBeUnique;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
@@ -12,21 +13,32 @@ use Illuminate\Support\Facades\Log;
 
 /**
  * Job для пересчёта кэша юнит-экономики
- * 
+ *
  * Запускается автоматически после:
  * - Синхронизации товаров
  * - Изменения настроек пользователя
+ *
+ * ShouldBeUnique защищает от двух параллельных пересчётов одной интеграции —
+ * без него при быстрых повторных dispatch'ах (sync завершился + user нажал
+ * «синхронизировать» ещё раз) две цепочки в очереди конкурировали за unique-индекс
+ * в unit_economics_cache и давали «Integrity constraint violation» / дедлоки.
  */
-class RecalculateUnitEconomicsCacheJob implements ShouldQueue
+class RecalculateUnitEconomicsCacheJob implements ShouldQueue, ShouldBeUnique
 {
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
 
     public int $tries = 3;
     public int $timeout = 900; // 15 минут
+    public int $uniqueFor = 1800; // 30 минут блокировки по ключу integrationId
 
     public function __construct(
         public int $integrationId
     ) {}
+
+    public function uniqueId(): string
+    {
+        return (string) $this->integrationId;
+    }
 
     public function handle(UnitEconomicsCacheService $cacheService): void
     {
