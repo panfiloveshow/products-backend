@@ -124,8 +124,12 @@ class ProductServiceTest extends TestCase
         $this->assertEquals($integration->id, $syncLog->integration_id);
     }
 
-    public function test_start_products_sync_clears_unit_economics_cache_for_selected_integration(): void
+    public function test_start_products_sync_preserves_ue_cache_and_invalidates_runtime_stats(): void
     {
+        // Поведение изменилось: на старте sync кэш НЕ удаляется (это прятало
+        // данные в UI на 2–6 минут). Записи остаются, shadow-update в
+        // RecalculateUnitEconomicsCacheJob обновит их плавно. Сбрасывается
+        // только Redis-кэш метрик, чтобы UI не показывал устаревшие агрегаты.
         $integration = Integration::factory()->create(['id' => 9001, 'marketplace' => 'ozon']);
         $otherIntegration = Integration::factory()->create(['id' => 9002, 'marketplace' => 'ozon']);
         $product = Product::factory()->create([
@@ -157,7 +161,8 @@ class ProductServiceTest extends TestCase
 
         $this->service->startSync('ozon', ['client_id' => 'test', 'api_key' => 'test'], $integration->id);
 
-        $this->assertDatabaseMissing('unit_economics_cache', [
+        // Записи UE-кэша НЕ трогаются при старте sync.
+        $this->assertDatabaseHas('unit_economics_cache', [
             'integration_id' => $integration->id,
             'sku' => $product->sku,
         ]);
@@ -165,6 +170,7 @@ class ProductServiceTest extends TestCase
             'integration_id' => $otherIntegration->id,
             'sku' => $otherProduct->sku,
         ]);
+        // Runtime-кэш (Redis) всё же сбрасывается — чтобы стрим агрегатов был свежим.
         $this->assertFalse(Cache::has("ue_cache_stats_{$integration->id}"));
     }
 

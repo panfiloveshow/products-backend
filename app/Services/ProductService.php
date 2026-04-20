@@ -146,8 +146,20 @@ class ProductService
                 return $existingSync;
             }
 
-            if ($syncType === 'products') {
-                $this->clearUnitEconomicsCacheForSync($integrationId, $marketplace);
+            // НЕ чистим кэш юнит-экономики на старте синхронизации.
+            // Раньше удаление шло здесь и UI показывал «Нет данных» 2–6 минут
+            // пока не отработает RecalculateUnitEconomicsCacheJob.
+            // Сейчас пересчёт работает через shadow-update (fix H4):
+            //   1. updateOrCreate по каждому SKU — существующие записи обновляются,
+            //   2. в конце удаляются только «устаревшие» (updated_at < startedAt),
+            //      то есть SKU, которых больше нет в каталоге.
+            // Юзер всё время видит данные; они просто плавно обновляются.
+            if ($syncType === 'products' && $integrationId !== null) {
+                // Сбрасываем только runtime-кэши (Redis), таблицу не трогаем.
+                $this->forgetUnitEconomicsRuntimeCache(
+                    $integrationId,
+                    $this->marketplaceAliases($marketplace)
+                );
             }
 
             $syncLog = SyncLog::create([
