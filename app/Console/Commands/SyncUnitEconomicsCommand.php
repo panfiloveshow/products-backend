@@ -449,6 +449,25 @@ class SyncUnitEconomicsCommand extends Command
                         $this->info('  Premium статус: '.($isPremium ? '✓ Premium' : '✗ Не Premium').' (из сохранённого статуса)');
                     }
 
+                    // Маппинг ozon_sku (числовой) -> offer_id (артикул продавца) нужен
+                    // и для postings-калькулятора (чтобы записать данные под обоими ключами),
+                    // и для /v1/analytics/data (где данные приходят по числовому sku).
+                    $ozonSkuToOfferIdMap = [];
+                    $offerIdToOzonSkuMap = [];
+                    Product::where('integration_id', $integrationId)
+                        ->whereNotNull('ozon_data')
+                        ->chunk(500, function ($products) use (&$ozonSkuToOfferIdMap, &$offerIdToOzonSkuMap) {
+                            foreach ($products as $product) {
+                                $ozonData = $product->ozon_data ?? [];
+                                $ozonSku = $ozonData['sku'] ?? null;
+                                $offerId = $ozonData['offer_id'] ?? $product->sku;
+                                if ($ozonSku) {
+                                    $ozonSkuToOfferIdMap[(string) $ozonSku] = $offerId;
+                                    $offerIdToOzonSkuMap[$offerId] = (string) $ozonSku;
+                                }
+                            }
+                        });
+
                     // === ПОЛУЧЕНИЕ ПРОЦЕНТА ВЫКУПА ===
                     // Шаг 0: пытаемся посчитать выкуп по реальным заказам из postings
                     // (28 дней). Это самый точный источник — матчит Ozon UI и не зависит
@@ -457,7 +476,13 @@ class SyncUnitEconomicsCommand extends Command
                     $postingsCalculator = app(\App\Services\Ozon\OzonPostingsBuyoutCalculator::class);
                     $postingsBuyoutMap = $postingsCalculator->calculateForIntegration((int) $integrationId, 28);
                     foreach ($postingsBuyoutMap as $sku => $buyout) {
+                        // Ключ из posting_items.sku = offer_id. Дублируем под ozon_sku (числовой),
+                        // чтобы downstream lookup по ozon_sku тоже получил postings-данные,
+                        // а не перезаписанные analytics API.
                         $redemptionData[$sku] = $buyout;
+                        if (isset($offerIdToOzonSkuMap[$sku])) {
+                            $redemptionData[$offerIdToOzonSkuMap[$sku]] = $buyout;
+                        }
                     }
                     if (! empty($postingsBuyoutMap)) {
                         $fullFromPostings = count(array_filter($postingsBuyoutMap, fn ($d) => ($d['has_full_data'] ?? false)));
@@ -465,24 +490,6 @@ class SyncUnitEconomicsCommand extends Command
                     }
 
                     if ($isPremium) {
-                        // Создаём маппинг ozon_sku -> offer_id для сопоставления данных из API
-                        // API аналитики возвращает ozon_data['sku'] (числовой ID в системе Ozon)
-                        // offer_id — это артикул продавца (SKU), по которому мы ищем товары
-                        $ozonSkuToOfferIdMap = [];
-                        Product::where('integration_id', $integrationId)
-                            ->whereNotNull('ozon_data')
-                            ->chunk(500, function ($products) use (&$ozonSkuToOfferIdMap) {
-                                foreach ($products as $product) {
-                                    $ozonData = $product->ozon_data ?? [];
-                                    // API аналитики использует ozon_data['sku'] (числовой ID Ozon)
-                                    $ozonSku = $ozonData['sku'] ?? null;
-                                    // offer_id — артикул продавца, совпадает с product.sku
-                                    $offerId = $ozonData['offer_id'] ?? $product->sku;
-                                    if ($ozonSku) {
-                                        $ozonSkuToOfferIdMap[(string) $ozonSku] = $offerId;
-                                    }
-                                }
-                            });
 
                         $this->info('  Создан маппинг ozon_sku -> offer_id для '.count($ozonSkuToOfferIdMap).' товаров');
 
