@@ -2724,4 +2724,183 @@ class UnitEconomicsCacheController extends Controller
 
         return $normalized !== '' ? $normalized : null;
     }
+
+    /**
+     * GET /api/unit-economics/freshness/{integrationId}
+     *
+     * Возвращает "светофор" свежести данных юнит-экономики для UI.
+     * Фронт вызывает при открытии страницы и поллит каждые 2–3 секунды
+     * во время sync, чтобы показать юзеру:
+     *   - данные свежие (только что пересчитаны)
+     *   - данные устарели (последний sync был давно)
+     *   - идёт пересчёт прямо сейчас (и какой этап)
+     */
+    public function freshness(int $integrationId): JsonResponse
+    {
+        $integration = Integration::find($integrationId);
+        if (! $integration) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Интеграция не найдена',
+            ], 404);
+        }
+
+        // Максимальный updated_at в кэше — момент когда данные реально обновились.
+        $cacheLastUpdated = \Illuminate\Support\Facades\DB::table('unit_economics_cache')
+            ->where('integration_id', $integrationId)
+            ->max('updated_at');
+        $cacheRowsCount = UnitEconomicsCache::where('integration_id', $integrationId)->count();
+
+        // Последний завершённый sync products/inventory + идущие сейчас.
+        $latestSync = \Illuminate\Support\Facades\DB::table('sync_logs')
+            ->where('integration_id', $integrationId)
+            ->orderByDesc('created_at')
+            ->limit(10)
+            ->get(['sync_type', 'status', 'items_synced', 'metadata', 'started_at', 'completed_at', 'created_at']);
+
+        $stagesBySyncType = [];
+        foreach ($latestSync as $log) {
+            // Берём самый свежий лог на каждый тип sync.
+            if (! isset($stagesBySyncType[$log->sync_type])) {
+                $stagesBySyncType[$log->sync_type] = $log;
+            }
+        }
+
+        // Проверяем очереди: идёт ли сейчас пересчёт UE / локальности.
+        $queueUe = \Illuminate\Support\Facades\DB::table('jobs')
+            ->where('queue', 'unit-economics')
+            ->where('payload', 'like', '%"integrationId":'.$integrationId.'%')
+            ->count();
+        $queueLocality = \Illuminate\Support\Facades\DB::table('jobs')
+            ->where('queue', 'locality')
+            ->where('payload', 'like', '%"integrationId":'.$integrationId.'%')
+            ->count();
+
+        // Собираем стадии.
+        $products = $stagesBySyncType['products'] ?? null;
+        $inventory = $stagesBySyncType['inventory'] ?? null;
+
+        $productsStage = $this->buildStageInfo($products, 'products');
+        $inventoryStage = $this->buildStageInfo($inventory, 'inventory');
+
+        $ueStage = [
+            'status' => $queueUe > 0 ? 'running' : ($cacheRowsCount > 0 ? 'completed' : 'pending'),
+            'last_updated_at' => $cacheLastUpdated,
+            'rows' => $cacheRowsCount,
+        ];
+
+        // Снапшот локальности
+        $localityLast = \Illuminate\Support\Facades\DB::table('locality_metrics_daily')
+            ->where('integration_id', $integrationId)
+            ->max('updated_at');
+        $localitySnapshotDate = \Illuminate\Support\Facades\DB::table('locality_metrics_daily')
+            ->where('integration_id', $integrationId)
+            ->max('snapshot_date');
+        $localityStage = [
+            'status' => $queueLocality > 0
+                ? 'running'
+                : ($localityLast ? 'completed' : 'pending'),
+            'last_updated_at' => $localityLast,
+            'snapshot_date' => $localitySnapshotDate,
+        ];
+
+        // Общий светофор.
+        $anyRunning = in_array('running', [$productsStage['status'], $inventoryStage['status'], $ueStage['status'], $localityStage['status']], true);
+        $allCompleted = $cacheRowsCount > 0
+            && $productsStage['status'] === 'completed'
+            && $inventoryStage['status'] === 'completed'
+            && $ueStage['status'] === 'completed'
+            && ! $anyRunning;
+
+        $freshnessColor = 'gray';
+        $freshnessLabel = 'Нет данных';
+        if ($anyRunning) {
+            $freshnessColor = 'yellow';
+            $freshnessLabel = 'Обновляется…';
+        } elseif ($cacheLastUpdated) {
+            $ageMinutes = now()->diffInMinutes(\Carbon\Carbon::parse($cacheLastUpdated));
+            if ($ageMinutes < 60) {
+                $freshnessColor = 'green';
+                $freshnessLabel = $this->humanAge($ageMinutes);
+            } elseif ($ageMinutes < 60 * 24) {
+                $freshnessColor = 'green';
+                $freshnessLabel = $this->humanAge($ageMinutes);
+            } elseif ($ageMinutes < 60 * 24 * 3) {
+                $freshnessColor = 'yellow';
+                $freshnessLabel = 'Данные старше суток — рекомендуем синхронизировать';
+            } else {
+                $freshnessColor = 'red';
+                $freshnessLabel = 'Данные устарели, нажмите «Синхронизировать»';
+            }
+        }
+
+        return response()->json([
+            'success' => true,
+            'data' => [
+                'integration_id' => $integrationId,
+                'overall' => [
+                    'color' => $freshnessColor,
+                    'label' => $freshnessLabel,
+                    'is_fresh' => $allCompleted,
+                    'is_updating' => $anyRunning,
+                    'last_updated_at' => $cacheLastUpdated,
+                ],
+                'stages' => [
+                    'products' => $productsStage,
+                    'inventory' => $inventoryStage,
+                    'unit_economics' => $ueStage,
+                    'locality' => $localityStage,
+                ],
+            ],
+        ]);
+    }
+
+    private function buildStageInfo(?object $log, string $syncType): array
+    {
+        if (! $log) {
+            return [
+                'status' => 'idle',
+                'items_synced' => 0,
+                'total' => null,
+                'progress_percent' => null,
+                'started_at' => null,
+                'completed_at' => null,
+            ];
+        }
+
+        $meta = is_string($log->metadata) ? json_decode($log->metadata, true) : [];
+        $total = $meta['total_from_api'] ?? null;
+        $items = (int) ($log->items_synced ?? 0);
+        $progress = null;
+        if ($total && $total > 0) {
+            $progress = min(100, (int) round(($items / $total) * 100));
+        } elseif ($log->status === 'completed') {
+            $progress = 100;
+        }
+
+        return [
+            'status' => $log->status,              // pending | running | completed | failed
+            'items_synced' => $items,
+            'total' => $total,
+            'progress_percent' => $progress,
+            'started_at' => $log->started_at,
+            'completed_at' => $log->completed_at,
+        ];
+    }
+
+    private function humanAge(int $minutes): string
+    {
+        if ($minutes < 1) {
+            return 'Только что';
+        }
+        if ($minutes < 60) {
+            return "Обновлено {$minutes} мин назад";
+        }
+        $hours = (int) floor($minutes / 60);
+        if ($hours < 24) {
+            return "Обновлено {$hours} ч назад";
+        }
+        $days = (int) floor($hours / 24);
+        return "Обновлено {$days} д назад";
+    }
 }

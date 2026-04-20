@@ -65,6 +65,7 @@ class CheckSellicoPermission
         'unit-economics.commissions'       => 'unit_economics.tariffs.view',
         'unit-economics.tariffs'           => 'unit_economics.tariffs.view',
         'unit-economics.cache-stats'       => 'unit_economics.view',
+        'unit-economics.freshness'         => 'unit_economics.view',
         'unit-economics.export.excel'      => 'unit_economics.view',
 
         // Автопланирование

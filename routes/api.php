@@ -185,6 +185,12 @@ Route::prefix('unit-economics')->middleware('sellico.permission')->group(functio
         ->middleware('integration.access')
         ->name('unit-economics.cache-stats');
 
+    // Светофор «свежести» данных UE + этапы синхронизации.
+    // Фронт поллит этот endpoint каждые 2–3 сек во время sync для progress-bar.
+    Route::get('/freshness/{integrationId}', [UnitEconomicsCacheController::class, 'freshness'])
+        ->middleware('integration.access')
+        ->name('unit-economics.freshness');
+
     // Calculate
     Route::post('/calculate/{marketplace}', [UnitEconomicsCacheController::class, 'calculate'])
         ->whereIn('marketplace', ['wildberries', 'ozon', 'yandex_market'])
