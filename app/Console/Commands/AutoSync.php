@@ -52,12 +52,36 @@ class AutoSync extends Command
                 continue;
             }
             
-            // Проверяем нет ли уже запущенной синхронизации
+            // Проверяем нет ли уже запущенной синхронизации.
+            // Fix H12: ранее зависший «running» блокировал автосинк навсегда.
+            // Теперь stale-таймаут 2 часа: если running больше 2ч — считаем его зомби,
+            // помечаем failed и стартуем новый прогон.
+            $staleRunning = SyncLog::where('integration_id', $integration->id)
+                ->where('sync_type', $syncType)
+                ->running()
+                ->where('started_at', '<', now()->subHours(2))
+                ->get();
+
+            if ($staleRunning->isNotEmpty()) {
+                foreach ($staleRunning as $stale) {
+                    $stale->update([
+                        'status' => 'failed',
+                        'finished_at' => now(),
+                        'error_message' => 'Auto-marked failed: running > 2 hours (stale lock)',
+                    ]);
+                }
+                Log::warning('AutoSync: stale running sync_logs marked failed', [
+                    'integration_id' => $integration->id,
+                    'count' => $staleRunning->count(),
+                ]);
+            }
+
             $running = SyncLog::where('integration_id', $integration->id)
                 ->where('sync_type', $syncType)
                 ->running()
+                ->where('started_at', '>=', now()->subHours(2))
                 ->exists();
-            
+
             if ($running) {
                 $this->line("  ⏭️  {$integration->name} ({$integration->marketplace}): уже запущена");
                 $skipped++;

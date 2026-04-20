@@ -20,86 +20,112 @@ class GenerateAlertsJob implements ShouldQueue
 
     public function handle(): void
     {
-        Log::info("Starting alerts generation");
-
-        $criticalWarehouses = InventoryWarehouse::where('stock_status', 'critical')
-            ->with('product')
-            ->get();
-
-        $lowStockWarehouses = InventoryWarehouse::where('stock_status', 'low')
-            ->with('product')
-            ->get();
+        Log::info('Starting alerts generation');
 
         $alertsCreated = 0;
-
-        foreach ($criticalWarehouses as $warehouse) {
-            $existingAlert = InventoryAlert::where('sku', $warehouse->sku)
-                ->where('warehouse_id', $warehouse->warehouse_id)
-                ->where('type', 'critical')
-                ->where('is_resolved', false)
-                ->first();
-
-            if (!$existingAlert) {
-                InventoryAlert::create([
-                    'sku' => $warehouse->sku,
-                    'warehouse_id' => $warehouse->warehouse_id,
-                    'warehouse_name' => $warehouse->warehouse_name,
-                    'type' => 'critical',
-                    'message' => "Критически низкий остаток: {$warehouse->quantity} шт. на складе {$warehouse->warehouse_name}",
-                    'action' => 'reorder',
-                    'priority' => 10,
-                ]);
-                $alertsCreated++;
-            }
-        }
-
-        foreach ($lowStockWarehouses as $warehouse) {
-            $existingAlert = InventoryAlert::where('sku', $warehouse->sku)
-                ->where('warehouse_id', $warehouse->warehouse_id)
-                ->where('type', 'warning')
-                ->where('is_resolved', false)
-                ->first();
-
-            if (!$existingAlert) {
-                InventoryAlert::create([
-                    'sku' => $warehouse->sku,
-                    'warehouse_id' => $warehouse->warehouse_id,
-                    'warehouse_name' => $warehouse->warehouse_name,
-                    'type' => 'warning',
-                    'message' => "Низкий остаток: {$warehouse->quantity} шт. ({$warehouse->days_of_stock} дней) на складе {$warehouse->warehouse_name}",
-                    'action' => 'monitor',
-                    'priority' => 5,
-                ]);
-                $alertsCreated++;
-            }
-        }
+        $alertsCreated += $this->generateAlertsForStatus('critical', 10, 'reorder');
+        $alertsCreated += $this->generateAlertsForStatus('low', 5, 'monitor');
 
         $this->resolveOutdatedAlerts();
 
-        Log::info("Alerts generation completed", [
+        Log::info('Alerts generation completed', [
             'created' => $alertsCreated,
         ]);
     }
 
+    /**
+     * Генерирует алерты для warehouses с указанным stock_status.
+     *
+     * Оптимизация (H7): раньше для каждого warehouse делался отдельный
+     * SELECT к inventory_alerts → N+1. Теперь подгружаем активные алерты одним
+     * запросом в keyed-set и чекаем принадлежность в памяти.
+     */
+    private function generateAlertsForStatus(string $status, int $priority, string $action): int
+    {
+        $warehouses = InventoryWarehouse::where('stock_status', $status)->get();
+        if ($warehouses->isEmpty()) {
+            return 0;
+        }
+
+        $alertType = $status === 'critical' ? 'critical' : 'warning';
+
+        // Одной выборкой тянем все уже существующие активные алерты по данным SKU+warehouse_id.
+        $skus = $warehouses->pluck('sku')->filter()->unique()->all();
+        $warehouseIds = $warehouses->pluck('warehouse_id')->filter()->unique()->all();
+        $existingKeys = InventoryAlert::query()
+            ->whereIn('sku', $skus)
+            ->whereIn('warehouse_id', $warehouseIds)
+            ->where('type', $alertType)
+            ->where('is_resolved', false)
+            ->get(['sku', 'warehouse_id'])
+            ->map(fn ($row) => $row->sku.'||'.$row->warehouse_id)
+            ->flip(); // flip → O(1) проверка через isset
+
+        $created = 0;
+        foreach ($warehouses as $warehouse) {
+            $key = $warehouse->sku.'||'.$warehouse->warehouse_id;
+            if (isset($existingKeys[$key])) {
+                continue;
+            }
+
+            $message = $status === 'critical'
+                ? "Критически низкий остаток: {$warehouse->quantity} шт. на складе {$warehouse->warehouse_name}"
+                : "Низкий остаток: {$warehouse->quantity} шт. ({$warehouse->days_of_stock} дней) на складе {$warehouse->warehouse_name}";
+
+            InventoryAlert::create([
+                'sku' => $warehouse->sku,
+                'warehouse_id' => $warehouse->warehouse_id,
+                'warehouse_name' => $warehouse->warehouse_name,
+                'type' => $alertType,
+                'message' => $message,
+                'action' => $action,
+                'priority' => $priority,
+            ]);
+            $created++;
+        }
+
+        return $created;
+    }
+
+    /**
+     * Разрешает устаревшие алерты (когда статус склада уже восстановился).
+     *
+     * Оптимизация (H7): раньше для каждого алерта делался SELECT по
+     * inventory_warehouses → N+1. Теперь загружаем warehouses одной выборкой
+     * по набору (sku, warehouse_id) из активных алертов.
+     */
     private function resolveOutdatedAlerts(): void
     {
         $activeAlerts = InventoryAlert::active()->get();
+        if ($activeAlerts->isEmpty()) {
+            return;
+        }
+
+        $skus = $activeAlerts->pluck('sku')->filter()->unique()->all();
+        $warehouseIds = $activeAlerts->pluck('warehouse_id')->filter()->unique()->all();
+
+        // Ключ "{sku}||{warehouse_id}" → stock_status.
+        $warehouseStatus = InventoryWarehouse::query()
+            ->whereIn('sku', $skus)
+            ->whereIn('warehouse_id', $warehouseIds)
+            ->get(['sku', 'warehouse_id', 'stock_status'])
+            ->mapWithKeys(fn ($row) => [$row->sku.'||'.$row->warehouse_id => $row->stock_status]);
 
         foreach ($activeAlerts as $alert) {
-            $warehouse = InventoryWarehouse::where('sku', $alert->sku)
-                ->where('warehouse_id', $alert->warehouse_id)
-                ->first();
+            $key = $alert->sku.'||'.$alert->warehouse_id;
+            $status = $warehouseStatus->get($key);
 
-            if (!$warehouse) {
+            if ($status === null) {
                 $alert->resolve();
                 continue;
             }
 
-            if ($alert->type === 'critical' && $warehouse->stock_status !== 'critical') {
+            if ($alert->type === 'critical' && $status !== 'critical') {
                 $alert->resolve();
+                continue;
             }
 
-            if ($alert->type === 'warning' && !in_array($warehouse->stock_status, ['critical', 'low'])) {
+            if ($alert->type === 'warning' && ! in_array($status, ['critical', 'low'], true)) {
                 $alert->resolve();
             }
         }

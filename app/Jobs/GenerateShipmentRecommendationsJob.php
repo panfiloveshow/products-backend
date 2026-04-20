@@ -24,7 +24,6 @@ class GenerateShipmentRecommendationsJob implements ShouldQueue
         Log::info("Starting shipment recommendations generation");
 
         $criticalProducts = InventoryWarehouse::where('stock_status', 'critical')
-            ->with('product')
             ->get()
             ->groupBy('sku');
 
@@ -33,20 +32,41 @@ class GenerateShipmentRecommendationsJob implements ShouldQueue
             return;
         }
 
+        // Оптимизация H8: раньше на каждый SKU делался Product::where('sku')->first()
+        // + отдельный запрос ->unitEconomics()->latest()->value() → 2 запроса на SKU.
+        // Теперь грузим Product + последний UnitEconomics одним прогоном.
+        $skus = $criticalProducts->keys()->filter()->unique()->values()->all();
+
+        $productsBySku = Product::query()
+            ->whereIn('sku', $skus)
+            ->get()
+            ->keyBy('sku');
+
+        // Последняя запись unit_economics на SKU — через DB max(id).
+        $latestCostPrice = \Illuminate\Support\Facades\DB::table('unit_economics')
+            ->select('sku', 'cost_price')
+            ->whereIn('id', function ($q) use ($skus) {
+                $q->selectRaw('MAX(id)')
+                    ->from('unit_economics')
+                    ->whereIn('sku', $skus)
+                    ->groupBy('sku');
+            })
+            ->pluck('cost_price', 'sku');
+
         $criticalItems = [];
         $recommendedItems = [];
         $totalCost = 0;
         $totalVolume = 0;
 
         foreach ($criticalProducts as $sku => $warehouses) {
-            $product = Product::where('sku', $sku)->first();
-            if (!$product) {
+            $product = $productsBySku->get($sku);
+            if (! $product) {
                 continue;
             }
 
             $avgDailySales = $warehouses->avg('average_daily_sales') ?? 1;
             $recommendedQty = (int) ($avgDailySales * 30);
-            $costPrice = $product->unitEconomics()->latest()->value('cost_price') ?? 500;
+            $costPrice = (float) ($latestCostPrice->get($sku) ?? 500);
             $estimatedCost = $recommendedQty * $costPrice;
 
             $criticalItems[] = [
