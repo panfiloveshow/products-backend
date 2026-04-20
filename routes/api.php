@@ -37,8 +37,11 @@ Route::prefix('integrations')->middleware('sellico.permission')->group(function 
     Route::get('/{id}/status', [IntegrationController::class, 'checkStatus'])->name('integrations.status');
 });
 
-// Integration sync - outside middleware group (permissions handled inside controller)
-Route::any('integrations/{id}/sync', [IntegrationController::class, 'sync'])->name('integrations.sync.direct');
+// Integration sync - outside sellico.permission middleware, т.к. метод
+// сам проверяет доступ через IntegrationAccessService::ensureAccessibleIntegration.
+// Ограничиваем методы POST/GET чтобы запретить CSRF-like трюки через PUT/DELETE.
+Route::match(['GET', 'POST'], 'integrations/{id}/sync', [IntegrationController::class, 'sync'])
+    ->name('integrations.sync.direct');
 
 /*
 |--------------------------------------------------------------------------
@@ -50,10 +53,12 @@ Route::get('/placeholder/{width}/{height}', [PlaceholderController::class, 'show
     ->whereNumber('height');
 
 Route::prefix('auth')->group(function () {
-    Route::post('/login', [AuthController::class, 'login']);
-    Route::get('/me', [AuthController::class, 'me']);
-    Route::get('/workspaces', [AuthController::class, 'workspaces']);
-    Route::get('/workspaces/{workspaceId}/integrations', [AuthController::class, 'integrations']);
+    // throttle:10,1 — не более 10 попыток логина в минуту с одного IP.
+    // Защита от credential stuffing / bruteforce.
+    Route::post('/login', [AuthController::class, 'login'])->middleware('throttle:10,1');
+    Route::get('/me', [AuthController::class, 'me'])->middleware('throttle:60,1');
+    Route::get('/workspaces', [AuthController::class, 'workspaces'])->middleware('throttle:60,1');
+    Route::get('/workspaces/{workspaceId}/integrations', [AuthController::class, 'integrations'])->middleware('throttle:60,1');
 });
 
 /*
@@ -320,5 +325,10 @@ Route::prefix('v1/locality')->middleware('sellico.permission')->group(function (
 Route::get('/wb-webhook/status', [WbWebhookController::class, 'status'])->name('wb-webhook.status');
 Route::post('/wb-webhook/register', [WbWebhookController::class, 'register'])->name('wb-webhook.register');
 Route::post('/wb-webhook/deactivate', [WbWebhookController::class, 'deactivate'])->name('wb-webhook.deactivate');
-// Публичный роут для приёма событий от WB (без авторизации)
-Route::post('/wb-webhook/receive/{integrationId}', [WbWebhookController::class, 'receive'])->name('wb-webhook.receive');
+// Публичный роут для приёма событий от WB. Авторизация — через HMAC-подпись
+// внутри контроллера (см. WbWebhookController::isSignatureValid).
+// throttle:300,1 — защита от спам-запросов без подписи (они всё равно получат 401,
+// но лимитер освобождает worker'ы).
+Route::post('/wb-webhook/receive/{integrationId}', [WbWebhookController::class, 'receive'])
+    ->middleware('throttle:300,1')
+    ->name('wb-webhook.receive');

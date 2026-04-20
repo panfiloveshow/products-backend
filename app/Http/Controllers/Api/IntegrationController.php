@@ -17,6 +17,28 @@ use Illuminate\Support\Facades\Validator;
 
 class IntegrationController extends Controller
 {
+    public function __construct(
+        private readonly IntegrationAccessService $integrationAccess,
+    ) {
+    }
+
+    /**
+     * Получить интеграцию с проверкой принадлежности к workspace.
+     * Возвращает либо валидную Integration, либо JsonResponse с 403/404.
+     */
+    private function authorizedIntegration(Request $request, int $id): Integration|JsonResponse
+    {
+        $access = $this->integrationAccess->ensureAccessibleIntegration($request, $id);
+        if (! ($access['success'] ?? false)) {
+            return response()->json([
+                'success' => false,
+                'message' => $access['message'] ?? 'Нет доступа к интеграции',
+            ], $access['status'] ?? 403);
+        }
+
+        return $access['integration'];
+    }
+
     /**
      * Список всех интеграций
      */
@@ -104,15 +126,11 @@ class IntegrationController extends Controller
     /**
      * Получить одну интеграцию
      */
-    public function show(int $id): JsonResponse
+    public function show(Request $request, int $id): JsonResponse
     {
-        $integration = Integration::find($id);
-
-        if (! $integration) {
-            return response()->json([
-                'success' => false,
-                'message' => 'Интеграция не найдена',
-            ], 404);
+        $integration = $this->authorizedIntegration($request, $id);
+        if ($integration instanceof JsonResponse) {
+            return $integration;
         }
 
         return response()->json([
@@ -154,16 +172,14 @@ class IntegrationController extends Controller
      */
     public function update(UpdateIntegrationRequest $request, int $id): JsonResponse
     {
-        $integration = Integration::find($id);
-
-        if (! $integration) {
-            return response()->json([
-                'success' => false,
-                'message' => 'Интеграция не найдена',
-            ], 404);
+        $integration = $this->authorizedIntegration($request, $id);
+        if ($integration instanceof JsonResponse) {
+            return $integration;
         }
 
         $validated = $request->validated();
+        // Защита от mass-assignment: не даём переписать integration_id / work_space_id через update.
+        unset($validated['id'], $validated['work_space_id'], $validated['integration_id']);
 
         $integration->update($validated);
 
@@ -177,15 +193,11 @@ class IntegrationController extends Controller
     /**
      * Удалить интеграцию
      */
-    public function destroy(int $id): JsonResponse
+    public function destroy(Request $request, int $id): JsonResponse
     {
-        $integration = Integration::find($id);
-
-        if (! $integration) {
-            return response()->json([
-                'success' => false,
-                'message' => 'Интеграция не найдена',
-            ], 404);
+        $integration = $this->authorizedIntegration($request, $id);
+        if ($integration instanceof JsonResponse) {
+            return $integration;
         }
 
         // Проверяем, есть ли связанные товары
@@ -212,7 +224,7 @@ class IntegrationController extends Controller
      * Запустить синхронизацию для интеграции
      * Получает credentials из Sellico API по integration_id
      */
-    public function sync(Request $request, int $id, ProductService $productService, SellicoApiService $sellicoApi): JsonResponse
+    public function sync(Request $request, int $id, ProductService $productService, SellicoApiService $sellicoApi, IntegrationAccessService $integrationAccess): JsonResponse
     {
         $token = $request->bearerToken()
             ?? $request->header('X-Sellico-Token')
@@ -223,6 +235,17 @@ class IntegrationController extends Controller
                 'success' => false,
                 'message' => 'Токен не предоставлен',
             ], 401);
+        }
+
+        // Проверка доступа пользователя к интеграции через Sellico (по user-token + workspace-заголовку).
+        // Без этой проверки любой авторизованный мог дёргать sync ЧУЖОЙ интеграции
+        // и триггерить takeover work_space_id ниже.
+        $access = $integrationAccess->ensureAccessibleIntegration($request, $id);
+        if (! ($access['success'] ?? false)) {
+            return response()->json([
+                'success' => false,
+                'message' => $access['message'] ?? 'Нет доступа к интеграции',
+            ], $access['status'] ?? 403);
         }
 
         // getIntegrationById использует сервисный токен (autobidder) для запросов к Sellico API
@@ -308,15 +331,11 @@ class IntegrationController extends Controller
     /**
      * Статус синхронизации интеграции
      */
-    public function syncStatus(int $id): JsonResponse
+    public function syncStatus(Request $request, int $id): JsonResponse
     {
-        $integration = Integration::find($id);
-
-        if (! $integration) {
-            return response()->json([
-                'success' => false,
-                'message' => 'Интеграция не найдена',
-            ], 404);
+        $integration = $this->authorizedIntegration($request, $id);
+        if ($integration instanceof JsonResponse) {
+            return $integration;
         }
 
         $lastSyncs = SyncLog::where('integration_id', $id)
@@ -409,13 +428,9 @@ class IntegrationController extends Controller
             ], 422);
         }
 
-        $integration = Integration::find($id);
-
-        if (! $integration) {
-            return response()->json([
-                'success' => false,
-                'message' => 'Интеграция не найдена',
-            ], 404);
+        $integration = $this->authorizedIntegration($request, $id);
+        if ($integration instanceof JsonResponse) {
+            return $integration;
         }
 
         // Premium аккаунты получают данные автоматически — ручной ввод запрещён

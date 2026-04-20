@@ -25,6 +25,14 @@ class CheckSellicoPermission
      * Ключ кэша для авторизационного токена сервис-аккаунта
      */
     protected const TOKEN_CACHE_KEY = 'sellico_access_token';
+
+    /**
+     * TTL grace-кэша положительных результатов проверки прав (секунды) — 24 часа.
+     * Используется как fallback, если CRM недоступен: ранее успешно проверенные
+     * связки (token + workspace + permission) продолжают работать, но новые
+     * получают 503. Это балансирует безопасность и устойчивость к CRM-outage.
+     */
+    protected const GRACE_CACHE_TTL = 86400;
     /**
      * Маппинг роутов на permissions
      */
@@ -193,9 +201,17 @@ class CheckSellicoPermission
 
         $permission = self::ROUTE_PERMISSIONS[$routeName];
 
+        // Kill-switch для локальной разработки. В production запрещён —
+        // даже если флаг случайно попадёт в .env prod, доступ не откроется.
         if (config('services.sellico.skip_permission_check', false)) {
-            Log::debug('CheckSellicoPermission: проверка прав пропущена через skip_permission_check');
-            return $next($request);
+            if (app()->environment('production')) {
+                Log::critical('CheckSellicoPermission: SELLICO_SKIP_PERMISSION_CHECK запрещён в production, игнорируем флаг', [
+                    'route' => $routeName,
+                ]);
+            } else {
+                Log::debug('CheckSellicoPermission: проверка прав пропущена через skip_permission_check (non-production)');
+                return $next($request);
+            }
         }
 
         $token = $request->header('X-Sellico-Token')
@@ -228,26 +244,39 @@ class CheckSellicoPermission
         // Кешируем токен пользователя по workspace_id — используется CLI-синком для доступа к API
         Cache::put("workspace_user_token:{$workspace}", $token, now()->addHours(22));
 
-        $cacheKey = "perm:{$workspace}:{$permission}:" . md5($token);
+        $tokenHash = md5($token);
+        $cacheKey = "perm:{$workspace}:{$permission}:{$tokenHash}";
+        $graceCacheKey = "perm_grace:{$workspace}:{$permission}:{$tokenHash}";
 
-        $allowed = Cache::remember($cacheKey, self::CACHE_TTL, function () use ($token, $user, $workspace, $permission, $routeName) {
-            return $this->checkPermissionRemotely($token, $user, $workspace, $permission, $routeName);
+        $allowed = Cache::remember($cacheKey, self::CACHE_TTL, function () use ($token, $user, $workspace, $permission, $routeName, $graceCacheKey) {
+            $result = $this->checkPermissionRemotely($token, $user, $workspace, $permission, $routeName);
+            // При подтверждённом доступе пишем в grace-кэш на 24 часа —
+            // чтобы пережить кратковременный outage CRM без падения API.
+            if ($result === true) {
+                Cache::put($graceCacheKey, true, self::GRACE_CACHE_TTL);
+            }
+            return $result;
         });
 
-        // Если проверка вернула null (ошибка), но у нас есть валидный токен и workspace - пропускаем
+        // Fail-closed with grace: при ошибке CRM пропускаем только тех, кто уже был
+        // успешно проверен в последние 24 часа; новым запросам отвечаем 503.
+        // Это ликвидирует прежний fail-open на любой ошибке/таймауте CRM.
         if ($allowed === null) {
-            Log::warning('CheckSellicoPermission: проверка прав вернула null, используем fallback', [
+            if (Cache::has($graceCacheKey)) {
+                Log::warning('CheckSellicoPermission: CRM недоступен, используем grace-кэш', [
+                    'route'      => $routeName,
+                    'permission' => $permission,
+                    'workspace'  => $workspace,
+                ]);
+                return $next($request);
+            }
+
+            Log::error('CheckSellicoPermission: CRM недоступен и нет grace-кэша — блокируем запрос', [
                 'route'      => $routeName,
                 'permission' => $permission,
                 'workspace'  => $workspace,
             ]);
-            
-            // Fallback: если есть токен и workspace, считаем что доступ разрешён
-            // Это предотвращает блокировку API при проблемах с CRM
-            if ($token && $workspace) {
-                return $next($request);
-            }
-            
+
             return response()->json([
                 'message' => 'Не удалось проверить права доступа. Попробуйте позже.',
                 'error'   => 'permission_check_failed',
@@ -306,11 +335,12 @@ class CheckSellicoPermission
         $serviceToken = $this->getServiceToken();
 
         if (empty($serviceToken)) {
-            Log::warning('CheckSellicoPermission: не удалось получить сервисный токен, пропускаем проверку', [
+            Log::error('CheckSellicoPermission: не удалось получить сервисный токен, блокируем запрос', [
                 'route'      => $routeName,
                 'permission' => $permission,
             ]);
-            return true;
+            // Fail-closed: без сервис-токена проверка невозможна.
+            return null;
         }
 
         $plainToken = str_contains($token, '|') ? explode('|', $token, 2)[1] : $token;
@@ -360,14 +390,14 @@ class CheckSellicoPermission
                         'route'      => $routeName,
                         'permission' => $permission,
                     ]);
-                    return true;
+                    // Fail-closed: возвращаем null, middleware примет решение на основе grace-кэша.
+                    return null;
                 }
                 Log::info('CheckSellicoPermission: повторная авторизация', [
                     'route'      => $routeName,
                     'permission' => $permission,
                     'workspace'  => $workspace,
                     'user'       => $user,
-                    'token'      => $token,
                 ]);
                 $retryResponse = Http::timeout(5)
                     ->accept('application/json')
@@ -378,7 +408,6 @@ class CheckSellicoPermission
                         'workspace'  => $workspace,
                         'permission' => $permission,
                     ]);
-                Log::info($retryResponse);
                 if ($retryResponse->successful()) {
                     $data = $retryResponse->json();
                     return (bool) ($data['valid'] ?? false);
@@ -434,13 +463,12 @@ class CheckSellicoPermission
             Log::error('CheckSellicoPermission: неожиданный ответ CRM', [
                 'route'      => $routeName,
                 'status'     => $response->status(),
-                'body'       => $response->body(),
                 'permission' => $permission,
                 'workspace'  => $workspace,
             ]);
 
-            // Fallback: пропускаем при прочих ошибках CRM
-            return true;
+            // Fail-closed: null → middleware решит через grace-кэш, иначе 503.
+            return null;
 
         } catch (\Exception $e) {
             Log::error('CheckSellicoPermission: ошибка запроса к CRM', [
@@ -450,8 +478,8 @@ class CheckSellicoPermission
                 'workspace'  => $workspace,
             ]);
 
-            // Fallback: пропускаем при ошибках сети
-            return true;
+            // Fail-closed: null → middleware решит через grace-кэш, иначе 503.
+            return null;
         }
     }
 
