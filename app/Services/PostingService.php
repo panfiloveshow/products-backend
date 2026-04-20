@@ -212,6 +212,14 @@ class PostingService
             'external_status' => $data['status'],
             'shipment_date' => isset($data['shipment_date']) ? date('Y-m-d H:i:s', strtotime($data['shipment_date'])) : null,
             'delivering_date' => isset($data['delivering_date']) ? date('Y-m-d H:i:s', strtotime($data['delivering_date'])) : null,
+            // Реальная дата создания заказа на Ozon. Раньше терялась в meta JSON —
+            // без неё нельзя было корректно отфильтровать «заказы за последние N дней»,
+            // приходилось использовать created_at (время нашего sync'а).
+            'in_process_at' => isset($data['in_process_at']) ? date('Y-m-d H:i:s', strtotime($data['in_process_at'])) : null,
+            // Дата фактической отмены (если есть в ответе API или в блоке cancellation).
+            'cancelled_at' => isset($data['cancellation']['cancelled_at'])
+                ? date('Y-m-d H:i:s', strtotime($data['cancellation']['cancelled_at']))
+                : (isset($data['cancelled_at']) ? date('Y-m-d H:i:s', strtotime($data['cancelled_at'])) : null),
             'warehouse_id' => $data['delivery_method']['warehouse_id'] ?? $data['analytics_data']['warehouse_id'] ?? null,
             'warehouse_name' => $data['delivery_method']['warehouse'] ?? $data['analytics_data']['warehouse_name'] ?? null,
             'delivery_method' => $data['delivery_method']['tpl_provider_type'] ?? $data['delivery_method']['name'] ?? $deliveryType,
@@ -222,7 +230,6 @@ class PostingService
             'analytics_data' => $data['analytics_data'] ?? null,
             'barcodes' => $data['barcodes'] ?? null,
             'meta' => [
-                'in_process_at' => $data['in_process_at'] ?? null,
                 'cancellation' => $data['cancellation'] ?? null,
                 'requirements' => $data['requirements'] ?? null,
             ],
