@@ -22,7 +22,6 @@ class CalculateRequest extends FormRequest
             // WB specific
             'wb_commission_percent' => 'nullable|numeric|min:0|max:100',
             'volume_liters' => 'nullable|numeric|min:0',
-            'volume_weight' => 'nullable|numeric|min:0',
             'storage_tariff' => 'nullable|numeric|min:0',
             'storage_days' => 'nullable|integer|min:0',
             'logistics_cost' => 'nullable|numeric|min:0',

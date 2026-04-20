@@ -261,6 +261,23 @@ class SyncProductsJob implements ShouldBeUnique, ShouldQueue
                 Log::info('UnitEconomics sync dispatched after products sync', [
                     'integration_id' => $this->syncLog->integration_id,
                 ]);
+
+                // Локальность продаж напрямую влияет на взвешенные тарифы
+                // в юнит-экономике, поэтому пересчитываем её после sync'а
+                // (раньше зависело только от cron'а в 05:00 — данные могли
+                // протухать на сутки). Задержка 60с чтобы inventory sync
+                // успел завершиться и положить свежие stock-данные.
+                if ($this->syncLog->marketplace === 'ozon') {
+                    \App\Domains\Locality\Jobs\AggregateLocalityDailyJob::dispatch(
+                        (int) $this->syncLog->integration_id
+                    )
+                        ->onQueue('locality')
+                        ->delay(now()->addSeconds(60));
+
+                    Log::info('Locality aggregate dispatched after products sync', [
+                        'integration_id' => $this->syncLog->integration_id,
+                    ]);
+                }
             }
         } catch (\Exception $e) {
             $this->syncLog->fail($e->getMessage());

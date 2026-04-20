@@ -513,13 +513,6 @@ class UnitEconomicsCacheService
         $heightCm = $heightMm !== null ? ((float) $heightMm / 10) : 0.0;
         $weightKg = $weightG !== null ? ((float) $weightG / 1000) : 0.0;
 
-        // Объём в литрах (см³/1000). Используется ниже для volume_weight и
-        // chargeable_volume_liters. Без этого блока каждый SKU падал с
-        // "Undefined variable $volumeLiters" и запись не попадала в кэш.
-        $volumeLiters = ($lengthCm > 0 && $widthCm > 0 && $heightCm > 0)
-            ? ($lengthCm * $widthCm * $heightCm) / 1000
-            : null;
-
         $costPrice = ($settings?->cost_price && $settings->cost_price > 0)
             ? $settings->cost_price
             : ($existingUE?->cost_price ?? 0);
@@ -583,9 +576,9 @@ class UnitEconomicsCacheService
         $acceptanceCost = (float) ($marketplaceData['acceptance_cost'] ?? 0);
         $penaltyCost = (float) ($marketplaceData['penalty_cost'] ?? 0);
 
-        $volumeWeight = $product->volume_weight ?? ($volumeLiters !== null ? round($volumeLiters / 5, 4) : null);
-        $chargeableVolumeLiters = $result->metadata['chargeable_volume_liters']
-            ?? ($volumeLiters !== null ? max((float) $volumeLiters, (float) (($volumeWeight ?? 0) * 5)) : null);
+        // (volume_weight / chargeable_volume_liters вычисляются позже — в
+        // convertResultToCacheData по результатам калькулятора; здесь этот блок
+        // был вставлен по ошибке и падал на `Undefined variable $result`.)
 
         return [
             'sku' => $product->sku,
@@ -761,6 +754,18 @@ class UnitEconomicsCacheService
         $volumeLiters = ($length > 0 && $width > 0 && $height > 0)
             ? ($length * $width * $height) / 1000
             : null;
+
+        // Объёмный вес (Ozon: volume_liters / 5) — используется в возвращаемых
+        // marketplace_data и volume_weight.
+        $volumeWeight = $product->volume_weight
+            ?? ($volumeLiters !== null ? round($volumeLiters / 5, 4) : null);
+
+        // Тарифицируемый объём для матрицы логистики — max(физ. объём, volumeWeight × 5).
+        // Калькулятор мог уже положить это значение в metadata.
+        $chargeableVolumeLiters = $result->metadata['chargeable_volume_liters']
+            ?? ($volumeLiters !== null
+                ? max((float) $volumeLiters, (float) (($volumeWeight ?? 0) * 5))
+                : null);
 
         return [
             'product_id' => $product->id,

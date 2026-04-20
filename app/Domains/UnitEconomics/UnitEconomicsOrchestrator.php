@@ -124,7 +124,6 @@ class UnitEconomicsOrchestrator
                 width: $input->width,
                 height: $input->height,
                 weight: $input->weight,
-                volumeWeight: $input->volumeWeight,
                 costPrice: $input->costPrice,
                 packagingCost: $input->packagingCost,
                 additionalCosts: $input->additionalCosts,
