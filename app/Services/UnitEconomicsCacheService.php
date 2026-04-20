@@ -513,6 +513,13 @@ class UnitEconomicsCacheService
         $heightCm = $heightMm !== null ? ((float) $heightMm / 10) : 0.0;
         $weightKg = $weightG !== null ? ((float) $weightG / 1000) : 0.0;
 
+        // Объём в литрах (см³/1000). Используется ниже для volume_weight и
+        // chargeable_volume_liters. Без этого блока каждый SKU падал с
+        // "Undefined variable $volumeLiters" и запись не попадала в кэш.
+        $volumeLiters = ($lengthCm > 0 && $widthCm > 0 && $heightCm > 0)
+            ? ($lengthCm * $widthCm * $heightCm) / 1000
+            : null;
+
         $costPrice = ($settings?->cost_price && $settings->cost_price > 0)
             ? $settings->cost_price
             : ($existingUE?->cost_price ?? 0);
