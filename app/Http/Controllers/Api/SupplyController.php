@@ -9,7 +9,7 @@ use App\Models\Supply;
 use App\Models\SupplyAnalytics;
 use App\Models\SupplyRecommendation;
 use App\Models\SupplySettings;
-use App\Services\Supply\SupplyRecommendationService;
+use App\Services\Supply\LegacySupplyRecommendationService;
 use App\Services\Supply\SupplyService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
@@ -27,7 +27,7 @@ use Illuminate\Support\Facades\Log;
 class SupplyController extends Controller
 {
     public function __construct(
-        protected SupplyRecommendationService $recommendationService,
+        protected LegacySupplyRecommendationService $recommendationService,
         protected SupplyService $supplyService
     ) {}
 

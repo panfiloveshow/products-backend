@@ -13,14 +13,23 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 
 /**
- * Сервис расчёта рекомендаций на поставку
- * 
- * Формула потребности (MVP):
- * demand = avg_sales_per_day(window) * target_days
- * need = max(0, demand - (stock_fbo + in_transit - safety_buffer))
- * need_rounded = округление по кратности (короб/минималка)
+ * Legacy-сервис расчёта рекомендаций на поставку (MVP-реализация).
+ *
+ * Формула потребности:
+ *   demand = avg_sales_per_day(window) * target_days
+ *   need = max(0, demand - (stock_fbo + in_transit - safety_buffer))
+ *   need_rounded = округление по кратности (короб/минималка)
+ *
+ * НЕ путать с {@see \App\Domains\Supplies\Services\SupplyRecommendationService},
+ * который использует DDD-архитектуру и делегирует вычисления в
+ * SupplyCalculationService + SupplyOptimizationService. У этих двух сервисов
+ * разные публичные методы — они НЕ взаимозаменяемы.
+ *
+ * Callers этого legacy-сервиса:
+ *   - App\Http\Controllers\Api\SupplyController
+ *   - App\Jobs\CalculateSupplyRecommendationsJob
  */
-class SupplyRecommendationService
+class LegacySupplyRecommendationService
 {
     /**
      * Рассчитать рекомендации для интеграции

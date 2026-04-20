@@ -3,7 +3,7 @@
 namespace App\Jobs;
 
 use App\Models\Integration;
-use App\Services\Supply\SupplyRecommendationService;
+use App\Services\Supply\LegacySupplyRecommendationService;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
@@ -28,7 +28,7 @@ class CalculateSupplyRecommendationsJob implements ShouldQueue
         public ?string $clusterId = null
     ) {}
 
-    public function handle(SupplyRecommendationService $service): void
+    public function handle(LegacySupplyRecommendationService $service): void
     {
         $startTime = microtime(true);
 
