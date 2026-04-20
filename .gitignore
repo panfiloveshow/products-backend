@@ -3,6 +3,8 @@
 .env
 .env.backup
 .env.production
+.env.local
+.env.*.local
 .phpactor.json
 .phpunit.result.cache
 /.fleet
@@ -22,3 +24,42 @@
 Homestead.json
 Homestead.yaml
 Thumbs.db
+
+# Local SQLite DBs
+*.sqlite
+*.sqlite-journal
+database/database.sqlite
+
+# Editor / tooling tmp
+.windsurf/tmp/
+.cursor/
+.claude/
+
+# Local deploy / secret helpers (никогда не коммитить)
+deploy-manual.sh
+deploy-simple.sh
+deploy-sudo.sh
+quick-deploy.sh
+fix-*.sh
+upload-via-web.php
+UPLOAD-*.md
+DEPLOYMENT_STATUS.md
+
+# Backup archives
+_backups/
+*.bak
+*.tar.gz
+
+# Ad-hoc debug scripts в корне
+/test-*.php
+/test_*.php
+
+# Artisan-generated
+storage/framework/cache/*
+storage/framework/sessions/*
+storage/framework/views/*
+storage/logs/*
+!storage/framework/cache/.gitignore
+!storage/framework/sessions/.gitignore
+!storage/framework/views/.gitignore
+!storage/logs/.gitignore
