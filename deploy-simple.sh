@@ -13,6 +13,16 @@ echo "=== Деплой на сервер ==="
 echo "Сервер: ${DEPLOY_USER}@${DEPLOY_HOST}:${REMOTE_PATH}"
 echo ""
 
+# Запускаем тесты перед деплоем
+echo "🧪 Запуск тестов..."
+php vendor/bin/phpunit --colors=always
+if [ $? -ne 0 ]; then
+  echo "❌ Тесты не прошли! Деплой отменён."
+  exit 1
+fi
+echo "✅ Тесты пройдены"
+echo ""
+
 # Синхронизируем файлы через rsync
 echo "📦 Синхронизация файлов..."
 export SSHPASS="$DEPLOY_PASS"

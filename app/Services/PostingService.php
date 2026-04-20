@@ -54,67 +54,131 @@ class PostingService
     private function syncOzonPostings(Integration $integration, ?string $status, ?string $dateFrom): array
     {
         $marketplace = OzonMarketplace::fromIntegration($integration);
-        $client = $marketplace->getClient();
+        $since = $dateFrom ? date('c', strtotime($dateFrom)) : date('c', strtotime('-60 days'));
+        $to = date('c');
 
-        // Маппинг статусов
+        $fbs = $this->syncOzonFbsPostings($integration, $marketplace, $status, $since, $to);
+        $fbo = $this->syncOzonFboPostings($integration, $marketplace, $since, $to);
+
+        Log::info('Ozon postings synced', [
+            'integration_id' => $integration->id,
+            'total' => $fbs['total'] + $fbo['total'],
+            'created' => $fbs['created'] + $fbo['created'],
+            'updated' => $fbs['updated'] + $fbo['updated'],
+            'fbs_total' => $fbs['total'],
+            'fbo_total' => $fbo['total'],
+        ]);
+
+        return [
+            'total' => $fbs['total'] + $fbo['total'],
+            'created' => $fbs['created'] + $fbo['created'],
+            'updated' => $fbs['updated'] + $fbo['updated'],
+        ];
+    }
+
+    private function syncOzonFbsPostings(Integration $integration, OzonMarketplace $marketplace, ?string $status, string $since, string $to): array
+    {
         $ozonStatus = match ($status) {
             'awaiting_packaging' => 'awaiting_packaging',
             'awaiting_deliver' => 'awaiting_deliver',
             'delivering' => 'delivering',
             'delivered' => 'delivered',
             'cancelled' => 'cancelled',
-            default => 'awaiting_packaging',
+            default => null,
         };
-
-        // Получаем отправления из Ozon API
-        $response = $client->post('/v3/posting/fbs/list', [
-            'dir' => 'DESC',
-            'filter' => [
-                'status' => $ozonStatus,
-                'since' => $dateFrom ? date('c', strtotime($dateFrom)) : date('c', strtotime('-30 days')),
-                'to' => date('c'),
-            ],
-            'limit' => 1000,
-            'offset' => 0,
-            'with' => [
-                'analytics_data' => true,
-                'barcodes' => true,
-                'financial_data' => true,
-            ],
-        ]);
-
-        if (!$response || !isset($response['result']['postings'])) {
-            Log::warning('No postings returned from Ozon API', [
-                'integration_id' => $integration->id,
-            ]);
-            return ['total' => 0, 'created' => 0, 'updated' => 0];
-        }
 
         $created = 0;
         $updated = 0;
+        $offset = 0;
+        $limit = 1000;
 
-        DB::beginTransaction();
-        try {
-            foreach ($response['result']['postings'] as $ozonPosting) {
-                $result = $this->upsertOzonPosting($integration, $ozonPosting);
-                if ($result === 'created') {
-                    $created++;
-                } else {
-                    $updated++;
+        do {
+            $response = $marketplace->getClient()->post('/v3/posting/fbs/list', [
+                'dir' => 'DESC',
+                'filter' => array_filter([
+                    'status' => $ozonStatus,
+                    'since' => $since,
+                    'to' => $to,
+                ]),
+                'limit' => $limit,
+                'offset' => $offset,
+                'with' => [
+                    'analytics_data' => true,
+                    'barcodes' => true,
+                    'financial_data' => true,
+                ],
+            ]);
+
+            $postings = $response['result']['postings'] ?? [];
+
+            DB::beginTransaction();
+            try {
+                foreach ($postings as $ozonPosting) {
+                    $result = $this->upsertOzonPosting($integration, $ozonPosting, 'fbs');
+                    if ($result === 'created') {
+                        $created++;
+                    } else {
+                        $updated++;
+                    }
                 }
+                DB::commit();
+            } catch (\Exception $e) {
+                DB::rollBack();
+                throw $e;
             }
-            DB::commit();
-        } catch (\Exception $e) {
-            DB::rollBack();
-            throw $e;
-        }
 
-        Log::info('Ozon postings synced', [
-            'integration_id' => $integration->id,
+            $offset += $limit;
+        } while (count($postings) === $limit);
+
+        return [
             'total' => $created + $updated,
             'created' => $created,
             'updated' => $updated,
-        ]);
+        ];
+    }
+
+    private function syncOzonFboPostings(Integration $integration, OzonMarketplace $marketplace, string $since, string $to): array
+    {
+        $created = 0;
+        $updated = 0;
+        $offset = 0;
+        $limit = 1000;
+
+        do {
+            $response = $marketplace->getClient()->post('/v2/posting/fbo/list', [
+                'dir' => 'DESC',
+                'filter' => [
+                    'since' => $since,
+                    'to' => $to,
+                ],
+                'limit' => $limit,
+                'offset' => $offset,
+                'with' => [
+                    'analytics_data' => true,
+                    'financial_data' => true,
+                ],
+            ]);
+
+            $postings = $response['result'] ?? [];
+
+            DB::beginTransaction();
+            try {
+                foreach ($postings as $ozonPosting) {
+                    $result = $this->upsertOzonPosting($integration, $ozonPosting, 'fbo');
+                    if ($result === 'created') {
+                        $created++;
+                    } else {
+                        $updated++;
+                    }
+                }
+                DB::commit();
+            } catch (\Exception $e) {
+                DB::rollBack();
+                throw $e;
+            }
+
+            $offset += $limit;
+        } while (count($postings) === $limit);
 
         return [
             'total' => $created + $updated,
@@ -126,9 +190,12 @@ class PostingService
     /**
      * Создать или обновить отправление Ozon
      */
-    private function upsertOzonPosting(Integration $integration, array $data): string
+    private function upsertOzonPosting(Integration $integration, array $data, string $deliveryType = 'fbs'): string
     {
-        $postingNumber = $data['posting_number'];
+        $postingNumber = (string) ($data['posting_number'] ?? '');
+        if ($postingNumber === '') {
+            throw new \RuntimeException('Ozon posting_number is missing');
+        }
         
         $existing = Posting::where('integration_id', $integration->id)
             ->where('posting_number', $postingNumber)
@@ -145,10 +212,10 @@ class PostingService
             'external_status' => $data['status'],
             'shipment_date' => isset($data['shipment_date']) ? date('Y-m-d H:i:s', strtotime($data['shipment_date'])) : null,
             'delivering_date' => isset($data['delivering_date']) ? date('Y-m-d H:i:s', strtotime($data['delivering_date'])) : null,
-            'warehouse_id' => $data['delivery_method']['warehouse_id'] ?? null,
-            'warehouse_name' => $data['delivery_method']['warehouse'] ?? null,
-            'delivery_method' => $data['delivery_method']['tpl_provider_type'] ?? null,
-            'delivery_type' => 'fbs',
+            'warehouse_id' => $data['delivery_method']['warehouse_id'] ?? $data['analytics_data']['warehouse_id'] ?? null,
+            'warehouse_name' => $data['delivery_method']['warehouse'] ?? $data['analytics_data']['warehouse_name'] ?? null,
+            'delivery_method' => $data['delivery_method']['tpl_provider_type'] ?? $data['delivery_method']['name'] ?? $deliveryType,
+            'delivery_type' => $deliveryType,
             'tpl_integration_type' => $data['tpl_integration_type'] ?? null,
             'customer' => $this->extractOzonCustomer($data),
             'financial_data' => $data['financial_data'] ?? null,
@@ -181,7 +248,7 @@ class PostingService
         }
 
         // Синхронизируем товары
-        $this->syncOzonPostingItems($posting, $data['products'] ?? []);
+        $this->syncOzonPostingItems($posting, $data['products'] ?? [], $deliveryType);
 
         // Пересчитываем итоги
         $posting->recalculateTotals();
@@ -195,7 +262,7 @@ class PostingService
     /**
      * Синхронизировать товары отправления Ozon
      */
-    private function syncOzonPostingItems(Posting $posting, array $products): void
+    private function syncOzonPostingItems(Posting $posting, array $products, string $deliveryType = 'fbs'): void
     {
         // Удаляем старые товары
         $posting->items()->delete();
@@ -214,7 +281,10 @@ class PostingService
                 'commission_amount' => $product['commission_amount'] ?? null,
                 'commission_percent' => $product['commission_percent'] ?? null,
                 'payout' => $product['payout'] ?? null,
+                'weight' => $product['weight'] ?? null,
+                'volume' => $product['volume'] ?? null,
                 'meta' => [
+                    'delivery_type' => $deliveryType,
                     'currency_code' => $product['currency_code'] ?? 'RUB',
                     'mandatory_mark' => $product['mandatory_mark'] ?? null,
                 ],
@@ -229,12 +299,13 @@ class PostingService
     {
         $customer = $data['customer'] ?? [];
         $address = $data['addressee'] ?? [];
+        $customerId = $customer['customer_id'] ?? null;
         
         return [
-            'name' => $address['name'] ?? ($customer['customer_id'] ? "Покупатель #{$customer['customer_id']}" : 'Покупатель'),
+            'name' => $address['name'] ?? ($customerId ? "Покупатель #{$customerId}" : 'Покупатель'),
             'phone' => isset($address['phone']) ? $this->maskPhone($address['phone']) : null,
             'address' => $address['address'] ?? null,
-            'customer_id' => $customer['customer_id'] ?? null,
+            'customer_id' => $customerId,
         ];
     }
 

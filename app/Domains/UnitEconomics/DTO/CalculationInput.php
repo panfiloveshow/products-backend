@@ -23,6 +23,7 @@ class CalculationInput
         public readonly float $width = 0,        // см  
         public readonly float $height = 0,       // см
         public readonly float $weight = 0,       // кг
+        public readonly ?float $volumeWeight = null, // Объёмный вес, кг
         
         // Себестоимость
         public readonly ?float $costPrice = null,
@@ -121,6 +122,20 @@ class CalculationInput
     }
 
     /**
+     * Получить тарифицируемый объём в литрах.
+     *
+     * В Ozon volume_weight хранится в кг и исторически считается как volume_liters / 5.
+     * Для тарифной матрицы приводим его обратно к литрам и берём более консервативное значение.
+     */
+    public function getChargeableVolumeInLiters(): float
+    {
+        $volumeLiters = $this->getVolumeInLiters();
+        $volumeByWeight = $this->volumeWeight !== null ? max(0.0, $this->volumeWeight * 5) : 0.0;
+
+        return max($volumeLiters, $volumeByWeight);
+    }
+
+    /**
      * Создать из массива
      */
     public static function fromArray(array $data): self
@@ -136,6 +151,7 @@ class CalculationInput
             width: (float) ($data['width'] ?? 0),
             height: (float) ($data['height'] ?? 0),
             weight: (float) ($data['weight'] ?? 0),
+            volumeWeight: isset($data['volume_weight']) ? (float) $data['volume_weight'] : null,
             costPrice: isset($data['cost_price']) ? (float) $data['cost_price'] : null,
             packagingCost: isset($data['packaging_cost']) ? (float) $data['packaging_cost'] : null,
             additionalCosts: isset($data['additional_costs']) ? (float) $data['additional_costs'] : null,

@@ -116,8 +116,13 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
 
         // Загружаем продукты для метаданных (barcode, name, pack_multiple, price)
         $skus = $warehouses->pluck('sku')->unique()->toArray();
+        // BUG FIX: для Yandex ищем товары и 'yandex', и 'yandex_market' — аналогично inventory
         $productsRaw = Product::where('integration_id', $integrationId)
-            ->where('marketplace', $marketplace)
+            ->when(
+                in_array($marketplace, ['yandex', 'yandex_market'], true),
+                fn ($q) => $q->whereIn('marketplace', ['yandex', 'yandex_market']),
+                fn ($q) => $q->where('marketplace', $marketplace)
+            )
             ->where(function ($q) use ($skus) {
                 $q->whereIn('sku', $skus)->orWhereIn('barcode', $skus);
             })
@@ -182,11 +187,16 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
             }
         }
 
+        // BUG FIX: для Yandex UE хранится как 'yandex_market' (нормализовано)
         $unitEconomicsRaw = UnitEconomics::where(function ($q) use ($integrationId) {
                 $q->where('integration_id', $integrationId)
                   ->orWhereNull('integration_id');
             })
-            ->where('marketplace', $marketplace)
+            ->when(
+                in_array($marketplace, ['yandex', 'yandex_market'], true),
+                fn ($q) => $q->whereIn('marketplace', ['yandex', 'yandex_market']),
+                fn ($q) => $q->where('marketplace', $marketplace)
+            )
             ->whereIn('sku', $skusForUe)
             ->orderByDesc('integration_id')
             ->get()
@@ -810,6 +820,83 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
             $totalLines++;
         }
 
+        // --- Locality enrichment + cluster split (Ozon only) ---
+        if ($marketplace === 'ozon' && ! empty($lines)) {
+            try {
+                $enricher = app(\App\Domains\Locality\Integration\LocalityEnrichmentService::class);
+
+                // split_by_cluster: per-план через params > per-integration через SupplySettings > default true
+                $splitByCluster = array_key_exists('split_by_cluster', $plan->params ?? [])
+                    ? (bool) $plan->params['split_by_cluster']
+                    : (bool) ($settings->locality_split_default ?? true);
+                $minConfidence = $plan->params['minimum_locality_confidence']
+                    ?? ($settings->locality_min_confidence_default ?? \App\Domains\Locality\Integration\LocalityEnrichmentService::DEFAULT_MIN_CONFIDENCE);
+                $maxClusters = (int) ($settings->locality_max_split_clusters
+                    ?? \App\Domains\Locality\Integration\LocalityEnrichmentService::DEFAULT_MAX_CLUSTERS);
+                $strategy = (string) ($plan->params['locality_distribution_strategy']
+                    ?? \App\Domains\Locality\Integration\LocalityEnrichmentService::STRATEGY_RECOMMENDATIONS);
+
+                $skuList = array_values(array_unique(array_column($lines, 'sku')));
+                $metrics = $enricher->loadMetricsForSkus((int) $integrationId, $skuList);
+                $recsPerSku = $enricher->loadRecommendationsForSkus((int) $integrationId, $skuList, (string) $minConfidence);
+
+                $enriched = [];
+                foreach ($lines as $line) {
+                    $sku = (string) $line['sku'];
+                    $metric = $metrics[$sku] ?? null;
+                    $recs = $recsPerSku[$sku] ?? collect([]);
+
+                    // 1) Cluster split (если включено и есть что делить)
+                    if ($splitByCluster && ! empty($recs) && $recs->isNotEmpty()) {
+                        $ozonClusterData = $ozonAnalytics[$sku]['clusters'] ?? [];
+                        $packMultiple = (int) ($settings->default_pack_multiple ?? 1);
+
+                        $split = $enricher->applyClusterSplit(
+                            $line,
+                            $recs,
+                            $ozonClusterData,
+                            (string) $strategy,
+                            $maxClusters,
+                            max(1, $packMultiple)
+                        );
+
+                        foreach ($split['children'] as $child) {
+                            $enrichedChild = $enricher->enrichLine($child, $metric, $recs, null);
+                            $enrichedChild['created_at'] = $child['created_at'] ?? now();
+                            $enrichedChild['updated_at'] = $child['updated_at'] ?? now();
+                            // array-поля → json для bulk insert
+                            foreach (['cluster_split_json', 'linked_locality_recommendation_ids'] as $jsonKey) {
+                                if (isset($enrichedChild[$jsonKey]) && is_array($enrichedChild[$jsonKey])) {
+                                    $enrichedChild[$jsonKey] = json_encode($enrichedChild[$jsonKey]);
+                                }
+                            }
+                            $enriched[] = $enrichedChild;
+                        }
+                        continue;
+                    }
+
+                    // 2) Только enrichment без split
+                    $enrichedLine = $enricher->enrichLine($line, $metric, $recs, null);
+                    foreach (['linked_locality_recommendation_ids'] as $jsonKey) {
+                        if (isset($enrichedLine[$jsonKey]) && is_array($enrichedLine[$jsonKey])) {
+                            $enrichedLine[$jsonKey] = json_encode($enrichedLine[$jsonKey]);
+                        }
+                    }
+                    $enriched[] = $enrichedLine;
+                }
+
+                $lines = $enriched;
+                $totalLines = count($lines);
+                $totalQty = array_sum(array_column($lines, 'qty_rounded'));
+            } catch (\Throwable $e) {
+                Log::warning('Locality enrichment failed, using plain lines', [
+                    'plan_id' => $plan->id,
+                    'error' => $e->getMessage(),
+                    'trace' => substr($e->getTraceAsString(), 0, 1000),
+                ]);
+            }
+        }
+
         // Bulk insert lines
         if (!empty($lines)) {
             foreach (array_chunk($lines, 500) as $chunk) {
@@ -844,6 +931,21 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
         }
 
         $resultJson = ['redistribution' => $redistributionSuggestions];
+
+        // --- Locality summary (Ozon only) ---
+        if ($marketplace === 'ozon') {
+            try {
+                $enricher = app(\App\Domains\Locality\Integration\LocalityEnrichmentService::class);
+                $plan->load('lines');
+                $resultJson['locality_summary'] = $enricher->buildPlanSummary($plan);
+            } catch (\Throwable $e) {
+                Log::warning('Locality summary build failed', [
+                    'plan_id' => $plan->id,
+                    'error' => $e->getMessage(),
+                ]);
+            }
+        }
+
         $plan->result_json = $resultJson;
 
         // --- Data quality score ---

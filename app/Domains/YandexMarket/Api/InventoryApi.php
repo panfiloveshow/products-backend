@@ -146,9 +146,9 @@ class InventoryApi implements InventoryApiInterface
     /**
      * Получить список складов
      *
-     * GET /campaigns/{campaignId}/warehouses
-     *
-     * Для получения складов бизнеса используйте getBusinessWarehouses()
+     * Пробуем два эндпоинта:
+     * 1. GET /campaigns/{campaignId}/warehouses — для кампаний с собственными складами
+     * 2. POST /businesses/{businessId}/warehouses — fallback через businessId (FBS/FBY)
      */
     public function getWarehouses(?Integration $integration = null): array
     {
@@ -157,11 +157,27 @@ class InventoryApi implements InventoryApiInterface
             return [];
         }
 
-        $response = $this->client->get('/v2/warehouses', [
-            'campaignId' => $cid,
-        ]);
+        // 1. Пробуем campaign-level эндпоинт
+        try {
+            $response = $this->client->get('/campaigns/{campaignId}/warehouses');
+            $warehouses = $response['warehouses'] ?? $response['result']['warehouses'] ?? [];
+            if (! empty($warehouses)) {
+                return $warehouses;
+            }
+        } catch (\Exception $e) {
+            // 404/400 — нормально для FBY/FBS, пробуем бизнес-эндпоинт
+        }
 
-        return $response['result']['warehouses'] ?? [];
+        // 2. Fallback: бизнес-склады через resolveBusinessId
+        try {
+            $businessId = $this->client->resolveBusinessId();
+            $response = $this->client->post("/businesses/{$businessId}/warehouses", []);
+            $warehouses = $response['result']['warehouses'] ?? $response['warehouses'] ?? [];
+
+            return $warehouses;
+        } catch (\Exception $e) {
+            return [];
+        }
     }
 
     /**

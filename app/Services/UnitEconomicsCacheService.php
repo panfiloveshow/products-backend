@@ -10,6 +10,7 @@ use App\Models\Product;
 use App\Models\UnitEconomics;
 use App\Models\UnitEconomicsCache;
 use App\Models\UnitEconomicsSettings;
+use App\Domains\Ozon\Tariffs\OzonPricingMatrix;
 use App\Domains\UnitEconomics\UnitEconomicsOrchestrator;
 use App\Domains\UnitEconomics\DTO\CalculationInput;
 use Illuminate\Support\Facades\Cache;
@@ -38,6 +39,10 @@ class UnitEconomicsCacheService
     private array $warehouseCoefficientCache = [];
     /** @var array<string, ?UnitEconomicsSettings> */
     private array $settingsCache = [];
+    /** @var array<string, array>|null Per-SKU locality data from real orders (batch-loaded) */
+    private ?array $localityCache = null;
+    /** @var int|null Seller-level FBO orders in last 7 days (cached per integration) */
+    private ?int $sellerFboOrders7DaysCache = null;
 
     public function __construct(
         UnitEconomicsOrchestrator $orchestrator,
@@ -148,6 +153,8 @@ class UnitEconomicsCacheService
     {
         $this->unitEconomicsCache = [];
         $this->settingsCache = [];
+        $this->localityCache = null;
+        $this->sellerFboOrders7DaysCache = null;
         $integration = $this->getIntegrationCached($integrationId);
         if (!$integration) {
             return ['error' => 'Integration not found'];
@@ -168,7 +175,17 @@ class UnitEconomicsCacheService
         ];
         
         $schemes = $this->getSchemesForMarketplace($integration->marketplace);
-        
+
+        // Batch-загрузка per-SKU locality из реальных заказов (Ozon)
+        if ($integration->marketplace === 'ozon') {
+            $localityService = app(\App\Services\Ozon\OzonLocalityService::class);
+            $this->localityCache = $localityService->resolveIntegrationLocality($integrationId);
+            Log::info('Locality data loaded for integration', [
+                'integration_id' => $integrationId,
+                'skus_with_data' => count($this->localityCache),
+            ]);
+        }
+
         Product::where('integration_id', $integrationId)
             ->chunkById(100, function ($products) use (&$stats, $schemes) {
                 foreach ($products as $product) {
@@ -290,6 +307,12 @@ class UnitEconomicsCacheService
         $markupRuleReasonLabel = null;
         $sales7Days = null;
         $profileDataSources = [];
+        $dominantClusterId = null;
+        $dominantClusterShare = null;
+        $expectedLocalityRate = null;
+        $weightedNonLocalMarkupPercent = null;
+        $clustersSummary = [];
+        $shippingRoutes = [];
 
         if ($marketplace === 'ozon') {
             $activeFixation = is_array($marketplaceData['active_fixation'] ?? null)
@@ -325,6 +348,12 @@ class UnitEconomicsCacheService
                 $product->sku,
                 'ALL'
             );
+            // Fallback: если для конкретного SKU нет профиля, берём любой профиль интеграции
+            if (! $deliveryProfile && $product->integration_id) {
+                $deliveryProfile = OzonSkuDeliveryProfile::where('integration_id', $product->integration_id)
+                    ->whereNotNull('cluster_profile')
+                    ->first();
+            }
             $profileStock = is_array($deliveryProfile?->stock_profile ?? null) ? $deliveryProfile->stock_profile : [];
             $profileSales = is_array($deliveryProfile?->sales_profile ?? null) ? $deliveryProfile->sales_profile : [];
             $profileCluster = is_array($deliveryProfile?->cluster_profile ?? null) ? $deliveryProfile->cluster_profile : [];
@@ -350,12 +379,13 @@ class UnitEconomicsCacheService
             $markupRuleReasonLabel = $marketplaceData['markup_rule_reason_label']
                 ?? $existingMarketplaceData['markup_rule_reason_label']
                 ?? null;
-            // Seller-level total FBO sales in 7 days (Ozon rule applies per-seller, not per-SKU)
-            $sellerFboSales7Days = \App\Models\InventoryWarehouse::where('integration_id', $product->integration_id)
-                ->where('marketplace', $marketplace)
-                ->where('fulfillment_type', 'FBO')
-                ->sum('sales_7_days');
-            $sales7Days = (int) $sellerFboSales7Days;
+            // Seller-level total FBO orders in 7 days (Ozon rule applies per-seller, not per-SKU)
+            // Подсчёт из реальных postings — inventory_warehouses.sales_7_days ненадёжен
+            if (! isset($this->sellerFboOrders7DaysCache)) {
+                $localityService = app(\App\Services\Ozon\OzonLocalityService::class);
+                $this->sellerFboOrders7DaysCache = $localityService->countSellerFboOrders7Days($product->integration_id);
+            }
+            $sales7Days = $this->sellerFboOrders7DaysCache;
             $profileDataSources = is_array($marketplaceData['profile_data_sources'] ?? null)
                 ? $marketplaceData['profile_data_sources']
                 : (is_array($existingMarketplaceData['profile_data_sources'] ?? null) ? $existingMarketplaceData['profile_data_sources'] : []);
@@ -419,15 +449,49 @@ class UnitEconomicsCacheService
                 : ($deliveryProfile?->weighted_non_local_markup_percent !== null
                     ? (float) $deliveryProfile->weighted_non_local_markup_percent
                     : (isset($existingMarketplaceData['weighted_non_local_markup_percent']) ? (float) $existingMarketplaceData['weighted_non_local_markup_percent'] : null));
-            $clustersSummary = is_array($marketplaceData['clusters_summary'] ?? null)
+            $baseClustersSummary = is_array($marketplaceData['clusters_summary'] ?? null)
                 ? $marketplaceData['clusters_summary']
                 : ($profileClustersSummary !== [] ? $profileClustersSummary : (is_array($existingMarketplaceData['clusters_summary'] ?? null) ? $existingMarketplaceData['clusters_summary'] : []));
+            // Locality из реальных заказов (per-SKU) — приоритетный источник
+            $skuLocality = $this->localityCache[$product->sku] ?? null;
+            $shippingRoutes = [];
+            if ($skuLocality && ! empty($skuLocality['clusters_summary'])) {
+                // markupAllowed учитывает правило Ozon >=50 FBO/7д и ручные исключения
+                // (Select-only, size_restricted) — при них наценка не применяется независимо от продаж.
+                $manualMarkupOverride = (bool) ($settings?->is_select_only || $settings?->is_size_restricted);
+                $markupAllowed = ! $manualMarkupOverride
+                    && (strtoupper($fulfillmentType) !== 'FBO' || $sales7Days === null || $sales7Days >= 50);
+                $clustersSummary = $this->mergeOzonRealOrdersClustersSummary(
+                    $skuLocality['clusters_summary'],
+                    $baseClustersSummary,
+                    $stockProfile,
+                    $markupAllowed
+                );
+                $salesProfile = ! empty($skuLocality['sales_profile'])
+                    ? $this->mergeOzonSalesProfileWithClustersSummary($skuLocality['sales_profile'], $clustersSummary)
+                    : $salesProfile;
+                $stockProfile = ! empty($skuLocality['stock_profile']) ? $skuLocality['stock_profile'] : $stockProfile;
+                $expectedLocalityRate = $skuLocality['locality_rate'];
+                $shippingRoutes = $skuLocality['shipping_routes'] ?? [];
+                $profileSource = 'real_orders';
+                $calculationConfidence = $skuLocality['total_orders'] >= 10 ? 'high' : 'medium';
+                // Доминантный кластер из реальных заказов
+                $topCluster = $skuLocality['clusters_summary'][0] ?? null;
+                if ($topCluster && ! $routeLabel) {
+                    $routeLabel = $topCluster['cluster_name'];
+                }
+                // route_resolution на основе реальных данных
+                $routeResolutionStatus = 'resolved';
+                $localityResolutionStatus = 'resolved';
+            } else {
+                $clustersSummary = $baseClustersSummary;
+            }
         }
 
-        $lengthMm = $settings?->length_mm ?? $marketplaceData['length_mm'] ?? $product->depth;
-        $widthMm = $settings?->width_mm ?? $marketplaceData['width_mm'] ?? $product->width;
-        $heightMm = $settings?->height_mm ?? $marketplaceData['height_mm'] ?? $product->height;
-        $weightG = $settings?->weight_g ?? $marketplaceData['weight_g'] ?? $product->weight;
+        $lengthMm = $settings?->length_mm ?? $marketplaceData['length_mm'] ?? $marketplaceData['dimensions']['depth'] ?? $product->depth;
+        $widthMm = $settings?->width_mm ?? $marketplaceData['width_mm'] ?? $marketplaceData['dimensions']['width'] ?? $product->width;
+        $heightMm = $settings?->height_mm ?? $marketplaceData['height_mm'] ?? $marketplaceData['dimensions']['height'] ?? $product->height;
+        $weightG = $settings?->weight_g ?? $marketplaceData['weight_g'] ?? $marketplaceData['dimensions']['weight'] ?? $product->weight;
 
         $lengthCm = $lengthMm !== null ? ((float) $lengthMm / 10) : 0.0;
         $widthCm = $widthMm !== null ? ((float) $widthMm / 10) : 0.0;
@@ -497,6 +561,10 @@ class UnitEconomicsCacheService
         $acceptanceCost = (float) ($marketplaceData['acceptance_cost'] ?? 0);
         $penaltyCost = (float) ($marketplaceData['penalty_cost'] ?? 0);
 
+        $volumeWeight = $product->volume_weight ?? ($volumeLiters !== null ? round($volumeLiters / 5, 4) : null);
+        $chargeableVolumeLiters = $result->metadata['chargeable_volume_liters']
+            ?? ($volumeLiters !== null ? max((float) $volumeLiters, (float) (($volumeWeight ?? 0) * 5)) : null);
+
         return [
             'sku' => $product->sku,
             'integration_id' => $product->integration_id,
@@ -508,6 +576,10 @@ class UnitEconomicsCacheService
             'width' => $widthCm,
             'height' => $heightCm,
             'weight' => $weightKg,
+            'length_mm' => $lengthMm,
+            'width_mm' => $widthMm,
+            'height_mm' => $heightMm,
+            'weight_g' => $weightG,
             'cost_price' => (float) $costPrice,
             'packaging_cost' => 0,
             'additional_costs' => 0,
@@ -563,8 +635,13 @@ class UnitEconomicsCacheService
             'tariff_breakdown' => is_array($tariffBreakdown) ? $tariffBreakdown : [],
             'stock_profile' => is_array($stockProfile['clusters'] ?? null) ? $stockProfile['clusters'] : ($stockProfile ?? []),
             'sales_profile' => is_array($salesProfile['clusters'] ?? null) ? $salesProfile['clusters'] : ($salesProfile ?? []),
+            'shipping_routes' => $shippingRoutes ?? [],
             'sales_7_days' => $sales7Days,
-            'markup_applied' => $marketplaceData['markup_applied'] ?? null,
+            // Ручные исключения: если товар отмечен как Select-only или size_restricted —
+            // Ozon не применяет наценку за нелокальную продажу. Принудительно false.
+            'markup_applied' => ($settings?->is_select_only || $settings?->is_size_restricted)
+                ? false
+                : ($marketplaceData['markup_applied'] ?? null),
             'weighted_logistics_cost' => isset($deliveryProfile) ? ($deliveryProfile->weighted_logistics_cost ?? null) : null,
             'product_name' => $product->name,
             '_extra' => [
@@ -598,6 +675,7 @@ class UnitEconomicsCacheService
                 'premium_recommendation' => ($integration?->is_premium ?? false)
                     ? null
                     : 'Подключите Premium Ozon, чтобы получать точные данные по кластерам спроса и локальности.',
+                'shipping_routes' => $shippingRoutes ?? [],
                 'active_fixation' => $activeFixation,
                 'turnover_days' => (int) ($existingUE?->turnover_days ?? 30),
                 'drr_percent' => $drrPercent,
@@ -685,6 +763,7 @@ class UnitEconomicsCacheService
                     'dominant_cluster_share' => $result->metadata['dominant_cluster_share'] ?? $extra['dominant_cluster_share'] ?? null,
                     'expected_locality_rate' => $result->metadata['expected_locality_rate'] ?? $extra['expected_locality_rate'] ?? null,
                     'weighted_non_local_markup_percent' => $result->metadata['weighted_non_local_markup_percent'] ?? $extra['weighted_non_local_markup_percent'] ?? null,
+                    'chargeable_volume_liters' => $chargeableVolumeLiters,
                     'shipping_cluster_id' => $result->metadata['shipping_cluster_id'] ?? $extra['active_fixation']['shipping_cluster_id'] ?? null,
                     'shipping_cluster_name' => $result->metadata['shipping_cluster_name'] ?? $extra['active_fixation']['shipping_cluster_name'] ?? null,
                     'fixation_applied' => $result->metadata['fixation_applied'] ?? $extra['active_fixation']['fixation_applied'] ?? null,
@@ -699,6 +778,7 @@ class UnitEconomicsCacheService
                     'sales_profile' => $extra['sales_profile'] ?? [],
                     'route_details' => $extra['route_details'] ?? [],
                     'order_economics_summary' => $extra['order_economics_summary'] ?? [],
+                    'shipping_routes' => $extra['shipping_routes'] ?? [],
                     'markup_rule_reason' => $extra['markup_rule_reason'] ?? null,
                     'markup_rule_reason_label' => $extra['markup_rule_reason_label'] ?? null,
                     'sales_7_days' => $extra['sales_7_days'] ?? null,
@@ -714,11 +794,11 @@ class UnitEconomicsCacheService
             'is_in_promotion' => $extra['is_in_promotion'] ?? false,
             'promotion_discount' => $extra['promotion_discount'] ?? 0,
             'volume_liters' => $volumeLiters,
-            'volume_weight' => $product->volume_weight,
-            'depth' => $product->depth,
-            'width' => $product->width,
-            'height' => $product->height,
-            'weight' => $product->weight,
+            'volume_weight' => $volumeWeight,
+            'depth' => $product->depth ?? $inputData['length_mm'] ?? null,
+            'width' => $product->width ?? $inputData['width_mm'] ?? null,
+            'height' => $product->height ?? $inputData['height_mm'] ?? null,
+            'weight' => $product->weight ?? $inputData['weight_g'] ?? null,
             // Комиссия
             'commission_percent' => $result->commissionPercent,
             'commission_amount' => $costs->commission,
@@ -1033,6 +1113,129 @@ class UnitEconomicsCacheService
     {
         return UnitEconomicsCache::where('calculated_at', '<', now()->subHours($maxAgeHours))
             ->delete();
+    }
+
+    private function mergeOzonRealOrdersClustersSummary(array $realOrderClusters, array $baseClustersSummary, array $stockProfile, bool $markupAllowed = true): array
+    {
+        $lookup = $this->buildOzonClusterLookup($baseClustersSummary);
+        $pricing = app(OzonPricingMatrix::class);
+        // Канонизация имён остатков через pricing matrix (единый источник с Calculator).
+        $stockClusterCanonical = collect($stockProfile)
+            ->pluck('cluster_name')
+            ->filter(fn ($name) => is_string($name) && trim($name) !== '')
+            ->map(fn (string $name) => $pricing->resolveClusterName($name))
+            ->filter()
+            ->unique()
+            ->values()
+            ->all();
+
+        return array_map(function (array $cluster) use ($lookup, $stockClusterCanonical, $pricing, $markupAllowed): array {
+            $matched = $this->findOzonClusterMatch($cluster, $lookup);
+            $clusterName = $cluster['cluster_name'] ?? $matched['cluster_name'] ?? null;
+            $canonicalName = is_string($clusterName) ? $pricing->resolveClusterName($clusterName) : null;
+            $isLocalCluster = $canonicalName !== null && in_array($canonicalName, $stockClusterCanonical, true);
+            $resolvedRoute = $pricing->resolveRoute(null, is_string($clusterName) ? $clusterName : null);
+            $nonLocalMarkupPercent = $pricing->resolveDestinationMarkupPercent(is_string($clusterName) ? $clusterName : null);
+            $effectiveMarkupPercent = (! $markupAllowed || $isLocalCluster) ? 0.0 : $nonLocalMarkupPercent;
+            $markupReason = $cluster['markup_reason']
+                ?? $matched['markup_reason']
+                ?? (! $markupAllowed
+                    ? 'fbo_lt_50_orders_7d'
+                    : ($isLocalCluster ? 'local_cluster' : ($nonLocalMarkupPercent > 0 ? 'non_local_markup_applied' : 'no_markup_for_cluster')));
+
+            return [
+                'cluster_id' => $cluster['cluster_id'] ?? $matched['cluster_id'] ?? null,
+                'cluster_name' => $clusterName,
+                'region' => $cluster['region'] ?? $matched['region'] ?? null,
+                'orders_count' => (int) ($cluster['orders_count'] ?? 0),
+                'orders_percent' => isset($cluster['orders_percent']) ? (float) $cluster['orders_percent'] : 0.0,
+                'delivery_time_fbo' => $cluster['delivery_time_fbo'] ?? $matched['delivery_time_fbo'] ?? null,
+                'delivery_time_fbs' => $cluster['delivery_time_fbs'] ?? $matched['delivery_time_fbs'] ?? null,
+                'is_local_cluster' => $isLocalCluster,
+                'route_key' => $cluster['route_key'] ?? $matched['route_key'] ?? $resolvedRoute['route_key'] ?? null,
+                'route_label' => $cluster['route_label'] ?? $matched['route_label'] ?? $resolvedRoute['route_label'] ?? null,
+                'non_local_markup_percent' => $nonLocalMarkupPercent,
+                'effective_markup_percent' => $effectiveMarkupPercent,
+                'markup_reason' => $markupReason,
+            ];
+        }, $realOrderClusters);
+    }
+
+    private function mergeOzonSalesProfileWithClustersSummary(array $salesProfile, array $clustersSummary): array
+    {
+        $clusters = is_array($salesProfile['clusters'] ?? null) ? $salesProfile['clusters'] : $salesProfile;
+        $lookup = $this->buildOzonClusterLookup($clustersSummary);
+
+        $merged = array_map(function (array $cluster) use ($lookup): array {
+            $matched = $this->findOzonClusterMatch($cluster, $lookup);
+
+            return array_merge($cluster, array_filter([
+                'cluster_id' => $cluster['cluster_id'] ?? $matched['cluster_id'] ?? null,
+                'cluster_name' => $cluster['cluster_name'] ?? $matched['cluster_name'] ?? null,
+                'is_local_cluster' => $matched['is_local_cluster'] ?? null,
+                'route_key' => $matched['route_key'] ?? null,
+                'route_label' => $matched['route_label'] ?? null,
+                'non_local_markup_percent' => isset($matched['non_local_markup_percent'])
+                    ? (float) $matched['non_local_markup_percent']
+                    : null,
+                'effective_markup_percent' => isset($matched['effective_markup_percent'])
+                    ? (float) $matched['effective_markup_percent']
+                    : null,
+                'markup_reason' => $matched['markup_reason'] ?? null,
+            ], static fn ($value) => $value !== null));
+        }, $clusters);
+
+        return is_array($salesProfile['clusters'] ?? null) ? ['clusters' => $merged] : $merged;
+    }
+
+    private function buildOzonClusterLookup(array $clusters): array
+    {
+        $lookup = [];
+
+        foreach ($clusters as $cluster) {
+            if (! is_array($cluster)) {
+                continue;
+            }
+
+            $clusterId = isset($cluster['cluster_id']) && $cluster['cluster_id'] !== '' ? (string) $cluster['cluster_id'] : null;
+            $clusterNameKey = $this->normalizeClusterKey($cluster['cluster_name'] ?? null);
+
+            if ($clusterId !== null) {
+                $lookup['id:' . $clusterId] = $cluster;
+            }
+
+            if ($clusterNameKey !== null) {
+                $lookup['name:' . $clusterNameKey] = $cluster;
+            }
+        }
+
+        return $lookup;
+    }
+
+    private function findOzonClusterMatch(array $cluster, array $lookup): array
+    {
+        $clusterId = isset($cluster['cluster_id']) && $cluster['cluster_id'] !== '' ? (string) $cluster['cluster_id'] : null;
+        if ($clusterId !== null && isset($lookup['id:' . $clusterId])) {
+            return $lookup['id:' . $clusterId];
+        }
+
+        $clusterNameKey = $this->normalizeClusterKey($cluster['cluster_name'] ?? null);
+        if ($clusterNameKey !== null && isset($lookup['name:' . $clusterNameKey])) {
+            return $lookup['name:' . $clusterNameKey];
+        }
+
+        return [];
+    }
+
+    private function normalizeClusterKey(mixed $value): ?string
+    {
+        if (! is_string($value)) {
+            return null;
+        }
+
+        $normalized = mb_strtolower(trim($value));
+
+        return $normalized !== '' ? $normalized : null;
     }
 
     /**

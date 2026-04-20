@@ -408,19 +408,6 @@ class OzonMarketplace implements MarketplaceInterface
             }
         }
         
-        // Габариты из v4 API (в мм и г)
-        $depth = isset($detailed['depth']) ? (int) $detailed['depth'] : null;
-        $width = isset($detailed['width']) ? (int) $detailed['width'] : null;
-        $height = isset($detailed['height']) ? (int) $detailed['height'] : null;
-        $weight = isset($detailed['weight']) ? (int) $detailed['weight'] : null;
-        
-        // Объёмный вес
-        $volumeWeight = $detailed['volume_weight'] ?? null;
-        $volumeLiters = null;
-        if ($depth && $width && $height) {
-            $volumeLiters = ($depth * $width * $height) / 1000000; // мм³ → л
-        }
-        
         // Изображения из v4 API
         // primary_image - главное фото карточки (вертикальное, основное)
         // images[] - массив дополнительных фото
@@ -486,6 +473,19 @@ class OzonMarketplace implements MarketplaceInterface
         if ($categoryId && $typeId && !empty($rawAttributes)) {
             $formattedCharacteristics = $this->categories->formatAttributes($rawAttributes, $categoryId, $typeId);
         }
+
+        $dimensions = $this->extractDimensions($detailed, $formattedCharacteristics);
+        $depth = $dimensions['length_mm'];
+        $width = $dimensions['width_mm'];
+        $height = $dimensions['height_mm'];
+        $weight = $dimensions['weight_g'];
+
+        // Объёмный вес
+        $volumeWeight = $detailed['volume_weight'] ?? $priceData['volume_weight'] ?? null;
+        $volumeLiters = null;
+        if ($depth && $width && $height) {
+            $volumeLiters = ($depth * $width * $height) / 1000000; // мм³ → л
+        }
         
         // Извлекаем бренд из атрибутов (attribute_id = 85 или 31 для бренда)
         $brand = '';
@@ -539,9 +539,13 @@ class OzonMarketplace implements MarketplaceInterface
                     'width' => $width,
                     'height' => $height,
                     'weight' => $weight,
-                    'dimension_unit' => $detailed['dimension_unit'] ?? 'mm',
-                    'weight_unit' => $detailed['weight_unit'] ?? 'g',
+                    'dimension_unit' => 'mm',
+                    'weight_unit' => 'g',
                 ],
+                'length_mm' => $depth,
+                'width_mm' => $width,
+                'height_mm' => $height,
+                'weight_g' => $weight,
                 'volume_liters' => $volumeLiters,
                 'volume_weight' => $volumeWeight,
                 'commissions' => $commissionsData,
@@ -556,6 +560,136 @@ class OzonMarketplace implements MarketplaceInterface
                 'color_image' => $detailed['color_image'] ?? null,
             ],
         ];
+    }
+
+    private function extractDimensions(array $detailed, array $formattedCharacteristics): array
+    {
+        $dimensionUnit = $detailed['dimension_unit'] ?? $detailed['dimensions']['dimension_unit'] ?? 'mm';
+        $weightUnit = $detailed['weight_unit'] ?? $detailed['dimensions']['weight_unit'] ?? 'g';
+
+        $length = $this->normalizeDimension(
+            $detailed['depth']
+                ?? $detailed['length']
+                ?? $detailed['dimensions']['depth']
+                ?? $detailed['dimensions']['length']
+                ?? null,
+            $dimensionUnit
+        );
+        $width = $this->normalizeDimension(
+            $detailed['width'] ?? $detailed['dimensions']['width'] ?? null,
+            $dimensionUnit
+        );
+        $height = $this->normalizeDimension(
+            $detailed['height'] ?? $detailed['dimensions']['height'] ?? null,
+            $dimensionUnit
+        );
+        $weight = $this->normalizeWeight(
+            $detailed['weight'] ?? $detailed['dimensions']['weight'] ?? null,
+            $weightUnit
+        );
+
+        if (! $length) {
+            $length = $this->normalizeDimension(
+                $this->characteristicValue($formattedCharacteristics, ['Глубина упаковки', 'Длина упаковки', 'Длина']),
+                'mm'
+            );
+        }
+        if (! $width) {
+            $width = $this->normalizeDimension(
+                $this->characteristicValue($formattedCharacteristics, ['Ширина упаковки', 'Ширина']),
+                'mm'
+            );
+        }
+        if (! $height) {
+            $height = $this->normalizeDimension(
+                $this->characteristicValue($formattedCharacteristics, ['Высота упаковки', 'Высота']),
+                'mm'
+            );
+        }
+        if (! $weight) {
+            $weight = $this->normalizeWeight(
+                $this->characteristicValue($formattedCharacteristics, ['Вес', 'Вес товара, г', 'Вес товара', 'Вес с упаковкой']),
+                'g'
+            );
+        }
+
+        return [
+            'length_mm' => $length,
+            'width_mm' => $width,
+            'height_mm' => $height,
+            'weight_g' => $weight,
+        ];
+    }
+
+    private function characteristicValue(array $characteristics, array $names): mixed
+    {
+        foreach ($characteristics as $key => $characteristic) {
+            if (is_array($characteristic)) {
+                $name = (string) ($characteristic['name'] ?? $key);
+                if (in_array($name, $names, true)) {
+                    return $characteristic['value'] ?? null;
+                }
+
+                continue;
+            }
+
+            if (in_array((string) $key, $names, true)) {
+                return $characteristic;
+            }
+        }
+
+        return null;
+    }
+
+    private function normalizeDimension(mixed $value, ?string $unit): ?float
+    {
+        $value = $this->numericValue($value);
+        if ($value === null || $value <= 0) {
+            return null;
+        }
+
+        return match (strtolower((string) $unit)) {
+            'cm', 'centimeter', 'centimeters', 'сm', 'см' => round($value * 10, 2),
+            'm', 'meter', 'meters', 'м' => round($value * 1000, 2),
+            default => round($value, 2),
+        };
+    }
+
+    private function normalizeWeight(mixed $value, ?string $unit): ?float
+    {
+        $value = $this->numericValue($value);
+        if ($value === null || $value <= 0) {
+            return null;
+        }
+
+        return match (strtolower((string) $unit)) {
+            'kg', 'kilogram', 'kilograms', 'кг' => round($value * 1000, 2),
+            default => round($value, 2),
+        };
+    }
+
+    private function numericValue(mixed $value): ?float
+    {
+        if ($value === null || $value === '') {
+            return null;
+        }
+
+        if (is_numeric($value)) {
+            return (float) $value;
+        }
+
+        if (is_array($value)) {
+            $value = $value['value'] ?? reset($value);
+        }
+
+        if (! is_string($value) && ! is_numeric($value)) {
+            return null;
+        }
+
+        $numeric = preg_replace('/[^\d.,]/', '', (string) $value);
+        $numeric = str_replace(',', '.', $numeric);
+
+        return $numeric !== '' ? (float) $numeric : null;
     }
 
     public function getProductPrices(): array
@@ -723,6 +857,11 @@ class OzonMarketplace implements MarketplaceInterface
     {
         $productIdToOfferId = $this->getProductIdToOfferIdMap();
         return $this->sales->getSalesBySkuAndWarehouse($days, $productIdToOfferId);
+    }
+
+    public function getSalesBySkuAndWarehouseFbs(int $days = 28): array
+    {
+        return $this->sales->getSalesBySkuAndWarehouseFbs($days);
     }
     
     /**

@@ -45,32 +45,43 @@ class SalesApi
     public function getSalesBySku(int $days = 30, array $shopSkus = []): array
     {
         try {
-            if ($shopSkus === []) {
-                $shopSkus = $this->collectShopSkusFromCatalog(500);
-            }
-            if ($shopSkus === []) {
+            $today = now()->format('Y-m-d');
+
+            // stats/orders возвращает реальные данные о заказах/отменах/возвратах по SKU
+            $raw30 = $this->fetchOrdersBySku(now()->subDays(30)->format('Y-m-d'), $today);
+            $raw14 = $this->fetchOrdersBySku(now()->subDays(14)->format('Y-m-d'), $today);
+            $raw7  = $this->fetchOrdersBySku(now()->subDays(7)->format('Y-m-d'), $today);
+
+            if (empty($raw30)) {
                 return [];
             }
 
-            $skuSlice = array_values(array_slice($shopSkus, 0, 500));
-            $today = now()->format('Y-m-d');
-
-            // BUG FIX: получаем реальные данные за каждый период вместо интерполяции
-            $raw30 = $this->fetchStatsSkus($skuSlice, now()->subDays(30)->format('Y-m-d'), $today);
-            $raw14 = $this->fetchStatsSkus($skuSlice, now()->subDays(14)->format('Y-m-d'), $today);
-            $raw7  = $this->fetchStatsSkus($skuSlice, now()->subDays(7)->format('Y-m-d'), $today);
-
             $salesData = [];
-            foreach ($raw30 as $sku => $orders30) {
-                $orders14 = $raw14[$sku] ?? (int) round($orders30 * 14 / 30);
-                $orders7  = $raw7[$sku]  ?? (int) round($orders30 * 7  / 30);
+            foreach ($raw30 as $sku => $data30) {
+                $orders30    = $data30['total'];
+                $cancelled30 = $data30['cancelled'];
+                $returned30  = $data30['returned'];
+
+                $orders14 = $raw14[$sku]['total'] ?? (int) round($orders30 * 14 / 30);
+                $orders7  = $raw7[$sku]['total']  ?? (int) round($orders30 * 7  / 30);
+
+                // % выкупа: (заказов - отменено - возвращено) / заказов * 100
+                $fulfilled = $orders30 - $cancelled30 - $returned30;
+                $redemptionRate = $orders30 > 0
+                    ? round(max(0, $fulfilled) / $orders30 * 100, 1)
+                    : null;
 
                 $salesData[(string) $sku] = [
-                    'sales_30_days' => $orders30,
-                    'sales_14_days' => $orders14,
-                    'sales_7_days'  => $orders7,
-                    'avg_daily_sales' => round($orders30 / 30, 2),
-                    'revenue' => 0,
+                    'sales_30_days'     => $orders30,
+                    'sales_14_days'     => $orders14,
+                    'sales_7_days'      => $orders7,
+                    'avg_daily_sales'   => round($orders30 / 30, 2),
+                    'revenue'           => 0,
+                    'orders_count'      => $orders30,
+                    'cancelled_count'   => $cancelled30,
+                    'returned_count'    => $returned30,
+                    'redemption_rate'   => $redemptionRate,
+                    'redemption_source' => $redemptionRate !== null ? 'api' : 'default',
                 ];
             }
 
@@ -83,31 +94,58 @@ class SalesApi
     }
 
     /**
-     * Один запрос /stats/skus за указанный период.
+     * Агрегирует статистику заказов по SKU из /stats/orders.
+     * Считаем отменёнными: CANCELLED_IN_PROCESSING, CANCELLED_IN_DELIVERY, CANCELLED.
+     * Считаем возвращёнными: RETURNED, PARTIALLY_RETURNED.
      *
-     * @param  list<string>  $shopSkus
-     * @return array<string, int>  sku => orderCount
+     * @return array<string, array{total: int, cancelled: int, returned: int}>
      */
-    private function fetchStatsSkus(array $shopSkus, string $dateFrom, string $dateTo): array
+    private function fetchOrdersBySku(string $dateFrom, string $dateTo): array
     {
         try {
-            $response = $this->client->post('/v2/campaigns/{campaignId}/stats/skus', [
-                'shopSkus' => $shopSkus,
-                'dateFrom' => $dateFrom,
-                'dateTo'   => $dateTo,
-            ]);
-
             $result = [];
-            foreach ($response['result']['shopSkus'] ?? [] as $item) {
-                $sku = $item['shopSku'] ?? null;
-                if ($sku) {
-                    $result[(string) $sku] = (int) ($item['orderCount'] ?? 0);
+            $page = 0;
+
+            do {
+                $response = $this->client->post('/v2/campaigns/{campaignId}/stats/orders', array_filter([
+                    'dateFrom'  => $dateFrom,
+                    'dateTo'    => $dateTo,
+                    'pagerFrom' => $page * 200,
+                    'pagerSize' => 200,
+                ]));
+
+                $orders = $response['result']['orders'] ?? [];
+
+                foreach ($orders as $order) {
+                    $status = strtoupper((string) ($order['status'] ?? ''));
+                    $isCancelled = str_contains($status, 'CANCEL');
+                    $isReturned  = str_contains($status, 'RETURN');
+
+                    foreach ($order['items'] ?? [] as $item) {
+                        $sku = (string) ($item['shopSku'] ?? '');
+                        if ($sku === '') {
+                            continue;
+                        }
+                        if (! isset($result[$sku])) {
+                            $result[$sku] = ['total' => 0, 'cancelled' => 0, 'returned' => 0];
+                        }
+                        $result[$sku]['total']++;
+                        if ($isCancelled) {
+                            $result[$sku]['cancelled']++;
+                        }
+                        if ($isReturned) {
+                            $result[$sku]['returned']++;
+                        }
+                    }
                 }
-            }
+
+                $hasMore = count($orders) === 200;
+                $page++;
+            } while ($hasMore && $page < 20); // max 4000 заказов
 
             return $result;
         } catch (\Exception $e) {
-            Log::warning('YandexMarket fetchStatsSkus error', [
+            Log::warning('YandexMarket fetchOrdersBySku error', [
                 'dateFrom' => $dateFrom,
                 'dateTo'   => $dateTo,
                 'error'    => $e->getMessage(),

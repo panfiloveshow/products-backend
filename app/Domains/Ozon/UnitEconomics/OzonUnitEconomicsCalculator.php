@@ -44,7 +44,7 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
     private function calculateFbo(CalculationInput $input): UnitEconomicsResult
     {
         $price = $input->price;
-        $volume = $input->getVolumeInLiters();
+        $volume = $input->getChargeableVolumeInLiters();
         $context = $this->resolveMarketplaceContext('FBO', $input, $volume);
 
         $returnCosts = $this->calculateExpectedReturnCosts('FBO', $context['base_logistics'], $input->redemptionRate);
@@ -90,7 +90,7 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
     private function calculateFbs(CalculationInput $input): UnitEconomicsResult
     {
         $price = $input->price;
-        $volume = $input->getVolumeInLiters();
+        $volume = $input->getChargeableVolumeInLiters();
         $context = $this->resolveMarketplaceContext('FBS', $input, $volume);
         $schemeCosts = $this->pricing->getSchemeCosts('FBS');
         $processingFee = (float) ($schemeCosts['processing_fee'] ?? 0);
@@ -137,7 +137,7 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
     private function calculateRfbs(CalculationInput $input): UnitEconomicsResult
     {
         $price = $input->price;
-        $context = $this->resolveMarketplaceContext('RFBS', $input, $input->getVolumeInLiters());
+        $context = $this->resolveMarketplaceContext('RFBS', $input, $input->getChargeableVolumeInLiters());
         $schemeCosts = $this->pricing->getSchemeCosts('RFBS');
         $agentFee = (float) ($schemeCosts['agent_fee'] ?? 0);
 
@@ -188,7 +188,7 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
     private function calculateExpress(CalculationInput $input): UnitEconomicsResult
     {
         $price = $input->price;
-        $context = $this->resolveMarketplaceContext('EXPRESS', $input, $input->getVolumeInLiters());
+        $context = $this->resolveMarketplaceContext('EXPRESS', $input, $input->getChargeableVolumeInLiters());
         $schemeCosts = $this->pricing->getSchemeCosts('EXPRESS');
         $agentFee = (float) ($schemeCosts['agent_fee'] ?? 0);
         $expressCompensation = $input->marketplaceCompensation ?? (float) ($schemeCosts['express_compensation'] ?? 0);
@@ -404,6 +404,8 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
             'dominant_cluster_share' => $dominantClusterShare !== null ? round($dominantClusterShare, 2) : null,
             'expected_locality_rate' => $expectedLocalityRate !== null ? round($expectedLocalityRate, 2) : null,
             'weighted_non_local_markup_percent' => $weightedNonLocalMarkupPercent !== null ? round($weightedNonLocalMarkupPercent, 2) : null,
+            'chargeable_volume_liters' => round($input->getChargeableVolumeInLiters(), 4),
+            'volume_weight' => $input->volumeWeight !== null ? round($input->volumeWeight, 4) : null,
             'profit_min' => round($scenarioRange['profit_min'], 2),
             'profit_base' => round($netProfit, 2),
             'profit_max' => round($scenarioRange['profit_max'], 2),
@@ -489,10 +491,10 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
             // Profile есть, но expected_locality не рассчитан — не локальная
             $isLocalSale = false;
         }
+        // Источник истины — Σ(share × effective_markup_percent) из clusters_summary (вариант A).
+        // Без профиля — используем явный override из input (например, repo_fallback / user),
+        // иначе остаётся null и финальная наценка упадёт на configMarkupPercent/0 ниже.
         $weightedNonLocalMarkupPercent = $profileMetrics['weighted_markup_percent'] ?? $input->weightedNonLocalMarkupPercent ?? null;
-        if ($weightedNonLocalMarkupPercent === null && $expectedLocalityRate !== null) {
-            $weightedNonLocalMarkupPercent = (100 - $expectedLocalityRate) / 100 * (float) $logisticsData['non_local_markup_percent'];
-        }
         if ($input->markupApplied === false) {
             $weightedNonLocalMarkupPercent = 0.0;
         }
@@ -573,13 +575,10 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
         $dominantSourceCluster = $fixedShippingCluster
             ?? $stockClusters[0]['cluster_name']
             ?? $this->pricing->resolveClusterName($input->routeLabel);
-        // Локальная продажа: 100% стока в одном кластере.
-        // Если сток размазан по кластерам — всегда нелокальная.
+        // Локальная продажа без фиксации допустима только когда весь доступный сток
+        // сосредоточен в одном кластере. Иначе не считаем продажу полностью локальной.
         $singleStockCluster = count($stockClusterNames) === 1 ? $stockClusterNames[0] : null;
         $markupAllowed = !($scheme === 'FBO' && $input->sales7Days !== null && $input->sales7Days < 50);
-        $redemptionFactor = $input->redemptionRate !== null
-            ? max(0.0, min(100.0, $input->redemptionRate)) / 100
-            : 1.0;
 
         $weightedBaseLogistics = 0.0;
         $weightedMarkupPercent = 0.0;
@@ -599,17 +598,20 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
                 ?? null
             );
 
-            // Локальная продажа = весь сток в одном кластере И destination = этот кластер
-            $isLocalCluster = $destinationCluster !== null
-                && $singleStockCluster !== null
-                && $destinationCluster === $singleStockCluster;
+            // Локальная продажа: если fixation задаёт кластер отгрузки — сравниваем с ним,
+            // иначе — destination совпадает с любым кластером остатков
+            $isLocalCluster = $destinationCluster !== null && (
+                $fixedShippingCluster !== null
+                    ? $destinationCluster === $fixedShippingCluster
+                    : ($singleStockCluster !== null && $destinationCluster === $singleStockCluster)
+            );
 
             if ($isLocalCluster) {
                 $localityShare += $share;
             }
 
             $sourceCluster = $fixedShippingCluster
-                ?? ($isLocalCluster ? $destinationCluster : $dominantSourceCluster);
+                ?? ($isLocalCluster ? $destinationCluster : ($dominantSourceCluster ?? $destinationCluster));
 
             $clusterLogistics = $this->pricing->resolveClusterLogistics(
                 $scheme,
@@ -621,11 +623,20 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
 
             $weightedBaseLogistics += ($share / 100) * (float) $clusterLogistics['base_cost'];
 
-            if (! $isLocalCluster && $markupAllowed) {
-                $weightedMarkupPercent += ($share / 100)
-                    * $this->pricing->resolveDestinationMarkupPercent($destinationCluster)
-                    * $redemptionFactor;
+            // Источник истины — effective_markup_percent из обогащённого clusters_summary.
+            // Если его нет (preview / legacy input) — вычисляем тем же правилом, что и Service.
+            // ВАЖНО: даже если в кэше лежит ненулевой effective_markup_percent (с момента когда sales7Days был ≥50),
+            // при текущем markupAllowed=false (sales упали ниже порога) принудительно обнуляем —
+            // правило Ozon применяется на момент отгрузки, не на момент обогащения кэша.
+            if ($isLocalCluster || ! $markupAllowed) {
+                $clusterMarkup = 0.0;
+            } elseif (array_key_exists('effective_markup_percent', $cluster) && $cluster['effective_markup_percent'] !== null) {
+                $clusterMarkup = (float) $cluster['effective_markup_percent'];
+            } else {
+                $clusterMarkup = $this->pricing->resolveDestinationMarkupPercent($destinationCluster);
             }
+
+            $weightedMarkupPercent += ($share / 100) * $clusterMarkup;
         }
 
         if (! $hasDemand) {
@@ -706,7 +717,7 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
 
     private function calculateScenarioRange(CalculationInput $input, array $fixedCosts): array
     {
-        $volume = $input->getVolumeInLiters();
+        $volume = $input->getChargeableVolumeInLiters();
         $scheme = strtoupper($input->fulfillmentType);
         $routes = $this->pricing->getConfig()['routes'] ?? [];
         $profits = [];

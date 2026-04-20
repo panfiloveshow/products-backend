@@ -49,6 +49,10 @@ class SupplySettings extends Model
         'restricted_skus',
         'is_active',
         'custom_rules',
+        // Locality integration
+        'locality_split_default',
+        'locality_min_confidence_default',
+        'locality_max_split_clusters',
     ];
 
     protected $casts = [
@@ -82,6 +86,9 @@ class SupplySettings extends Model
         'restricted_skus' => 'array',
         'is_active' => 'boolean',
         'custom_rules' => 'array',
+        // Locality integration
+        'locality_split_default' => 'boolean',
+        'locality_max_split_clusters' => 'integer',
     ];
 
     public function integration(): BelongsTo

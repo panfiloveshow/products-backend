@@ -198,6 +198,102 @@ class SalesApi
     }
 
     /**
+     * Получить продажи FBS по SKU и складу через /v3/posting/fbs/list за последние N дней.
+     *
+     * @return array [offer_id => [warehouse_id => ['warehouse_name', 'sales_7_days', 'sales_14_days', 'sales_30_days', 'avg_daily_sales', 'ordered_units_total', 'fulfillment_type']]]
+     */
+    public function getSalesBySkuAndWarehouseFbs(int $days = 28): array
+    {
+        try {
+            $since = now()->subDays($days)->setTime(0, 0, 0)->toIso8601String();
+            $to = now()->toIso8601String();
+            $offset = 0;
+            $limit = 1000;
+            $rawUnits = [];
+
+            do {
+                $response = $this->client->post('/v3/posting/fbs/list', [
+                    'dir' => 'ASC',
+                    'filter' => [
+                        'since' => $since,
+                        'to' => $to,
+                        'status' => 'delivered',
+                    ],
+                    'limit' => $limit,
+                    'offset' => $offset,
+                    'with' => [
+                        'analytics_data' => true,
+                        'financial_data' => false,
+                    ],
+                ]);
+
+                $postings = $response['result']['postings'] ?? [];
+
+                foreach ($postings as $posting) {
+                    $analytics = $posting['analytics_data'] ?? [];
+                    $warehouseName = (string) ($analytics['warehouse_name'] ?? '');
+                    $warehouseIdRaw = (string) ($analytics['warehouse_id'] ?? '');
+
+                    if ($warehouseName === '' && $warehouseIdRaw === '') {
+                        continue;
+                    }
+
+                    $warehouseId = $warehouseIdRaw !== ''
+                        ? 'ozonfbs_' . $warehouseIdRaw
+                        : 'ozonfbs_' . substr(md5($warehouseName), 0, 12);
+
+                    foreach ($posting['products'] ?? [] as $product) {
+                        $offerId = (string) ($product['offer_id'] ?? '');
+                        if ($offerId === '') {
+                            continue;
+                        }
+
+                        $qty = (int) ($product['quantity'] ?? 0);
+                        if (! isset($rawUnits[$offerId][$warehouseId])) {
+                            $rawUnits[$offerId][$warehouseId] = [
+                                'units' => 0,
+                                'warehouse_name' => $warehouseName !== '' ? $warehouseName : $warehouseIdRaw,
+                            ];
+                        }
+
+                        $rawUnits[$offerId][$warehouseId]['units'] += $qty;
+                    }
+                }
+
+                $offset += $limit;
+            } while (count($postings) === $limit);
+
+            $result = [];
+            foreach ($rawUnits as $offerId => $warehouses) {
+                foreach ($warehouses as $warehouseId => $data) {
+                    $units = $data['units'];
+                    $avgDaily = $days > 0 ? round($units / $days, 2) : 0;
+
+                    $result[$offerId][$warehouseId] = [
+                        'warehouse_name' => $data['warehouse_name'],
+                        'sales_7_days' => (int) round($units * 7 / $days),
+                        'sales_14_days' => (int) round($units * 14 / $days),
+                        'sales_30_days' => (int) round($units * 30 / $days),
+                        'avg_daily_sales' => $avgDaily,
+                        'ordered_units_total' => $units,
+                        'fulfillment_type' => 'FBS',
+                    ];
+                }
+            }
+
+            Log::info('Ozon getSalesBySkuAndWarehouseFbs loaded', [
+                'days' => $days,
+                'skus_count' => count($result),
+            ]);
+
+            return $result;
+        } catch (\Exception $e) {
+            Log::error('Ozon getSalesBySkuAndWarehouseFbs error', ['error' => $e->getMessage()]);
+            return [];
+        }
+    }
+
+    /**
      * Получить статистику заказов по SKU
      */
     public function getOrdersStatsBySku(string $dateFrom, string $dateTo): array

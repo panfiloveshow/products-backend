@@ -54,6 +54,54 @@ class IntegrationController extends Controller
     }
 
     /**
+     * Проверка статуса интеграции (валидность токена, принадлежность workspace)
+     */
+    public function checkStatus(int $id, Request $request, IntegrationAccessService $integrationAccessService): JsonResponse
+    {
+        $resolution = $integrationAccessService->ensureAccessibleIntegration($request, $id);
+        if (! ($resolution['success'] ?? false)) {
+            return response()->json([
+                'success' => false,
+                'message' => $resolution['message'] ?? 'Интеграция не найдена',
+            ], $resolution['status'] ?? 404);
+        }
+
+        $integration = $resolution['integration'];
+
+        $validationStatus = 'valid';
+        $validationError = null;
+        $lastCheckedAt = now();
+
+        $workspaceId = $request->header('X-Sellico-Workspace')
+            ?? $request->header('X-Workspace-Id')
+            ?? $request->input('workspace');
+
+        // Проверка принадлежности workspace
+        if ($integration->work_space_id !== null && $workspaceId && (int) $integration->work_space_id !== (int) $workspaceId) {
+            $validationStatus = 'workspace_mismatch';
+            $validationError = 'Интеграция принадлежит другому workspace';
+        }
+
+        $integration->update([
+            'last_validation_at' => $lastCheckedAt,
+            'last_validation_status' => $validationStatus,
+            'last_validation_error' => $validationError,
+        ]);
+
+        return response()->json([
+            'success' => true,
+            'data' => [
+                'integration_id' => $id,
+                'validation_status' => $validationStatus,
+                'validation_error' => $validationError,
+                'last_checked_at' => $lastCheckedAt->toIso8601String(),
+                'work_space_id' => $integration->work_space_id,
+                'marketplace' => $integration->marketplace,
+            ],
+        ]);
+    }
+
+    /**
      * Получить одну интеграцию
      */
     public function show(int $id): JsonResponse
@@ -177,10 +225,8 @@ class IntegrationController extends Controller
             ], 401);
         }
 
-        // Устанавливаем токен для Sellico API
-        $sellicoApi->setAccessToken($token);
-
-        // Получаем credentials интеграции из Sellico
+        // getIntegrationById использует сервисный токен (autobidder) для запросов к Sellico API
+        // Пользовательский токен сохраняем для прокидывания в фоновые задачи
         $result = $sellicoApi->getIntegrationById($id);
 
         if (! $result['success']) {
@@ -193,7 +239,7 @@ class IntegrationController extends Controller
         $integrationData = $result['integration'];
         $credentials = $result['credentials'];
         $credentials['_sellico_token'] = $token; // Прокидываем токен для фоновых задач
-        $workspaceId = (int) ($integrationData['work_space_id'] ?? $integrationData['workspace_id'] ?? 0);
+        $workspaceId = IntegrationAccessService::extractRemoteWorkspaceIdFromSellicoPayload($integrationData);
         $marketplace = strtolower($integrationData['type'] ?? '');
 
         // Нормализуем тип маркетплейса
@@ -311,7 +357,7 @@ class IntegrationController extends Controller
     public function testConnection(Request $request): JsonResponse
     {
         $validator = Validator::make($request->all(), [
-            'marketplace' => 'required|string|in:wildberries,ozon,yandex',
+            'marketplace' => 'required|string|in:wildberries,ozon,yandex_market',
             'credentials' => 'required|array',
         ]);
 
@@ -440,6 +486,10 @@ class IntegrationController extends Controller
             'is_premium' => $integration->is_premium,
             'manual_redemption_rate' => $integration->manual_redemption_rate,
             'created_at' => $integration->created_at,
+            // Валидация интеграции
+            'last_validation_at' => $integration->last_validation_at,
+            'last_validation_status' => $integration->last_validation_status,
+            'last_validation_error' => $detailed ? $integration->last_validation_error : null,
         ];
 
         if ($detailed) {
@@ -475,7 +525,7 @@ class IntegrationController extends Controller
                 }
                 break;
 
-            case 'yandex':
+            case 'yandex_market':
                 if (empty($credentials['token'])) {
                     $errors[] = 'token обязателен для Yandex Market';
                 }

@@ -27,8 +27,11 @@ final class SyncStartGuard
         return sprintf('sync:start:%s:%s:%s', $syncType, $mp, $integrationId ?? 'null');
     }
 
+    private const STALE_SYNC_HOURS = 2;
+
     /**
      * Активная синхронизация: pending (джоба ещё не взята) или running.
+     * Синхронизации старше STALE_SYNC_HOURS считаются зависшими и автоматически завершаются с ошибкой.
      */
     public static function findActiveDuplicate(string $syncType, string $marketplace, ?int $integrationId): ?SyncLog
     {
@@ -46,6 +49,27 @@ final class SyncStartGuard
             $query->where('integration_id', $integrationId);
         }
 
-        return $query->first();
+        $existing = $query->first();
+
+        if (! $existing) {
+            return null;
+        }
+
+        $startedAt = $existing->started_at ?? $existing->created_at;
+        if ($startedAt && $startedAt->diffInHours(now()) >= self::STALE_SYNC_HOURS) {
+            $existing->fail('Синхронизация зависла и была автоматически завершена (таймаут ' . self::STALE_SYNC_HOURS . 'ч)');
+
+            \Illuminate\Support\Facades\Log::warning('SyncStartGuard: stale sync auto-failed', [
+                'sync_log_id' => $existing->id,
+                'sync_type' => $existing->sync_type,
+                'marketplace' => $existing->marketplace,
+                'integration_id' => $existing->integration_id,
+                'started_at' => $startedAt,
+            ]);
+
+            return null;
+        }
+
+        return $existing;
     }
 }

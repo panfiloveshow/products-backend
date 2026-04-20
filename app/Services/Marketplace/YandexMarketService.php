@@ -245,6 +245,8 @@ class YandexMarketService implements MarketplaceInterface
                                 'warehouse_name' => $wname,
                                 'marketplace' => 'yandex_market',
                                 'quantity' => (int) ($stock['count'] ?? 0),
+                                'warehouse_coefficient' => 1.0, // Yandex doesn't provide coefficient, use default
+                                'fulfillment_type' => 'FBY', // Default to FBY for Yandex
                             ];
                         }
                     }

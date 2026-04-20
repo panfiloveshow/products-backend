@@ -2,6 +2,7 @@
 
 namespace App\Http\Controllers\Api;
 
+use App\Domains\Ozon\Tariffs\OzonPricingMatrix;
 use App\Domains\UnitEconomics\DTO\CalculationInput;
 use App\Domains\UnitEconomics\UnitEconomicsOrchestrator;
 use App\Http\Controllers\Controller;
@@ -517,11 +518,23 @@ class UnitEconomicsCacheController extends Controller
 
         $pageContext = $this->buildWildberriesUnitEconomicsPageContext($marketplace, $items);
 
-        // Обогащаем данные
-        $enrichedItems = $items->map(function ($cache) use ($fulfillmentType, $settingsMap, $pageContext) {
-            $settings = $settingsMap->get($cache->sku);
+        $paidStorageMap = $this->buildPaidStorageMap($items, $integrationId, $marketplace);
 
-            return $this->enrichCacheItem($cache, $fulfillmentType, $settings, $pageContext);
+        // Обогащаем данные
+        $enrichedItems = $items->map(function ($cache) use ($fulfillmentType, $settingsMap, $pageContext, $paidStorageMap) {
+            $settings = $settingsMap->get($cache->sku);
+            $enriched = $this->enrichCacheItem($cache, $fulfillmentType, $settings, $pageContext);
+            $paidStorageAmount = round((float) ($paidStorageMap[$cache->sku] ?? 0), 2);
+            $enriched['paid_storage_amount'] = $paidStorageAmount;
+
+            // В Excel не оставляем «Хранение» нулём, если фактическое платное
+            // хранение по SKU уже найдено в отчётах/остатках.
+            $storageCost = round((float) ($enriched['storage_cost'] ?? 0), 2);
+            if ($storageCost <= 0 && $paidStorageAmount > 0) {
+                $enriched = $this->applyExportStorageDelta($enriched, $paidStorageAmount);
+            }
+
+            return $enriched;
         })->toArray();
 
         // Получаем имя интеграции
@@ -563,41 +576,68 @@ class UnitEconomicsCacheController extends Controller
         $sheet = $spreadsheet->getActiveSheet();
         $sheet->setTitle('Юнит-экономика');
 
-        // ── Определения колонок (A-Y, 25 колонок) ──
+        // ── Определения колонок (A-AG, 33 колонки) ──
         $columns = [
-            'A' => ['header' => 'Артикул', 'width' => 15, 'field' => 'sku', 'format' => '@'],
-            'B' => ['header' => 'Наименование', 'width' => 40, 'field' => 'product_name', 'format' => '@'],
-            'C' => ['header' => 'Цена, ₽', 'width' => 12, 'field' => 'price', 'format' => '#,##0.00'],
-            'D' => ['header' => 'Себестоимость, ₽', 'width' => 14, 'field' => 'cost_price', 'format' => '#,##0.00'],
-            'E' => ['header' => 'Наценка, x', 'width' => 11, 'field' => 'markup_percent', 'format' => '0.00'],
-            'F' => ['header' => 'Комиссия, %', 'width' => 11, 'field' => 'commission_percent', 'format' => '0.00"%"'],
-            'G' => ['header' => 'Комиссия, ₽', 'width' => 12, 'field' => 'commission_amount', 'format' => '#,##0.00'],
-            'H' => ['header' => 'Логистика, ₽', 'width' => 12, 'field' => 'logistics_cost', 'format' => '#,##0.00'],
-            'I' => ['header' => 'Посл. миля, ₽', 'width' => 12, 'field' => 'last_mile_cost', 'format' => '#,##0.00'],
-            'J' => ['header' => 'Доставка, ₽', 'width' => 12, 'field' => 'formula_delivery', 'format' => '#,##0.00'],
-            'K' => ['header' => 'Кластер поставки', 'width' => 20, 'field' => 'cluster', 'format' => '@'],
-            'L' => ['header' => 'Локальность', 'width' => 14, 'field' => 'locality', 'format' => '@'],
-            'M' => ['header' => 'Нелок. наценка, %', 'width' => 15, 'field' => 'non_local_markup_percent', 'format' => '0.00"%"'],
-            'N' => ['header' => '% выкупа', 'width' => 10, 'field' => 'redemption_rate', 'format' => '0.00"%"'],
-            'O' => ['header' => 'Эквайринг, %', 'width' => 12, 'field' => 'acquiring_percent', 'format' => '0.00"%"'],
-            'P' => ['header' => 'РК, %', 'width' => 8, 'field' => 'drr_percent', 'format' => '0.00"%"'],
-            'Q' => ['header' => 'Наша часть, %', 'width' => 12, 'field' => 'our_share_percent', 'format' => '0.00"%"'],
-            'R' => ['header' => 'Налог, %', 'width' => 9, 'field' => 'tax_percent', 'format' => '0.00"%"'],
-            'S' => ['header' => 'НДС, %', 'width' => 8, 'field' => 'vat_percent', 'format' => '0.00"%"'],
-            'T' => ['header' => 'Хранение, ₽', 'width' => 12, 'field' => 'storage_cost', 'format' => '#,##0.00'],
-            'U' => ['header' => 'Итого затраты, ₽', 'width' => 14, 'field' => 'total_costs', 'format' => '#,##0.00'],
-            'V' => ['header' => 'Прибыль, ₽', 'width' => 12, 'field' => 'net_profit', 'format' => '#,##0.00'],
-            'W' => ['header' => 'Маржа, %', 'width' => 10, 'field' => 'margin_percent', 'format' => '0.00"%"'],
-            'X' => ['header' => 'ROI, %', 'width' => 10, 'field' => 'roi_percent', 'format' => '0.00"%"'],
-            'Y' => ['header' => 'На р/с, ₽', 'width' => 12, 'field' => 'to_settlement_account', 'format' => '#,##0.00'],
+            'A'  => ['header' => 'Артикул',             'width' => 15, 'field' => 'sku',                      'format' => '@'],
+            'B'  => ['header' => 'Наименование',        'width' => 40, 'field' => 'product_name',             'format' => '@'],
+            'C'  => ['header' => 'Цена, ₽',             'width' => 12, 'field' => 'price',                    'format' => '#,##0.00 "₽"'],
+            'D'  => ['header' => 'Себестоимость, ₽',    'width' => 14, 'field' => 'cost_price',               'format' => '#,##0.00 "₽"'],
+            'E'  => ['header' => 'Наценка, x',          'width' => 11, 'field' => 'markup_percent',           'format' => '0.00'],
+            'F'  => ['header' => 'Продажи, шт',         'width' => 11, 'field' => 'sales_count',              'format' => '#,##0'],
+            'G'  => ['header' => 'Выручка, ₽',          'width' => 13, 'field' => 'revenue',                  'format' => '#,##0.00 "₽"'],
+            'H'  => ['header' => 'Оборач-ть, дн',       'width' => 12, 'field' => 'turnover_days',            'format' => '0'],
+            'I'  => ['header' => 'Комиссия, %',         'width' => 11, 'field' => 'commission_percent',       'format' => '0.00"%"'],
+            'J'  => ['header' => 'Комиссия, ₽',         'width' => 12, 'field' => 'commission_amount',        'format' => '#,##0.00 "₽"'],
+            'K'  => ['header' => 'Логистика, ₽',        'width' => 12, 'field' => 'logistics_cost',           'format' => '#,##0.00 "₽"'],
+            'L'  => ['header' => 'Посл. миля, ₽',       'width' => 12, 'field' => 'last_mile_cost',           'format' => '#,##0.00 "₽"'],
+            'M'  => ['header' => 'Доставка, ₽',         'width' => 12, 'field' => 'formula_delivery',         'format' => '#,##0.00 "₽"'],
+            'N'  => ['header' => 'Возвраты, ₽',         'width' => 12, 'field' => 'expected_return_cost',     'format' => '#,##0.00 "₽"'],
+            'O'  => ['header' => 'Хранение, ₽',         'width' => 12, 'field' => 'storage_cost',             'format' => '#,##0.00 "₽"'],
+            'P'  => ['header' => 'Эквайринг, %',        'width' => 12, 'field' => 'acquiring_percent',        'format' => '0.00"%"'],
+            'Q'  => ['header' => 'РК, %',               'width' => 8,  'field' => 'drr_percent',              'format' => '0.00"%"'],
+            'R'  => ['header' => 'Наша часть, %',       'width' => 12, 'field' => 'our_share_percent',        'format' => '0.00"%"'],
+            'S'  => ['header' => 'Налог, %',            'width' => 9,  'field' => 'tax_percent',              'format' => '0.00"%"'],
+            'T'  => ['header' => 'НДС, %',              'width' => 8,  'field' => 'vat_percent',              'format' => '0.00"%"'],
+            'U'  => ['header' => 'Локальность',         'width' => 14, 'field' => 'locality',                 'format' => '@'],
+            'V'  => ['header' => 'Локальность, %',      'width' => 13, 'field' => 'expected_locality_rate',   'format' => '0.00"%"'],
+            'W'  => ['header' => 'Нелок. наценка, %',   'width' => 15, 'field' => 'non_local_markup_percent', 'format' => '0.00"%"'],
+            'X'  => ['header' => 'Причина наценки',     'width' => 28, 'field' => 'markup_rule_reason_label', 'format' => '@'],
+            'Y'  => ['header' => '% выкупа',            'width' => 10, 'field' => 'redemption_rate',          'format' => '0.00"%"'],
+            'Z'  => ['header' => 'Точность',            'width' => 11, 'field' => 'calculation_confidence',   'format' => '@'],
+            'AA' => ['header' => 'Итого затраты, ₽',    'width' => 14, 'field' => 'total_costs',              'format' => '#,##0.00 "₽"'],
+            'AB' => ['header' => 'Прибыль min, ₽',      'width' => 13, 'field' => 'profit_min',               'format' => '#,##0.00 "₽"'],
+            'AC' => ['header' => 'Прибыль, ₽',          'width' => 12, 'field' => 'net_profit',               'format' => '#,##0.00 "₽"'],
+            'AD' => ['header' => 'Прибыль max, ₽',      'width' => 13, 'field' => 'profit_max',               'format' => '#,##0.00 "₽"'],
+            'AE' => ['header' => 'Маржа, %',            'width' => 10, 'field' => 'margin_percent',           'format' => '0.00"%"'],
+            'AF' => ['header' => 'ROI, %',              'width' => 10, 'field' => 'roi_percent',              'format' => '0.00"%"'],
+            'AG' => ['header' => 'На р/с, ₽',           'width' => 12, 'field' => 'to_settlement_account',    'format' => '#,##0.00 "₽"'],
         ];
 
-        $lastCol = 'Y';
+        $lastCol = 'AG';
 
         // ── Ширины колонок ──
         foreach ($columns as $col => $def) {
             $sheet->getColumnDimension($col)->setWidth($def['width']);
         }
+
+        // ── Группировка колонок (outline) — можно сворачивать/разворачивать в Excel ──
+        $collapsibleGroups = [
+            ['I', 'J'],   // Комиссия (% + ₽)
+            ['P', 'T'],   // Проценты прочих сборов
+            ['V', 'X'],   // Деталь локальности и наценки
+            ['AB', 'AB'], // Прибыль min
+            ['AD', 'AD'], // Прибыль max
+        ];
+        foreach ($collapsibleGroups as [$from, $to]) {
+            $fromIndex = \PhpOffice\PhpSpreadsheet\Cell\Coordinate::columnIndexFromString($from);
+            $toIndex = \PhpOffice\PhpSpreadsheet\Cell\Coordinate::columnIndexFromString($to);
+            for ($i = $fromIndex; $i <= $toIndex; $i++) {
+                $colLetter = \PhpOffice\PhpSpreadsheet\Cell\Coordinate::stringFromColumnIndex($i);
+                $sheet->getColumnDimension($colLetter)->setOutlineLevel(1);
+                $sheet->getColumnDimension($colLetter)->setCollapsed(false);
+            }
+        }
+        $sheet->setShowSummaryRight(false);
 
         // ── Logo ──
         $logoPath = storage_path('app/sellico-logo.png');
@@ -679,25 +719,39 @@ class UnitEconomicsCacheController extends Controller
         $currentRow = $dataStartRow;
 
         // Текстовые колонки (формат '@')
-        $textColumns = ['A', 'B', 'K', 'L'];
+        $textColumns = ['A', 'B', 'U', 'X', 'Z'];
+        // Колонки, которые должны отображаться пустыми при null (а не как 0)
+        $nullableNumericColumns = ['V'];
 
         foreach ($items as $item) {
             $isEvenRow = ($currentRow - $dataStartRow) % 2 === 1;
+            $isLowConfidence = strtolower((string) ($item['calculation_confidence'] ?? '')) === 'low';
+            $isInPromotion = (bool) ($item['is_in_promotion'] ?? false);
 
             foreach ($columns as $col => $def) {
                 $field = $def['field'];
 
-                if ($col === 'J') {
-                    // J: Доставка — Excel-формула =H+I
-                    $sheet->setCellValue("J{$currentRow}", "=H{$currentRow}+I{$currentRow}");
-                } elseif ($col === 'K') {
-                    // K: Кластер поставки
-                    $sheet->setCellValue("K{$currentRow}", $item['shipping_cluster_name'] ?? $item['route_label'] ?? '');
-                } elseif ($col === 'L') {
-                    // L: Локальность
-                    $sheet->setCellValue("L{$currentRow}", $this->resolveLocalityLabel($item));
-                } elseif (in_array($col, $textColumns)) {
-                    // Текстовые поля (A, B)
+                if ($col === 'M') {
+                    // M: Доставка — Excel-формула =K+L (логистика + посл. миля)
+                    $sheet->setCellValue("M{$currentRow}", "=K{$currentRow}+L{$currentRow}");
+                } elseif ($col === 'AE') {
+                    // AE: Маржа — Excel-формула =IF(C>0, AC/C*100, 0)
+                    $sheet->setCellValue("AE{$currentRow}", "=IF(C{$currentRow}>0,AC{$currentRow}/C{$currentRow}*100,0)");
+                } elseif ($col === 'AF') {
+                    // AF: ROI — Excel-формула =IF(D>0, AC/D*100, 0)
+                    $sheet->setCellValue("AF{$currentRow}", "=IF(D{$currentRow}>0,AC{$currentRow}/D{$currentRow}*100,0)");
+                } elseif ($col === 'U') {
+                    // U: Локальность (лейбл)
+                    $sheet->setCellValue("U{$currentRow}", $this->resolveLocalityLabel($item));
+                } elseif ($col === 'Z') {
+                    // Z: Точность расчёта (лейбл)
+                    $sheet->setCellValue("Z{$currentRow}", $this->resolveConfidenceLabel($item['calculation_confidence'] ?? null));
+                } elseif (in_array($col, $nullableNumericColumns, true)) {
+                    // Числовые nullable — пустая ячейка при null
+                    $value = $item[$field] ?? null;
+                    $sheet->setCellValue("{$col}{$currentRow}", $value === null ? '' : (float) $value);
+                } elseif (in_array($col, $textColumns, true)) {
+                    // Текстовые поля
                     $sheet->setCellValue("{$col}{$currentRow}", $item[$field] ?? '');
                 } else {
                     // Числовые поля
@@ -705,8 +759,25 @@ class UnitEconomicsCacheController extends Controller
                 }
             }
 
-            // Чередование цвета строк: белый / светло-зелёный
-            if ($isEvenRow) {
+            // Приоритет заливки: low-confidence > акция > чередование
+            if ($isLowConfidence) {
+                // Светло-оранжевый фон — данные неточные, требует внимания
+                $sheet->getStyle("A{$currentRow}:{$lastCol}{$currentRow}")->applyFromArray([
+                    'fill' => [
+                        'fillType' => Fill::FILL_SOLID,
+                        'startColor' => ['rgb' => 'fff7ed'],
+                    ],
+                ]);
+            } elseif ($isInPromotion) {
+                // Светло-голубой — товар в акции
+                $sheet->getStyle("A{$currentRow}:{$lastCol}{$currentRow}")->applyFromArray([
+                    'fill' => [
+                        'fillType' => Fill::FILL_SOLID,
+                        'startColor' => ['rgb' => 'eff6ff'],
+                    ],
+                ]);
+            } elseif ($isEvenRow) {
+                // Чередование: белый / светло-зелёный
                 $sheet->getStyle("A{$currentRow}:{$lastCol}{$currentRow}")->applyFromArray([
                     'fill' => [
                         'fillType' => Fill::FILL_SOLID,
@@ -715,18 +786,52 @@ class UnitEconomicsCacheController extends Controller
                 ]);
             }
 
-            // Красный цвет для отрицательной прибыли (V)
+            // Маркер акции: левый синий бордер на колонке C (Цена)
+            if ($isInPromotion) {
+                $sheet->getStyle("C{$currentRow}")->applyFromArray([
+                    'borders' => [
+                        'left' => [
+                            'borderStyle' => Border::BORDER_THICK,
+                            'color' => ['rgb' => '2563eb'],
+                        ],
+                    ],
+                ]);
+            }
+
+            // Маркер просроченной фиксации тарифа: оранжевая рамка вокруг артикула
+            $fixedUntil = $item['fixed_until'] ?? null;
+            $fixationApplied = (bool) ($item['fixation_applied'] ?? false);
+            if ($fixationApplied && $fixedUntil) {
+                try {
+                    $expiresAt = \Carbon\Carbon::parse($fixedUntil);
+                    if ($expiresAt->isPast()) {
+                        $sheet->getStyle("A{$currentRow}")->applyFromArray([
+                            'font' => ['color' => ['rgb' => 'c2410c'], 'bold' => true],
+                            'borders' => [
+                                'outline' => [
+                                    'borderStyle' => Border::BORDER_MEDIUM,
+                                    'color' => ['rgb' => 'f97316'],
+                                ],
+                            ],
+                        ]);
+                    }
+                } catch (\Throwable $e) {
+                    // некорректный формат даты — игнорируем
+                }
+            }
+
+            // Красный цвет для отрицательной прибыли (AC)
             $netProfit = (float) ($item['net_profit'] ?? 0);
             if ($netProfit < 0) {
-                $sheet->getStyle("V{$currentRow}")->applyFromArray([
+                $sheet->getStyle("AC{$currentRow}")->applyFromArray([
                     'font' => ['color' => ['rgb' => 'dc2626']],
                 ]);
             }
 
-            // Красный цвет для отрицательной маржи (W)
+            // Красный цвет для отрицательной маржи (AE)
             $marginPercent = (float) ($item['margin_percent'] ?? 0);
             if ($marginPercent < 0) {
-                $sheet->getStyle("W{$currentRow}")->applyFromArray([
+                $sheet->getStyle("AE{$currentRow}")->applyFromArray([
                     'font' => ['color' => ['rgb' => 'dc2626']],
                 ]);
             }
@@ -749,8 +854,8 @@ class UnitEconomicsCacheController extends Controller
         $summaryRow = $currentRow;
         $sheet->setCellValue("A{$summaryRow}", 'ИТОГО');
 
-        // SUM формулы для денежных колонок
-        $sumCols = ['C', 'G', 'H', 'I', 'J', 'T', 'U', 'V', 'Y'];
+        // SUM формулы для денежных колонок и количеств
+        $sumCols = ['C', 'F', 'G', 'J', 'K', 'L', 'M', 'N', 'O', 'AA', 'AB', 'AC', 'AD', 'AG'];
         foreach ($sumCols as $col) {
             if ($dataEndRow >= $dataStartRow) {
                 $sheet->setCellValue("{$col}{$summaryRow}", "=SUM({$col}{$dataStartRow}:{$col}{$dataEndRow})");
@@ -760,7 +865,7 @@ class UnitEconomicsCacheController extends Controller
         }
 
         // AVERAGE формулы для процентных/относительных колонок
-        $avgCols = ['E', 'F', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'W', 'X'];
+        $avgCols = ['E', 'H', 'I', 'P', 'Q', 'R', 'S', 'T', 'V', 'W', 'Y', 'AE', 'AF'];
         foreach ($avgCols as $col) {
             if ($dataEndRow >= $dataStartRow) {
                 $sheet->setCellValue("{$col}{$summaryRow}", "=AVERAGE({$col}{$dataStartRow}:{$col}{$dataEndRow})");
@@ -795,10 +900,424 @@ class UnitEconomicsCacheController extends Controller
             ],
         ]);
 
-        // ── Заморозка панелей ──
-        $sheet->freezePane('A5');
+        // ── Заморозка панелей: строка 4 (заголовки) + колонки A:B (SKU + Название) ──
+        $sheet->freezePane('C5');
+
+        // ── Дополнительные листы ──
+        $this->buildSummarySheet($spreadsheet, $items, $integrationName, $marketplace, $fulfillmentType);
+        $this->buildClustersSheet($spreadsheet, $items);
+        $this->buildMetadataSheet($spreadsheet, $items, $integrationName, $marketplace, $fulfillmentType);
+
+        // Активный лист при открытии — основной
+        $spreadsheet->setActiveSheetIndex(0);
 
         return $spreadsheet;
+    }
+
+    private function applyExportStorageDelta(array $item, float $storageCost): array
+    {
+        $oldStorageCost = round((float) ($item['storage_cost'] ?? 0), 2);
+        $delta = round($storageCost - $oldStorageCost, 2);
+        if ($delta <= 0) {
+            return $item;
+        }
+
+        $item['storage_cost'] = $storageCost;
+        $item['total_costs'] = round((float) ($item['total_costs'] ?? 0) + $delta, 2);
+        $item['net_profit'] = round((float) ($item['net_profit'] ?? 0) - $delta, 2);
+        $item['profit_min'] = round((float) ($item['profit_min'] ?? 0) - $delta, 2);
+        $item['profit_max'] = round((float) ($item['profit_max'] ?? 0) - $delta, 2);
+        $item['to_settlement_account'] = round((float) ($item['to_settlement_account'] ?? 0) - $delta, 2);
+
+        $price = (float) ($item['price'] ?? 0);
+        $costPrice = (float) ($item['cost_price'] ?? 0);
+        $item['margin_percent'] = $price > 0 ? round($item['net_profit'] / $price * 100, 2) : 0;
+        $item['roi_percent'] = $costPrice > 0 ? round($item['net_profit'] / $costPrice * 100, 2) : 0;
+
+        return $item;
+    }
+
+    /**
+     * Платное хранение для Excel: ищем не только по cache.sku, но и по карточке товара
+     * (sku / barcode / vendor_code), потому что Ozon-отчёты могут приходить под offer_id.
+     *
+     * @param Collection<int, UnitEconomicsCache> $items
+     * @return array<string, float>
+     */
+    private function buildPaidStorageMap(Collection $items, int $integrationId, string $marketplace): array
+    {
+        if ($items->isEmpty()) {
+            return [];
+        }
+
+        $lookupKeysBySku = $items->mapWithKeys(function (UnitEconomicsCache $cache) {
+            return [$cache->sku => collect($this->resolveInventoryLookupKeys($cache, $cache->product))
+                ->map(fn (string $key) => $this->normalizeStorageLookupKey($key))
+                ->filter()
+                ->unique()
+                ->values()
+                ->all()];
+        });
+
+        $normalizedLookupKeys = $lookupKeysBySku
+            ->flatten()
+            ->unique()
+            ->values()
+            ->all();
+
+        $storageByKey = collect();
+        if ($normalizedLookupKeys !== []) {
+            $placeholders = implode(',', array_fill(0, count($normalizedLookupKeys), '?'));
+            $storageByKey = InventoryWarehouse::query()
+                ->where('integration_id', $integrationId)
+                ->where('marketplace', $marketplace)
+                ->whereRaw("LOWER(TRIM(sku)) IN ({$placeholders})", $normalizedLookupKeys)
+                ->selectRaw('
+                    sku,
+                    COALESCE(SUM(COALESCE(storage_fee_prev_month, 0)), 0) AS fee_prev_month,
+                    COALESCE(SUM(COALESCE(storage_fee_last_week, 0)), 0) AS fee_last_week,
+                    COALESCE(SUM(COALESCE(storage_fee_total, 0)), 0) AS fee_total,
+                    COALESCE(SUM(COALESCE(storage_cost_per_month, 0)), 0) AS storage_monthly,
+                    COALESCE(SUM(COALESCE(paid_storage_fee, 0) + COALESCE(paid_storage_penalty, 0)), 0) AS fee_legacy
+                ')
+                ->groupBy('sku')
+                ->get()
+                ->mapWithKeys(function ($row) {
+                    $best = (float) $row->fee_prev_month;
+                    if ($best <= 0) {
+                        $best = (float) $row->fee_last_week * 4; // неделя -> ~месяц
+                    }
+                    if ($best <= 0) {
+                        $best = (float) $row->fee_total;
+                    }
+                    if ($best <= 0) {
+                        $best = (float) $row->storage_monthly;
+                    }
+                    if ($best <= 0) {
+                        $best = (float) $row->fee_legacy;
+                    }
+
+                    $normalizedSku = $this->normalizeStorageLookupKey((string) $row->sku);
+
+                    return $normalizedSku ? [$normalizedSku => $best] : [];
+                });
+        }
+
+        return $items->mapWithKeys(function (UnitEconomicsCache $cache) use ($lookupKeysBySku, $storageByKey) {
+            $amount = collect($lookupKeysBySku->get($cache->sku, []))
+                ->unique()
+                ->sum(fn (string $lookupKey) => (float) ($storageByKey[$lookupKey] ?? 0));
+
+            if ($amount <= 0 && $cache->product) {
+                $amount = (float) ($cache->product->storage_cost ?? 0);
+            }
+
+            return [$cache->sku => round($amount, 2)];
+        })->toArray();
+    }
+
+    private function normalizeStorageLookupKey(?string $value): ?string
+    {
+        $normalized = mb_strtolower(trim((string) $value));
+
+        return $normalized !== '' ? $normalized : null;
+    }
+
+    /**
+     * Лист «Сводка» — KPI-блок + топ прибыльных/убыточных
+     */
+    private function buildSummarySheet(
+        Spreadsheet $spreadsheet,
+        array $items,
+        string $integrationName,
+        string $marketplace,
+        string $fulfillmentType
+    ): void {
+        $sheet = $spreadsheet->createSheet();
+        $sheet->setTitle('Сводка');
+
+        // Агрегаты
+        $totalCount = count($items);
+        $profitable = 0;
+        $unprofitable = 0;
+        $totalRevenue = 0.0;
+        $totalProfit = 0.0;
+        $marginSum = 0.0;
+        $marginCount = 0;
+        $lowConfidence = 0;
+        $inPromotion = 0;
+        $nonLocal = 0;
+        $noMarkupData = 0;
+
+        foreach ($items as $item) {
+            $profit = (float) ($item['net_profit'] ?? 0);
+            if ($profit > 0) {
+                $profitable++;
+            } else {
+                $unprofitable++;
+            }
+            $totalRevenue += (float) ($item['revenue'] ?? 0);
+            $totalProfit += $profit;
+            if (isset($item['margin_percent']) && $item['margin_percent'] !== null) {
+                $marginSum += (float) $item['margin_percent'];
+                $marginCount++;
+            }
+            if (strtolower((string) ($item['calculation_confidence'] ?? '')) === 'low') {
+                $lowConfidence++;
+            }
+            if (! empty($item['is_in_promotion'])) {
+                $inPromotion++;
+            }
+            if (($item['is_local_sale'] ?? null) === false) {
+                $nonLocal++;
+            }
+            if (($item['markup_rule_reason'] ?? null) === 'no_markup_for_cluster') {
+                $noMarkupData++;
+            }
+        }
+        $avgMargin = $marginCount > 0 ? round($marginSum / $marginCount, 2) : 0;
+
+        // Заголовок
+        $sheet->setCellValue('A1', 'SELLICO — Сводка по юнит-экономике');
+        $sheet->mergeCells('A1:D1');
+        $sheet->getStyle('A1')->applyFromArray([
+            'font' => ['bold' => true, 'size' => 16, 'color' => ['rgb' => '16a34a']],
+            'alignment' => ['vertical' => Alignment::VERTICAL_CENTER],
+        ]);
+        $sheet->getRowDimension(1)->setRowHeight(32);
+
+        $sheet->setCellValue('A2', "Магазин: {$integrationName} | Маркетплейс: {$marketplace} | Схема: " . strtoupper($fulfillmentType) . ' | Дата: ' . now()->format('d.m.Y'));
+        $sheet->mergeCells('A2:D2');
+        $sheet->getStyle('A2')->applyFromArray([
+            'font' => ['size' => 10, 'color' => ['rgb' => '6b7280']],
+        ]);
+
+        // KPI-блок
+        $kpis = [
+            ['Всего товаров',        $totalCount,                                           '#,##0'],
+            ['Прибыльных',           $profitable,                                           '#,##0'],
+            ['Убыточных',            $unprofitable,                                         '#,##0'],
+            ['Общая выручка, ₽',     round($totalRevenue, 2),                               '#,##0.00 "₽"'],
+            ['Общая прибыль, ₽',     round($totalProfit, 2),                                '#,##0.00 "₽"'],
+            ['Средняя маржа, %',     $avgMargin,                                            '0.00"%"'],
+            ['Low-confidence, шт',   $lowConfidence,                                        '#,##0'],
+            ['В акции, шт',          $inPromotion,                                          '#,##0'],
+            ['Не локальных, шт',     $nonLocal,                                             '#,##0'],
+            ['Без данных кластера',  $noMarkupData,                                         '#,##0'],
+        ];
+
+        $sheet->getColumnDimension('A')->setWidth(30);
+        $sheet->getColumnDimension('B')->setWidth(18);
+        $sheet->getColumnDimension('C')->setWidth(3);
+        $sheet->getColumnDimension('D')->setWidth(40);
+
+        $row = 4;
+        foreach ($kpis as [$label, $value, $format]) {
+            $sheet->setCellValue("A{$row}", $label);
+            $sheet->setCellValue("B{$row}", $value);
+            $sheet->getStyle("B{$row}")->getNumberFormat()->setFormatCode($format);
+            $sheet->getStyle("A{$row}:B{$row}")->applyFromArray([
+                'font' => ['size' => 11],
+                'borders' => ['allBorders' => ['borderStyle' => Border::BORDER_THIN, 'color' => ['rgb' => 'd1d5db']]],
+            ]);
+            $sheet->getStyle("A{$row}")->applyFromArray([
+                'font' => ['bold' => true],
+                'fill' => ['fillType' => Fill::FILL_SOLID, 'startColor' => ['rgb' => 'f0fdf4']],
+            ]);
+            $row++;
+        }
+
+        // Топ-5 прибыльных и убыточных
+        $sorted = collect($items)->sortByDesc(fn ($i) => (float) ($i['net_profit'] ?? 0))->values();
+        $topProfitable = $sorted->take(5);
+        $topLosing = $sorted->reverse()->take(5);
+
+        $topRow = 4;
+        $sheet->setCellValue("D{$topRow}", 'ТОП-5 прибыльных SKU');
+        $sheet->mergeCells("D{$topRow}:D" . ($topRow));
+        $sheet->getStyle("D{$topRow}")->applyFromArray([
+            'font' => ['bold' => true, 'size' => 11, 'color' => ['rgb' => 'FFFFFF']],
+            'fill' => ['fillType' => Fill::FILL_SOLID, 'startColor' => ['rgb' => '16a34a']],
+            'alignment' => ['horizontal' => Alignment::HORIZONTAL_CENTER],
+        ]);
+        $topRow++;
+        foreach ($topProfitable as $item) {
+            $sku = $item['sku'] ?? '';
+            $profit = (float) ($item['net_profit'] ?? 0);
+            $sheet->setCellValue("D{$topRow}", $sku . ' — ' . number_format($profit, 2, '.', ' ') . ' ₽');
+            $sheet->getStyle("D{$topRow}")->applyFromArray([
+                'borders' => ['allBorders' => ['borderStyle' => Border::BORDER_THIN, 'color' => ['rgb' => 'd1d5db']]],
+            ]);
+            $topRow++;
+        }
+
+        $topRow++;
+        $sheet->setCellValue("D{$topRow}", 'ТОП-5 убыточных SKU');
+        $sheet->getStyle("D{$topRow}")->applyFromArray([
+            'font' => ['bold' => true, 'size' => 11, 'color' => ['rgb' => 'FFFFFF']],
+            'fill' => ['fillType' => Fill::FILL_SOLID, 'startColor' => ['rgb' => 'dc2626']],
+            'alignment' => ['horizontal' => Alignment::HORIZONTAL_CENTER],
+        ]);
+        $topRow++;
+        foreach ($topLosing as $item) {
+            $sku = $item['sku'] ?? '';
+            $profit = (float) ($item['net_profit'] ?? 0);
+            $sheet->setCellValue("D{$topRow}", $sku . ' — ' . number_format($profit, 2, '.', ' ') . ' ₽');
+            $sheet->getStyle("D{$topRow}")->applyFromArray([
+                'font' => ['color' => ['rgb' => 'dc2626']],
+                'borders' => ['allBorders' => ['borderStyle' => Border::BORDER_THIN, 'color' => ['rgb' => 'd1d5db']]],
+            ]);
+            $topRow++;
+        }
+    }
+
+    /**
+     * Лист «Кластеры» — разбивка clusters_summary по SKU (откуда приходят заказы и с какой наценкой)
+     */
+    private function buildClustersSheet(Spreadsheet $spreadsheet, array $items): void
+    {
+        $sheet = $spreadsheet->createSheet();
+        $sheet->setTitle('Кластеры');
+
+        $headers = [
+            'A' => ['header' => 'Артикул',           'width' => 15],
+            'B' => ['header' => 'Наименование',      'width' => 40],
+            'C' => ['header' => 'Заказы, %',         'width' => 11],
+            'D' => ['header' => 'Локальный',         'width' => 11],
+            'E' => ['header' => 'Эфф. наценка, %',   'width' => 15],
+            'F' => ['header' => 'Логистика, ₽',      'width' => 13],
+        ];
+        foreach ($headers as $col => $def) {
+            $sheet->getColumnDimension($col)->setWidth($def['width']);
+            $sheet->setCellValue("{$col}1", $def['header']);
+        }
+        $sheet->getStyle('A1:F1')->applyFromArray([
+            'font' => ['bold' => true, 'color' => ['rgb' => 'FFFFFF']],
+            'fill' => ['fillType' => Fill::FILL_SOLID, 'startColor' => ['rgb' => '16a34a']],
+            'alignment' => ['horizontal' => Alignment::HORIZONTAL_CENTER, 'vertical' => Alignment::VERTICAL_CENTER],
+        ]);
+        $sheet->getRowDimension(1)->setRowHeight(22);
+        $sheet->setAutoFilter('A1:F1');
+
+        $row = 2;
+        foreach ($items as $item) {
+            $clusters = $item['clusters_summary'] ?? [];
+            if (! is_array($clusters) || $clusters === []) {
+                continue;
+            }
+            foreach ($clusters as $cluster) {
+                if (! is_array($cluster)) {
+                    continue;
+                }
+                $sheet->setCellValue("A{$row}", $item['sku'] ?? '');
+                $sheet->setCellValue("B{$row}", $item['product_name'] ?? '');
+                $sheet->setCellValue("C{$row}", (float) ($cluster['orders_percent'] ?? 0));
+                $sheet->setCellValue("D{$row}", ! empty($cluster['is_local_cluster']) ? 'Да' : 'Нет');
+                $sheet->setCellValue("E{$row}", (float) ($cluster['effective_markup_percent'] ?? 0));
+                $sheet->setCellValue("F{$row}", (float) ($cluster['logistics_cost'] ?? $cluster['logistics_amount'] ?? 0));
+                $row++;
+            }
+        }
+
+        $lastDataRow = $row - 1;
+        if ($lastDataRow >= 2) {
+            $sheet->getStyle("C2:C{$lastDataRow}")->getNumberFormat()->setFormatCode('0.00"%"');
+            $sheet->getStyle("E2:E{$lastDataRow}")->getNumberFormat()->setFormatCode('0.00"%"');
+            $sheet->getStyle("F2:F{$lastDataRow}")->getNumberFormat()->setFormatCode('#,##0.00 "₽"');
+            $sheet->getStyle("A2:F{$lastDataRow}")->applyFromArray([
+                'borders' => ['allBorders' => ['borderStyle' => Border::BORDER_THIN, 'color' => ['rgb' => 'd1d5db']]],
+            ]);
+            $sheet->freezePane('A2');
+        } else {
+            $sheet->setCellValue('A2', 'Нет данных о кластерах (нет активной фиксации или нет заказов по кластерам за период)');
+            $sheet->mergeCells('A2:F2');
+            $sheet->getStyle('A2')->applyFromArray([
+                'font' => ['italic' => true, 'color' => ['rgb' => '6b7280']],
+                'alignment' => ['horizontal' => Alignment::HORIZONTAL_CENTER],
+            ]);
+        }
+    }
+
+    /**
+     * Лист «Метаданные» — параметры расчёта, версии тарифов, источники данных
+     */
+    private function buildMetadataSheet(
+        Spreadsheet $spreadsheet,
+        array $items,
+        string $integrationName,
+        string $marketplace,
+        string $fulfillmentType
+    ): void {
+        $sheet = $spreadsheet->createSheet();
+        $sheet->setTitle('Метаданные');
+
+        // Собираем версии тарифов и источники
+        $tariffVersions = [];
+        $tariffSources = [];
+        $profileSources = [];
+        $fixationCount = 0;
+        $apiSourceCount = 0;
+        $fallbackCount = 0;
+        foreach ($items as $item) {
+            if (! empty($item['tariff_version'])) {
+                $tariffVersions[(string) $item['tariff_version']] = true;
+            }
+            if (! empty($item['tariff_source'])) {
+                $tariffSources[(string) $item['tariff_source']] = true;
+            }
+            $ps = (string) ($item['profile_source'] ?? '');
+            if ($ps !== '') {
+                $profileSources[$ps] = ($profileSources[$ps] ?? 0) + 1;
+            }
+            if (! empty($item['fixation_applied'])) {
+                $fixationCount++;
+            }
+            if ($ps === 'api') {
+                $apiSourceCount++;
+            } elseif ($ps !== '') {
+                $fallbackCount++;
+            }
+        }
+
+        $sheet->getColumnDimension('A')->setWidth(32);
+        $sheet->getColumnDimension('B')->setWidth(60);
+
+        $sheet->setCellValue('A1', 'Параметры экспорта');
+        $sheet->mergeCells('A1:B1');
+        $sheet->getStyle('A1')->applyFromArray([
+            'font' => ['bold' => true, 'size' => 14, 'color' => ['rgb' => '16a34a']],
+        ]);
+        $sheet->getRowDimension(1)->setRowHeight(26);
+
+        $rows = [
+            ['Магазин',              $integrationName],
+            ['Маркетплейс',          $marketplace],
+            ['Схема',                strtoupper($fulfillmentType)],
+            ['Дата генерации',       now()->format('d.m.Y H:i')],
+            ['Количество SKU',       count($items)],
+            ['Версии тарифов',       implode(', ', array_keys($tariffVersions)) ?: '—'],
+            ['Источники тарифов',    implode(', ', array_keys($tariffSources)) ?: '—'],
+            ['SKU с фиксацией',      $fixationCount],
+            ['Источник: API',        $apiSourceCount],
+            ['Источник: fallback',   $fallbackCount],
+            ['Источник данных спроса', 'Ozon Delivery Analytics API'],
+            ['Источник остатков',      'Ozon Stocks API'],
+            ['Источник продаж',        'Ozon postings / sales by warehouse'],
+        ];
+
+        $row = 3;
+        foreach ($rows as [$label, $value]) {
+            $sheet->setCellValue("A{$row}", $label);
+            $sheet->setCellValue("B{$row}", (string) $value);
+            $sheet->getStyle("A{$row}:B{$row}")->applyFromArray([
+                'borders' => ['allBorders' => ['borderStyle' => Border::BORDER_THIN, 'color' => ['rgb' => 'd1d5db']]],
+            ]);
+            $sheet->getStyle("A{$row}")->applyFromArray([
+                'font' => ['bold' => true],
+                'fill' => ['fillType' => Fill::FILL_SOLID, 'startColor' => ['rgb' => 'f0fdf4']],
+            ]);
+            $row++;
+        }
     }
 
     /**
@@ -821,6 +1340,19 @@ class UnitEconomicsCacheController extends Controller
         }
 
         return '';
+    }
+
+    /**
+     * Человекочитаемый лейбл точности расчёта (calculation_confidence)
+     */
+    private function resolveConfidenceLabel(?string $confidence): string
+    {
+        return match (strtolower((string) $confidence)) {
+            'high'   => 'Высокая',
+            'medium' => 'Средняя',
+            'low'    => 'Низкая',
+            default  => '',
+        };
     }
 
     /**
@@ -1021,6 +1553,10 @@ class UnitEconomicsCacheController extends Controller
         // Добавляем поля для совместимости с v1
         $data['actual_weight'] = $product ? (float) ($product->weight ?? 0) / 1000 : 0;
         $data['turnover_days'] = $product?->turnover_days ?? 30;
+        $volumeWeight = $cache->volume_weight ?? $product?->volume_weight;
+        $chargeableVolumeLiters = $data['chargeable_volume_liters']
+            ?? ($data['marketplace_data']['chargeable_volume_liters'] ?? null)
+            ?? ($cache->volume_liters !== null ? max((float) $cache->volume_liters, (float) (($volumeWeight ?? 0) * 5)) : null);
 
         // Габариты как объект
         $data['dimensions'] = [
@@ -1029,6 +1565,8 @@ class UnitEconomicsCacheController extends Controller
             'height' => $cache->height ? number_format((float) $cache->height, 2, '.', '') : null,
             'weight' => $cache->weight ? number_format((float) $cache->weight, 2, '.', '') : null,
             'volume' => $cache->volume_liters ? number_format((float) $cache->volume_liters, 4, '.', '') : null,
+            'volume_weight' => $volumeWeight !== null ? number_format((float) $volumeWeight, 4, '.', '') : null,
+            'chargeable_volume' => $chargeableVolumeLiters !== null ? number_format((float) $chargeableVolumeLiters, 4, '.', '') : null,
         ];
 
         // Комиссии по схемам из ozon_data
@@ -1102,10 +1640,8 @@ class UnitEconomicsCacheController extends Controller
                 ?? $marketplaceData['route_label']
                 ?? ($activeFixation['shipping_cluster_name'] ?? null)
                 ?? ($ozonData['route_label'] ?? null);
-            $data['shipping_cluster_id'] = $marketplaceData['shipping_cluster_id']
-                ?? ($activeFixation['shipping_cluster_id'] ?? null);
-            $data['shipping_cluster_name'] = $marketplaceData['shipping_cluster_name']
-                ?? ($activeFixation['shipping_cluster_name'] ?? null);
+            // shipping_cluster_id / shipping_cluster_name удалены из ответа —
+            // используйте route_key / route_label (идентичные значения)
             $data['destination_cluster_id'] = $marketplaceData['destination_cluster_id']
                 ?? null;
             $data['destination_cluster_name'] = $marketplaceData['destination_cluster_name']
@@ -1131,10 +1667,6 @@ class UnitEconomicsCacheController extends Controller
             if ($data['is_local_sale'] === null && array_key_exists('is_local_sale', $ozonData)) {
                 $data['is_local_sale'] = $ozonData['is_local_sale'];
             }
-            $rawNonLocalMarkupPercent = $cache->non_local_markup_percent !== null
-                ? round((float) $cache->non_local_markup_percent, 2)
-                : null;
-            $data['raw_non_local_markup_percent'] = $rawNonLocalMarkupPercent ?? 0;
             $data['price_segment'] = $cache->price_segment;
             $data['sales_fee_percent'] = round((float) ($cache->sales_fee_percent ?? $cache->commission_percent), 2);
             $data['route_resolution_status'] = $marketplaceData['route_resolution_status']
@@ -1157,49 +1689,13 @@ class UnitEconomicsCacheController extends Controller
                 : (isset($ozonData['dominant_cluster_share'])
                     ? round((float) $ozonData['dominant_cluster_share'], 2)
                     : null);
-            $cacheDerivedLocalityRate = $data['is_local_sale'] === null ? null : ($data['is_local_sale'] ? 100.0 : 0.0);
-            $data['expected_locality_rate'] = $cacheDerivedLocalityRate
-                ?? (isset($marketplaceData['expected_locality_rate'])
-                    ? round((float) $marketplaceData['expected_locality_rate'], 2)
-                    : (isset($ozonData['expected_locality_rate'])
-                        ? round((float) $ozonData['expected_locality_rate'], 2)
-                        : null));
-            $data['weighted_non_local_markup_percent'] = $rawNonLocalMarkupPercent;
-            if ($data['weighted_non_local_markup_percent'] === null) {
-                $data['weighted_non_local_markup_percent'] = isset($marketplaceData['weighted_non_local_markup_percent'])
-                    ? round((float) $marketplaceData['weighted_non_local_markup_percent'], 2)
-                    : (isset($ozonData['weighted_non_local_markup_percent'])
-                        ? round((float) $ozonData['weighted_non_local_markup_percent'], 2)
-                        : $rawNonLocalMarkupPercent);
-            }
-            $data['non_local_markup_percent'] = $data['weighted_non_local_markup_percent'];
-            $data['logistics_markup_percent'] = $data['weighted_non_local_markup_percent'];
-            $data['non_local_markup_amount'] = round((float) $cache->price * ((float) $data['non_local_markup_percent'] / 100), 2);
-            $data['logistics_markup_amount'] = $data['non_local_markup_amount'];
             $data['sales_7_days'] = isset($marketplaceData['sales_7_days'])
                 ? (int) $marketplaceData['sales_7_days']
                 : (isset($ozonData['sales_7_days']) ? (int) $ozonData['sales_7_days'] : null);
-            // Пересчитываем markup_allowed на основе актуальных sales_7_days,
-            // а не используем stale значение из кеша
+            // markup_allowed считаем по актуальным sales_7_days, а не по stale значению из кеша
             $isFboScheme = strtoupper($cache->fulfillment_type ?? '') === 'FBO';
             $sellerSales7Days = $data['sales_7_days'];
             $data['markup_allowed'] = !($isFboScheme && $sellerSales7Days !== null && $sellerSales7Days < 50);
-            $data['markup_rule_reason'] = null; // Сбрасываем — пересчитаем ниже
-            // Определяем причину нулевой наценки
-            if ($data['markup_allowed'] === false) {
-                $data['markup_rule_reason'] = 'fbo_lt_50_orders_7d';
-                // Обнуляем наценку для отображения — Ozon не начисляет
-                $data['non_local_markup_percent'] = 0;
-                $data['logistics_markup_percent'] = 0;
-                $data['non_local_markup_amount'] = 0;
-                $data['logistics_markup_amount'] = 0;
-            } elseif (($data['expected_locality_rate'] ?? null) !== null && (float) $data['expected_locality_rate'] >= 99.99) {
-                $data['markup_rule_reason'] = 'local_cluster';
-            }
-            $data['markup_rule_reason_label'] = $this->humanizeOzonMarkupReason(
-                is_string($data['markup_rule_reason'] ?? null) ? $data['markup_rule_reason'] : null,
-                $data['sales_7_days'] ?? null
-            );
             $data['profit_min'] = isset($marketplaceData['profit_min'])
                 ? round((float) $marketplaceData['profit_min'], 2)
                 : round((float) $cache->net_profit, 2);
@@ -1224,6 +1720,86 @@ class UnitEconomicsCacheController extends Controller
                 : (is_array($ozonData['sales_profile'] ?? null)
                     ? $ozonData['sales_profile']
                     : []);
+            [$data['clusters_summary'], $data['sales_profile']] = $this->normalizeOzonClusterMarkupData(
+                $data['clusters_summary'],
+                $data['sales_profile'],
+                $data['stock_profile'],
+                (bool) ($data['markup_allowed'] ?? true)
+            );
+            $marketplaceData['clusters_summary'] = $data['clusters_summary'];
+            $marketplaceData['sales_profile'] = $data['sales_profile'];
+
+            // expected_locality_rate: сначала пробуем пересчитать из свежих clusters_summary,
+            // только в отсутствие данных — fallback на is_local_sale (100%/0%).
+            $localityShare = 0.0;
+            $hasLocalityDemand = false;
+            foreach ($data['clusters_summary'] as $clusterRow) {
+                if (! is_array($clusterRow)) {
+                    continue;
+                }
+                $share = (float) ($clusterRow['orders_percent'] ?? 0);
+                if ($share <= 0) {
+                    continue;
+                }
+                $hasLocalityDemand = true;
+                if (! empty($clusterRow['is_local_cluster'])) {
+                    $localityShare += $share;
+                }
+            }
+            if ($hasLocalityDemand) {
+                $data['expected_locality_rate'] = round(min(100.0, $localityShare), 2);
+            } else {
+                $data['expected_locality_rate'] = $data['is_local_sale'] === null
+                    ? null
+                    : ($data['is_local_sale'] ? 100.0 : 0.0);
+            }
+
+            // Единственный источник истины для наценки — Σ(share × effective_markup_percent).
+            // Никаких чтений из $cache->non_local_markup_percent или $marketplaceData —
+            // значения всегда пересчитываются на лету из обогащённых clusters_summary.
+            $recalculatedWeighted = 0.0;
+            foreach ($data['clusters_summary'] as $clusterRow) {
+                if (! is_array($clusterRow)) {
+                    continue;
+                }
+                $share = (float) ($clusterRow['orders_percent'] ?? 0);
+                if ($share <= 0) {
+                    continue;
+                }
+                $recalculatedWeighted += ($share / 100) * (float) ($clusterRow['effective_markup_percent'] ?? 0);
+            }
+            $weightedMarkup = round($recalculatedWeighted, 2);
+            $data['weighted_non_local_markup_percent'] = $weightedMarkup;
+            $data['non_local_markup_percent'] = $weightedMarkup;
+            $data['logistics_markup_percent'] = $weightedMarkup;
+            $data['non_local_markup_amount'] = round((float) $cache->price * ($weightedMarkup / 100), 2);
+            $data['logistics_markup_amount'] = $data['non_local_markup_amount'];
+            $data['raw_non_local_markup_percent'] = $weightedMarkup;
+
+            $data['markup_rule_reason'] = null;
+            if ($data['markup_allowed'] === false) {
+                $data['markup_rule_reason'] = 'fbo_lt_50_orders_7d';
+            } elseif (($data['expected_locality_rate'] ?? null) !== null && (float) $data['expected_locality_rate'] >= 99.99) {
+                $data['markup_rule_reason'] = 'local_cluster';
+            } elseif ($weightedMarkup > 0) {
+                $data['markup_rule_reason'] = 'non_local_markup_applied';
+            } else {
+                $data['markup_rule_reason'] = 'no_markup_for_cluster';
+            }
+            $data['markup_rule_reason_label'] = $this->humanizeOzonMarkupReason(
+                is_string($data['markup_rule_reason'] ?? null) ? $data['markup_rule_reason'] : null,
+                $data['sales_7_days'] ?? null
+            );
+            // Не отдаём «Кластер поставки» во фронт — поля используются только внутренне
+            // (фиксации/локальность). Для маршрута используй route_label / route_key.
+            unset(
+                $marketplaceData['shipping_cluster_id'],
+                $marketplaceData['shipping_cluster_name']
+            );
+            $data['marketplace_data'] = $marketplaceData;
+            $data['shipping_routes'] = is_array($marketplaceData['shipping_routes'] ?? null)
+                ? $marketplaceData['shipping_routes']
+                : [];
             $data['route_details'] = is_array($marketplaceData['route_details'] ?? null)
                 ? $marketplaceData['route_details']
                 : (is_array($ozonData['route_details'] ?? null)
@@ -1247,10 +1823,11 @@ class UnitEconomicsCacheController extends Controller
         // Поля для таблицы (на верхнем уровне для удобства фронтенда)
         // Приоритет: настройки пользователя > кэш > продукт
         // В БД размеры хранятся в мм, вес в г
-        $lengthMm = $settings?->length_mm ?? $cache->depth ?? $product?->depth;
-        $widthMm = $settings?->width_mm ?? $cache->width ?? $product?->width;
-        $heightMm = $settings?->height_mm ?? $cache->height ?? $product?->height;
-        $weightG = $settings?->weight_g ?? $cache->weight ?? $product?->weight;
+        $ozonData = $product?->ozon_data ?? [];
+        $lengthMm = $settings?->length_mm ?? $cache->depth ?? $product?->depth ?? $ozonData['length_mm'] ?? $ozonData['dimensions']['depth'] ?? null;
+        $widthMm = $settings?->width_mm ?? $cache->width ?? $product?->width ?? $ozonData['width_mm'] ?? $ozonData['dimensions']['width'] ?? null;
+        $heightMm = $settings?->height_mm ?? $cache->height ?? $product?->height ?? $ozonData['height_mm'] ?? $ozonData['dimensions']['height'] ?? null;
+        $weightG = $settings?->weight_g ?? $cache->weight ?? $product?->weight ?? $ozonData['weight_g'] ?? $ozonData['dimensions']['weight'] ?? null;
 
         $volumeLiters = $cache->volume_liters;
         if ($volumeLiters === null && $lengthMm !== null && $widthMm !== null && $heightMm !== null) {
@@ -1265,6 +1842,8 @@ class UnitEconomicsCacheController extends Controller
         $data['scheme_info'] = $this->getSchemeInfo($scheme, $cache->marketplace);
 
         $data['volume_liters'] = $volumeLiters !== null ? round((float) $volumeLiters, 4) : null;
+        $data['volume_weight'] = $volumeWeight !== null ? round((float) $volumeWeight, 4) : null;
+        $data['chargeable_volume_liters'] = $chargeableVolumeLiters !== null ? round((float) $chargeableVolumeLiters, 4) : null;
         $data['length_mm'] = $lengthMm !== null ? round((float) $lengthMm, 0) : null;
         $data['width_mm'] = $widthMm !== null ? round((float) $widthMm, 0) : null;
         $data['height_mm'] = $heightMm !== null ? round((float) $heightMm, 0) : null;
@@ -2054,5 +2633,95 @@ class UnitEconomicsCacheController extends Controller
             'non_local_markup_applied' => 'Надбавка применяется: продажа идёт вне локального кластера',
             default => null,
         };
+    }
+
+    private function normalizeOzonClusterMarkupData(
+        array $clustersSummary,
+        array $salesProfile,
+        array $stockProfile,
+        bool $markupAllowed
+    ): array {
+        $salesClusters = is_array($salesProfile['clusters'] ?? null) ? $salesProfile['clusters'] : $salesProfile;
+        $pricing = app(OzonPricingMatrix::class);
+
+        // Канонизация имён остатков через pricing matrix (единый источник с Calculator).
+        $stockClusterCanonical = collect($stockProfile)
+            ->pluck('cluster_name')
+            ->filter(fn ($name) => is_string($name) && trim($name) !== '')
+            ->map(fn (string $name) => $pricing->resolveClusterName($name))
+            ->filter()
+            ->unique()
+            ->values()
+            ->all();
+
+        $summaryLookup = [];
+        foreach ($clustersSummary as $cluster) {
+            if (! is_array($cluster)) {
+                continue;
+            }
+
+            $clusterId = isset($cluster['cluster_id']) && $cluster['cluster_id'] !== '' ? (string) $cluster['cluster_id'] : null;
+            $clusterNameKey = $this->normalizeClusterKey($cluster['cluster_name'] ?? null);
+
+            if ($clusterId !== null) {
+                $summaryLookup['id:' . $clusterId] = $cluster;
+            }
+
+            if ($clusterNameKey !== null) {
+                $summaryLookup['name:' . $clusterNameKey] = $cluster;
+            }
+        }
+
+        $enrichCluster = function (array $cluster) use ($pricing, $summaryLookup, $stockClusterCanonical, $markupAllowed): array {
+            $clusterId = isset($cluster['cluster_id']) && $cluster['cluster_id'] !== '' ? (string) $cluster['cluster_id'] : null;
+            $clusterName = $cluster['cluster_name'] ?? null;
+            $clusterNameKey = $this->normalizeClusterKey($clusterName);
+
+            $matched = [];
+            if ($clusterId !== null && isset($summaryLookup['id:' . $clusterId])) {
+                $matched = $summaryLookup['id:' . $clusterId];
+            } elseif ($clusterNameKey !== null && isset($summaryLookup['name:' . $clusterNameKey])) {
+                $matched = $summaryLookup['name:' . $clusterNameKey];
+            }
+
+            $resolvedName = $clusterName ?? $matched['cluster_name'] ?? null;
+            $resolvedRoute = $pricing->resolveRoute(null, is_string($resolvedName) ? $resolvedName : null);
+            $canonicalName = is_string($resolvedName) ? $pricing->resolveClusterName($resolvedName) : null;
+            $isLocalCluster = $canonicalName !== null && in_array($canonicalName, $stockClusterCanonical, true);
+            $nonLocalMarkupPercent = $pricing->resolveDestinationMarkupPercent(is_string($resolvedName) ? $resolvedName : null);
+            $effectiveMarkupPercent = (! $markupAllowed || $isLocalCluster) ? 0.0 : $nonLocalMarkupPercent;
+            $markupReason = $cluster['markup_reason']
+                ?? $matched['markup_reason']
+                ?? (! $markupAllowed
+                    ? 'fbo_lt_50_orders_7d'
+                    : ($isLocalCluster ? 'local_cluster' : ($nonLocalMarkupPercent > 0 ? 'non_local_markup_applied' : 'no_markup_for_cluster')));
+
+            return array_merge($matched, $cluster, [
+                'cluster_id' => $clusterId ?? ($matched['cluster_id'] ?? null),
+                'cluster_name' => $resolvedName,
+                'is_local_cluster' => $isLocalCluster,
+                'route_key' => $cluster['route_key'] ?? $matched['route_key'] ?? $resolvedRoute['route_key'] ?? null,
+                'route_label' => $cluster['route_label'] ?? $matched['route_label'] ?? $resolvedRoute['route_label'] ?? null,
+                'non_local_markup_percent' => $nonLocalMarkupPercent,
+                'effective_markup_percent' => $effectiveMarkupPercent,
+                'markup_reason' => $markupReason,
+            ]);
+        };
+
+        return [
+            array_map($enrichCluster, $clustersSummary),
+            array_map($enrichCluster, $salesClusters),
+        ];
+    }
+
+    private function normalizeClusterKey(mixed $value): ?string
+    {
+        if (! is_string($value)) {
+            return null;
+        }
+
+        $normalized = mb_strtolower(trim($value));
+
+        return $normalized !== '' ? $normalized : null;
     }
 }

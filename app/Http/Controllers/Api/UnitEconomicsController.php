@@ -53,9 +53,34 @@ class UnitEconomicsController extends Controller
             $validated['price_max'] ?? null
         );
 
-        $sortField = $validated['sort'] ?? 'sku';
-        $sortOrder = $validated['sort_order'] ?? 'asc';
-        $query->orderBy($sortField, $sortOrder);
+        // Default sort: сначала товары с активными продажами за 28д (из ozon_order_unit_economics,
+        // то же что показывает Locality). Если unit_economics.sales_count устарел или пустой —
+        // всё равно SKU с заказами попадут наверх.
+        $integrationIdForSort = $validated['integration_id'] ?? null;
+        $marketplaceForSort = $validated['marketplace'] ?? null;
+
+        if (isset($validated['sort'])) {
+            $sortField = $validated['sort'];
+            $sortOrder = $validated['sort_order'] ?? 'asc';
+            $query->orderBy($sortField, $sortOrder);
+        } elseif ($marketplaceForSort === 'ozon' && $integrationIdForSort) {
+            $recentOrdersSub = \Illuminate\Support\Facades\DB::table('ozon_order_unit_economics')
+                ->selectRaw('sku, COUNT(*) AS recent_orders_28d')
+                ->where('integration_id', $integrationIdForSort)
+                ->where('order_date', '>=', now()->subDays(28))
+                ->whereNotIn('markup_reason_code', ['cancelled_order', 'not_redeemed'])
+                ->groupBy('sku');
+
+            $query->leftJoinSub($recentOrdersSub, 'recent', function ($join) {
+                    $join->on('recent.sku', '=', 'unit_economics.sku');
+                })
+                ->select('unit_economics.*')
+                ->orderByRaw('COALESCE(recent.recent_orders_28d, 0) DESC')
+                ->orderByRaw('COALESCE(unit_economics.sales_count, 0) DESC')
+                ->orderBy('unit_economics.sku', 'asc');
+        } else {
+            $query->orderByRaw('COALESCE(sales_count, 0) DESC, sku ASC');
+        }
 
         $limit = $validated['limit'] ?? 50;
         $page = $validated['page'] ?? 1;
@@ -111,7 +136,12 @@ class UnitEconomicsController extends Controller
         } elseif ($actualScheme) {
             $query->where('fulfillment_type', $actualScheme);
         } else {
-            $query->where('is_actual_scheme', true);
+            // BUG FIX: если нет записей с is_actual_scheme=true, показываем все записи
+            // а не пустую таблицу (актуально для Yandex Market где ранее is_actual_scheme не заполнялся)
+            $hasActual = (clone $baseQuery)->where('is_actual_scheme', true)->exists();
+            if ($hasActual) {
+                $query->where('is_actual_scheme', true);
+            }
         }
 
         if (!empty($validated['search'])) {
@@ -136,9 +166,29 @@ class UnitEconomicsController extends Controller
             $validated['price_max'] ?? null
         );
 
-        $sortField = $validated['sort'] ?? 'sku';
-        $sortOrder = $validated['sort_order'] ?? 'asc';
-        $query->orderBy($sortField, $sortOrder);
+        // Default sort: товары с активными продажами за 28д (из ozon_order_unit_economics) первыми.
+        if (isset($validated['sort'])) {
+            $sortField = $validated['sort'];
+            $sortOrder = $validated['sort_order'] ?? 'asc';
+            $query->orderBy($sortField, $sortOrder);
+        } elseif ($marketplace === 'ozon' && $integrationId) {
+            $recentOrdersSub = \Illuminate\Support\Facades\DB::table('ozon_order_unit_economics')
+                ->selectRaw('sku, COUNT(*) AS recent_orders_28d')
+                ->where('integration_id', $integrationId)
+                ->where('order_date', '>=', now()->subDays(28))
+                ->whereNotIn('markup_reason_code', ['cancelled_order', 'not_redeemed'])
+                ->groupBy('sku');
+
+            $query->leftJoinSub($recentOrdersSub, 'recent', function ($join) {
+                    $join->on('recent.sku', '=', 'unit_economics.sku');
+                })
+                ->select('unit_economics.*')
+                ->orderByRaw('COALESCE(recent.recent_orders_28d, 0) DESC')
+                ->orderByRaw('COALESCE(unit_economics.sales_count, 0) DESC')
+                ->orderBy('unit_economics.sku', 'asc');
+        } else {
+            $query->orderByRaw('COALESCE(sales_count, 0) DESC, sku ASC');
+        }
 
         $limit = $validated['limit'] ?? 50;
         $page = $validated['page'] ?? 1;
@@ -154,7 +204,10 @@ class UnitEconomicsController extends Controller
         if ($effectiveFulfillmentType) {
             $statsQuery->where('fulfillment_type', strtoupper($effectiveFulfillmentType));
         } else {
-            $statsQuery->where('is_actual_scheme', true);
+            $hasActualStats = (clone $statsQuery)->where('is_actual_scheme', true)->exists();
+            if ($hasActualStats) {
+                $statsQuery->where('is_actual_scheme', true);
+            }
         }
 
         $stats = [

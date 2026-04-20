@@ -73,6 +73,13 @@ class CheckSellicoPermission
         'auto-supply-plans.export.xlsx'  => 'auto_supply.export',
         'auto-supply-plans.export.csv'   => 'auto_supply.export',
         'auto-supply-plans.export.wb'    => 'auto_supply.export',
+        'auto-supply-plans.locality-impact' => 'auto_supply.view',
+        'auto-supply-plans.cluster-split' => 'auto_supply.view',
+        'auto-supply-plans.locality-recommendations' => 'auto_supply.view',
+        'auto-supply-plans.cluster-draft-preview' => 'auto_supply.view',
+        'auto-supply-plans.create-cluster-drafts' => 'auto_supply.export',
+        'auto-supply-plans.from-locality-recommendations' => 'auto_supply.create',
+        'auto-supply-plans.preview-split-by-cluster' => 'auto_supply.view',
 
         // Остатки
         'inventory.index'           => 'products.view',
@@ -92,6 +99,7 @@ class CheckSellicoPermission
         'integrations.index'         => 'products.view',
         'integrations.premiumStatus' => 'products.view',
         'integrations.sync'          => 'products.sync.execute',
+        'integrations.sync.direct'   => 'products.sync.execute',
         'integrations.manualRedemptionRate' => 'products.edit',
         'integrations.syncStatus'    => 'products.sync.status',
         'integrations.status'        => 'products.view',
@@ -144,6 +152,22 @@ class CheckSellicoPermission
         'ozon-reports.summary'         => 'unit_economics.view',
         'ozon-reports.warehouseSales'  => 'unit_economics.view',
         'ozon-reports.destroy'         => 'unit_economics.view',
+
+        // Locality Engine (Ozon FBO — встроен в юнит-экономику)
+        'locality.overview'                        => 'unit_economics.view',
+        'locality.skus'                            => 'unit_economics.view',
+        'locality.clusters'                        => 'unit_economics.view',
+        'locality.explain'                         => 'unit_economics.view',
+        'locality.counterfactual'                  => 'unit_economics.view',
+        'locality.explain.q'                       => 'unit_economics.view',
+        'locality.counterfactual.q'                => 'unit_economics.view',
+        'locality.recommendations.index'           => 'unit_economics.view',
+        'locality.recommendations.show'            => 'unit_economics.view',
+        'locality.recommendations.dismiss'         => 'unit_economics.edit',
+        'locality.recommendations.draftPreview'    => 'unit_economics.view',
+        'locality.recommendations.draftCreate'     => 'unit_economics.edit',
+        'locality.reconciliation'                  => 'unit_economics.view',
+        'locality.recompute'                       => 'unit_economics.view',
     ];
 
     /**

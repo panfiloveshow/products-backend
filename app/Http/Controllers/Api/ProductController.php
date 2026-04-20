@@ -193,7 +193,7 @@ class ProductController extends Controller
         $marketplace = $this->normalizeMarketplace($marketplace);
         $integrationId = $request->integer('integration_id') ?: null;
 
-        if (! $integrationId && $request->bearerToken()) {
+        if (! $integrationId && $this->requestAccessToken($request)) {
             $syncLogs = $this->startMarketplaceSyncAcrossWorkspaces($request, $marketplace);
 
             if (! empty($syncLogs)) {
@@ -211,35 +211,27 @@ class ProductController extends Controller
 
         // Если передан integration_id, берём credentials из интеграции
         if ($integrationId) {
-            $integration = Integration::find($integrationId);
-            if ($integration) {
-                $credentials = $integration->credentials ?? [];
-            } else {
-                // Если локально нет, пробуем получить из Sellico API
-                $token = $request->bearerToken();
-                if ($token) {
-                    $sellicoApi = app(\App\Services\SellicoApiService::class);
-                    $sellicoApi->setAccessToken($token);
-                    $result = $sellicoApi->getIntegrationById($integrationId);
+            $resolution = $this->integrationAccessService->ensureAccessibleIntegration(
+                $request,
+                $integrationId,
+                $marketplace
+            );
 
-                    if ($result['success'] && ! empty($result['credentials'])) {
-                        $credentials = $result['credentials'];
-                    } else {
-                        \Log::error('ProductController::sync - Sellico API integration fetch failed', [
-                            'integration_id' => $integrationId,
-                            'result' => $result,
-                        ]);
+            if (! ($resolution['success'] ?? false)) {
+                \Log::error('ProductController::sync - integration access failed', [
+                    'integration_id' => $integrationId,
+                    'marketplace' => $marketplace,
+                    'message' => $resolution['message'] ?? null,
+                ]);
 
-                        return response()->json(['error' => 'Integration not found locally or in Sellico API', 'details' => $result], 404);
-                    }
-                } else {
-                    \Log::error('ProductController::sync - No local integration and no token provided', [
-                        'integration_id' => $integrationId,
-                    ]);
-
-                    return response()->json(['error' => 'Integration not found locally and no token provided'], 404);
-                }
+                return response()->json([
+                    'error' => $resolution['message'] ?? 'Integration not found locally or in Sellico API',
+                ], $resolution['status'] ?? 404);
             }
+
+            /** @var Integration $integration */
+            $integration = $resolution['integration'];
+            $credentials = $integration->credentials ?? [];
         } else {
             // Валидация credentials в зависимости от маркетплейса
             $rules = match ($marketplace) {
@@ -267,8 +259,9 @@ class ProductController extends Controller
         }
 
         // Прокидываем токен авторизации для Sellico API в фоновые очереди
-        if ($request->bearerToken()) {
-            $credentials['_sellico_token'] = $request->bearerToken();
+        $accessToken = $this->requestAccessToken($request);
+        if ($accessToken) {
+            $credentials['_sellico_token'] = $accessToken;
         }
 
         $syncLog = $this->productService->startSync(
@@ -298,7 +291,7 @@ class ProductController extends Controller
 
     private function startMarketplaceSyncAcrossWorkspaces(Request $request, string $marketplace): array
     {
-        $token = $request->bearerToken();
+        $token = $this->requestAccessToken($request);
         if (! $token) {
             return [];
         }
@@ -382,6 +375,22 @@ class ProductController extends Controller
         }
 
         return $started;
+    }
+
+    /**
+     * Токен Sellico: фронт шлёт X-Sellico-Token; часть клиентов — Authorization Bearer.
+     */
+    private function requestAccessToken(Request $request): ?string
+    {
+        $token = $request->bearerToken()
+            ?? $request->header('X-Sellico-Token')
+            ?? $request->header('X-Token');
+
+        if ($token === null || $token === '') {
+            return null;
+        }
+
+        return $token;
     }
 
     private function normalizeMarketplace(string $marketplace): string

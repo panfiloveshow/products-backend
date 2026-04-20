@@ -4,6 +4,9 @@ namespace App\Jobs;
 
 use App\Models\Product;
 use App\Models\SyncLog;
+use App\Models\UnitEconomics;
+use App\Models\UnitEconomicsCache;
+use App\Models\InventoryWarehouse;
 use App\Services\InventoryService;
 use App\Services\Marketplace\MarketplaceFactory;
 use Illuminate\Bus\Queueable;
@@ -56,6 +59,12 @@ class SyncProductsJob implements ShouldBeUnique, ShouldQueue
     {
         $this->syncLog->start();
 
+        // Обновляем статус на интеграции
+        if ($this->syncLog->integration_id) {
+            \App\Models\Integration::where('id', $this->syncLog->integration_id)
+                ->update(['last_sync_status' => 'running', 'last_sync_at' => now()]);
+        }
+
         try {
             // Получаем credentials из SyncLog (зашифрованы в БД)
             $credentials = $this->syncLog->credentials ?? [];
@@ -63,6 +72,18 @@ class SyncProductsJob implements ShouldBeUnique, ShouldQueue
             // Создаём сервис маркетплейса с credentials
             $marketplace = MarketplaceFactory::create($this->syncLog->marketplace, $credentials);
             $products = $marketplace->getProducts();
+
+            // Для Yandex: добавляем integration_id в каждый товар если он есть
+            if ($this->syncLog->integration_id && in_array($this->syncLog->marketplace, ['yandex', 'yandex_market'], true)) {
+                foreach ($products as &$product) {
+                    $product['integration_id'] = $this->syncLog->integration_id;
+                }
+                unset($product);
+                Log::info('Yandex products enriched with integration_id', [
+                    'integration_id' => $this->syncLog->integration_id,
+                    'count' => count($products),
+                ]);
+            }
 
             $beforeFilter = count($products);
             $products = array_values(array_filter(
@@ -152,6 +173,8 @@ class SyncProductsJob implements ShouldBeUnique, ShouldQueue
                 }
             }
 
+            $pruned = $this->pruneMissingMarketplaceProducts($products);
+
             // Сохраняем метаданные о синхронизации
             $this->syncLog->update([
                 'metadata' => array_merge($this->syncLog->metadata ?? [], [
@@ -159,17 +182,25 @@ class SyncProductsJob implements ShouldBeUnique, ShouldQueue
                     'created' => $created,
                     'updated' => $updated,
                     'unchanged' => $synced - $created - $updated,
+                    'pruned' => $pruned,
                     'phase' => 'products_done',
                 ]),
             ]);
 
             $this->syncLog->complete($synced, $failed);
 
+            // Обновляем статус на интеграции
+            if ($this->syncLog->integration_id) {
+                \App\Models\Integration::where('id', $this->syncLog->integration_id)
+                    ->update(['last_sync_status' => 'completed', 'last_sync_at' => now(), 'last_sync_error' => null]);
+            }
+
             Log::info('Products sync completed', [
                 'marketplace' => $this->syncLog->marketplace,
                 'synced' => $synced,
                 'created' => $created,
                 'updated' => $updated,
+                'pruned' => $pruned,
                 'failed' => $failed,
             ]);
 
@@ -188,8 +219,25 @@ class SyncProductsJob implements ShouldBeUnique, ShouldQueue
                     'inventory_sync_id' => $inventorySyncLog->id,
                 ]);
             }
+
+            // Запускаем пересчёт юнит-экономики + кэша после синхронизации товаров
+            if ($this->syncLog->integration_id) {
+                SyncUnitEconomicsJob::dispatch($this->syncLog->integration_id)
+                    ->onQueue('unit-economics')
+                    ->delay(now()->addSeconds(30));
+
+                Log::info('UnitEconomics sync dispatched after products sync', [
+                    'integration_id' => $this->syncLog->integration_id,
+                ]);
+            }
         } catch (\Exception $e) {
             $this->syncLog->fail($e->getMessage());
+
+            // Обновляем статус на интеграции
+            if ($this->syncLog->integration_id) {
+                \App\Models\Integration::where('id', $this->syncLog->integration_id)
+                    ->update(['last_sync_status' => 'failed', 'last_sync_error' => substr($e->getMessage(), 0, 500)]);
+            }
 
             Log::error('Products sync failed', [
                 'marketplace' => $this->syncLog->marketplace,
@@ -198,6 +246,77 @@ class SyncProductsJob implements ShouldBeUnique, ShouldQueue
 
             throw $e;
         }
+    }
+
+    private function pruneMissingMarketplaceProducts(array $products): int
+    {
+        if (($this->syncLog->marketplace ?? '') !== 'ozon') {
+            return 0;
+        }
+
+        $integrationId = $this->syncLog->integration_id;
+        if (! $integrationId) {
+            return 0;
+        }
+
+        $currentSkus = collect($products)
+            ->pluck('sku')
+            ->filter(fn ($sku) => trim((string) $sku) !== '')
+            ->map(fn ($sku) => trim((string) $sku))
+            ->unique()
+            ->values();
+
+        if ($currentSkus->isEmpty()) {
+            return 0;
+        }
+
+        $staleSkus = Product::query()
+            ->where('integration_id', $integrationId)
+            ->where('marketplace', $this->syncLog->marketplace)
+            ->whereNotIn('sku', $currentSkus->all())
+            ->pluck('sku')
+            ->filter(fn ($sku) => trim((string) $sku) !== '')
+            ->unique()
+            ->values();
+
+        if ($staleSkus->isEmpty()) {
+            return 0;
+        }
+
+        $staleSkuValues = $staleSkus->all();
+
+        UnitEconomicsCache::query()
+            ->where('integration_id', $integrationId)
+            ->where('marketplace', $this->syncLog->marketplace)
+            ->whereIn('sku', $staleSkuValues)
+            ->delete();
+
+        UnitEconomics::query()
+            ->where('integration_id', $integrationId)
+            ->where('marketplace', $this->syncLog->marketplace)
+            ->whereIn('sku', $staleSkuValues)
+            ->delete();
+
+        InventoryWarehouse::query()
+            ->where('integration_id', $integrationId)
+            ->where('marketplace', $this->syncLog->marketplace)
+            ->whereIn('sku', $staleSkuValues)
+            ->delete();
+
+        $deletedProducts = Product::query()
+            ->where('integration_id', $integrationId)
+            ->where('marketplace', $this->syncLog->marketplace)
+            ->whereIn('sku', $staleSkuValues)
+            ->delete();
+
+        Log::info('Pruned stale marketplace products after full sync', [
+            'marketplace' => $this->syncLog->marketplace,
+            'integration_id' => $integrationId,
+            'stale_skus_count' => count($staleSkuValues),
+            'deleted_products' => $deletedProducts,
+        ]);
+
+        return $deletedProducts;
     }
 
     /**
@@ -276,6 +395,13 @@ class SyncProductsJob implements ShouldBeUnique, ShouldQueue
             if ($byIntegration) {
                 return $byIntegration;
             }
+
+            // Не выходим за пределы текущей интеграции: один и тот же SKU/marketplace_id
+            // может существовать в другом магазине этого же маркетплейса.
+            return Product::where('marketplace', $marketplace)
+                ->where('sku', $sku)
+                ->whereNull('integration_id')
+                ->first();
         }
 
         $marketplaceId = $productData['marketplace_id'] ?? null;
@@ -313,6 +439,11 @@ class SyncProductsJob implements ShouldBeUnique, ShouldQueue
             'brand',
             'rating',
             'reviews_count',
+            'depth',
+            'width',
+            'height',
+            'weight',
+            'volume_weight',
         ];
 
         foreach ($fieldsToCompare as $field) {
@@ -333,7 +464,7 @@ class SyncProductsJob implements ShouldBeUnique, ShouldQueue
             }
 
             // Для decimal полей сравниваем с округлением
-            if (in_array($field, ['price', 'old_price', 'rating'])) {
+            if (in_array($field, ['price', 'old_price', 'rating', 'depth', 'width', 'height', 'weight', 'volume_weight'])) {
                 if (round((float) $existingValue, 2) !== round((float) $newValue, 2)) {
                     return true;
                 }

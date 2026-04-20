@@ -81,6 +81,24 @@ class SyncInventoryJob implements ShouldBeUnique, ShouldQueue
                 $inventory = $marketplaceService->getInventory();
             }
 
+            // Yandex: загружаем маппинг warehouseId → name для человекочитаемых названий складов
+            $yandexWarehouseNames = [];
+            if (in_array($this->syncLog->marketplace, ['yandex', 'yandex_market'], true) && method_exists($marketplaceService, 'getWarehouses')) {
+                try {
+                    $warehouses = $marketplaceService->getWarehouses();
+                    foreach ($warehouses as $wh) {
+                        $whId = (string) ($wh['id'] ?? '');
+                        $whName = $wh['name'] ?? null;
+                        if ($whId !== '' && $whName) {
+                            $yandexWarehouseNames[$whId] = $whName;
+                        }
+                    }
+                    Log::info('Yandex warehouse names loaded', ['count' => count($yandexWarehouseNames)]);
+                } catch (\Exception $e) {
+                    Log::warning('Failed to load Yandex warehouse names', ['error' => $e->getMessage()]);
+                }
+            }
+
             // WB: дополнительно синхронизируем FBS-остатки (склады продавца)
             if ($this->syncLog->marketplace === 'wildberries' && method_exists($marketplaceService, 'getFbsStocks')) {
                 $fbsStocks = $marketplaceService->getFbsStocks();
@@ -165,6 +183,13 @@ class SyncInventoryJob implements ShouldBeUnique, ShouldQueue
 
                 if (! empty($item['warehouses']) && is_array($item['warehouses'])) {
                     foreach ($item['warehouses'] as $wh) {
+                        // Yandex: подставляем человекочитаемое название склада из маппинга
+                        if (! empty($yandexWarehouseNames)) {
+                            $whId = (string) ($wh['warehouse_id'] ?? '');
+                            if (isset($yandexWarehouseNames[$whId]) && empty($wh['warehouse_name'])) {
+                                $wh['warehouse_name'] = $yandexWarehouseNames[$whId];
+                            }
+                        }
                         $flatInventory[] = array_merge($wh, [
                             'sku' => $sku,
                             'marketplace' => $this->syncLog->marketplace,
@@ -289,7 +314,11 @@ class SyncInventoryJob implements ShouldBeUnique, ShouldQueue
             // Это исправляет накопление старых складов и завышенный суммарный остаток
             if (! empty($apiPairs) && $this->syncLog->integration_id) {
                 $deleted = 0;
-                InventoryWarehouse::where('marketplace', $this->syncLog->marketplace)
+                InventoryWarehouse::when(
+                        in_array($this->syncLog->marketplace, ['yandex', 'yandex_market'], true),
+                        fn ($q) => $q->whereIn('marketplace', ['yandex', 'yandex_market']),
+                        fn ($q) => $q->where('marketplace', $this->syncLog->marketplace)
+                    )
                     ->where('integration_id', $this->syncLog->integration_id)
                     ->chunkById(500, function ($rows) use ($apiPairs, &$deleted) {
                         foreach ($rows as $row) {
@@ -306,6 +335,29 @@ class SyncInventoryJob implements ShouldBeUnique, ShouldQueue
                         'marketplace' => $this->syncLog->marketplace,
                         'integration_id' => $this->syncLog->integration_id,
                         'deleted' => $deleted,
+                    ]);
+                }
+            }
+
+            // Yandex: обновляем fulfillment_type для ВСЕХ записей интеграции
+            // (при синке обновляются только записи из API — остальные сохраняют старый тип)
+            if (in_array($this->syncLog->marketplace, ['yandex', 'yandex_market'], true)
+                && method_exists($marketplaceService, 'getScheme')
+            ) {
+                $detectedScheme = $marketplaceService->getScheme();
+                $updatedType = InventoryWarehouse::when(
+                        in_array($this->syncLog->marketplace, ['yandex', 'yandex_market'], true),
+                        fn ($q) => $q->whereIn('marketplace', ['yandex', 'yandex_market']),
+                        fn ($q) => $q->where('marketplace', $this->syncLog->marketplace)
+                    )
+                    ->where('integration_id', $this->syncLog->integration_id)
+                    ->where('fulfillment_type', '!=', $detectedScheme)
+                    ->update(['fulfillment_type' => $detectedScheme]);
+                if ($updatedType > 0) {
+                    Log::info('Yandex fulfillment_type bulk-updated', [
+                        'integration_id' => $this->syncLog->integration_id,
+                        'scheme' => $detectedScheme,
+                        'updated' => $updatedType,
                     ]);
                 }
             }
@@ -431,9 +483,15 @@ class SyncInventoryJob implements ShouldBeUnique, ShouldQueue
             $resolvedWarehouseName = (string) ($stockData['warehouse_id'] ?? 'unknown');
         }
 
+        // BUG FIX: нормализуем marketplace — всегда сохраняем как 'yandex_market'
+        $normalizedMarketplace = match ($stockData['marketplace']) {
+            'yandex' => 'yandex_market',
+            default => $stockData['marketplace'],
+        };
+
         $newData = [
             'warehouse_name' => $resolvedWarehouseName,
-            'marketplace' => $stockData['marketplace'],
+            'marketplace' => $normalizedMarketplace,
             'quantity' => $qty,
             'fulfillment_type' => $stockData['fulfillment_type'] ?? null,
             'last_updated' => now(),

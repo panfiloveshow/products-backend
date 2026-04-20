@@ -109,7 +109,8 @@ class SyncUnitEconomicsJob implements ShouldQueue
             ]);
             
             // Запускаем пересчёт кэша ПОСЛЕ завершения синхронизации UnitEconomics
-            RecalculateUnitEconomicsCacheJob::dispatch($this->integrationId);
+            RecalculateUnitEconomicsCacheJob::dispatch($this->integrationId)
+                ->onQueue('unit-economics');
             
         } catch (\Exception $e) {
             Log::error('SyncUnitEconomicsJob failed', [

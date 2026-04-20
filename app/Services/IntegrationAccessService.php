@@ -5,13 +5,32 @@ namespace App\Services;
 use App\Models\Integration;
 use Illuminate\Database\QueryException;
 use Illuminate\Http\Request;
-use Illuminate\Support\Facades\Cache;
 
 class IntegrationAccessService
 {
     public function __construct(
         private SellicoApiService $sellicoApi
     ) {}
+
+    /**
+     * ID воркспейса из payload интеграции Sellico (snake_case и camelCase).
+     */
+    public static function extractRemoteWorkspaceIdFromSellicoPayload(array $integrationData): int
+    {
+        foreach (['work_space_id', 'workspace_id', 'workSpaceId', 'workspaceId', 'work_spaceId'] as $key) {
+            if (! array_key_exists($key, $integrationData)) {
+                continue;
+            }
+            $value = $integrationData[$key];
+            if ($value === null || $value === '') {
+                continue;
+            }
+
+            return (int) $value;
+        }
+
+        return 0;
+    }
 
     /**
      * Гарантирует, что интеграция доступна локально и принадлежит текущему workspace.
@@ -66,7 +85,7 @@ class IntegrationAccessService
             $this->sellicoApi->setAccessToken($token);
         }
 
-        $result = $this->sellicoApi->getIntegrationById($integrationId);
+        $result = $this->sellicoApi->getIntegrationById($integrationId, $workspaceId);
         if (! ($result['success'] ?? false)) {
             return [
                 'success' => false,
@@ -215,14 +234,13 @@ class IntegrationAccessService
         }
 
         $this->sellicoApi->setAccessToken($token);
-        Cache::forget("sellico_integration_{$integrationId}");
-        $result = $this->sellicoApi->getIntegrationById($integrationId);
+        $result = $this->sellicoApi->getIntegrationById($integrationId, $workspaceId);
         if (! ($result['success'] ?? false)) {
             return null;
         }
 
         $integrationData = $result['integration'] ?? [];
-        $remoteWorkspaceId = (int) ($integrationData['work_space_id'] ?? $integrationData['workspace_id'] ?? 0);
+        $remoteWorkspaceId = self::extractRemoteWorkspaceIdFromSellicoPayload($integrationData);
         $marketplace = $this->normalizeMarketplace((string) ($integrationData['type'] ?? $expectedMarketplace ?? ''));
 
         if ($workspaceId && $remoteWorkspaceId && $remoteWorkspaceId !== $workspaceId) {

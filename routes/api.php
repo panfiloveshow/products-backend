@@ -15,6 +15,13 @@ use App\Http\Controllers\Api\WbBarcodeCostController;
 use App\Http\Controllers\Api\WbWebhookController;
 use App\Http\Controllers\Api\SupplierController;
 use App\Http\Controllers\Api\OzonOrderReportController;
+use App\Http\Controllers\Api\Locality\LocalityOverviewController;
+use App\Http\Controllers\Api\Locality\LocalitySkuController;
+use App\Http\Controllers\Api\Locality\LocalityClusterController;
+use App\Http\Controllers\Api\Locality\LocalityExplainController;
+use App\Http\Controllers\Api\Locality\LocalityReconciliationController;
+use App\Http\Controllers\Api\Locality\LocalityRecommendationController;
+use App\Http\Controllers\Api\Locality\LocalityRecomputeController;
 use Illuminate\Support\Facades\Route;
 
 /*
@@ -26,10 +33,12 @@ Route::prefix('integrations')->middleware('sellico.permission')->group(function 
     Route::get('/', [IntegrationController::class, 'index'])->name('integrations.index');
     Route::get('/{id}/premium-status', [IntegrationController::class, 'getPremiumStatus'])->name('integrations.premiumStatus');
     Route::put('/{id}/manual-redemption-rate', [IntegrationController::class, 'setManualRedemptionRate'])->name('integrations.manualRedemptionRate');
-    Route::post('/{id}/sync', [IntegrationController::class, 'sync'])->name('integrations.sync');
     Route::get('/{id}/sync-status', [IntegrationController::class, 'syncStatus'])->name('integrations.syncStatus');
     Route::get('/{id}/status', [IntegrationController::class, 'checkStatus'])->name('integrations.status');
 });
+
+// Integration sync - outside middleware group (permissions handled inside controller)
+Route::any('integrations/{id}/sync', [IntegrationController::class, 'sync'])->name('integrations.sync.direct');
 
 /*
 |--------------------------------------------------------------------------
@@ -207,6 +216,22 @@ Route::prefix('auto-supply-plans')->middleware('sellico.permission')->group(func
     Route::get('/{id}/export/ozon-by-warehouse', [AutoSupplyPlanController::class, 'exportOzonByWarehouse'])
         ->name('auto-supply-plans.export.csv');
     Route::get('/{id}/export/wb', [AutoSupplyPlanController::class, 'exportWb'])->name('auto-supply-plans.export.wb');
+
+    // Locality integration
+    Route::get('/{id}/locality-impact', [AutoSupplyPlanController::class, 'localityImpact'])
+        ->name('auto-supply-plans.locality-impact');
+    Route::get('/{id}/cluster-split', [AutoSupplyPlanController::class, 'clusterSplit'])
+        ->name('auto-supply-plans.cluster-split');
+    Route::get('/{id}/locality-recommendations', [AutoSupplyPlanController::class, 'localityRecommendations'])
+        ->name('auto-supply-plans.locality-recommendations');
+    Route::get('/{id}/cluster-draft-preview', [AutoSupplyPlanController::class, 'clusterDraftPreview'])
+        ->name('auto-supply-plans.cluster-draft-preview');
+    Route::post('/{id}/create-cluster-drafts', [AutoSupplyPlanController::class, 'createClusterDrafts'])
+        ->name('auto-supply-plans.create-cluster-drafts');
+    Route::post('/from-locality-recommendations', [AutoSupplyPlanController::class, 'createFromLocalityRecommendations'])
+        ->name('auto-supply-plans.from-locality-recommendations');
+    Route::post('/preview-split-by-cluster', [AutoSupplyPlanController::class, 'previewSplitByCluster'])
+        ->name('auto-supply-plans.preview-split-by-cluster');
 });
 
 /*
@@ -258,6 +283,33 @@ Route::prefix('ozon-reports')->middleware('sellico.permission')->group(function 
     Route::get('/summary', [OzonOrderReportController::class, 'reportSummary'])->name('ozon-reports.summary');
     Route::get('/warehouse-sales', [OzonOrderReportController::class, 'warehouseSales'])->name('ozon-reports.warehouseSales');
     Route::delete('/{id}', [OzonOrderReportController::class, 'destroy'])->name('ozon-reports.destroy');
+});
+
+/*
+|--------------------------------------------------------------------------
+| Locality Engine Module
+|--------------------------------------------------------------------------
+*/
+Route::prefix('v1/locality')->middleware('sellico.permission')->group(function () {
+    Route::get('/overview', [LocalityOverviewController::class, 'index'])->name('locality.overview');
+    Route::get('/skus', [LocalitySkuController::class, 'index'])->name('locality.skus');
+    Route::get('/clusters', [LocalityClusterController::class, 'index'])->name('locality.clusters');
+    Route::get('/sku/{sku}/explain', [LocalityExplainController::class, 'show'])
+        ->where('sku', '.+')
+        ->name('locality.explain');
+    Route::post('/sku/{sku}/counterfactual', [LocalityExplainController::class, 'counterfactual'])
+        ->where('sku', '.+')
+        ->name('locality.counterfactual');
+    // Query-based варианты (для SKU со слэшами — path-версия ломается на encoded %2F в nginx)
+    Route::get('/explain', [LocalityExplainController::class, 'show'])->name('locality.explain.q');
+    Route::post('/counterfactual', [LocalityExplainController::class, 'counterfactual'])->name('locality.counterfactual.q');
+    Route::get('/recommendations', [LocalityRecommendationController::class, 'index'])->name('locality.recommendations.index');
+    Route::get('/recommendations/{id}', [LocalityRecommendationController::class, 'show'])->name('locality.recommendations.show');
+    Route::post('/recommendations/{id}/dismiss', [LocalityRecommendationController::class, 'dismiss'])->name('locality.recommendations.dismiss');
+    Route::post('/recommendations/{id}/draft/preview', [LocalityRecommendationController::class, 'draftPreview'])->name('locality.recommendations.draftPreview');
+    Route::post('/recommendations/{id}/draft/create', [LocalityRecommendationController::class, 'draftCreate'])->name('locality.recommendations.draftCreate');
+    Route::get('/reconciliation', [LocalityReconciliationController::class, 'index'])->name('locality.reconciliation');
+    Route::post('/recompute', [LocalityRecomputeController::class, 'store'])->name('locality.recompute');
 });
 
 /*

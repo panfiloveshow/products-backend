@@ -26,7 +26,7 @@ class SyncProductsRequest extends BaseFormRequest
                 'client_id' => 'required|string',
                 'api_key' => 'required|string',
             ],
-            'yandex' => [
+            'yandex_market' => [
                 'token' => 'required|string',
                 'campaign_id' => 'required|string',
                 'business_id' => 'nullable|string',

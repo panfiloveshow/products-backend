@@ -1,101 +1,76 @@
 <?php
 
-use App\Jobs\CalculateForecastsJob;
-use App\Jobs\CalculateUnitEconomicsJob;
-use App\Jobs\GenerateAlertsJob;
-use App\Jobs\GenerateShipmentRecommendationsJob;
-use App\Jobs\SyncInventoryJob;
-use App\Jobs\SyncProductsJob;
-use App\Jobs\SyncSalesJob;
-use App\Models\Integration;
-use App\Models\SyncLog;
-use App\Support\SyncStartGuard;
 use Illuminate\Foundation\Inspiring;
 use Illuminate\Support\Facades\Artisan;
-use Illuminate\Support\Facades\Schedule;
 
 Artisan::command('inspire', function () {
     $this->comment(Inspiring::quote());
 })->purpose('Display an inspiring quote');
 
-/*
-|--------------------------------------------------------------------------
-| Scheduled Jobs
-|--------------------------------------------------------------------------
-*/
+// Все синхронизации запускаются пользователем вручную через UI.
+// Scheduled jobs отключены — нет фоновой нагрузки на API маркетплейсов.
+//
+// Exception: Locality Engine — единственный источник правды для расчёта
+// non-local переплат и рекомендаций поставок. Включи через ENV LOCALITY_SCHEDULE=true,
+// запусти `php artisan schedule:work` (или systemd cron по артизану).
 
-// Sync products every 6 hours
-Schedule::call(function () {
-    if (! \Illuminate\Support\Facades\Schema::hasTable('integrations')) {
-        return;
-    }
-    $integrations = Integration::active()->autoSyncEnabled()->get();
-    foreach ($integrations as $integration) {
-        $running = SyncLog::where('integration_id', $integration->id)
-            ->where('sync_type', 'products')
-            ->running()
-            ->exists();
-        if ($running) {
-            continue;
-        }
-        $syncLog = SyncLog::create([
-            'marketplace' => SyncStartGuard::storageMarketplace((string) $integration->marketplace),
-            'integration_id' => $integration->id,
-            'sync_type' => 'products',
-            'status' => SyncLog::STATUS_PENDING,
-            'credentials' => $integration->getDecryptedCredentials(),
-        ]);
-        SyncProductsJob::dispatch($syncLog);
-    }
-})->everySixHours()->name('sync_products_all');
+if (filter_var(env('LOCALITY_SCHEDULE', false), FILTER_VALIDATE_BOOLEAN)) {
+    \Illuminate\Support\Facades\Schedule::job(new \App\Domains\Locality\Jobs\SyncClusterMapJob())
+        ->weeklyOn(1, '03:00')
+        ->withoutOverlapping()
+        ->name('locality.sync-cluster-map');
 
-// Sync inventory every 2 hours
-Schedule::call(function () {
-    if (! \Illuminate\Support\Facades\Schema::hasTable('integrations')) {
-        return;
-    }
-    $integrations = Integration::active()->autoSyncEnabled()->get();
-    foreach ($integrations as $integration) {
-        $running = SyncLog::where('integration_id', $integration->id)
-            ->where('sync_type', 'inventory')
-            ->running()
-            ->exists();
-        if ($running) {
-            continue;
-        }
-        $syncLog = SyncLog::create([
-            'marketplace' => SyncStartGuard::storageMarketplace((string) $integration->marketplace),
-            'integration_id' => $integration->id,
-            'sync_type' => 'inventory',
-            'status' => SyncLog::STATUS_PENDING,
-            'credentials' => $integration->getDecryptedCredentials(),
-        ]);
-        SyncInventoryJob::dispatch($syncLog);
-    }
-})->everyTwoHours()->name('sync_inventory_all');
+    \Illuminate\Support\Facades\Schedule::job(new \App\Domains\Locality\Jobs\SyncFinanceTransactionsJob())
+        ->dailyAt('04:00')
+        ->withoutOverlapping()
+        ->name('locality.sync-finance');
 
-// Sync sales every 3 hours (через 1 час после inventory чтобы данные уже обновились)
-Schedule::job(new SyncSalesJob)
-    ->cron('0 1,4,7,10,13,16,19,22 * * *')
-    ->name('sync_sales_all')
-    ->withoutOverlapping();
+    \Illuminate\Support\Facades\Schedule::job(new \App\Domains\Locality\Jobs\AggregateLocalityDailyJob())
+        ->dailyAt('05:00')
+        ->withoutOverlapping()
+        ->name('locality.aggregate-daily');
 
-// Calculate forecasts daily at 03:00
-Schedule::job(new CalculateForecastsJob)
-    ->dailyAt('03:00')
-    ->name('calculate_forecasts');
+    \Illuminate\Support\Facades\Schedule::job(new \App\Domains\Locality\Jobs\GenerateRecommendationsJob())
+        ->weeklyOn(1, '06:00')
+        ->withoutOverlapping()
+        ->name('locality.generate-recommendations');
 
-// Generate alerts every 2 hours
-Schedule::job(new GenerateAlertsJob)
-    ->everyTwoHours()
-    ->name('generate_alerts');
+    \Illuminate\Support\Facades\Schedule::job(new \App\Domains\Locality\Jobs\ReconcileFinanceJob())
+        ->weeklyOn(1, '07:00')
+        ->withoutOverlapping()
+        ->name('locality.reconcile-finance');
 
-// Generate shipment recommendations daily at 06:00
-Schedule::job(new GenerateShipmentRecommendationsJob)
-    ->dailyAt('06:00')
-    ->name('generate_shipment_recommendations');
+    \Illuminate\Support\Facades\Schedule::job(new \App\Domains\Locality\Jobs\SyncLinkedSupplyOrdersJob())
+        ->dailyAt('02:00')
+        ->withoutOverlapping()
+        ->name('locality.sync-linked-supply-orders');
 
-// Calculate unit economics daily at 04:00
-Schedule::job(new CalculateUnitEconomicsJob)
-    ->dailyAt('04:00')
-    ->name('calculate_unit_economics');
+    \Illuminate\Support\Facades\Schedule::job(new \App\Domains\Locality\Jobs\PurgeStaleLocalityRecommendationsJob())
+        ->weeklyOn(0, '03:30')
+        ->withoutOverlapping()
+        ->name('locality.purge-stale-recommendations');
+}
+
+// Платное хранение Ozon FBO — пишет в inventory_warehouses.storage_fee_prev_month.
+// Включи через ENV OZON_STORAGE_SCHEDULE=true. Источник: Ozon Placement-by-Products report.
+if (filter_var(env('OZON_STORAGE_SCHEDULE', false), FILTER_VALIDATE_BOOLEAN)) {
+    \Illuminate\Support\Facades\Schedule::job(new \App\Jobs\SyncStorageCostJob('ozon', 30))
+        ->dailyAt('03:30')
+        ->withoutOverlapping()
+        ->name('ozon.sync-storage-cost');
+}
+
+// Ad-hoc запуск синхронизации платного хранения Ozon (для проверки/первого прогрева кэша).
+// Использование: php artisan sync:ozon-storage --days=30 --integration_id=59 --wait=60
+Artisan::command('sync:ozon-storage {--days=30 : Окно периода в днях для отчёта Ozon Placement} {--integration_id= : ID интеграции Ozon} {--wait=60 : Максимальное ожидание отчёта, секунд}', function () {
+    $days = (int) $this->option('days');
+    $integrationId = $this->option('integration_id') !== null && $this->option('integration_id') !== ''
+        ? (int) $this->option('integration_id')
+        : null;
+    $wait = (int) $this->option('wait');
+
+    $scope = $integrationId ? "интеграция {$integrationId}" : 'все Ozon-интеграции';
+    $this->info("Запуск SyncStorageCostJob для Ozon ({$scope}), окно {$days} дн., ожидание {$wait} сек.");
+    \App\Jobs\SyncStorageCostJob::dispatchSync('ozon', $days, $integrationId, $wait);
+    $this->info('Готово. Проверь storage/logs/laravel.log → SyncStorageCostJob.');
+})->purpose('Синхронизация платного хранения Ozon FBO в inventory_warehouses');

@@ -2,6 +2,7 @@
 
 namespace App\Domains\Ozon\Api;
 
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
 
 /**
@@ -268,6 +269,38 @@ class StorageApi
      */
     public function getPlacementCostByProducts(string $dateFrom, string $dateTo, int $maxWaitSeconds = 60): array
     {
+        $cacheKey = $this->placementProductsCacheKey($dateFrom, $dateTo);
+        $cached = Cache::get($cacheKey);
+        if (is_array($cached)) {
+            Log::info('Ozon placement report data loaded from cache', [
+                'date_from' => $dateFrom,
+                'date_to' => $dateTo,
+                'skus_count' => count($cached),
+            ]);
+
+            return $cached;
+        }
+
+        $existingReport = $this->findExistingPlacementReport('seller_placement_by_products');
+        if ($existingReport !== null && ! empty($existingReport['code'])) {
+            // URL из /v1/report/list живёт ~3 часа (X-Amz-Expires=10800). Всегда
+            // запрашиваем свежую подписанную ссылку через /v1/report/info —
+            // это не считается как новый отчёт и обходит дневной лимит 5/день.
+            $reportInfo = $this->getReportInfo((string) $existingReport['code']);
+            $fileUrl = $reportInfo['file'] ?? ($existingReport['file'] ?? null);
+
+            if ($fileUrl) {
+                $data = $this->downloadAndParsePlacementReport((string) $fileUrl);
+                if ($data !== []) {
+                    Cache::put($cacheKey, $data, now()->addHours(2));
+
+                    return $data;
+                }
+                // Если парсинг вернул пусто (ссылка протухла / XLSX битый) —
+                // не возвращаем пустоту, а пробуем создать новый отчёт ниже.
+            }
+        }
+
         $reportId = $this->createPlacementReportByProducts($dateFrom, $dateTo);
         
         if (!$reportId || is_numeric($reportId)) {
@@ -306,7 +339,22 @@ class StorageApi
             return [];
         }
 
-        return $this->downloadAndParsePlacementReport($fileUrl);
+        $data = $this->downloadAndParsePlacementReport($fileUrl);
+        if ($data !== []) {
+            Cache::put($cacheKey, $data, now()->addHours(2));
+        }
+
+        return $data;
+    }
+
+    private function placementProductsCacheKey(string $dateFrom, string $dateTo): string
+    {
+        return sprintf(
+            'ozon:placement:products:%s:%s:%s',
+            $this->client->getClientCacheKey(),
+            $dateFrom,
+            $dateTo
+        );
     }
 
     /**
@@ -327,7 +375,7 @@ class StorageApi
                     $createdTime = strtotime($createdAt);
                     $hoursAgo = (time() - $createdTime) / 3600;
                     
-                    if ($hoursAgo < 2.5) {
+                    if ($hoursAgo < 48) {
                         Log::info('Found existing placement report', [
                             'report_id' => $report['code'] ?? 'unknown',
                             'created_at' => $createdAt,
@@ -359,7 +407,13 @@ class StorageApi
     {
         try {
             $tempFile = '/tmp/ozon_placement_' . md5($fileUrl) . '.xlsx';
-            $content = file_get_contents($fileUrl);
+            $context = stream_context_create([
+                'http' => [
+                    'timeout' => 30,
+                    'ignore_errors' => true,
+                ],
+            ]);
+            $content = file_get_contents($fileUrl, false, $context);
             
             if (!$content) {
                 Log::warning('Ozon placement report: empty file');
@@ -369,17 +423,41 @@ class StorageApi
             file_put_contents($tempFile, $content);
             
             $reader = new \PhpOffice\PhpSpreadsheet\Reader\Xlsx();
+            $reader->setReadDataOnly(true);
             $spreadsheet = $reader->load($tempFile);
             $sheet = $spreadsheet->getActiveSheet();
             $maxRow = $sheet->getHighestRow();
+            $maxColumn = \PhpOffice\PhpSpreadsheet\Cell\Coordinate::columnIndexFromString($sheet->getHighestColumn());
             
-            // Колонка 3 = Артикул (offer_id), Колонка 12 = Начисленная стоимость размещения
+            [$headerRow, $headers] = $this->detectPlacementReportHeaders($sheet, $maxColumn);
+            $skuColumn = $this->resolvePlacementReportColumn($headers, [
+                fn (string $header): bool => str_contains($header, 'артикул'),
+                fn (string $header): bool => str_contains($header, 'offer'),
+                fn (string $header): bool => $header === 'sku' || str_contains($header, 'sku'),
+            ], 3);
+            $costColumn = $this->resolvePlacementReportColumn($headers, [
+                fn (string $header): bool => str_contains($header, 'начис') && str_contains($header, 'размещ'),
+                fn (string $header): bool => str_contains($header, 'стоим') && str_contains($header, 'размещ'),
+                fn (string $header): bool => str_contains($header, 'списан') || str_contains($header, 'списано'),
+                fn (string $header): bool => str_contains($header, 'placement') && str_contains($header, 'cost'),
+                fn (string $header): bool => str_contains($header, 'storage') && str_contains($header, 'cost'),
+            ], 12);
+
+            Log::info('Ozon placement report columns resolved', [
+                'header_row' => $headerRow,
+                'sku_column' => $skuColumn,
+                'sku_header' => $headers[$skuColumn] ?? null,
+                'cost_column' => $costColumn,
+                'cost_header' => $headers[$costColumn] ?? null,
+                'rows' => max(0, $maxRow - $headerRow),
+            ]);
+
             $result = [];
             $totalCost = 0;
             
-            for ($r = 2; $r <= $maxRow; $r++) {
-                $sku = $sheet->getCellByColumnAndRow(3, $r)->getValue();
-                $cost = (float)$sheet->getCellByColumnAndRow(12, $r)->getValue();
+            for ($r = $headerRow + 1; $r <= $maxRow; $r++) {
+                $sku = $sheet->getCellByColumnAndRow($skuColumn, $r)->getValue();
+                $cost = $this->parsePlacementMoney($sheet->getCellByColumnAndRow($costColumn, $r)->getCalculatedValue());
                 
                 if (!$sku || empty(trim((string)$sku))) continue;
                 
@@ -398,7 +476,7 @@ class StorageApi
             Log::info('Ozon placement report parsed', [
                 'skus_count' => count($result),
                 'total_cost' => round($totalCost, 2),
-                'rows' => $maxRow - 1,
+                'rows' => $maxRow - $headerRow,
             ]);
 
             return $result;
@@ -407,6 +485,91 @@ class StorageApi
             @unlink($tempFile ?? '');
             return [];
         }
+    }
+
+    /**
+     * @return array{0:int, 1:array<int,string>}
+     */
+    private function detectPlacementReportHeaders($sheet, int $maxColumn): array
+    {
+        $fallbackHeaders = [];
+        for ($row = 1; $row <= min(15, $sheet->getHighestRow()); $row++) {
+            $headers = [];
+            for ($col = 1; $col <= $maxColumn; $col++) {
+                $headers[$col] = $this->normalizePlacementHeader(
+                    (string) $sheet->getCellByColumnAndRow($col, $row)->getValue()
+                );
+            }
+
+            $nonEmptyHeaders = array_filter($headers, fn (string $header): bool => $header !== '');
+            if ($fallbackHeaders === [] && $nonEmptyHeaders !== []) {
+                $fallbackHeaders = $headers;
+            }
+
+            $hasSku = $this->resolvePlacementReportColumn($headers, [
+                fn (string $header): bool => str_contains($header, 'артикул') || str_contains($header, 'offer') || str_contains($header, 'sku'),
+            ], null) !== null;
+            $hasCost = $this->resolvePlacementReportColumn($headers, [
+                fn (string $header): bool => (str_contains($header, 'начис') && str_contains($header, 'размещ'))
+                    || (str_contains($header, 'стоим') && str_contains($header, 'размещ'))
+                    || str_contains($header, 'списан')
+                    || (str_contains($header, 'placement') && str_contains($header, 'cost'))
+                    || (str_contains($header, 'storage') && str_contains($header, 'cost')),
+            ], null) !== null;
+
+            if ($hasSku && $hasCost) {
+                return [$row, $headers];
+            }
+        }
+
+        return [1, $fallbackHeaders];
+    }
+
+    private function resolvePlacementReportColumn(array $headers, array $predicates, ?int $fallback): ?int
+    {
+        foreach ($predicates as $predicate) {
+            foreach ($headers as $column => $header) {
+                if ($header !== '' && $predicate($header)) {
+                    return (int) $column;
+                }
+            }
+        }
+
+        return $fallback;
+    }
+
+    private function normalizePlacementHeader(string $header): string
+    {
+        $header = mb_strtolower(trim($header));
+        $header = str_replace(["\xc2\xa0", "\n", "\r", "\t"], ' ', $header);
+        $header = preg_replace('/\s+/u', ' ', $header) ?? $header;
+
+        return trim($header);
+    }
+
+    private function parsePlacementMoney(mixed $value): float
+    {
+        if (is_numeric($value)) {
+            return (float) $value;
+        }
+
+        $value = trim((string) $value);
+        if ($value === '') {
+            return 0.0;
+        }
+
+        $value = str_replace(["\xc2\xa0", ' '], '', $value);
+        $value = preg_replace('/[^\d,\.\-]/u', '', $value) ?? '';
+        if ($value === '' || $value === '-') {
+            return 0.0;
+        }
+
+        if (str_contains($value, ',') && str_contains($value, '.')) {
+            $value = str_replace('.', '', $value);
+        }
+        $value = str_replace(',', '.', $value);
+
+        return is_numeric($value) ? (float) $value : 0.0;
     }
 
     /**

@@ -51,6 +51,26 @@ class YandexMarketTariffs implements TariffsProviderInterface
     private const FBS_PROCESSING_FEE = 25.0;
 
     /**
+     * Обработка возврата (фиксированная ставка)
+     */
+    private const RETURN_PROCESSING_FEE = 50.0;
+
+    /**
+     * Тариф хранения FBY (₽ за литр в день)
+     */
+    private const FBY_STORAGE_RATE_PER_LITER_PER_DAY = 0.08;
+
+    /**
+     * Коэффициенты хранения по оборачиваемости (дней на складе)
+     */
+    private const STORAGE_TURNOVER_COEFFICIENTS = [
+        ['max_days' => 60,  'coefficient' => 1.0],
+        ['max_days' => 120, 'coefficient' => 1.5],
+        ['max_days' => 180, 'coefficient' => 2.0],
+        ['max_days' => PHP_INT_MAX, 'coefficient' => 3.0],
+    ];
+
+    /**
      * Эквайринг
      */
     private const ACQUIRING_RATE = 2.0; // 2%
@@ -174,5 +194,33 @@ class YandexMarketTariffs implements TariffsProviderInterface
             'FBS' => $this->getWeightCost(self::FBS_WEIGHT_TARIFFS, $weight),
             default => 0,
         };
+    }
+
+    /**
+     * Стоимость обработки возврата (фиксированная)
+     */
+    public function getReturnProcessingFee(): float
+    {
+        return self::RETURN_PROCESSING_FEE;
+    }
+
+    /**
+     * Рассчитать стоимость хранения FBY (за месяц)
+     */
+    public function calculateStorageCost(float $volumeLiters, int $turnoverDays = 30): float
+    {
+        if ($volumeLiters <= 0) {
+            return 0;
+        }
+
+        $coefficient = 1.0;
+        foreach (self::STORAGE_TURNOVER_COEFFICIENTS as $tier) {
+            if ($turnoverDays <= $tier['max_days']) {
+                $coefficient = $tier['coefficient'];
+                break;
+            }
+        }
+
+        return round($volumeLiters * self::FBY_STORAGE_RATE_PER_LITER_PER_DAY * 30 * $coefficient, 2);
     }
 }

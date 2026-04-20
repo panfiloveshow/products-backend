@@ -6,10 +6,13 @@ use App\Jobs\SyncInventoryJob;
 use App\Jobs\SyncProductsJob;
 use App\Models\Product;
 use App\Models\SyncLog;
+use App\Models\UnitEconomicsCache;
 use App\Support\SyncStartGuard;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Schema;
 
 class ProductService
 {
@@ -143,6 +146,10 @@ class ProductService
                 return $existingSync;
             }
 
+            if ($syncType === 'products') {
+                $this->clearUnitEconomicsCacheForSync($integrationId, $marketplace);
+            }
+
             $syncLog = SyncLog::create([
                 'marketplace' => SyncStartGuard::storageMarketplace($marketplace),
                 'integration_id' => $integrationId,
@@ -157,8 +164,72 @@ class ProductService
                 SyncProductsJob::dispatch($syncLog);
             }
 
+            \Log::info('Sync job queued', [
+                'sync_log_id' => $syncLog->id,
+                'sync_type' => $syncType,
+                'marketplace' => $syncLog->marketplace,
+                'integration_id' => $integrationId,
+                'queue_connection' => config('queue.default'),
+            ]);
+
             return $syncLog;
         });
+    }
+
+    private function clearUnitEconomicsCacheForSync(?int $integrationId, string $marketplace): void
+    {
+        if (! Schema::hasTable('unit_economics_cache')) {
+            return;
+        }
+
+        $deleted = 0;
+        $marketplaces = $this->marketplaceAliases($marketplace);
+
+        if ($integrationId !== null) {
+            $deleted = UnitEconomicsCache::where('integration_id', $integrationId)->delete();
+            $this->forgetUnitEconomicsRuntimeCache($integrationId, $marketplaces);
+        } else {
+            $deleted = UnitEconomicsCache::whereIn('marketplace', $marketplaces)->delete();
+        }
+
+        Log::info('UnitEconomics cache cleared before products sync', [
+            'integration_id' => $integrationId,
+            'marketplace' => $marketplace,
+            'deleted_count' => $deleted,
+        ]);
+    }
+
+    private function forgetUnitEconomicsRuntimeCache(int $integrationId, array $marketplaces): void
+    {
+        Cache::forget("ue_cache_stats_{$integrationId}");
+        Cache::lock("ue_recalculate_{$integrationId}", 900)->forceRelease();
+
+        foreach ($marketplaces as $marketplace) {
+            Cache::forget("ue_scheme_counts_{$integrationId}_{$marketplace}");
+            Cache::forget("ue_actual_scheme_{$integrationId}_{$marketplace}");
+
+            foreach ($this->unitEconomicsSchemes($marketplace) as $scheme) {
+                Cache::forget("ue_stats_{$integrationId}_{$marketplace}_{$scheme}");
+            }
+        }
+    }
+
+    private function marketplaceAliases(string $marketplace): array
+    {
+        return match ($marketplace) {
+            'yandex', 'yandex_market' => ['yandex', 'yandex_market'],
+            default => [$marketplace],
+        };
+    }
+
+    private function unitEconomicsSchemes(string $marketplace): array
+    {
+        return match ($marketplace) {
+            'ozon' => ['FBO', 'FBS', 'RFBS', 'EXPRESS'],
+            'wildberries' => ['FBO', 'FBS', 'DBS', 'EDBS', 'DBW'],
+            'yandex', 'yandex_market' => ['FBY', 'FBS', 'DBS', 'EXPRESS'],
+            default => ['FBO'],
+        };
     }
 
     public static function invalidateStatsCache(?int $integrationId = null, ?string $marketplace = null): void

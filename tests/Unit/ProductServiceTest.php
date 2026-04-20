@@ -5,8 +5,10 @@ namespace Tests\Unit;
 use App\Models\Integration;
 use App\Models\Product;
 use App\Models\SyncLog;
+use App\Models\UnitEconomicsCache;
 use App\Services\ProductService;
 use Illuminate\Foundation\Testing\LazilyRefreshDatabase;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Queue;
 use Illuminate\Support\Facades\Schema;
@@ -120,6 +122,50 @@ class ProductServiceTest extends TestCase
         $syncLog = $this->service->startSync('ozon', $credentials, $integration->id);
 
         $this->assertEquals($integration->id, $syncLog->integration_id);
+    }
+
+    public function test_start_products_sync_clears_unit_economics_cache_for_selected_integration(): void
+    {
+        $integration = Integration::factory()->create(['id' => 9001, 'marketplace' => 'ozon']);
+        $otherIntegration = Integration::factory()->create(['id' => 9002, 'marketplace' => 'ozon']);
+        $product = Product::factory()->create([
+            'integration_id' => $integration->id,
+            'marketplace' => 'ozon',
+        ]);
+        $otherProduct = Product::factory()->create([
+            'integration_id' => $otherIntegration->id,
+            'marketplace' => 'ozon',
+        ]);
+
+        UnitEconomicsCache::create([
+            'integration_id' => $integration->id,
+            'product_id' => $product->id,
+            'sku' => $product->sku,
+            'marketplace' => 'ozon',
+            'fulfillment_type' => 'FBO',
+            'price' => 100,
+        ]);
+        UnitEconomicsCache::create([
+            'integration_id' => $otherIntegration->id,
+            'product_id' => $otherProduct->id,
+            'sku' => $otherProduct->sku,
+            'marketplace' => 'ozon',
+            'fulfillment_type' => 'FBO',
+            'price' => 100,
+        ]);
+        Cache::put("ue_cache_stats_{$integration->id}", ['stale' => true]);
+
+        $this->service->startSync('ozon', ['client_id' => 'test', 'api_key' => 'test'], $integration->id);
+
+        $this->assertDatabaseMissing('unit_economics_cache', [
+            'integration_id' => $integration->id,
+            'sku' => $product->sku,
+        ]);
+        $this->assertDatabaseHas('unit_economics_cache', [
+            'integration_id' => $otherIntegration->id,
+            'sku' => $otherProduct->sku,
+        ]);
+        $this->assertFalse(Cache::has("ue_cache_stats_{$integration->id}"));
     }
 
     /**

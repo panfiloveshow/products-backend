@@ -6,6 +6,7 @@ use App\Domains\UnitEconomics\DTO\CalculationInput;
 use App\Domains\UnitEconomics\UnitEconomicsOrchestrator;
 use App\Models\OzonSupplyFixation;
 use App\Models\OzonSkuDeliveryProfile;
+use App\Models\Product;
 use App\Models\UnitEconomics;
 use Illuminate\Support\Facades\Cache;
 
@@ -177,6 +178,7 @@ class UnitEconomicsService
         $salesCount = max(1, (int) ($data['sales_count'] ?? 1));
         $volumeLiters = (float) ($data['volume_liters'] ?? 0);
         $sideCm = $volumeLiters > 0 ? pow($volumeLiters * 1000, 1 / 3) : 0;
+        $categoryForCommission = $this->resolveOzonCategoryForCommission($data);
 
         $input = CalculationInput::fromArray([
             'sku' => $data['sku'] ?? 'preview',
@@ -189,7 +191,8 @@ class UnitEconomicsService
             'width' => (float) ($data['width'] ?? $sideCm),
             'height' => (float) ($data['height'] ?? $sideCm),
             'weight' => (float) ($data['weight'] ?? 0),
-            'category_id' => $data['category_id'] ?? 'default',
+            'volume_weight' => isset($data['volume_weight']) ? (float) $data['volume_weight'] : null,
+            'category_id' => $categoryForCommission,
             'commission_rate' => isset($data['commission_percent']) ? (float) $data['commission_percent'] : null,
             'redemption_rate' => isset($data['redemption_rate']) ? (float) $data['redemption_rate'] : null,
             'acquiring_percent' => isset($data['acquiring_percent']) ? (float) $data['acquiring_percent'] : 1.5,
@@ -289,6 +292,7 @@ class UnitEconomicsService
                 'dominant_cluster_share' => isset($result['dominant_cluster_share']) ? round((float) $result['dominant_cluster_share'], 2) : null,
                 'expected_locality_rate' => isset($result['expected_locality_rate']) ? round((float) $result['expected_locality_rate'], 2) : null,
                 'weighted_non_local_markup_percent' => isset($result['weighted_non_local_markup_percent']) ? round((float) $result['weighted_non_local_markup_percent'], 2) : null,
+                'chargeable_volume_liters' => isset($result['chargeable_volume_liters']) ? round((float) $result['chargeable_volume_liters'], 4) : null,
                 'profit_min' => isset($result['profit_min']) ? round((float) $result['profit_min'] * $salesCount, 2) : null,
                 'profit_base' => isset($result['profit_base']) ? round((float) $result['profit_base'] * $salesCount, 2) : null,
                 'profit_max' => isset($result['profit_max']) ? round((float) $result['profit_max'] * $salesCount, 2) : null,
@@ -385,6 +389,38 @@ class UnitEconomicsService
         }
 
         return $data;
+    }
+
+    private function resolveOzonCategoryForCommission(array $data): string
+    {
+        foreach (['category_name', 'category', 'category_id'] as $key) {
+            $value = $data[$key] ?? null;
+            if (is_string($value) && trim($value) !== '' && ! is_numeric(trim($value))) {
+                return trim($value);
+            }
+        }
+
+        $integrationId = (int) ($data['integration_id'] ?? 0);
+        $sku = (string) ($data['sku'] ?? '');
+        if ($integrationId <= 0 || $sku === '') {
+            return 'default';
+        }
+
+        try {
+            $product = Product::query()
+                ->where('integration_id', $integrationId)
+                ->where('sku', $sku)
+                ->first();
+
+            $productCategory = $product?->category;
+            if (is_string($productCategory) && trim($productCategory) !== '' && ! is_numeric(trim($productCategory))) {
+                return trim($productCategory);
+            }
+        } catch (\Throwable) {
+            // Plain PHPUnit/unit contexts may not have a configured DB connection.
+        }
+
+        return 'default';
     }
 
     private function calculateYandex(array $data): array
@@ -719,6 +755,7 @@ class UnitEconomicsService
     ): array {
         $exitCode = \Illuminate\Support\Facades\Artisan::call('unit-economics:sync', [
             '--integration' => $integration->id,
+            '--skip-cache-dispatch' => true,
         ]);
 
         return [

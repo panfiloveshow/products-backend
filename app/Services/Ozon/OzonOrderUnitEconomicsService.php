@@ -9,6 +9,7 @@ use App\Models\OzonWarehouseCluster;
 use App\Models\Posting;
 use App\Models\PostingItem;
 use App\Models\Product;
+use App\Models\UnitEconomicsSettings;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Collection;
 
@@ -17,6 +18,7 @@ class OzonOrderUnitEconomicsService
     public function __construct(
         private readonly OzonPricingMatrix $pricing = new OzonPricingMatrix(),
         private readonly OzonSupplyFixationService $fixationService = new OzonSupplyFixationService(),
+        private readonly OzonLocalityService $localityService = new OzonLocalityService(),
     ) {
     }
 
@@ -195,17 +197,20 @@ class OzonOrderUnitEconomicsService
     private function resolveVolumeLiters(PostingItem $item, ?Product $product): float
     {
         $itemVolume = (float) ($item->volume ?? 0);
-        if ($itemVolume > 0) {
-            return $itemVolume;
-        }
+        $productVolumeWeight = (float) ($product?->volume_weight ?? $product?->ozon_data['volume_weight'] ?? 0);
+        // В Ozon volume_weight хранится в кг по формуле volume_weight = volume_liters / 5.
+        // Обратное преобразование в литры: × 5. См. CalculationInput.php:127.
+        $volumeByWeight = $productVolumeWeight > 0 ? $productVolumeWeight * 5 : 0.0;
 
         $lengthMm = (float) ($product?->ozon_data['length_mm'] ?? $product?->depth ?? 0);
         $widthMm = (float) ($product?->ozon_data['width_mm'] ?? $product?->width ?? 0);
         $heightMm = (float) ($product?->ozon_data['height_mm'] ?? $product?->height ?? 0);
 
-        return $lengthMm > 0 && $widthMm > 0 && $heightMm > 0
+        $volumeByDimensions = $lengthMm > 0 && $widthMm > 0 && $heightMm > 0
             ? round(($lengthMm * $widthMm * $heightMm) / 1000000, 4)
             : 0.0;
+
+        return max($itemVolume, $volumeByDimensions, $volumeByWeight);
     }
 
     private function resolveShippingClusterName(Posting $posting, ?Product $product): ?string
@@ -219,12 +224,14 @@ class OzonOrderUnitEconomicsService
         }
 
         $cluster = OzonWarehouseCluster::findByWarehouseName((string) $warehouseName);
+        $rawName = $cluster?->cluster_name ?? (string) $warehouseName;
 
-        return $cluster?->cluster_name ?? (string) $warehouseName;
+        return $this->pricing->resolveClusterName($rawName);
     }
 
     private function resolveDestinationClusterName(Posting $posting, string $sku): ?string
     {
+        // 1. analytics_data posting'а
         $analytics = is_array($posting->analytics_data ?? null) ? $posting->analytics_data : [];
         foreach (['delivery_cluster', 'cluster_name', 'region', 'delivery_region', 'delivery_cluster_name'] as $key) {
             $value = $analytics[$key] ?? null;
@@ -233,11 +240,34 @@ class OzonOrderUnitEconomicsService
             }
         }
 
+        // 2. cluster_to из financial_data posting'а (Ozon отдаёт кластер назначения)
+        $financialData = is_array($posting->financial_data ?? null) ? $posting->financial_data : [];
+        $clusterTo = $financialData['cluster_to'] ?? null;
+        if (is_string($clusterTo) && trim($clusterTo) !== '') {
+            return $this->pricing->resolveClusterName($clusterTo);
+        }
+
+        // 3. Delivery profile конкретного SKU
         $profile = OzonSkuDeliveryProfile::findForProduct($posting->integration_id, $sku, 'ALL');
         $clusterProfile = is_array($profile?->cluster_profile ?? null) ? $profile->cluster_profile : [];
         $dominant = $clusterProfile['clusters_summary'][0]['cluster_name'] ?? null;
+        if ($dominant) {
+            return $this->pricing->resolveClusterName((string) $dominant);
+        }
 
-        return $dominant ? $this->pricing->resolveClusterName((string) $dominant) : null;
+        // 4. Доминантный кластер интеграции (из любого существующего профиля)
+        if ($posting->integration_id) {
+            $anyProfile = OzonSkuDeliveryProfile::where('integration_id', $posting->integration_id)
+                ->whereNotNull('cluster_profile')
+                ->first();
+            $anyClusters = is_array($anyProfile?->cluster_profile ?? null) ? $anyProfile->cluster_profile : [];
+            $anyDominant = $anyClusters['clusters_summary'][0]['cluster_name'] ?? null;
+            if ($anyDominant) {
+                return $this->pricing->resolveClusterName((string) $anyDominant);
+            }
+        }
+
+        return null;
     }
 
     private function resolveClusterIdByName(?string $clusterName): ?string
@@ -273,10 +303,7 @@ class OzonOrderUnitEconomicsService
         }
 
         // Seller-level total FBO sales in 7 days (Ozon rule applies per-seller, not per-SKU)
-        $sellerFboSales7Days = (int) \App\Models\InventoryWarehouse::where('integration_id', $posting->integration_id)
-            ->where('marketplace', 'ozon')
-            ->where('fulfillment_type', 'FBO')
-            ->sum('sales_7_days');
+        $sellerFboSales7Days = $this->localityService->countSellerFboOrders7Days((int) $posting->integration_id);
 
         if ($sellerFboSales7Days < 50) {
             return [false, 'fbo_lt_50_orders_7d', 'Надбавка не применяется: за 7 дней по FBO меньше 50 заказов', 'confirmed'];
@@ -287,14 +314,24 @@ class OzonOrderUnitEconomicsService
             return [false, 'zero_markup_cluster', 'Надбавка не применяется: для кластера назначения ставка 0%', 'confirmed'];
         }
 
+        // Ручные исключения через UnitEconomicsSettings (админ/продавец отмечает SKU).
+        // #7 Select-платформа и #6 складские ограничения (крупногабарит, ювелирка) —
+        // Ozon официально не применяет наценку, но через API эти признаки не отдаются.
+        $settings = UnitEconomicsSettings::query()
+            ->where('integration_id', $posting->integration_id)
+            ->where('sku', $sku)
+            ->first();
+
+        if ($settings?->is_select_only) {
+            return [false, 'select_only', 'Надбавка не применяется: товар продаётся только на Select', 'manual_override'];
+        }
+
+        if ($settings?->is_size_restricted) {
+            return [false, 'size_restricted', 'Надбавка не применяется: товар нельзя поставить в локальный склад (крупногабарит/ювелирка)', 'manual_override'];
+        }
+
         // NOT IMPLEMENTED: Ozon shipped from non-local cluster when local stock was available
         // (requires Ozon's internal routing decision data, not available via API)
-
-        // NOT IMPLEMENTED: Product cannot be placed in buyer's cluster warehouse
-        // (requires warehouse restriction data, not available via API)
-
-        // NOT IMPLEMENTED: Product sold only on Select platform
-        // (requires Select platform detection, not available via current integration)
 
         return [true, 'non_local_markup_applied', 'Надбавка применяется по кластеру назначения', 'confirmed'];
     }

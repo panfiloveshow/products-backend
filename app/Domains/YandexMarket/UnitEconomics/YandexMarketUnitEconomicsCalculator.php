@@ -46,9 +46,9 @@ class YandexMarketUnitEconomicsCalculator implements UnitEconomicsCalculatorInte
         $acquiring = ($tariffBreakdown['AGENCY_COMMISSION'] ?? 0) + ($tariffBreakdown['PAYMENT_TRANSFER'] ?? 0);
         $acquiringRate = $price > 0
             ? (($acquiring / $price) * 100)
-            : ($input->acquiringPercent ?? $this->commissions->getAcquiringRate());
+            : (($input->acquiringPercent > 0 ? $input->acquiringPercent : null) ?? $this->commissions->getAcquiringRate());
         if ($acquiring <= 0) {
-            $acquiringRate = $input->acquiringPercent ?? $this->commissions->getAcquiringRate();
+            $acquiringRate = ($input->acquiringPercent > 0 ? $input->acquiringPercent : null) ?? $this->commissions->getAcquiringRate();
             $acquiring = $price * ($acquiringRate / 100);
         }
 
@@ -70,18 +70,24 @@ class YandexMarketUnitEconomicsCalculator implements UnitEconomicsCalculatorInte
             $processingFee = strtoupper($input->fulfillmentType) === 'FBS' ? 25.0 : 0;
         }
 
-        // Возвраты
-        $expectedReturnCost = $this->calculateExpectedReturnCost(
-            $input->fulfillmentType,
-            $weight,
-            $input->redemptionRate
-        );
+        // Возвраты (разбивка по компонентам)
+        $returnLogistics = $this->tariffs->calculateReturnLogisticsCost($input->fulfillmentType, $weight);
+        $returnProcessing = $this->tariffs->getReturnProcessingFee();
+        $redemptionRate = $input->redemptionRate ?? 95;
+        $returnRate = ($redemptionRate >= 100) ? 0 : (100 - $redemptionRate) / 100;
+        $expectedReturnCost = ($returnLogistics + $returnProcessing) * $returnRate;
 
         // Себестоимость
         $costPrice = $input->costPrice ?? 0;
         $packagingCost = $input->packagingCost ?? 0;
         $additionalCosts = $input->additionalCosts ?? 0;
+
+        // Хранение: из input или рассчитываем по тарифу
         $storageCost = $input->storageCost ?? 0;
+        if ($storageCost <= 0 && $volume > 0) {
+            $turnoverDays = $input->turnoverDays ?? 30;
+            $storageCost = $this->tariffs->calculateStorageCost($volume, $turnoverDays);
+        }
 
         // Стоимость доставки
         $deliveryCost = $logistics + $processingFee;
@@ -95,8 +101,8 @@ class YandexMarketUnitEconomicsCalculator implements UnitEconomicsCalculatorInte
             processingFee: $processingFee,
             deliveryCost: $deliveryCost,
             storageCost: $storageCost,
-            returnLogistics: 0,
-            returnProcessing: 0,
+            returnLogistics: $returnLogistics,
+            returnProcessing: $returnProcessing,
             expectedReturnCost: $expectedReturnCost,
             costPrice: $costPrice,
             packagingCost: $packagingCost,
@@ -140,26 +146,16 @@ class YandexMarketUnitEconomicsCalculator implements UnitEconomicsCalculatorInte
             'express_delivery' => round($tariffBreakdown['EXPRESS_DELIVERY'] ?? 0, 2),
             'sorting' => round($processingFee, 2),
             'storage_cost' => round($storageCost, 2),
+            'return_logistics_cost' => round($returnLogistics, 2),
+            'return_processing_cost' => round($returnProcessing, 2),
+            'expected_return_cost' => round($expectedReturnCost, 2),
+            'effective_logistics' => round($deliveryCost + $expectedReturnCost, 2),
+            'packaging_cost' => round($packagingCost, 2),
             'to_settlement_account' => round($toSettlementAccount, 2),
             'own_delivery_cost' => round($input->ownDeliveryCost ?? 0, 2),
         ];
 
         return $result;
-    }
-
-    /**
-     * Рассчитать ожидаемые расходы на возвраты
-     */
-    private function calculateExpectedReturnCost(string $scheme, float $weight, ?float $redemptionRate): float
-    {
-        if ($redemptionRate === null || $redemptionRate >= 100) {
-            return 0;
-        }
-
-        $returnLogistics = $this->tariffs->calculateReturnLogisticsCost($scheme, $weight);
-        $returnRate = (100 - $redemptionRate) / 100;
-        
-        return $returnLogistics * $returnRate;
     }
 
     private function normalizeTariffBreakdown(array $tariffBreakdown): array

@@ -59,6 +59,18 @@ class AutoSupplyPlanLine extends Model
         'explain_json',
         'risk_level',
         'simulation_json',
+        // Locality integration
+        'local_share_percent',
+        'potential_overpayment_rub',
+        'lost_margin_rub',
+        'expected_local_share_after_pp',
+        'expected_savings_rub',
+        'locality_confidence',
+        'cluster_split_json',
+        'linked_locality_recommendation_ids',
+        'parent_line_key',
+        'is_cluster_split',
+        'aggregated_qty_rounded',
     ];
 
     protected $casts = [
@@ -89,6 +101,16 @@ class AutoSupplyPlanLine extends Model
         'turnover_days' => 'decimal:1',
         'explain_json' => 'array',
         'simulation_json' => 'array',
+        // Locality integration
+        'local_share_percent' => 'decimal:2',
+        'potential_overpayment_rub' => 'decimal:2',
+        'lost_margin_rub' => 'decimal:2',
+        'expected_local_share_after_pp' => 'decimal:2',
+        'expected_savings_rub' => 'decimal:2',
+        'cluster_split_json' => 'array',
+        'linked_locality_recommendation_ids' => 'array',
+        'is_cluster_split' => 'boolean',
+        'aggregated_qty_rounded' => 'integer',
     ];
 
     public function plan(): BelongsTo

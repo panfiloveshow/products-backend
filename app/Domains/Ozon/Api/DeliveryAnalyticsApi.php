@@ -195,8 +195,52 @@ class DeliveryAnalyticsApi
 
                 // Добавляем данные по кластеру
                 foreach ($item['clusters_data'] as $cluster) {
-                    $allRecommendations[$sku]['clusters'][$cluster['cluster_id']] = $cluster;
+                    $clusterKey = (string) ($cluster['cluster_id'] ?? '');
+                    if ($clusterKey === '') {
+                        continue;
+                    }
+
+                    if (! isset($allRecommendations[$sku]['clusters'][$clusterKey])) {
+                        $allRecommendations[$sku]['clusters'][$clusterKey] = $cluster;
+                        continue;
+                    }
+
+                    $existing = $allRecommendations[$sku]['clusters'][$clusterKey];
+                    $allRecommendations[$sku]['clusters'][$clusterKey] = [
+                        ...$existing,
+                        'orders_count' => (int) ($existing['orders_count'] ?? 0) + (int) ($cluster['orders_count'] ?? 0),
+                        'sales_quantity' => (int) ($existing['sales_quantity'] ?? 0) + (int) ($cluster['sales_quantity'] ?? 0),
+                        'sales_amount' => (float) ($existing['sales_amount'] ?? 0) + (float) ($cluster['sales_amount'] ?? 0),
+                    ];
                 }
+            }
+        }
+
+        foreach ($allRecommendations as $sku => $recommendation) {
+            $clusters = array_values($recommendation['clusters'] ?? []);
+            $totalOrders = array_sum(array_map(
+                static fn (array $cluster): int => (int) ($cluster['orders_count'] ?? 0),
+                $clusters
+            ));
+
+            if ($totalOrders > 0) {
+                foreach ($clusters as &$cluster) {
+                    $cluster['orders_percent'] = round(((int) ($cluster['orders_count'] ?? 0) / $totalOrders) * 100, 2);
+                }
+                unset($cluster);
+            }
+
+            usort($clusters, static function (array $left, array $right): int {
+                return ((int) ($right['orders_count'] ?? 0)) <=> ((int) ($left['orders_count'] ?? 0));
+            });
+
+            $allRecommendations[$sku]['clusters'] = [];
+            foreach ($clusters as $cluster) {
+                $clusterKey = (string) ($cluster['cluster_id'] ?? '');
+                if ($clusterKey === '') {
+                    continue;
+                }
+                $allRecommendations[$sku]['clusters'][$clusterKey] = $cluster;
             }
         }
 

@@ -178,31 +178,55 @@ class InventoryController extends Controller
      */
     public function sync(Request $request, string $marketplace): JsonResponse
     {
-        // Валидация credentials в зависимости от маркетплейса
-        $rules = match ($marketplace) {
-            'wildberries' => ['api_key' => 'required|string'],
-            'ozon' => ['client_id' => 'required|string', 'api_key' => 'required|string'],
-            'yandex' => ['token' => 'required|string', 'campaign_id' => 'required|string'],
-            default => [],
-        };
-
-        $request->validate($rules);
-
-        // Собираем credentials из запроса
-        $credentials = match ($marketplace) {
-            'wildberries' => ['api_key' => $request->input('api_key')],
-            'ozon' => [
-                'client_id' => $request->input('client_id'),
-                'api_key' => $request->input('api_key'),
-            ],
-            'yandex' => [
-                'token' => $request->input('token'),
-                'campaign_id' => $request->input('campaign_id'),
-            ],
-            default => [],
+        $marketplace = match ($marketplace) {
+            'yandex' => 'yandex_market',
+            default => $marketplace,
         };
 
         $integrationId = $request->input('integration_id');
+        $credentials = [];
+
+        if ($integrationId) {
+            $integration = Integration::find($integrationId);
+            if ($integration) {
+                $credentials = $integration->credentials ?? [];
+            }
+        }
+
+        if (empty($credentials)) {
+            $rules = match ($marketplace) {
+                'wildberries' => ['api_key' => 'required|string'],
+                'ozon' => ['client_id' => 'required|string', 'api_key' => 'required|string'],
+                'yandex_market' => ['token' => 'required|string', 'campaign_id' => 'required|string'],
+                default => [],
+            };
+
+            $request->validate($rules);
+
+            $credentials = match ($marketplace) {
+                'wildberries' => ['api_key' => $request->input('api_key')],
+                'ozon' => [
+                    'client_id' => $request->input('client_id'),
+                    'api_key' => $request->input('api_key'),
+                ],
+                'yandex_market' => [
+                    'token' => $request->input('token'),
+                    'campaign_id' => $request->input('campaign_id'),
+                ],
+                default => [],
+            };
+        }
+
+        if ($marketplace === 'yandex_market' && empty($credentials['campaign_id'] ?? null) && !empty($credentials['client_id'] ?? null)) {
+            $credentials['campaign_id'] = $credentials['client_id'];
+        }
+
+        $accessToken = $request->bearerToken()
+            ?? $request->header('X-Sellico-Token')
+            ?? $request->header('X-Token');
+        if ($accessToken) {
+            $credentials['_sellico_token'] = $accessToken;
+        }
 
         $syncLog = $this->inventoryService->startSync(
             $marketplace,

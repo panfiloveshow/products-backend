@@ -4,6 +4,10 @@ namespace App\Providers;
 
 use App\Events\ShipmentStatusChanged;
 use App\Listeners\SendShipmentStatusNotification;
+use App\Models\OzonSkuDeliveryProfile;
+use App\Models\OzonSupplyFixation;
+use App\Observers\OzonSkuDeliveryProfileObserver;
+use App\Observers\OzonSupplyFixationObserver;
 use Illuminate\Foundation\Support\Providers\EventServiceProvider as ServiceProvider;
 
 class EventServiceProvider extends ServiceProvider
@@ -23,6 +27,9 @@ class EventServiceProvider extends ServiceProvider
     public function boot(): void
     {
         parent::boot();
+
+        OzonSkuDeliveryProfile::observe(OzonSkuDeliveryProfileObserver::class);
+        OzonSupplyFixation::observe(OzonSupplyFixationObserver::class);
     }
 
     /**

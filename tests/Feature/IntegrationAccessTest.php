@@ -76,7 +76,7 @@ class IntegrationAccessTest extends TestCase
                 $this->accessToken = $token;
             }
 
-            public function getIntegrationById(int $integrationId): array
+            public function getIntegrationById(int $integrationId, ?int $workspaceId = null): array
             {
                 if ($integrationId !== 55) {
                     return [

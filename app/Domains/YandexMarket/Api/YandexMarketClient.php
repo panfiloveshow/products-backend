@@ -49,28 +49,53 @@ class YandexMarketClient
      */
     public function get(string $endpoint, array $params = []): ?array
     {
-        try {
-            $url = $this->buildUrl($endpoint);
+        $requestId = uniqid('ym_req_', true);
+        $url = $this->buildUrl($endpoint);
 
+        Log::info('Yandex Market API Request', [
+            'request_id' => $requestId,
+            'method' => 'GET',
+            'endpoint' => $endpoint,
+            'url' => $url,
+            'params' => $params,
+            'campaign_id' => $this->campaignId ? substr($this->campaignId, 0, 4) . '***' : 'empty',
+            'has_token' => !empty($this->apiKey),
+        ]);
+
+        try {
             $response = Http::withHeaders($this->getHeaders())
                 ->timeout($this->timeout)
                 ->get($url, $params);
+
+            $status = $response->status();
+            $body = $response->body();
+
+            Log::info('Yandex Market API Response', [
+                'request_id' => $requestId,
+                'method' => 'GET',
+                'endpoint' => $endpoint,
+                'status' => $status,
+                'response_size' => strlen($body),
+                'response_sample' => $this->truncateResponse($body, 500),
+            ]);
 
             if ($response->successful()) {
                 return $response->json();
             }
 
-            $message = $this->formatHttpError($endpoint, $response->status(), $response->body());
+            $message = $this->formatHttpError($endpoint, $status, $body);
 
             Log::warning('Yandex Market API error', [
+                'request_id' => $requestId,
                 'endpoint' => $endpoint,
-                'status' => $response->status(),
-                'body' => $response->body(),
+                'status' => $status,
+                'body' => substr($body, 0, 500),
             ]);
 
             throw new \RuntimeException($message);
         } catch (\Exception $e) {
             Log::error('Yandex Market API exception', [
+                'request_id' => $requestId,
                 'endpoint' => $endpoint,
                 'error' => $e->getMessage(),
             ]);
@@ -85,33 +110,59 @@ class YandexMarketClient
      */
     public function post(string $endpoint, array $data = [], array $query = []): ?array
     {
+        $requestId = uniqid('ym_req_', true);
+        $url = $this->buildUrl($endpoint);
+        if ($query !== []) {
+            $url .= '?'.http_build_query($query);
+        }
+
+        $payload = $data === [] ? new \stdClass : $data;
+
+        Log::info('Yandex Market API Request', [
+            'request_id' => $requestId,
+            'method' => 'POST',
+            'endpoint' => $endpoint,
+            'url' => $url,
+            'payload_size' => strlen(json_encode($payload)),
+            'payload_sample' => $this->truncateResponse(json_encode($payload), 500),
+            'campaign_id' => $this->campaignId ? substr($this->campaignId, 0, 4) . '***' : 'empty',
+            'has_token' => !empty($this->apiKey),
+        ]);
+
         try {
-            $url = $this->buildUrl($endpoint);
-            if ($query !== []) {
-                $url .= '?'.http_build_query($query);
-            }
-
-            $payload = $data === [] ? new \stdClass : $data;
-
             $response = Http::withHeaders($this->getHeaders())
                 ->timeout($this->timeout)
                 ->post($url, $payload);
+
+            $status = $response->status();
+            $body = $response->body();
+
+            Log::info('Yandex Market API Response', [
+                'request_id' => $requestId,
+                'method' => 'POST',
+                'endpoint' => $endpoint,
+                'status' => $status,
+                'response_size' => strlen($body),
+                'response_sample' => $this->truncateResponse($body, 500),
+            ]);
 
             if ($response->successful()) {
                 return $response->json();
             }
 
-            $message = $this->formatHttpError($endpoint, $response->status(), $response->body());
+            $message = $this->formatHttpError($endpoint, $status, $body);
 
             Log::warning('Yandex Market API error', [
+                'request_id' => $requestId,
                 'endpoint' => $endpoint,
-                'status' => $response->status(),
-                'body' => $response->body(),
+                'status' => $status,
+                'body' => substr($body, 0, 500),
             ]);
 
             throw new \RuntimeException($message);
         } catch (\Exception $e) {
             Log::error('Yandex Market API exception', [
+                'request_id' => $requestId,
                 'endpoint' => $endpoint,
                 'error' => $e->getMessage(),
             ]);
@@ -242,5 +293,16 @@ class YandexMarketClient
         $snippet = trim(mb_substr($body, 0, 300));
 
         return "Yandex Market API request failed: {$endpoint} [{$status}] {$snippet}";
+    }
+
+    /**
+     * Обрезать тело ответа для логирования
+     */
+    private function truncateResponse(string $body, int $maxLength = 500): string
+    {
+        if (strlen($body) <= $maxLength) {
+            return $body;
+        }
+        return substr($body, 0, $maxLength) . '... [truncated]';
     }
 }

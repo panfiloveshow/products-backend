@@ -315,6 +315,14 @@ class InventoryService
                 $pending->delay(now()->addSeconds($dispatchDelaySeconds));
             }
 
+            \Log::info('Sync job queued', [
+                'sync_log_id' => $syncLog->id,
+                'sync_type' => 'inventory',
+                'marketplace' => $syncLog->marketplace,
+                'integration_id' => $integrationId,
+                'queue_connection' => config('queue.default'),
+            ]);
+
             return $syncLog;
         });
     }

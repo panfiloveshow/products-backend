@@ -5,6 +5,7 @@ namespace App\Console\Commands;
 use App\Models\Integration;
 use App\Models\SyncLog;
 use App\Services\ProductService;
+use App\Services\SellicoApiService;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Log;
 
@@ -64,8 +65,29 @@ class AutoSync extends Command
             }
             
             try {
+                // BUG FIX: Integration.credentials часто null — получаем из Sellico API
                 $credentials = $integration->getDecryptedCredentials();
-                
+                if (empty($credentials)) {
+                    $sellicoApi = app(SellicoApiService::class);
+                    $sellicoResult = $sellicoApi->getIntegrationById($integration->id);
+                    if ($sellicoResult['success'] && !empty($sellicoResult['credentials'])) {
+                        $credentials = $sellicoResult['credentials'];
+                    }
+                }
+
+                // Yandex: подставляем campaign_id из client_id если не задан
+                if (in_array($integration->marketplace, ['yandex', 'yandex_market'], true)) {
+                    if (empty($credentials['campaign_id'] ?? null) && !empty($credentials['client_id'] ?? null)) {
+                        $credentials['campaign_id'] = $credentials['client_id'];
+                    }
+                }
+
+                if (empty($credentials)) {
+                    $this->warn("  ⚠️  {$integration->name}: credentials не найдены");
+                    $skipped++;
+                    continue;
+                }
+
                 $syncLog = $productService->startSync(
                     $integration->marketplace,
                     $credentials,

@@ -44,6 +44,11 @@ class SyncProductsJobTest extends TestCase
             $table->decimal('price', 12, 2)->nullable();
             $table->decimal('old_price', 12, 2)->nullable();
             $table->integer('stock')->default(0);
+            $table->decimal('depth', 10, 2)->nullable();
+            $table->decimal('width', 10, 2)->nullable();
+            $table->decimal('height', 10, 2)->nullable();
+            $table->decimal('weight', 10, 2)->nullable();
+            $table->decimal('volume_weight', 10, 4)->nullable();
             $table->text('description')->nullable();
             $table->json('images')->nullable();
             $table->string('category')->nullable();
@@ -59,7 +64,8 @@ class SyncProductsJobTest extends TestCase
             $table->json('yandex_data')->nullable();
             $table->timestamps();
 
-            $table->unique(['sku', 'marketplace'], 'products_sku_marketplace_unique');
+            $table->unique(['marketplace', 'sku', 'integration_id'], 'products_marketplace_sku_integration_unique');
+            $table->unique(['marketplace', 'marketplace_id', 'integration_id'], 'products_marketplace_integration_unique');
         });
     }
 
@@ -71,7 +77,7 @@ class SyncProductsJobTest extends TestCase
         parent::tearDown();
     }
 
-    public function test_sync_product_rebinds_existing_unique_product_to_current_integration(): void
+    public function test_sync_product_creates_separate_product_for_another_integration(): void
     {
         $existingProduct = Product::create([
             'sku' => '2099/black1',
@@ -103,12 +109,78 @@ class SyncProductsJobTest extends TestCase
         ]);
 
         $existingProduct->refresh();
+        $newProduct = Product::where('marketplace', 'ozon')
+            ->where('sku', '2099/black1')
+            ->where('integration_id', 55)
+            ->first();
+
+        $this->assertSame('created', $result);
+        $this->assertSame(2, Product::count());
+        $this->assertSame(17, $existingProduct->integration_id);
+        $this->assertSame('Old product', $existingProduct->name);
+        $this->assertNotNull($newProduct);
+        $this->assertSame('Updated product', $newProduct->name);
+        $this->assertSame('250.00', $newProduct->price);
+        $this->assertSame(5, $newProduct->stock);
+    }
+
+    public function test_sync_product_updates_ozon_dimensions_when_they_arrive_later(): void
+    {
+        $product = Product::create([
+            'sku' => 'bag-001',
+            'name' => 'Bag',
+            'price' => 1000,
+            'stock' => 3,
+            'marketplace' => 'ozon',
+            'marketplace_id' => '123456',
+            'integration_id' => 17,
+            'ozon_data' => ['dimensions' => ['depth' => null]],
+        ]);
+
+        $syncLog = SyncLog::create([
+            'marketplace' => 'ozon',
+            'integration_id' => 17,
+            'sync_type' => 'products',
+            'status' => SyncLog::STATUS_PENDING,
+        ]);
+
+        $job = new SyncProductsJob($syncLog);
+        $method = new ReflectionMethod($job, 'syncProduct');
+        $method->setAccessible(true);
+
+        $result = $method->invoke($job, [
+            'sku' => 'bag-001',
+            'name' => 'Bag',
+            'price' => 1000,
+            'stock' => 3,
+            'marketplace_id' => '123456',
+            'depth' => 310,
+            'width' => 220,
+            'height' => 80,
+            'weight' => 540,
+            'volume_weight' => 5.456,
+            'ozon_data' => [
+                'length_mm' => 310,
+                'width_mm' => 220,
+                'height_mm' => 80,
+                'weight_g' => 540,
+                'dimensions' => [
+                    'depth' => 310,
+                    'width' => 220,
+                    'height' => 80,
+                    'weight' => 540,
+                ],
+            ],
+        ]);
+
+        $product->refresh();
 
         $this->assertSame('updated', $result);
-        $this->assertSame(1, Product::count());
-        $this->assertSame(55, $existingProduct->integration_id);
-        $this->assertSame('Updated product', $existingProduct->name);
-        $this->assertSame('250.00', $existingProduct->price);
-        $this->assertSame(5, $existingProduct->stock);
+        $this->assertEquals(310, $product->depth);
+        $this->assertEquals(220, $product->width);
+        $this->assertEquals(80, $product->height);
+        $this->assertEquals(540, $product->weight);
+        $this->assertEquals(5.456, $product->volume_weight);
+        $this->assertSame(310, $product->ozon_data['length_mm']);
     }
 }

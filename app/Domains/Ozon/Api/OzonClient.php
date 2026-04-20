@@ -23,6 +23,11 @@ class OzonClient
         $this->apiKey = $apiKey ?? config('services.ozon.api_key') ?? '';
     }
 
+    public function getClientCacheKey(): string
+    {
+        return hash('sha256', $this->clientId);
+    }
+
     /**
      * Создать клиент из Integration модели
      */
@@ -41,8 +46,20 @@ class OzonClient
      */
     public function post(string $endpoint, array $data = [], bool $forceObject = false): ?array
     {
+        $requestId = uniqid('ozon_req_', true);
         $maxAttempts = 3;
         $body = (empty($data) && $forceObject) ? (object)[] : $data;
+
+        Log::info('Ozon API Request', [
+            'request_id' => $requestId,
+            'method' => 'POST',
+            'endpoint' => $endpoint,
+            'url' => self::BASE_URL . $endpoint,
+            'payload_size' => strlen(json_encode($body)),
+            'payload_sample' => $this->truncateResponse(json_encode($body), 500),
+            'client_id_prefix' => $this->clientId ? substr($this->clientId, 0, 4) . '***' : 'empty',
+            'has_api_key' => !empty($this->apiKey),
+        ]);
 
         for ($attempt = 1; $attempt <= $maxAttempts; $attempt++) {
             try {
@@ -51,6 +68,19 @@ class OzonClient
                     ->asJson()
                     ->post(self::BASE_URL . $endpoint, $body);
 
+                $status = $response->status();
+                $bodyContent = $response->body();
+
+                Log::info('Ozon API Response', [
+                    'request_id' => $requestId,
+                    'method' => 'POST',
+                    'endpoint' => $endpoint,
+                    'attempt' => $attempt,
+                    'status' => $status,
+                    'response_size' => strlen($bodyContent),
+                    'response_sample' => $this->truncateResponse($bodyContent, 500),
+                ]);
+
                 if ($response->successful()) {
                     return $response->json();
                 }
@@ -58,6 +88,7 @@ class OzonClient
                 if ($response->status() === 429 && $attempt < $maxAttempts) {
                     $delay = $attempt * 1500000;
                     Log::warning('Ozon API rate limit, retry', [
+                        'request_id' => $requestId,
                         'endpoint' => $endpoint,
                         'attempt'  => $attempt,
                         'delay_ms' => $delay / 1000,
@@ -75,9 +106,10 @@ class OzonClient
                 $decoded['_http_status'] = $response->status();
 
                 Log::warning('Ozon API error', [
+                    'request_id' => $requestId,
                     'endpoint'  => $endpoint,
-                    'status'    => $response->status(),
-                    'body'      => $response->body(),
+                    'status'    => $status,
+                    'body'      => substr($bodyContent, 0, 500),
                     'client_id' => $this->clientId ? substr($this->clientId, 0, 4) . '***' : 'empty',
                     'has_api_key' => !empty($this->apiKey),
                 ]);
@@ -85,7 +117,9 @@ class OzonClient
                 return $decoded;
             } catch (\Exception $e) {
                 Log::error('Ozon API exception', [
+                    'request_id' => $requestId,
                     'endpoint'  => $endpoint,
+                    'attempt' => $attempt,
                     'error'     => $e->getMessage(),
                     'client_id' => $this->clientId ? substr($this->clientId, 0, 4) . '***' : 'empty',
                 ]);
@@ -131,26 +165,54 @@ class OzonClient
      */
     public function get(string $endpoint, array $params = []): ?array
     {
+        $requestId = uniqid('ozon_req_', true);
+        
+        Log::info('Ozon API Request', [
+            'request_id' => $requestId,
+            'method' => 'GET',
+            'endpoint' => $endpoint,
+            'url' => self::BASE_URL . $endpoint,
+            'params' => $params,
+            'client_id_prefix' => $this->clientId ? substr($this->clientId, 0, 4) . '***' : 'empty',
+            'has_api_key' => !empty($this->apiKey),
+        ]);
+
         try {
             $response = Http::withHeaders($this->getHeaders())
                 ->timeout($this->timeout)
                 ->get(self::BASE_URL . $endpoint, $params);
+
+            $status = $response->status();
+            $body = $response->body();
+
+            Log::info('Ozon API Response', [
+                'request_id' => $requestId,
+                'method' => 'GET',
+                'endpoint' => $endpoint,
+                'status' => $status,
+                'response_size' => strlen($body),
+                'response_sample' => $this->truncateResponse($body, 500),
+            ]);
 
             if ($response->successful()) {
                 return $response->json();
             }
 
             Log::warning('Ozon API error', [
+                'request_id' => $requestId,
                 'endpoint' => $endpoint,
-                'status' => $response->status(),
-                'body' => $response->body(),
+                'status' => $status,
+                'body' => substr($body, 0, 500),
+                'client_id_prefix' => $this->clientId ? substr($this->clientId, 0, 4) . '***' : 'empty',
             ]);
 
             return null;
         } catch (\Exception $e) {
             Log::error('Ozon API exception', [
+                'request_id' => $requestId,
                 'endpoint' => $endpoint,
                 'error' => $e->getMessage(),
+                'client_id_prefix' => $this->clientId ? substr($this->clientId, 0, 4) . '***' : 'empty',
             ]);
             return null;
         }
@@ -176,5 +238,16 @@ class OzonClient
     {
         $this->timeout = $seconds;
         return $this;
+    }
+
+    /**
+     * Обрезать тело ответа для логирования
+     */
+    private function truncateResponse(string $body, int $maxLength = 500): string
+    {
+        if (strlen($body) <= $maxLength) {
+            return $body;
+        }
+        return substr($body, 0, $maxLength) . '... [truncated]';
     }
 }

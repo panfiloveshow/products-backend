@@ -1,0 +1,130 @@
+<?php
+
+namespace Tests\Unit;
+
+use App\Domains\UnitEconomics\UnitEconomicsOrchestrator;
+use App\Http\Controllers\Api\UnitEconomicsCacheController;
+use App\Models\Integration;
+use App\Models\Product;
+use App\Models\UnitEconomicsCache;
+use App\Services\IntegrationAccessService;
+use App\Services\UnitEconomicsCacheService;
+use App\Services\UnitEconomicsService;
+use PHPUnit\Framework\TestCase;
+
+class UnitEconomicsCacheControllerTest extends TestCase
+{
+    public function test_normalize_ozon_cluster_markup_data_enriches_summary_and_sales_profile(): void
+    {
+        $controller = new UnitEconomicsCacheController(
+            $this->createMock(UnitEconomicsCacheService::class),
+            $this->createMock(UnitEconomicsService::class),
+            $this->createMock(UnitEconomicsOrchestrator::class),
+            $this->createMock(IntegrationAccessService::class),
+        );
+
+        $method = new \ReflectionMethod(UnitEconomicsCacheController::class, 'normalizeOzonClusterMarkupData');
+        $method->setAccessible(true);
+
+        [$summary, $salesProfile] = $method->invoke(
+            $controller,
+            [
+                [
+                    'cluster_name' => 'Москва, МО и Дальние регионы',
+                    'orders_percent' => 57.14,
+                ],
+                [
+                    'cluster_name' => 'Самара',
+                    'orders_percent' => 14.29,
+                ],
+            ],
+            [
+                [
+                    'cluster_name' => 'Москва, МО и Дальние регионы',
+                    'sales_share_percent' => 57.14,
+                ],
+                [
+                    'cluster_name' => 'Самара',
+                    'sales_share_percent' => 14.29,
+                ],
+            ],
+            [
+                ['cluster_name' => 'Омск'],
+                ['cluster_name' => 'Москва, МО и Дальние регионы'],
+            ],
+            true
+        );
+
+        $this->assertSame(0.0, $summary[0]['effective_markup_percent']);
+        $this->assertSame(8.0, $summary[0]['non_local_markup_percent']);
+        $this->assertSame('local_cluster', $summary[0]['markup_reason']);
+        $this->assertSame(8.0, $summary[1]['effective_markup_percent']);
+        $this->assertSame(0.0, $salesProfile[0]['effective_markup_percent']);
+        $this->assertSame(8.0, $salesProfile[1]['effective_markup_percent']);
+        $this->assertSame('Самара', $salesProfile[1]['cluster_name']);
+    }
+
+    public function test_enrich_cache_item_exposes_volume_weight_and_chargeable_volume(): void
+    {
+        $controller = new UnitEconomicsCacheController(
+            $this->createMock(UnitEconomicsCacheService::class),
+            $this->createMock(UnitEconomicsService::class),
+            $this->createMock(UnitEconomicsOrchestrator::class),
+            $this->createMock(IntegrationAccessService::class),
+        );
+
+        $product = new Product([
+            'marketplace' => 'wildberries',
+            'volume_weight' => 0.4,
+            'weight' => 350,
+        ]);
+        $product->fulfillment_type = 'FBO';
+
+        $cache = new UnitEconomicsCache([
+            'integration_id' => 1,
+            'product_id' => 10,
+            'sku' => 'sku-1',
+            'marketplace' => 'wildberries',
+            'fulfillment_type' => 'FBO',
+            'sales_count' => 1,
+            'price' => 250,
+            'total_costs' => 100,
+            'logistics_cost' => 29.48,
+            'last_mile_cost' => 25,
+            'commission_amount' => 10,
+            'acquiring_amount' => 3,
+            'storage_cost' => 0,
+            'volume_liters' => 1.0,
+            'volume_weight' => 0.4,
+            'depth' => 100,
+            'width' => 100,
+            'height' => 100,
+            'weight' => 350,
+            'marketplace_data' => [
+                'chargeable_volume_liters' => 2.0,
+            ],
+        ]);
+        $cache->setRelation('product', $product);
+
+        $method = new \ReflectionMethod(UnitEconomicsCacheController::class, 'enrichCacheItem');
+        $method->setAccessible(true);
+
+        $pageContext = [
+            'wb_warehouses_by_product_key' => collect([
+                '10|1' => collect(),
+            ]),
+            'integrations_by_id' => collect([
+                1 => new Integration([
+                    'localization_index' => 1.0,
+                ]),
+            ]),
+        ];
+
+        $result = $method->invoke($controller, $cache, 'FBO', null, $pageContext);
+
+        $this->assertSame(0.4, $result['volume_weight']);
+        $this->assertSame(2.0, $result['chargeable_volume_liters']);
+        $this->assertSame('0.4000', $result['dimensions']['volume_weight']);
+        $this->assertSame('2.0000', $result['dimensions']['chargeable_volume']);
+    }
+}

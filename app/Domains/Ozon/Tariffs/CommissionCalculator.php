@@ -9,6 +9,13 @@ use App\Domains\Marketplace\Contracts\CommissionsProviderInterface;
  */
 class CommissionCalculator implements CommissionsProviderInterface
 {
+    private OzonPricingMatrix $pricing;
+
+    public function __construct()
+    {
+        $this->pricing = new OzonPricingMatrix();
+    }
+
     /**
      * Комиссии по категориям (%) — fallback значения для FBO
      * Актуально с 10.11.2025
@@ -78,19 +85,9 @@ class CommissionCalculator implements CommissionsProviderInterface
      */
     public function getCommissionRate(string $categoryId, ?string $scheme = null): float
     {
-        // Точное совпадение
-        if (isset(self::CATEGORY_COMMISSIONS[$categoryId])) {
-            return (float) self::CATEGORY_COMMISSIONS[$categoryId];
-        }
+        $resolved = $this->pricing->resolveCommission($scheme ?? 'FBO', $categoryId, 1500);
 
-        // Частичное совпадение
-        foreach (self::CATEGORY_COMMISSIONS as $category => $rate) {
-            if (stripos($categoryId, $category) !== false || stripos($category, $categoryId) !== false) {
-                return (float) $rate;
-            }
-        }
-
-        return (float) self::CATEGORY_COMMISSIONS['default'];
+        return (float) $resolved['sales_fee_percent'];
     }
 
     /**
@@ -98,7 +95,7 @@ class CommissionCalculator implements CommissionsProviderInterface
      */
     public function getAllCommissions(): array
     {
-        return self::CATEGORY_COMMISSIONS;
+        return $this->pricing->getConfig()['commissions'] ?? [];
     }
 
     /**

@@ -2,6 +2,7 @@
 
 namespace App\Services;
 
+use App\Models\Integration;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
@@ -158,7 +159,7 @@ class SellicoApiService
             
             $item = [
                 'id'             => $integration['id'],
-                'work_space_id'  => $integration['work_space_id'] ?? $integration['workspace_id'] ?? null,
+                'work_space_id'  => $integration['work_space_id'] ?? $integration['workspace_id'] ?? $integration['workSpaceId'] ?? $integration['workspaceId'] ?? null,
                 'name'           => $integration['name'],
                 'type'           => $integration['type'],
                 'description'    => $integration['description'] ?? null,
@@ -312,7 +313,57 @@ class SellicoApiService
             return $this->accessToken;
         }
 
-        return Cache::get('sellico_user_access_token');
+        $cached = Cache::get('sellico_user_access_token');
+        if ($cached) {
+            $this->accessToken = $cached;
+            return $cached;
+        }
+
+        // Автологин через .env credentials
+        return $this->getServiceToken();
+    }
+
+    /**
+     * Получить сервисный токен (логин через .env credentials)
+     */
+    public function getServiceToken(): ?string
+    {
+        $cached = Cache::get('sellico_service_access_token');
+        if ($cached) {
+            return $cached;
+        }
+
+        $email    = config('services.sellico.email')    ?? env('SELLICO_EMAIL');
+        $password = config('services.sellico.password') ?? env('SELLICO_PASSWORD');
+
+        if (!$email || !$password) {
+            return null;
+        }
+
+        try {
+            $response = Http::timeout(10)->post("{$this->baseUrl}/login", [
+                'email' => $email,
+                'password' => $password,
+            ]);
+
+            if ($response->successful()) {
+                $token = $response->json('access_token');
+                if ($token) {
+                    Cache::put('sellico_service_access_token', $token, now()->addHours(23));
+                    Log::info('Sellico service login successful');
+                    return $token;
+                }
+            }
+
+            Log::error('Sellico service login failed', [
+                'status' => $response->status(),
+                'body' => substr($response->body(), 0, 200),
+            ]);
+        } catch (\Exception $e) {
+            Log::error('Sellico service login exception', ['error' => $e->getMessage()]);
+        }
+
+        return null;
     }
 
     /**
@@ -364,104 +415,181 @@ class SellicoApiService
 
     /**
      * Получить интеграцию по ID
+     *
+     * Логика:
+     * 1. Логинимся сервисным аккаунтом (autobidder) через /api/login
+     * 2. Ищем интеграцию через /api/get-integrations/{workspaceId}
+     *    (прямой endpoint /api/integrations/{id} не существует в Sellico CRM)
      */
-    public function getIntegrationById(int $integrationId): array
+    public function getIntegrationById(int $integrationId, ?int $workspaceId = null): array
     {
-        $cacheKey = "sellico_integration_{$integrationId}";
-        $cached = Cache::get($cacheKey);
-        if ($cached) {
-            return $cached;
+        $serviceToken = $this->getServiceToken();
+        $tokens = [];
+
+        if ($this->accessToken) {
+            $tokens['user'] = $this->accessToken;
         }
 
-        $token = $this->getAccessToken();
-        
-        if (!$token) {
+        if ($serviceToken) {
+            $tokens['service'] = $serviceToken;
+        }
+
+        if (empty($tokens)) {
+            Log::error('getIntegrationById: не удалось получить сервисный токен Sellico');
             return [
                 'success' => false,
-                'error' => 'Не авторизован в Sellico API',
+                'error' => 'Не удалось авторизоваться в Sellico API (сервисный аккаунт)',
             ];
         }
 
         try {
-            // 1) Пробуем прямой endpoint (может отсутствовать на некоторых версиях Sellico API)
-            $response = Http::timeout(8)->withToken($token)
-                ->get("{$this->baseUrl}/integrations/{$integrationId}");
+            foreach ($tokens as $tokenType => $token) {
+                $response = Http::timeout(8)->withToken($token)
+                    ->get("{$this->baseUrl}/get-integration/{$integrationId}");
 
-            if ($response->successful()) {
-                $data = $response->json('data') ?? $response->json();
+                if (! $response->successful()) {
+                    Log::info('getIntegrationById: direct endpoint miss', [
+                        'integration_id' => $integrationId,
+                        'workspace_id' => $workspaceId,
+                        'token_type' => $tokenType,
+                        'status' => $response->status(),
+                    ]);
+                    continue;
+                }
 
-                $result = [
-                    'success' => true,
-                    'integration' => $data,
-                    'credentials' => $data['credentials'] ?? [
-                        'api_key' => $data['api_key'] ?? null,
-                        'client_id' => $data['client_id'] ?? null,
-                        'token' => $data['token'] ?? null,
-                        'campaign_id' => $data['campaign_id'] ?? null,
-                        'business_id' => $data['business_id'] ?? null,
-                    ],
-                ];
-                Cache::put($cacheKey, $result, 3600);
-                return $result;
+                $integration = $response->json('data') ?? $response->json();
+                if (is_array($integration) && ! empty($integration)) {
+                    $remoteWorkspaceId = IntegrationAccessService::extractRemoteWorkspaceIdFromSellicoPayload($integration);
+                    if ($workspaceId && $remoteWorkspaceId && $remoteWorkspaceId !== $workspaceId) {
+                        continue;
+                    }
+
+                    return $this->formatIntegrationResult($integration);
+                }
             }
 
-            // 2) Fallback: ищем интеграцию во всех workspace пользователя
-            $workspacesResponse = Http::timeout(8)->withToken($token)
-                ->get("{$this->baseUrl}/workspaces");
+            $workspaceIds = $this->getCandidateWorkspaceIds($integrationId, $workspaceId, $tokens);
 
-            if ($workspacesResponse->successful()) {
-                $workspacesRaw = $workspacesResponse->json('data') ?? $workspacesResponse->json();
-                $workspaces = is_array($workspacesRaw) ? $workspacesRaw : [];
+            Log::info('getIntegrationById: searching', [
+                'integration_id' => $integrationId,
+                'workspace_ids' => $workspaceIds,
+            ]);
 
-                foreach ($workspaces as $workspace) {
-                    $workspaceId = $workspace['id'] ?? null;
-                    if (!$workspaceId) {
+            foreach ($tokens as $tokenType => $token) {
+                foreach ($workspaceIds as $candidateWorkspaceId) {
+                    $response = Http::timeout(8)->withToken($token)
+                        ->get("{$this->baseUrl}/get-integrations/{$candidateWorkspaceId}");
+
+                    if (! $response->successful()) {
+                        Log::info('getIntegrationById: workspace endpoint miss', [
+                            'integration_id' => $integrationId,
+                            'workspace_id' => $candidateWorkspaceId,
+                            'token_type' => $tokenType,
+                            'status' => $response->status(),
+                        ]);
                         continue;
                     }
 
-                    $integrationsResponse = Http::timeout(8)->withToken($token)
-                        ->get("{$this->baseUrl}/workspaces/{$workspaceId}/integrations");
-
-                    if (!$integrationsResponse->successful()) {
+                    $integrations = $response->json('data') ?? $response->json();
+                    if (! is_array($integrations)) {
                         continue;
                     }
-
-                    $integrationsRaw = $integrationsResponse->json('data') ?? $integrationsResponse->json();
-                    $integrations = is_array($integrationsRaw) ? $integrationsRaw : [];
 
                     foreach ($integrations as $integration) {
-                        if ((int)($integration['id'] ?? 0) !== $integrationId) {
+                        if ((int) ($integration['id'] ?? 0) !== $integrationId) {
                             continue;
                         }
 
-                        $result = [
-                            'success' => true,
-                            'integration' => $integration,
-                            'credentials' => $integration['credentials'] ?? [
-                                'api_key' => $integration['api_key'] ?? null,
-                                'client_id' => $integration['client_id'] ?? null,
-                                'token' => $integration['token'] ?? null,
-                                'campaign_id' => $integration['campaign_id'] ?? null,
-                                'business_id' => $integration['business_id'] ?? null,
-                            ],
-                        ];
-                        Cache::put($cacheKey, $result, 3600);
-                        return $result;
+                        Log::info('getIntegrationById: found', [
+                            'integration_id' => $integrationId,
+                            'workspace_id' => $candidateWorkspaceId,
+                            'token_type' => $tokenType,
+                            'type' => $integration['type'] ?? 'unknown',
+                        ]);
+
+                        return $this->formatIntegrationResult($integration);
                     }
                 }
             }
 
+            Log::warning('getIntegrationById: not found in any workspace', [
+                'integration_id' => $integrationId,
+                'searched_workspaces' => $workspaceIds,
+            ]);
+
             return [
                 'success' => false,
-                'error' => $response->json('message', 'Интеграция не найдена в Sellico API'),
+                'error' => "Интеграция #{$integrationId} не найдена в Sellico API",
             ];
         } catch (\Exception $e) {
-            Log::error('Sellico get integration by id error: ' . $e->getMessage());
+            Log::error('getIntegrationById exception', [
+                'integration_id' => $integrationId,
+                'error' => $e->getMessage(),
+            ]);
             return [
                 'success' => false,
                 'error' => $e->getMessage(),
             ];
         }
+    }
+
+    /**
+     * @param array<string, string> $tokens
+     * @return array<int, int>
+     */
+    private function getCandidateWorkspaceIds(int $integrationId, ?int $workspaceId, array $tokens): array
+    {
+        $workspaceIds = [];
+
+        if ($workspaceId) {
+            $workspaceIds[] = $workspaceId;
+        }
+
+        $localWorkspaceId = Integration::where('id', $integrationId)->value('work_space_id');
+        if ($localWorkspaceId) {
+            $workspaceIds[] = (int) $localWorkspaceId;
+        }
+
+        foreach ($tokens as $tokenType => $token) {
+            $response = Http::timeout(8)->withToken($token)->get("{$this->baseUrl}/workspaces");
+            if (! $response->successful()) {
+                Log::info('getIntegrationById: workspaces endpoint miss', [
+                    'integration_id' => $integrationId,
+                    'token_type' => $tokenType,
+                    'status' => $response->status(),
+                ]);
+                continue;
+            }
+
+            $workspacesRaw = $response->json('data') ?? $response->json();
+            $workspaces = is_array($workspacesRaw) ? $workspacesRaw : [];
+
+            foreach ($workspaces as $workspace) {
+                $candidateId = $workspace['id'] ?? null;
+                if ($candidateId) {
+                    $workspaceIds[] = (int) $candidateId;
+                }
+            }
+        }
+
+        return array_values(array_unique(array_filter($workspaceIds)));
+    }
+
+    private function formatIntegrationResult(array $integration): array
+    {
+        return [
+            'success' => true,
+            'integration' => $integration,
+            'credentials' => $integration['credentials'] ?? [
+                'api_key' => $integration['api_key'] ?? null,
+                'client_id' => $integration['client_id'] ?? null,
+                'token' => $integration['token'] ?? null,
+                'campaign_id' => $integration['campaign_id'] ?? null,
+                'business_id' => $integration['business_id'] ?? null,
+                'performance_api_key' => $integration['performance_api_key'] ?? null,
+                'performance_client_secret' => $integration['performance_client_secret'] ?? null,
+            ],
+        ];
     }
 
     /**

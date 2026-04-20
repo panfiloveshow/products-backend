@@ -17,6 +17,13 @@ use App\Domains\Marketplace\Contracts\TariffsProviderInterface;
  */
 class OzonTariffs implements TariffsProviderInterface
 {
+    private OzonPricingMatrix $pricing;
+
+    public function __construct()
+    {
+        $this->pricing = new OzonPricingMatrix();
+    }
+
     /**
      * FBO тарифы логистики — прогрессивная шкала (с 10.12.2025)
      * Для товаров от 301₽:
@@ -92,6 +99,30 @@ class OzonTariffs implements TariffsProviderInterface
      */
     public function getLogisticsTariffs(string $scheme): array
     {
+        $scheme = strtoupper($scheme);
+        $routes = $this->pricing->getConfig()['routes'] ?? [];
+        $schemeCosts = $this->pricing->getSchemeCosts($scheme);
+
+        if (!empty($routes)) {
+            return [
+                'scheme' => $scheme,
+                'routing_mode' => 'route_matrix',
+                'effective_from' => $this->pricing->getEffectiveFrom(),
+                'routes' => array_map(
+                    fn (array $route) => [
+                        'label' => $route['label'] ?? null,
+                        'is_local_sale' => $route['is_local_sale'] ?? null,
+                        'non_local_markup_percent' => $route['non_local_markup_percent'] ?? null,
+                        'tariffs' => $route[$scheme] ?? [],
+                    ],
+                    $routes
+                ),
+                'last_mile_max' => $schemeCosts['last_mile'] ?? 0,
+                'processing_fee' => $schemeCosts['processing_fee'] ?? 0,
+                'return_processing' => $schemeCosts['return_processing'] ?? 0,
+            ];
+        }
+
         return match (strtoupper($scheme)) {
             'FBO' => [
                 'scheme' => 'FBO',

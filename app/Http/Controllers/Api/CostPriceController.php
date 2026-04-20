@@ -95,13 +95,15 @@ class CostPriceController extends Controller
             $sku = $item['sku'];
             $costPrice = $item['cost_price'];
 
-            // Ищем товар по артикулу продавца (vendorCode/offer_id) или sku/barcode
+            // Ищем товар по артикулу продавца (vendorCode/offer_id/offerId) или sku/barcode
             $query = Product::where(function ($q) use ($sku) {
                 $q->where('sku', $sku)
                   ->orWhere('marketplace_id', $sku)
                   ->orWhereRaw("wb_data->>'vendorCode' = ?", [$sku])
                   ->orWhereRaw("ozon_data->>'offer_id' = ?", [$sku])
-                  ->orWhereRaw("ozon_data->>'vendor_code' = ?", [$sku]);
+                  ->orWhereRaw("ozon_data->>'vendor_code' = ?", [$sku])
+                  ->orWhereRaw("yandex_data->>'offerId' = ?", [$sku])
+                  ->orWhereRaw("yandex_data->>'shopSku' = ?", [$sku]);
             });
 
             if ($integrationId) {

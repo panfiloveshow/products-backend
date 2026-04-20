@@ -163,6 +163,8 @@ class AutoSupplyPlanController extends Controller
                 MAX(offer_id) as offer_id,
                 MAX(product_name) as product_name,
                 MAX(barcode) as barcode,
+                MAX(warehouse_id) as warehouse_id,
+                MAX(warehouse_name) as warehouse_name,
                 SUM(qty_rounded) as qty_rounded,
                 SUM(qty_recommended) as qty_recommended,
                 SUM(current_stock) as current_stock,
@@ -263,6 +265,8 @@ class AutoSupplyPlanController extends Controller
                 MAX(offer_id) as offer_id,
                 MAX(product_name) as product_name,
                 MAX(barcode) as barcode,
+                MAX(warehouse_id) as warehouse_id,
+                MAX(warehouse_name) as warehouse_name,
                 SUM(qty_rounded) as qty_rounded,
                 SUM(qty_recommended) as qty_recommended,
                 SUM(current_stock) as current_stock,
@@ -449,7 +453,11 @@ class AutoSupplyPlanController extends Controller
         $integrationId = $integration->id;
 
         $warehouses = \App\Models\InventoryWarehouse::where('integration_id', $integrationId)
-            ->where('marketplace', $integration->marketplace)
+            ->when(
+                in_array($integration->marketplace, ['yandex', 'yandex_market'], true),
+                fn ($q) => $q->whereIn('marketplace', ['yandex', 'yandex_market']),
+                fn ($q) => $q->where('marketplace', $integration->marketplace)
+            )
             ->selectRaw('warehouse_id, warehouse_name, COUNT(DISTINCT sku) as sku_count, SUM(quantity) as total_stock, SUM(sales_30_days) as total_sales_30d, SUM(sales_7_days) as total_sales_7d, AVG(storage_cost_per_day) as avg_storage_cost_daily, SUM(storage_fee_total) as total_storage_fee')
             ->groupBy('warehouse_id', 'warehouse_name')
             ->orderByDesc(\DB::raw('SUM(quantity)'))
@@ -508,6 +516,460 @@ class AutoSupplyPlanController extends Controller
             'message' => 'OK',
             'data' => $result->values(),
         ]);
+    }
+
+    /**
+     * GET /api/auto-supply-plans/{id}/locality-impact
+     * Влияние плана на локальность: before/after доля, экономия, timeline, топ offender-кластеров.
+     */
+    public function localityImpact(Request $request, string $id): JsonResponse
+    {
+        $plan = AutoSupplyPlan::with('integration')->findOrFail($id);
+
+        $access = $this->integrationAccessService
+            ->ensureAccessibleIntegration($request, (int) $plan->integration_id);
+        if (! ($access['success'] ?? false)) {
+            return response()->json([
+                'message' => $access['message'] ?? 'Доступ запрещён',
+            ], $access['status'] ?? 403);
+        }
+
+        if ($plan->marketplace !== 'ozon') {
+            return response()->json([
+                'message' => 'Locality-анализ доступен только для Ozon-планов',
+                'error' => 'not_ozon_plan',
+            ], 422);
+        }
+
+        $summary = $plan->result_json['locality_summary'] ?? null;
+
+        // Fallback: если план не содержит summary (старый план или сбой при расчёте) — строим on-the-fly.
+        if ($summary === null) {
+            try {
+                $enricher = app(\App\Domains\Locality\Integration\LocalityEnrichmentService::class);
+                $summary = $enricher->buildPlanSummary($plan);
+            } catch (\Throwable $e) {
+                return response()->json([
+                    'message' => 'Не удалось построить Locality-анализ',
+                    'error' => $e->getMessage(),
+                ], 500);
+            }
+        }
+
+        // Timeline 28 дней для графика
+        $timeline = \App\Models\LocalityMetricDaily::query()
+            ->where('integration_id', $plan->integration_id)
+            ->where('period_days', 28)
+            ->where('snapshot_date', '>=', now()->subDays(28)->toDateString())
+            ->selectRaw('snapshot_date, SUM(orders_count) AS orders, SUM(local_orders_count) AS local_orders,
+                         SUM(overpayment_amount) AS overpayment')
+            ->groupBy('snapshot_date')
+            ->orderBy('snapshot_date')
+            ->get()
+            ->map(fn ($row) => [
+                'date' => $row->snapshot_date instanceof \Carbon\Carbon
+                    ? $row->snapshot_date->toDateString()
+                    : (string) $row->snapshot_date,
+                'orders' => (int) $row->orders,
+                'local_orders' => (int) $row->local_orders,
+                'overpayment_rub' => (float) $row->overpayment,
+                'local_share_percent' => (int) $row->orders > 0
+                    ? round(((int) $row->local_orders / (int) $row->orders) * 100, 2)
+                    : null,
+            ])
+            ->values()
+            ->all();
+
+        $enricher = app(\App\Domains\Locality\Integration\LocalityEnrichmentService::class);
+        $narrative = $enricher->narrate($summary);
+
+        return response()->json([
+            'message' => 'Success',
+            'data' => [
+                'plan_id' => $plan->id,
+                'summary' => $summary,
+                'narrative' => $narrative,
+                'timeline' => $timeline,
+            ],
+        ]);
+    }
+
+    /**
+     * GET /api/auto-supply-plans/{id}/cluster-split
+     * Группирует split-строки плана по target_cluster_id, выдаёт агрегат per-кластер.
+     */
+    public function clusterSplit(Request $request, string $id): JsonResponse
+    {
+        $plan = AutoSupplyPlan::findOrFail($id);
+        $access = $this->integrationAccessService
+            ->ensureAccessibleIntegration($request, (int) $plan->integration_id);
+        if (! ($access['success'] ?? false)) {
+            return response()->json(['message' => $access['message'] ?? 'Доступ запрещён'], $access['status'] ?? 403);
+        }
+
+        $rows = $plan->lines()
+            ->whereNotNull('cluster_id')
+            ->selectRaw("
+                cluster_id,
+                MAX(cluster_name) AS cluster_name,
+                COUNT(DISTINCT sku) AS sku_count,
+                SUM(qty_rounded) AS total_qty,
+                SUM(expected_savings_rub) AS total_savings,
+                AVG(local_share_percent) AS avg_local_share,
+                MIN(locality_confidence) AS min_confidence
+            ")
+            ->groupBy('cluster_id')
+            ->orderByDesc('total_savings')
+            ->get()
+            ->map(fn ($row) => [
+                'cluster_id' => (string) $row->cluster_id,
+                'cluster_name' => (string) $row->cluster_name,
+                'sku_count' => (int) $row->sku_count,
+                'total_qty' => (int) $row->total_qty,
+                'expected_savings_rub' => round((float) $row->total_savings, 2),
+                'avg_local_share_percent' => $row->avg_local_share !== null
+                    ? round((float) $row->avg_local_share, 2)
+                    : null,
+                'confidence' => (string) ($row->min_confidence ?? 'low'),
+            ])
+            ->values()
+            ->all();
+
+        return response()->json(['message' => 'Success', 'data' => $rows]);
+    }
+
+    /**
+     * GET /api/auto-supply-plans/{id}/locality-recommendations
+     * Список всех активных LocalityRecommendation для SKU из плана, с флагом in_plan.
+     */
+    public function localityRecommendations(Request $request, string $id): JsonResponse
+    {
+        $plan = AutoSupplyPlan::findOrFail($id);
+        $access = $this->integrationAccessService
+            ->ensureAccessibleIntegration($request, (int) $plan->integration_id);
+        if (! ($access['success'] ?? false)) {
+            return response()->json(['message' => $access['message'] ?? 'Доступ запрещён'], $access['status'] ?? 403);
+        }
+
+        $skusInPlan = $plan->lines()->pluck('sku')->unique()->values();
+        $linkedRecIds = collect($plan->lines()
+            ->whereNotNull('linked_locality_recommendation_ids')
+            ->pluck('linked_locality_recommendation_ids')
+            ->all())
+            ->flatMap(function ($raw) {
+                $decoded = is_string($raw) ? json_decode($raw, true) : (is_array($raw) ? $raw : []);
+                return is_array($decoded) ? $decoded : [];
+            })
+            ->unique()
+            ->values()
+            ->all();
+
+        $recs = \App\Models\LocalityRecommendation::query()
+            ->where('integration_id', $plan->integration_id)
+            ->whereIn('sku', $skusInPlan)
+            ->where('state', \App\Models\LocalityRecommendation::STATE_NEW)
+            ->orderByDesc('rank_score')
+            ->get();
+
+        $data = $recs->map(fn ($r) => [
+            'id' => (int) $r->id,
+            'sku' => (string) $r->sku,
+            'target_cluster_id' => $r->target_cluster_id,
+            'target_cluster_name' => (string) $r->target_cluster_name,
+            'recommended_qty_units' => (int) $r->recommended_qty_units,
+            'expected_savings_rub' => (float) $r->expected_savings_rub,
+            'expected_local_share_uplift_pp' => (float) $r->expected_local_share_uplift_pp,
+            'confidence' => (string) $r->confidence,
+            'in_plan' => in_array((int) $r->id, array_map('intval', $linkedRecIds), true),
+        ])->all();
+
+        return response()->json(['message' => 'Success', 'data' => $data]);
+    }
+
+    /**
+     * GET /api/auto-supply-plans/{id}/cluster-draft-preview
+     * Превью: что создастся в Ozon, если нажать «Создать драфты по всем кластерам» (без API-вызова).
+     */
+    public function clusterDraftPreview(Request $request, string $id): JsonResponse
+    {
+        $plan = AutoSupplyPlan::findOrFail($id);
+        $access = $this->integrationAccessService
+            ->ensureAccessibleIntegration($request, (int) $plan->integration_id);
+        if (! ($access['success'] ?? false)) {
+            return response()->json(['message' => $access['message'] ?? 'Доступ запрещён'], $access['status'] ?? 403);
+        }
+
+        $groups = $plan->lines()
+            ->whereNotNull('cluster_id')
+            ->where('is_cluster_split', true)
+            ->orderBy('cluster_id')
+            ->get()
+            ->groupBy('cluster_id')
+            ->map(function ($linesInCluster) {
+                $first = $linesInCluster->first();
+                return [
+                    'cluster_id' => (string) $first->cluster_id,
+                    'cluster_name' => (string) $first->cluster_name,
+                    'items' => $linesInCluster->map(fn ($l) => [
+                        'sku' => (string) $l->sku,
+                        'offer_id' => $l->offer_id,
+                        'product_name' => $l->product_name,
+                        'quantity' => (int) $l->qty_rounded,
+                    ])->values()->all(),
+                    'total_qty' => (int) $linesInCluster->sum('qty_rounded'),
+                    'expected_savings_rub' => round((float) $linesInCluster->sum('expected_savings_rub'), 2),
+                ];
+            })
+            ->values()
+            ->all();
+
+        return response()->json([
+            'message' => 'Success',
+            'data' => [
+                'clusters' => $groups,
+                'total_drafts' => count($groups),
+                'total_qty' => array_sum(array_column($groups, 'total_qty')),
+            ],
+        ]);
+    }
+
+    /**
+     * POST /api/auto-supply-plans/{id}/create-cluster-drafts
+     * Batch: создаёт по одному Ozon FBO-draft на каждый target-кластер плана.
+     */
+    public function createClusterDrafts(Request $request, string $id): JsonResponse
+    {
+        $plan = AutoSupplyPlan::with('integration')->findOrFail($id);
+        $access = $this->integrationAccessService
+            ->ensureAccessibleIntegration($request, (int) $plan->integration_id);
+        if (! ($access['success'] ?? false)) {
+            return response()->json(['message' => $access['message'] ?? 'Доступ запрещён'], $access['status'] ?? 403);
+        }
+
+        if ($plan->marketplace !== 'ozon') {
+            return response()->json(['message' => 'Только для Ozon-планов', 'error' => 'not_ozon'], 422);
+        }
+
+        $groups = $plan->lines()
+            ->whereNotNull('cluster_id')
+            ->where('is_cluster_split', true)
+            ->get()
+            ->groupBy('cluster_id');
+
+        if ($groups->isEmpty()) {
+            return response()->json([
+                'message' => 'У плана нет split-строк с привязкой к кластерам',
+                'error' => 'no_cluster_split',
+            ], 422);
+        }
+
+        $applier = app(\App\Domains\Locality\Recommendation\LocalityDraftApplier::class);
+        $results = ['drafts' => [], 'errors' => []];
+
+        foreach ($groups as $clusterId => $lines) {
+            $items = [];
+            foreach ($lines as $line) {
+                $product = \App\Models\Product::query()
+                    ->where('integration_id', $plan->integration_id)
+                    ->where('sku', $line->sku)
+                    ->first();
+                $ozonSku = $this->resolveOzonSku($product);
+                if ($ozonSku <= 0) {
+                    continue;
+                }
+                $items[] = ['sku' => $ozonSku, 'quantity' => (int) $line->qty_rounded];
+            }
+
+            if (empty($items)) {
+                $results['errors'][] = [
+                    'cluster_id' => (string) $clusterId,
+                    'error' => 'no_items_with_ozon_sku',
+                ];
+                continue;
+            }
+
+            try {
+                $result = $applier->applyBatch($plan->integration, $items, (int) $clusterId);
+                if (($result['success'] ?? false) && ($result['draft_id'] ?? null)) {
+                    $results['drafts'][] = [
+                        'cluster_id' => (string) $clusterId,
+                        'cluster_name' => (string) $lines->first()->cluster_name,
+                        'draft_id' => (string) $result['draft_id'],
+                        'items_count' => count($items),
+                        'total_qty' => array_sum(array_column($items, 'quantity')),
+                    ];
+                } else {
+                    $results['errors'][] = [
+                        'cluster_id' => (string) $clusterId,
+                        'error' => $result['error'] ?? 'unknown',
+                    ];
+                }
+            } catch (\Throwable $e) {
+                $results['errors'][] = [
+                    'cluster_id' => (string) $clusterId,
+                    'error' => $e->getMessage(),
+                ];
+            }
+
+            usleep(1_000_000); // rate-limit между кластерами
+        }
+
+        // Сохраним результат в план для истории
+        $plan->result_json = array_merge($plan->result_json ?? [], ['cluster_drafts' => $results]);
+        $plan->save();
+
+        return response()->json([
+            'message' => sprintf(
+                'Создано %d draft(ов) из %d кластеров',
+                count($results['drafts']),
+                $groups->count()
+            ),
+            'data' => $results,
+        ]);
+    }
+
+    /**
+     * POST /api/auto-supply-plans/from-locality-recommendations
+     * Создаёт новый план, seeded конкретным набором LocalityRecommendation.
+     * Body: { integration_id, recommendation_ids[], base_params?: {mode, horizon_days, ...} }
+     */
+    public function createFromLocalityRecommendations(Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'integration_id' => 'required|integer|exists:integrations,id',
+            'recommendation_ids' => 'required|array|min:1',
+            'recommendation_ids.*' => 'integer',
+            'base_params' => 'nullable|array',
+        ]);
+
+        $access = $this->integrationAccessService
+            ->ensureAccessibleIntegration($request, (int) $validated['integration_id']);
+        if (! ($access['success'] ?? false)) {
+            return response()->json(['message' => $access['message'] ?? 'Доступ запрещён'], $access['status'] ?? 403);
+        }
+
+        /** @var Integration $integration */
+        $integration = $access['integration'];
+        if ($integration->marketplace !== 'ozon') {
+            return response()->json(['message' => 'Только Ozon', 'error' => 'not_ozon'], 422);
+        }
+
+        // Валидируем что все рекомендации принадлежат этой интеграции
+        $recs = \App\Models\LocalityRecommendation::query()
+            ->where('integration_id', $integration->id)
+            ->whereIn('id', $validated['recommendation_ids'])
+            ->get();
+        if ($recs->count() !== count($validated['recommendation_ids'])) {
+            return response()->json([
+                'message' => 'Некоторые recommendation_id не принадлежат этой интеграции',
+                'error' => 'invalid_recommendation_ids',
+            ], 422);
+        }
+
+        $seedSkus = $recs->pluck('sku')->unique()->values()->all();
+        $baseParams = array_merge([
+            'target_days' => 28,
+            'safety_days' => 5,
+            'lead_time_days' => 7,
+            'ewma_alpha' => 0.35,
+            'split_by_cluster' => true,
+            'locality_distribution_strategy' => \App\Domains\Locality\Integration\LocalityEnrichmentService::STRATEGY_RECOMMENDATIONS,
+        ], $request->input('base_params', []));
+
+        $baseParams['source'] = 'locality_recommendations';
+        $baseParams['seed_recommendation_ids'] = $recs->pluck('id')->map(fn ($i) => (int) $i)->all();
+        $baseParams['seed_skus'] = $seedSkus;
+
+        $plan = AutoSupplyPlan::create([
+            'integration_id' => $integration->id,
+            'mp_account_id' => $integration->id,
+            'marketplace' => $integration->marketplace,
+            'status' => AutoSupplyPlan::STATUS_PENDING,
+            'mode' => $request->input('base_params.mode', 'balanced'),
+            'horizon_days' => $baseParams['target_days'] ?? 28,
+            'min_cover_days' => $request->input('base_params.min_cover_days', 7),
+            'target_cover_days' => $baseParams['target_days'] ?? 28,
+            'max_cover_days' => $request->input('base_params.max_cover_days', 42),
+            'safety_stock_days' => $baseParams['safety_days'] ?? 5,
+            'forecast_model' => 'EWMA_0.35',
+            'algorithm_version' => 'asp-1.0.0',
+            'params' => $baseParams,
+        ]);
+
+        CalculateAutoSupplyPlanJob::dispatch($plan->id);
+
+        return response()->json([
+            'message' => sprintf(
+                'План создан на основе %d рекомендаций Locality (%d SKU). Расчёт запущен.',
+                $recs->count(),
+                count($seedSkus)
+            ),
+            'data' => $plan->load('integration'),
+        ], 201);
+    }
+
+    /**
+     * POST /api/auto-supply-plans/preview-split-by-cluster
+     * Live-предпросмотр для CreatePlanDialog: сколько будет split-групп, ожидаемая локальность, экономия.
+     * Body: { integration_id, min_confidence? }
+     */
+    public function previewSplitByCluster(Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'integration_id' => 'required|integer|exists:integrations,id',
+            'min_confidence' => 'nullable|string|in:low,medium,high',
+        ]);
+
+        $access = $this->integrationAccessService
+            ->ensureAccessibleIntegration($request, (int) $validated['integration_id']);
+        if (! ($access['success'] ?? false)) {
+            return response()->json(['message' => $access['message'] ?? 'Доступ запрещён'], $access['status'] ?? 403);
+        }
+
+        $minConfidence = (string) ($validated['min_confidence'] ?? 'medium');
+        $allowed = match ($minConfidence) {
+            'low' => ['low', 'medium', 'high'],
+            'high' => ['high'],
+            default => ['medium', 'high'],
+        };
+
+        $recs = \App\Models\LocalityRecommendation::query()
+            ->where('integration_id', $validated['integration_id'])
+            ->where('state', \App\Models\LocalityRecommendation::STATE_NEW)
+            ->whereIn('confidence', $allowed)
+            ->get();
+
+        $skuCount = $recs->pluck('sku')->unique()->count();
+        $clustersCount = $recs->pluck('target_cluster_id')->filter()->unique()->count();
+        $totalSavings = round((float) $recs->sum('expected_savings_rub'), 2);
+        $avgUpliftPp = $recs->isNotEmpty()
+            ? round((float) $recs->avg('expected_local_share_uplift_pp'), 2)
+            : 0.0;
+
+        return response()->json([
+            'message' => 'Success',
+            'data' => [
+                'recommendations_count' => $recs->count(),
+                'skus_count' => $skuCount,
+                'clusters_count' => $clustersCount,
+                'expected_savings_rub' => $totalSavings,
+                'avg_local_share_uplift_pp' => $avgUpliftPp,
+                'min_confidence_used' => $minConfidence,
+            ],
+        ]);
+    }
+
+    /**
+     * Извлекает ozon_sku (числовой ID) из `products.ozon_data.sku`.
+     */
+    private function resolveOzonSku(?Product $product): int
+    {
+        if ($product === null) {
+            return 0;
+        }
+        $ozonData = is_array($product->ozon_data ?? null) ? $product->ozon_data : [];
+        $sku = $ozonData['sku'] ?? ($ozonData['product_id'] ?? null);
+        return (int) ($sku ?? 0);
     }
 
     /**

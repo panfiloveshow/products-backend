@@ -21,7 +21,8 @@ class SyncUnitEconomicsCommand extends Command
     protected $signature = 'unit-economics:sync 
                             {--integration= : Integration ID to sync}
                             {--marketplace= : Marketplace to sync (wildberries, ozon, yandex)}
-                            {--all : Sync all integrations}';
+                            {--all : Sync all integrations}
+                            {--skip-cache-dispatch : Do not dispatch cache recalculation after syncing}';
 
     protected $description = 'Sync unit economics from real product data';
 
@@ -676,7 +677,6 @@ class SyncUnitEconomicsCommand extends Command
                 // 2. Пробуем Sellico API (сервис-аккаунт)
                 if (empty($yandexToken)) {
                     $sellicoService = new \App\Services\SellicoApiService;
-                    \Illuminate\Support\Facades\Cache::forget("sellico_integration_{$integrationId}");
                     $sellicoResult = $sellicoService->getIntegrationById($integrationId);
 
                     if ($sellicoResult['success'] && ! empty($sellicoResult['credentials'])) {
@@ -694,7 +694,6 @@ class SyncUnitEconomicsCommand extends Command
                         if ($cachedUserToken) {
                             $sellicoService2 = new \App\Services\SellicoApiService;
                             $sellicoService2->setAccessToken($cachedUserToken);
-                            \Illuminate\Support\Facades\Cache::forget("sellico_integration_{$integrationId}");
                             $sellicoResult2 = $sellicoService2->getIntegrationById($integrationId);
 
                             if ($sellicoResult2['success'] && ! empty($sellicoResult2['credentials'])) {
@@ -1005,7 +1004,7 @@ class SyncUnitEconomicsCommand extends Command
         }
 
         // Пересчитываем кэш юнит-экономики после синхронизации
-        if ($synced > 0) {
+        if ($synced > 0 && ! $this->option('skip-cache-dispatch')) {
             $lockKey = "ue_recalculate_{$integrationId}";
             if (Cache::lock($lockKey, 900)->get()) {
                 \App\Jobs\RecalculateUnitEconomicsCacheJob::dispatch($integrationId);
@@ -1013,6 +1012,8 @@ class SyncUnitEconomicsCommand extends Command
             } else {
                 $this->info("  Пересчёт кэша для integration_id={$integrationId} уже выполняется, пропускаем");
             }
+        } elseif ($synced > 0) {
+            $this->info("  Пересчёт кэша для integration_id={$integrationId} будет запущен вызывающим job");
         }
 
         return ['synced' => $synced, 'errors' => $errors];
@@ -1279,16 +1280,45 @@ class SyncUnitEconomicsCommand extends Command
                     : strtoupper($inventory?->fulfillment_type ?? 'FBO');
                 $data['fulfillment_type'] = $fulfillmentType;
 
-                // === ГАБАРИТЫ ИЗ ХАРАКТЕРИСТИК ===
+                // === ГАБАРИТЫ ИЗ ТОВАРА/Ozon DATA/ХАРАКТЕРИСТИК ===
                 $characteristics = $product->characteristics ?? [];
-                $length = $this->extractNumericValue($characteristics['Глубина упаковки'] ?? null) ?? 100; // мм
-                $width = $this->extractNumericValue($characteristics['Ширина упаковки'] ?? null) ?? 100;
-                $height = $this->extractNumericValue($characteristics['Высота упаковки'] ?? null) ?? 100;
-                $weight = $this->extractNumericValue($characteristics['Вес'] ?? $characteristics['Вес товара, г'] ?? null) ?? 500; // г
+                $lengthFromSource = $this->extractNumericValue(
+                    $product->depth
+                        ?? $ozonData['length_mm']
+                        ?? $ozonData['dimensions']['depth']
+                        ?? $this->characteristicValue($characteristics, ['Глубина упаковки', 'Длина упаковки', 'Длина'])
+                );
+                $widthFromSource = $this->extractNumericValue(
+                    $product->width
+                        ?? $ozonData['width_mm']
+                        ?? $ozonData['dimensions']['width']
+                        ?? $this->characteristicValue($characteristics, ['Ширина упаковки', 'Ширина'])
+                );
+                $heightFromSource = $this->extractNumericValue(
+                    $product->height
+                        ?? $ozonData['height_mm']
+                        ?? $ozonData['dimensions']['height']
+                        ?? $this->characteristicValue($characteristics, ['Высота упаковки', 'Высота'])
+                );
+                $weightFromSource = $this->extractNumericValue(
+                    $product->weight
+                        ?? $ozonData['weight_g']
+                        ?? $ozonData['dimensions']['weight']
+                        ?? $this->characteristicValue($characteristics, ['Вес', 'Вес товара, г', 'Вес товара', 'Вес с упаковкой'])
+                );
+
+                $length = $lengthFromSource ?? 100; // мм
+                $width = $widthFromSource ?? 100;
+                $height = $heightFromSource ?? 100;
+                $weight = $weightFromSource ?? 500; // г
 
                 // Объём в литрах (мм³ -> л)
                 $volumeLiters = ($length * $width * $height) / 1000000;
                 $data['volume_liters'] = round($volumeLiters, 2);
+                $data['length_mm'] = $lengthFromSource ? round($lengthFromSource, 2) : null;
+                $data['width_mm'] = $widthFromSource ? round($widthFromSource, 2) : null;
+                $data['height_mm'] = $heightFromSource ? round($heightFromSource, 2) : null;
+                $data['weight_g'] = $weightFromSource ? round($weightFromSource, 0) : null;
 
                 // Объёмный вес (объём / 5)
                 $data['volume_weight'] = round($volumeLiters / 5, 2);
@@ -1577,6 +1607,10 @@ class SyncUnitEconomicsCommand extends Command
                 'commission_amount' => $calculated['commission_amount'] ?? null,
 
                 // Габариты
+                'length_mm' => $calculated['length_mm'] ?? $data['length_mm'] ?? null,
+                'width_mm' => $calculated['width_mm'] ?? $data['width_mm'] ?? null,
+                'height_mm' => $calculated['height_mm'] ?? $data['height_mm'] ?? null,
+                'weight_g' => $calculated['weight_g'] ?? $data['weight_g'] ?? null,
                 'volume_liters' => $calculated['volume_liters'] ?? $data['volume_liters'] ?? null,
                 'volume_weight' => $calculated['volume_weight'] ?? $data['volume_weight'] ?? null,
                 'actual_weight' => $calculated['actual_weight'] ?? $data['actual_weight'] ?? null,
@@ -2069,7 +2103,7 @@ class SyncUnitEconomicsCommand extends Command
                 'weighted_logistics_cost' => $weightedLogisticsCost,
                 'markup_allowed' => $markupAllowed,
                 'markup_rule_reason' => $markupRuleReason,
-                'sales_7_days' => $sales7Days,
+                'sales_7_days' => $stockProfile['total_sales_7_days'] ?? $sellerFboSales7Days,
                 'is_local_sale' => $localityResolved
                     ? ($expectedLocalityRate !== null ? $expectedLocalityRate >= 100.0 : null)
                     : null,
@@ -2440,5 +2474,25 @@ class SyncUnitEconomicsCommand extends Command
         $numeric = str_replace(',', '.', $numeric);
 
         return $numeric !== '' ? (float) $numeric : null;
+    }
+
+    private function characteristicValue(array $characteristics, array $names): mixed
+    {
+        foreach ($characteristics as $key => $characteristic) {
+            if (is_array($characteristic)) {
+                $name = (string) ($characteristic['name'] ?? $key);
+                if (in_array($name, $names, true)) {
+                    return $characteristic['value'] ?? null;
+                }
+
+                continue;
+            }
+
+            if (in_array((string) $key, $names, true)) {
+                return $characteristic;
+            }
+        }
+
+        return null;
     }
 }

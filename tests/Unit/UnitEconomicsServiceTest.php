@@ -37,6 +37,8 @@ class UnitEconomicsServiceTest extends TestCase
         $this->assertArrayHasKey('net_profit', $result);
         $this->assertArrayHasKey('margin_percent', $result);
         $this->assertArrayHasKey('to_settlement_account', $result);
+        $this->assertArrayHasKey('route_key', $result);
+        $this->assertArrayHasKey('price_segment', $result);
         
         $this->assertEquals(1000, $result['revenue']);
         $this->assertGreaterThan(0, $result['total_costs']);
@@ -218,10 +220,9 @@ class UnitEconomicsServiceTest extends TestCase
     }
 
     /**
-     * Тест использования коэффициентов из API Ozon (localization_index)
-     * Проверяет, что коэффициенты из API имеют приоритет над расчётом по таблице
+     * Тест новой Ozon-модели: нелокальная продажа даёт route-based markup
      */
-    public function test_calculate_ozon_with_api_coefficients(): void
+    public function test_calculate_ozon_with_route_markup(): void
     {
         $data = [
             'price' => 1000,
@@ -229,28 +230,39 @@ class UnitEconomicsServiceTest extends TestCase
             'sales_count' => 1,
             'volume_liters' => 1,
             'fulfillment_type' => 'FBO',
-            'commission_percent' => 15,
             'redemption_rate' => 80,
-            'avg_delivery_time_hours' => 38,
-            // Коэффициенты из API Ozon (должны использоваться вместо расчёта по таблице)
-            'localization_index' => 1.55,           // Коэффициент из API
-            'localization_additional_percent' => 2.75, // Доп.% из API
+            'route_key' => 'cluster_far',
         ];
 
         $result = $this->service->calculate('ozon', $data);
 
-        // Проверяем, что используются коэффициенты из API, а не из таблицы
-        $this->assertEquals(1.55, $result['logistics_coefficient']);
-        $this->assertEquals(2.75, $result['additional_commission_percent']);
-        
-        // Доп. комиссия = 1000 * 2.75% = 27.5
-        $this->assertEquals(27.5, $result['additional_commission_amount']);
+        $this->assertSame('cluster_far', $result['route_key']);
+        $this->assertSame(false, $result['is_local_sale']);
+        $this->assertEquals(8.0, $result['non_local_markup_percent']);
+        $this->assertEquals(80.0, $result['non_local_markup_amount']);
     }
 
     /**
-     * Тест fallback на таблицу коэффициентов когда API данные отсутствуют
+     * Тест новой Ozon-модели: price segment выбирается автоматически
      */
-    public function test_calculate_ozon_fallback_to_table_coefficients(): void
+    public function test_calculate_ozon_resolves_price_segment(): void
+    {
+        $data = [
+            'price' => 250,
+            'cost_price' => 300,
+            'sales_count' => 1,
+            'volume_liters' => 1,
+            'fulfillment_type' => 'FBO',
+            'redemption_rate' => 80,
+        ];
+
+        $result = $this->service->calculate('ozon', $data);
+
+        $this->assertSame('100.01-300', $result['price_segment']);
+        $this->assertArrayHasKey('sales_fee_percent', $result);
+    }
+
+    public function test_calculate_ozon_uses_category_name_for_commission_matrix(): void
     {
         $data = [
             'price' => 1000,
@@ -258,16 +270,32 @@ class UnitEconomicsServiceTest extends TestCase
             'sales_count' => 1,
             'volume_liters' => 1,
             'fulfillment_type' => 'FBO',
-            'commission_percent' => 15,
-            'redemption_rate' => 80,
-            'avg_delivery_time_hours' => 38,
-            // НЕ передаём localization_index — должен использоваться расчёт по таблице
+            'category_id' => 12345,
+            'category_name' => 'Электроника',
         ];
 
         $result = $this->service->calculate('ozon', $data);
 
-        // Для 38 часов по таблице: коэффициент 1.44, доп.% 2.2
-        $this->assertEquals(1.44, $result['logistics_coefficient']);
-        $this->assertEquals(2.2, $result['additional_commission_percent']);
+        $this->assertSame(9.0, $result['sales_fee_percent']);
+        $this->assertSame(9.0, $result['commission_percent']);
+    }
+
+    public function test_calculate_ozon_uses_volume_weight_for_logistics_bucket(): void
+    {
+        $data = [
+            'price' => 250,
+            'cost_price' => 100,
+            'sales_count' => 1,
+            'volume_liters' => 1,
+            'volume_weight' => 0.4,
+            'fulfillment_type' => 'FBO',
+            'shipping_cluster_name' => 'Воронеж',
+            'destination_cluster_name' => 'Воронеж',
+        ];
+
+        $result = $this->service->calculate('ozon', $data);
+
+        $this->assertSame(2.0, $result['chargeable_volume_liters']);
+        $this->assertSame(29.48, $result['base_logistics_cost']);
     }
 }
