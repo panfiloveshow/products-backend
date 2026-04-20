@@ -20,11 +20,11 @@ class CalculationInput
         
         // Габариты
         public readonly float $length = 0,       // см
-        public readonly float $width = 0,        // см  
+        public readonly float $width = 0,        // см
         public readonly float $height = 0,       // см
         public readonly float $weight = 0,       // кг
-        public readonly ?float $volumeWeight = null, // Объёмный вес, кг
-        
+        public readonly ?float $volumeWeight = null, // Объёмный вес, кг (для Ozon = volume_liters / 5)
+
         // Себестоимость
         public readonly ?float $costPrice = null,
         public readonly ?float $packagingCost = null,
@@ -125,7 +125,8 @@ class CalculationInput
      * Получить тарифицируемый объём в литрах.
      *
      * В Ozon volume_weight хранится в кг и исторически считается как volume_liters / 5.
-     * Для тарифной матрицы приводим его обратно к литрам и берём более консервативное значение.
+     * Для тарифной матрицы приводим его обратно к литрам и берём более консервативное
+     * значение — max(габариты в литрах, volume_weight × 5).
      */
     public function getChargeableVolumeInLiters(): float
     {

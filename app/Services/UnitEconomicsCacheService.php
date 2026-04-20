@@ -288,7 +288,16 @@ class UnitEconomicsCacheService
             ?? $existingUE?->commission_percent
             ?? 15;
 
-        $defaultRedemptionRate = $marketplace === 'wildberries' ? 80 : 100;
+        // Дефолты по маркетплейсам — среднерыночные показатели, используются
+        // только если нет данных ни из API, ни из ручного override. Раньше для Ozon
+        // стоял 100% — это завышало маржу у новых интеграций и для товаров,
+        // которых нет в выгрузке Ozon Analytics (non-Premium / свежие SKU).
+        $defaultRedemptionRate = match ($marketplace) {
+            'wildberries' => 80,
+            'ozon' => 85,
+            'yandex', 'yandex_market' => 90,
+            default => 90,
+        };
         $redemptionRate = $settings?->redemption_rate_override
             ?? $existingUE?->redemption_rate
             ?? $redemption['redemption_rate']

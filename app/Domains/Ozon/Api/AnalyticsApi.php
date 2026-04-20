@@ -122,14 +122,15 @@ class AnalyticsApi
                 $returns = (int)($row['metrics'][2] ?? 0);
                 $cancellations = (int)($row['metrics'][3] ?? 0);
 
-                // % выкупа = (ordered - cancellations) / ordered * 100
-                // Используем cancellations, т.к. это отмены за период (более точно чем delivered)
-                // delivered может быть > ordered из-за переносов между периодами
+                // % выкупа = (ordered − cancellations − returns) / ordered × 100
+                // Ozon в своём отчёте «redemptions_report» считает ровно так же —
+                // вычитает и отмены, и возвраты (колонка N «Сумма отмен и возвратов»).
+                // Раньше код учитывал только cancellations — из-за этого наш выкуп
+                // был завышен на ~процент возвратов (для одежды/обуви это 10–15%).
                 $redemptionRate = 100;
                 if ($ordered > 0) {
-                    // Основная формула: (заказано - отменено) / заказано
-                    $notCancelled = max(0, $ordered - $cancellations);
-                    $redemptionRate = round(($notCancelled / $ordered) * 100, 2);
+                    $notRedeemed = min($ordered, max(0, $cancellations) + max(0, $returns));
+                    $redemptionRate = round((($ordered - $notRedeemed) / $ordered) * 100, 2);
                 }
 
                 $data = [
