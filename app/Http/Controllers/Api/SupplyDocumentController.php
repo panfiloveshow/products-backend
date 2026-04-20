@@ -3,6 +3,7 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
+use App\Models\Integration;
 use App\Models\Supply;
 use App\Models\SupplyPackage;
 use App\Models\SupplyDocument;
@@ -151,6 +152,7 @@ class SupplyDocumentController extends Controller
             ]);
 
             $this->pushSupplyActivity(
+                $request,
                 $supply,
                 'supply_package_label_generated',
                 'Сгенерирована этикетка грузоместа',
@@ -261,6 +263,7 @@ class SupplyDocumentController extends Controller
         ]);
 
         $this->pushSupplyActivity(
+            $request,
             $supply,
             'supply_labels_bulk_generated',
             'Массовая генерация этикеток',
@@ -288,7 +291,7 @@ class SupplyDocumentController extends Controller
      * Сгенерировать упаковочный лист
      * POST /api/supplies/{supplyId}/documents/packing-list
      */
-    public function generatePackingList(int $supplyId): JsonResponse
+    public function generatePackingList(Request $request, int $supplyId): JsonResponse
     {
         $supply = Supply::with(['items', 'packages.items', 'integration'])->findOrFail($supplyId);
 
@@ -309,6 +312,7 @@ class SupplyDocumentController extends Controller
             $this->logEvent($supply, SupplyEvent::TYPE_DOCUMENT_GENERATED, 'Сгенерирован упаковочный лист');
 
             $this->pushSupplyActivity(
+                $request,
                 $supply,
                 'supply_packing_list_generated',
                 'Сгенерирован упаковочный лист',
@@ -589,21 +593,38 @@ HTML;
 
     /**
      * Отправка activity в PlaceSales API с привязкой к workspace через integration поставки.
+     * Использует user-токен из текущего HTTP-запроса (service token для activities не годится).
      *
      * @param  array<string, mixed>  $meta
      */
-    private function pushSupplyActivity(Supply $supply, string $action, string $title, ?string $description, array $meta): void
+    private function pushSupplyActivity(Request $request, Supply $supply, string $action, string $title, ?string $description, array $meta): void
     {
         if (! $supply->integration_id) {
             return;
         }
 
-        ActivityLogger::forIntegration(
-            (int) $supply->integration_id,
+        $workspaceId = (int) (Integration::where('id', $supply->integration_id)->value('work_space_id') ?? 0);
+        if ($workspaceId <= 0) {
+            return;
+        }
+
+        $token = $request->bearerToken()
+            ?? $request->header('X-Sellico-Token')
+            ?? $request->header('X-Token');
+
+        if (! is_string($token) || $token === '') {
+            return;
+        }
+
+        $meta = array_merge(['integration_id' => (int) $supply->integration_id], $meta);
+
+        ActivityLogger::forWorkspace(
+            $workspaceId,
             $action,
             $title,
             $description,
             $meta,
+            $token,
         );
     }
 

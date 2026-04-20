@@ -63,6 +63,9 @@ class SyncSalesJob implements ShouldQueue
     {
         $marketplace   = $syncLog->marketplace;
         $integrationId = $syncLog->integration_id;
+        // User-токен сохранён в credentials предыдущего sync'а (IntegrationController::sync).
+        // Если его нет (например, cron AutoSync) — activity не отправляем.
+        $userToken     = $syncLog->credentials['_sellico_token'] ?? null;
 
         try {
             $integration = Integration::find($integrationId);
@@ -74,7 +77,7 @@ class SyncSalesJob implements ShouldQueue
 
         // Для Ozon: разбивка продаж по складам через /v1/analytics/data (dimension: sku + warehouse_id)
         if ($marketplace === 'ozon' && method_exists($service, 'getSalesBySkuAndWarehouse')) {
-            $this->syncOzonSalesByWarehouse($service, $integrationId);
+            $this->syncOzonSalesByWarehouse($service, $integrationId, $userToken);
             return;
         }
 
@@ -168,7 +171,8 @@ class SyncSalesJob implements ShouldQueue
                     'sync_type' => 'sales',
                     'updated_products' => $updatedProducts,
                     'updated_warehouses' => $updatedWarehouses,
-                ]
+                ],
+                $userToken,
             );
         }
     }
@@ -176,7 +180,7 @@ class SyncSalesJob implements ShouldQueue
     /**
      * Синхронизация продаж Ozon: FBO + FBS по складам.
      */
-    private function syncOzonSalesByWarehouse($service, int $integrationId): void
+    private function syncOzonSalesByWarehouse($service, int $integrationId, ?string $userToken = null): void
     {
         $fboSales = method_exists($service, 'getSalesBySkuAndWarehouse')
             ? $service->getSalesBySkuAndWarehouse(28)
@@ -227,7 +231,8 @@ class SyncSalesJob implements ShouldQueue
                 'sync_type' => 'sales',
                 'updated_products' => $updatedProducts,
                 'updated_warehouses' => $updatedWarehouses,
-            ]
+            ],
+            $userToken,
         );
     }
 

@@ -58,7 +58,10 @@ class ActivityLogger
      * Отправить активность, вычислив workspace_id по integration_id
      * (Integration->work_space_id).
      *
-     * Используется из фоновых job'ов, где нет HTTP-контекста с авторизованным пользователем.
+     * Используется из фоновых job'ов. ОБЯЗАТЕЛЬНО передавать $userToken —
+     * это токен пользователя, инициировавшего синхронизацию (живёт в
+     * SyncLog.credentials['_sellico_token']). Без user-токена activity
+     * не отправится (service token для activities не используется).
      *
      * @param  array<string, mixed>  $meta
      */
@@ -68,7 +71,17 @@ class ActivityLogger
         string $title,
         ?string $description = null,
         array $meta = [],
+        ?string $userToken = null,
     ): void {
+        if (! $userToken) {
+            Log::info('ActivityLogger: нет user-токена, activity пропущена', [
+                'integration_id' => $integrationId,
+                'action' => $action,
+            ]);
+
+            return;
+        }
+
         $workspaceId = (int) (Integration::where('id', $integrationId)->value('work_space_id') ?? 0);
 
         if ($workspaceId <= 0) {
@@ -84,7 +97,7 @@ class ActivityLogger
             'integration_id' => $integrationId,
         ], $meta);
 
-        self::forWorkspace($workspaceId, $action, $title, $description, $meta);
+        self::forWorkspace($workspaceId, $action, $title, $description, $meta, $userToken);
     }
 
     /**
@@ -118,7 +131,16 @@ class ActivityLogger
             return;
         }
 
-        self::forWorkspace($workspaceId, $action, $title, $description, $meta, is_string($token) ? $token : null);
+        if (! is_string($token) || $token === '') {
+            Log::info('ActivityLogger: нет user-токена в request, activity пропущена', [
+                'action' => $action,
+                'workspace_id' => $workspaceId,
+            ]);
+
+            return;
+        }
+
+        self::forWorkspace($workspaceId, $action, $title, $description, $meta, $token);
     }
 
     private static function extractWorkspaceFromRequest(Request $request): int

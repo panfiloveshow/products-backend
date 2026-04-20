@@ -597,15 +597,19 @@ class SellicoApiService
      *
      * POST /workspaces/{workspace}/activities
      *
-     * Предпочитаемый путь: пользовательский токен (activity привязывается к реальному user_id).
-     * Fallback: сервисный токен (activity будет привязана к service-account user_id).
+     * ТРЕБУЕТСЯ пользовательский токен. Service-account токен НЕ подходит —
+     * activity должна быть привязана к реальному user_id в PlaceSales.
+     * Service token не используется как fallback: лучше не отправить activity,
+     * чем отправить её от имени service-account и исказить аудит в CRM.
      *
      * @param  int                 $workspaceId  ID рабочего пространства PlaceSales.
      * @param  string              $action       Machine-readable ключ события (`products_sync_started`, `integration_created`, ...).
      * @param  string              $title        Человекочитаемый заголовок.
      * @param  string|null         $description  Доп. описание.
      * @param  array<string,mixed> $meta         Произвольные метаданные (entity_type, entity_id, counters).
-     * @param  string|null         $token        Явно переданный токен. Если null — используется user/service cascade.
+     * @param  string|null         $token        Пользовательский токен. Если null — берётся из текущей сессии
+     *                                           ($this->accessToken или cache 'sellico_user_access_token').
+     *                                           Если user-токен не найден — activity НЕ отправляется.
      */
     public function sendActivity(
         int $workspaceId,
@@ -622,12 +626,18 @@ class SellicoApiService
             ];
         }
 
-        $token = $token ?? $this->accessToken ?? Cache::get('sellico_user_access_token') ?? $this->getServiceToken();
+        $token = $token ?? $this->accessToken ?? Cache::get('sellico_user_access_token');
 
         if (! $token) {
+            Log::info('Sellico sendActivity skipped: нет пользовательского токена', [
+                'workspace_id' => $workspaceId,
+                'action' => $action,
+            ]);
+
             return [
                 'success' => false,
-                'error' => 'Не авторизован в Sellico API (нет ни user, ни service токена)',
+                'error' => 'Не передан пользовательский токен (service token для activities не используется)',
+                'skipped' => true,
             ];
         }
 

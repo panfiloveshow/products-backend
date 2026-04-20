@@ -60,6 +60,10 @@ class SyncProductsJob implements ShouldBeUnique, ShouldQueue
     {
         $this->syncLog->start();
 
+        // User-токен прокидывается в credentials при старте sync (IntegrationController::sync).
+        // Activities отправляются только если есть user-токен — service token не используется.
+        $userToken = $this->syncLog->credentials['_sellico_token'] ?? null;
+
         // Обновляем статус на интеграции
         if ($this->syncLog->integration_id) {
             \App\Models\Integration::where('id', $this->syncLog->integration_id)
@@ -75,7 +79,8 @@ class SyncProductsJob implements ShouldBeUnique, ShouldQueue
                     'entity_id' => $this->syncLog->id,
                     'marketplace' => $this->syncLog->marketplace,
                     'sync_type' => 'products',
-                ]
+                ],
+                $userToken,
             );
         }
 
@@ -223,7 +228,8 @@ class SyncProductsJob implements ShouldBeUnique, ShouldQueue
                         'updated' => $updated,
                         'pruned' => $pruned,
                         'failed' => $failed,
-                    ]
+                    ],
+                    $userToken,
                 );
             }
 
@@ -298,7 +304,8 @@ class SyncProductsJob implements ShouldBeUnique, ShouldQueue
                         'marketplace' => $this->syncLog->marketplace,
                         'sync_type' => 'products',
                         'error' => substr($e->getMessage(), 0, 500),
-                    ]
+                    ],
+                    $userToken,
                 );
             }
 

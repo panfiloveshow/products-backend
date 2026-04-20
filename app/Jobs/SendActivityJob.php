@@ -58,13 +58,15 @@ class SendActivityJob implements ShouldQueue
         if (! ($result['success'] ?? false)) {
             $status = $result['status'] ?? null;
 
+            // skipped=true — отсутствует user-токен, ретраить бесполезно.
             // 401/403 — токен невалиден или не имеет прав, повтор не поможет.
             // 422 — невалидный payload, тоже бессмысленно ретраить.
-            if (in_array($status, [401, 403, 422], true)) {
-                Log::warning('SendActivityJob: non-retryable error, skipping retries', [
+            if (($result['skipped'] ?? false) || in_array($status, [401, 403, 422], true)) {
+                Log::warning('SendActivityJob: non-retryable, skipping retries', [
                     'workspace_id' => $this->workspaceId,
                     'action' => $this->action,
                     'status' => $status,
+                    'skipped' => $result['skipped'] ?? false,
                     'error' => $result['error'] ?? null,
                 ]);
 
