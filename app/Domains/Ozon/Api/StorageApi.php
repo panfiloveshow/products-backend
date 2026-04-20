@@ -406,20 +406,31 @@ class StorageApi
     private function downloadAndParsePlacementReport(string $fileUrl): array
     {
         try {
+            // SSRF guard: URL приходит от Ozon API, но безопаснее явно
+            // разрешить только https://*.ozon.ru / ozon.ru — иначе ошибка.
+            if (! $this->isAllowedOzonReportUrl($fileUrl)) {
+                Log::warning('Ozon placement report: URL не прошёл allow-list', [
+                    'host' => parse_url($fileUrl, PHP_URL_HOST),
+                ]);
+                return [];
+            }
+
             $tempFile = '/tmp/ozon_placement_' . md5($fileUrl) . '.xlsx';
             $context = stream_context_create([
                 'http' => [
                     'timeout' => 30,
                     'ignore_errors' => true,
+                    'follow_location' => 0, // не следовать редиректам — защита от SSRF-rebind
+                    'max_redirects' => 0,
                 ],
             ]);
             $content = file_get_contents($fileUrl, false, $context);
-            
+
             if (!$content) {
                 Log::warning('Ozon placement report: empty file');
                 return [];
             }
-            
+
             file_put_contents($tempFile, $content);
             
             $reader = new \PhpOffice\PhpSpreadsheet\Reader\Xlsx();
@@ -640,5 +651,25 @@ class StorageApi
             Log::error('Ozon getStorageTotalFromCashFlow error', ['error' => $e->getMessage()]);
             return [];
         }
+    }
+
+    /**
+     * Разрешаем скачивать отчёты только с *.ozon.ru / ozon.ru по https.
+     * Закрывает SSRF-вектор при компрометации Ozon API (например, MITM
+     * или подмена response): злоумышленник не сможет заставить бэкенд
+     * скачать файл с произвольного URL.
+     */
+    private function isAllowedOzonReportUrl(string $url): bool
+    {
+        $parts = parse_url($url);
+        if (! $parts || ($parts['scheme'] ?? '') !== 'https' || empty($parts['host'])) {
+            return false;
+        }
+
+        $host = strtolower($parts['host']);
+
+        return $host === 'ozon.ru'
+            || str_ends_with($host, '.ozon.ru')
+            || str_ends_with($host, '.ozon.cloud');
     }
 }

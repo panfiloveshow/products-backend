@@ -424,10 +424,17 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
                 : ($sales30 > 0 ? $sales30 / 30 : 0);
 
             if ($avg30 > 0 && $sales14 > 0) {
-                $avg8_14 = ($sales14 - $sales7) / 7;
+                // Fix H11: возвраты и корректировки могут сделать sales14<sales7
+                // или sales30<sales14 → avg_*_Avg становится отрицательным, и
+                // salesTrendPercent улетал в +-1000%+. Клампим к [-100..+100] чтобы
+                // тренд не уводил priority-score в крайности.
+                $avg8_14 = max(0, ($sales14 - $sales7) / 7);
                 $shortTrend = $avg8_14 > 0 ? (($avg7 - $avg8_14) / $avg8_14) * 100 : 0;
-                $older16Avg = ($sales30 - $sales14) / 16;
+                $older16Avg = max(0, ($sales30 - $sales14) / 16);
                 $midTrend = $older16Avg > 0 ? (($avg14 - $older16Avg) / $older16Avg) * 100 : 0;
+
+                $shortTrend = max(-100.0, min(100.0, $shortTrend));
+                $midTrend = max(-100.0, min(100.0, $midTrend));
                 $salesTrendPercent = round($shortTrend * 0.6 + $midTrend * 0.4, 2);
 
                 if ($salesTrendPercent > 10) $salesTrend = 'growing';

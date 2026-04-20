@@ -192,32 +192,55 @@ class InventoryService
 
     public function getInventoryStats(array $filters = []): array
     {
-        $query = Product::whereHas('inventoryWarehouses');
-
-        if (! empty($filters['marketplace']) && $filters['marketplace'] !== 'all') {
-            $mp = strtolower((string) $filters['marketplace']);
-            $query->whereHas('inventoryWarehouses', function ($q) use ($mp) {
+        // Fix M3: раньше фильтр marketplace применялся только к total_products,
+        // а total_marketplace_stock / low_stock / out_of_stock / internal_stock
+        // считались по всем интеграциям системы. Пользователи видели
+        // противоречивые цифры: "товаров 50" но "остатков 100000 шт" из чужих магазинов.
+        $marketplaceFilter = function ($q) use ($filters) {
+            if (! empty($filters['marketplace']) && $filters['marketplace'] !== 'all') {
+                $mp = strtolower((string) $filters['marketplace']);
                 if (in_array($mp, ['yandex', 'yandex_market'], true)) {
                     $q->whereIn('marketplace', ['yandex', 'yandex_market']);
                 } else {
                     $q->where('marketplace', $mp);
                 }
-            });
+            }
+            if (! empty($filters['integration_id'])) {
+                $q->where('integration_id', $filters['integration_id']);
+            }
+        };
+
+        $productQuery = Product::whereHas('inventoryWarehouses', $marketplaceFilter);
+        $totalProducts = $productQuery->count();
+
+        // Product::stock — внутренний, не marketplace-specific. Если фильтр задан —
+        // считаем только продукты, затронутые фильтром (через products с нужным
+        // marketplace/integration). Иначе суммируем всё.
+        $internalStockQuery = Product::query();
+        if (! empty($filters['marketplace']) && $filters['marketplace'] !== 'all') {
+            $mp = strtolower((string) $filters['marketplace']);
+            if (in_array($mp, ['yandex', 'yandex_market'], true)) {
+                $internalStockQuery->whereIn('marketplace', ['yandex', 'yandex_market']);
+            } else {
+                $internalStockQuery->where('marketplace', $mp);
+            }
         }
+        if (! empty($filters['integration_id'])) {
+            $internalStockQuery->where('integration_id', $filters['integration_id']);
+        }
+        $totalInternalStock = (int) $internalStockQuery->sum('stock');
 
-        $totalProducts = $query->count();
-        $totalInternalStock = Product::sum('stock');
+        $totalMarketplaceStock = (int) InventoryWarehouse::query()
+            ->where($marketplaceFilter)
+            ->sum('quantity');
 
-        // Суммируем quantity по каждому уникальному SKU+warehouse_id (не по всей таблице)
-        // чтобы избежать задвоения если одна запись дублируется
-        $totalMarketplaceStock = InventoryWarehouse::selectRaw('SUM(quantity) as total')
-            ->value('total') ?? 0;
-
-        $lowStockProducts = Product::whereHas('inventoryWarehouses', function ($q) {
+        $lowStockProducts = Product::whereHas('inventoryWarehouses', function ($q) use ($marketplaceFilter) {
+            $marketplaceFilter($q);
             $q->lowStock();
         })->count();
 
-        $outOfStockProducts = Product::whereHas('inventoryWarehouses', function ($q) {
+        $outOfStockProducts = Product::whereHas('inventoryWarehouses', function ($q) use ($marketplaceFilter) {
+            $marketplaceFilter($q);
             $q->outOfStock();
         })->count();
 

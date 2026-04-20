@@ -311,7 +311,11 @@ class SupplyDocumentController extends Controller
         $directory = "supply_documents/{$supply->id}/labels";
         Storage::makeDirectory($directory);
 
-        $filename = "{$directory}/label_{$package->barcode}.{$format}";
+        // Защита от path-traversal: barcode приходит от маркетплейса/пользователя
+        // и теоретически может содержать «../», backslash, null-byte. Используем
+        // slug как имя файла, оригинал barcode остаётся в БД (package->barcode).
+        $safeBarcode = $this->safeFilenameFragment($package->barcode ?? (string) $package->id);
+        $filename = "{$directory}/label_{$safeBarcode}.{$format}";
 
         if ($format === 'pdf') {
             $html = $this->renderLabelHtml($data);
@@ -416,7 +420,9 @@ ZPL;
     {
         $directory = "supply_documents/{$supply->id}";
         Storage::makeDirectory($directory);
-        $filename = "{$directory}/packing_list_{$supply->crm_number}.pdf";
+        // crm_number теоретически приходит от маркетплейса/Sellico — slug защищает от path-traversal.
+        $safeCrmNumber = $this->safeFilenameFragment($supply->crm_number ?? (string) $supply->id);
+        $filename = "{$directory}/packing_list_{$safeCrmNumber}.pdf";
 
         $packagesHtml = '';
         foreach ($supply->packages as $package) {
@@ -538,5 +544,17 @@ HTML;
             'ip_address' => request()->ip(),
             'created_at' => now(),
         ]);
+    }
+
+    /**
+     * Безопасный фрагмент имени файла — только a-z, 0-9, "-" и "_".
+     * Гарантирует, что barcode / crm_number из внешнего источника не сможет
+     * попасть в path через «../», backslash, null-byte или unicode-сепараторы.
+     */
+    private function safeFilenameFragment(string $value): string
+    {
+        $value = preg_replace('/[^A-Za-z0-9_-]+/', '_', $value) ?? '';
+        $value = trim($value, '_-');
+        return $value !== '' ? substr($value, 0, 64) : 'unknown';
     }
 }
