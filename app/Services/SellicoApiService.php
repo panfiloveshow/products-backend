@@ -593,6 +593,97 @@ class SellicoApiService
     }
 
     /**
+     * Отправить активность пользователя в PlaceSales API.
+     *
+     * POST /workspaces/{workspace}/activities
+     *
+     * Предпочитаемый путь: пользовательский токен (activity привязывается к реальному user_id).
+     * Fallback: сервисный токен (activity будет привязана к service-account user_id).
+     *
+     * @param  int                 $workspaceId  ID рабочего пространства PlaceSales.
+     * @param  string              $action       Machine-readable ключ события (`products_sync_started`, `integration_created`, ...).
+     * @param  string              $title        Человекочитаемый заголовок.
+     * @param  string|null         $description  Доп. описание.
+     * @param  array<string,mixed> $meta         Произвольные метаданные (entity_type, entity_id, counters).
+     * @param  string|null         $token        Явно переданный токен. Если null — используется user/service cascade.
+     */
+    public function sendActivity(
+        int $workspaceId,
+        string $action,
+        string $title,
+        ?string $description = null,
+        array $meta = [],
+        ?string $token = null
+    ): array {
+        if ($workspaceId <= 0) {
+            return [
+                'success' => false,
+                'error' => 'workspace_id обязателен для отправки активности',
+            ];
+        }
+
+        $token = $token ?? $this->accessToken ?? Cache::get('sellico_user_access_token') ?? $this->getServiceToken();
+
+        if (! $token) {
+            return [
+                'success' => false,
+                'error' => 'Не авторизован в Sellico API (нет ни user, ни service токена)',
+            ];
+        }
+
+        $payload = [
+            'action' => $action,
+            'title' => $title,
+        ];
+
+        if ($description !== null && $description !== '') {
+            $payload['description'] = $description;
+        }
+
+        if ($meta !== []) {
+            $payload['meta'] = $meta;
+        }
+
+        try {
+            $response = Http::timeout(8)
+                ->withToken($token)
+                ->acceptJson()
+                ->post("{$this->baseUrl}/workspaces/{$workspaceId}/activities", $payload);
+
+            if ($response->successful()) {
+                return [
+                    'success' => true,
+                    'activity' => $response->json(),
+                ];
+            }
+
+            Log::warning('Sellico sendActivity failed', [
+                'workspace_id' => $workspaceId,
+                'action' => $action,
+                'status' => $response->status(),
+                'body' => substr($response->body(), 0, 300),
+            ]);
+
+            return [
+                'success' => false,
+                'error' => $response->json('message', "HTTP {$response->status()}"),
+                'status' => $response->status(),
+            ];
+        } catch (\Exception $e) {
+            Log::error('Sellico sendActivity exception', [
+                'workspace_id' => $workspaceId,
+                'action' => $action,
+                'error' => $e->getMessage(),
+            ]);
+
+            return [
+                'success' => false,
+                'error' => $e->getMessage(),
+            ];
+        }
+    }
+
+    /**
      * Получить список товаров (SKU) интеграции из Sellico
      */
     public function getIntegrationProducts(int $integrationId): array

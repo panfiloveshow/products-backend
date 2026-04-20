@@ -9,6 +9,7 @@ use App\Models\UnitEconomicsCache;
 use App\Models\InventoryWarehouse;
 use App\Services\InventoryService;
 use App\Services\Marketplace\MarketplaceFactory;
+use App\Support\ActivityLogger;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldBeUnique;
 use Illuminate\Contracts\Queue\ShouldQueue;
@@ -63,6 +64,19 @@ class SyncProductsJob implements ShouldBeUnique, ShouldQueue
         if ($this->syncLog->integration_id) {
             \App\Models\Integration::where('id', $this->syncLog->integration_id)
                 ->update(['last_sync_status' => 'running', 'last_sync_at' => now()]);
+
+            ActivityLogger::forIntegration(
+                (int) $this->syncLog->integration_id,
+                'products_sync_started',
+                'Запущена синхронизация товаров',
+                "Маркетплейс: {$this->syncLog->marketplace}",
+                [
+                    'entity_type' => 'sync_log',
+                    'entity_id' => $this->syncLog->id,
+                    'marketplace' => $this->syncLog->marketplace,
+                    'sync_type' => 'products',
+                ]
+            );
         }
 
         try {
@@ -193,6 +207,24 @@ class SyncProductsJob implements ShouldBeUnique, ShouldQueue
             if ($this->syncLog->integration_id) {
                 \App\Models\Integration::where('id', $this->syncLog->integration_id)
                     ->update(['last_sync_status' => 'completed', 'last_sync_at' => now(), 'last_sync_error' => null]);
+
+                ActivityLogger::forIntegration(
+                    (int) $this->syncLog->integration_id,
+                    'products_sync_completed',
+                    'Синхронизация товаров завершена',
+                    "Обработано {$synced} товаров (создано {$created}, обновлено {$updated})",
+                    [
+                        'entity_type' => 'sync_log',
+                        'entity_id' => $this->syncLog->id,
+                        'marketplace' => $this->syncLog->marketplace,
+                        'sync_type' => 'products',
+                        'synced' => $synced,
+                        'created' => $created,
+                        'updated' => $updated,
+                        'pruned' => $pruned,
+                        'failed' => $failed,
+                    ]
+                );
             }
 
             Log::info('Products sync completed', [
@@ -237,6 +269,20 @@ class SyncProductsJob implements ShouldBeUnique, ShouldQueue
             if ($this->syncLog->integration_id) {
                 \App\Models\Integration::where('id', $this->syncLog->integration_id)
                     ->update(['last_sync_status' => 'failed', 'last_sync_error' => substr($e->getMessage(), 0, 500)]);
+
+                ActivityLogger::forIntegration(
+                    (int) $this->syncLog->integration_id,
+                    'products_sync_failed',
+                    'Ошибка синхронизации товаров',
+                    substr($e->getMessage(), 0, 300),
+                    [
+                        'entity_type' => 'sync_log',
+                        'entity_id' => $this->syncLog->id,
+                        'marketplace' => $this->syncLog->marketplace,
+                        'sync_type' => 'products',
+                        'error' => substr($e->getMessage(), 0, 500),
+                    ]
+                );
             }
 
             Log::error('Products sync failed', [

@@ -7,6 +7,7 @@ use App\Models\Supply;
 use App\Models\SupplyPackage;
 use App\Models\SupplyDocument;
 use App\Models\SupplyEvent;
+use App\Support\ActivityLogger;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Storage;
@@ -149,6 +150,20 @@ class SupplyDocumentController extends Controller
                 'format' => $format,
             ]);
 
+            $this->pushSupplyActivity(
+                $supply,
+                'supply_package_label_generated',
+                'Сгенерирована этикетка грузоместа',
+                "Грузоместо #{$package->sequence_number} ({$package->barcode}), формат {$format}",
+                [
+                    'entity_type' => 'supply_package',
+                    'entity_id' => $package->id,
+                    'supply_id' => $supply->id,
+                    'barcode' => $package->barcode,
+                    'format' => $format,
+                ]
+            );
+
             return response()->json([
                 'success' => true,
                 'data' => $this->formatDocument($document->fresh()),
@@ -245,6 +260,20 @@ class SupplyDocumentController extends Controller
             'errors_count' => count($errors),
         ]);
 
+        $this->pushSupplyActivity(
+            $supply,
+            'supply_labels_bulk_generated',
+            'Массовая генерация этикеток',
+            'Сгенерировано '.count($generated).' из '.$packages->count().' этикеток',
+            [
+                'entity_type' => 'supply',
+                'entity_id' => $supply->id,
+                'generated_count' => count($generated),
+                'errors_count' => count($errors),
+                'format' => $format,
+            ]
+        );
+
         return response()->json([
             'success' => true,
             'data' => [
@@ -278,6 +307,18 @@ class SupplyDocumentController extends Controller
             $document->markAsReady($filePath, Storage::exists($filePath) ? Storage::size($filePath) : null);
 
             $this->logEvent($supply, SupplyEvent::TYPE_DOCUMENT_GENERATED, 'Сгенерирован упаковочный лист');
+
+            $this->pushSupplyActivity(
+                $supply,
+                'supply_packing_list_generated',
+                'Сгенерирован упаковочный лист',
+                "Упаковочный лист для поставки {$supply->crm_number}",
+                [
+                    'entity_type' => 'supply',
+                    'entity_id' => $supply->id,
+                    'crm_number' => $supply->crm_number,
+                ]
+            );
 
             return response()->json([
                 'success' => true,
@@ -544,6 +585,26 @@ HTML;
             'ip_address' => request()->ip(),
             'created_at' => now(),
         ]);
+    }
+
+    /**
+     * Отправка activity в PlaceSales API с привязкой к workspace через integration поставки.
+     *
+     * @param  array<string, mixed>  $meta
+     */
+    private function pushSupplyActivity(Supply $supply, string $action, string $title, ?string $description, array $meta): void
+    {
+        if (! $supply->integration_id) {
+            return;
+        }
+
+        ActivityLogger::forIntegration(
+            (int) $supply->integration_id,
+            $action,
+            $title,
+            $description,
+            $meta,
+        );
     }
 
     /**

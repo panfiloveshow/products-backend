@@ -10,6 +10,7 @@ use App\Models\SyncLog;
 use App\Services\IntegrationAccessService;
 use App\Services\ProductService;
 use App\Services\SellicoApiService;
+use App\Support\ActivityLogger;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Log;
@@ -160,6 +161,18 @@ class IntegrationController extends Controller
             'marketplace' => $integration->marketplace,
         ]);
 
+        ActivityLogger::forRequest(
+            $request,
+            action: 'integration_created',
+            title: 'Интеграция создана',
+            description: "Создана интеграция «{$integration->name}» ({$integration->marketplace})",
+            meta: [
+                'entity_type' => 'integration',
+                'entity_id' => $integration->id,
+                'marketplace' => $integration->marketplace,
+            ],
+        );
+
         return response()->json([
             'success' => true,
             'message' => 'Интеграция создана',
@@ -182,6 +195,19 @@ class IntegrationController extends Controller
         unset($validated['id'], $validated['work_space_id'], $validated['integration_id']);
 
         $integration->update($validated);
+
+        ActivityLogger::forRequest(
+            $request,
+            action: 'integration_updated',
+            title: 'Интеграция обновлена',
+            description: "Обновлены данные интеграции «{$integration->name}»",
+            meta: [
+                'entity_type' => 'integration',
+                'entity_id' => $integration->id,
+                'marketplace' => $integration->marketplace,
+                'changed_fields' => array_keys($validated),
+            ],
+        );
 
         return response()->json([
             'success' => true,
@@ -210,9 +236,28 @@ class IntegrationController extends Controller
             ], 400);
         }
 
+        $integrationSnapshot = [
+            'id' => $integration->id,
+            'name' => $integration->name,
+            'marketplace' => $integration->marketplace,
+            'work_space_id' => $integration->work_space_id,
+        ];
+
         $integration->delete();
 
         Log::info('Integration deleted', ['id' => $id]);
+
+        ActivityLogger::forRequest(
+            $request,
+            action: 'integration_deleted',
+            title: 'Интеграция удалена',
+            description: "Удалена интеграция «{$integrationSnapshot['name']}»",
+            meta: [
+                'entity_type' => 'integration',
+                'entity_id' => $integrationSnapshot['id'],
+                'marketplace' => $integrationSnapshot['marketplace'],
+            ],
+        );
 
         return response()->json([
             'success' => true,
@@ -304,6 +349,20 @@ class IntegrationController extends Controller
                 $credentials,
                 $id,
                 $syncType
+            );
+
+            ActivityLogger::forRequest(
+                $request,
+                action: 'integration_sync_triggered',
+                title: 'Запущена синхронизация интеграции',
+                description: "Пользователь запустил {$syncType}-синхронизацию ({$marketplace})",
+                meta: [
+                    'entity_type' => 'integration',
+                    'entity_id' => $id,
+                    'marketplace' => $marketplace,
+                    'sync_type' => $syncType,
+                    'sync_id' => $syncLog->id,
+                ],
             );
 
             return response()->json([
@@ -449,6 +508,18 @@ class IntegrationController extends Controller
             'integration_id' => $id,
             'redemption_rate' => $request->redemption_rate,
         ]);
+
+        ActivityLogger::forRequest(
+            $request,
+            action: 'integration_manual_redemption_rate_set',
+            title: 'Установлен ручной процент выкупа',
+            description: "Ручной процент выкупа: {$request->redemption_rate}%",
+            meta: [
+                'entity_type' => 'integration',
+                'entity_id' => $id,
+                'redemption_rate' => (float) $request->redemption_rate,
+            ],
+        );
 
         return response()->json([
             'success' => true,

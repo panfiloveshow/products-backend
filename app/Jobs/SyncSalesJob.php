@@ -7,6 +7,7 @@ use App\Models\Product;
 use App\Models\SyncLog;
 use App\Models\Integration;
 use App\Domains\Marketplace\MarketplaceFactory;
+use App\Support\ActivityLogger;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
@@ -153,6 +154,23 @@ class SyncSalesJob implements ShouldQueue
             'updated_products'   => $updatedProducts,
             'updated_warehouses' => $updatedWarehouses,
         ]);
+
+        if ($integrationId) {
+            ActivityLogger::forIntegration(
+                (int) $integrationId,
+                'sales_sync_completed',
+                'Синхронизация продаж завершена',
+                "Маркетплейс: {$marketplace}. Обновлено товаров: {$updatedProducts}, складов: {$updatedWarehouses}",
+                [
+                    'entity_type' => 'integration',
+                    'entity_id' => $integrationId,
+                    'marketplace' => $marketplace,
+                    'sync_type' => 'sales',
+                    'updated_products' => $updatedProducts,
+                    'updated_warehouses' => $updatedWarehouses,
+                ]
+            );
+        }
     }
 
     /**
@@ -196,6 +214,21 @@ class SyncSalesJob implements ShouldQueue
             'updated_products'   => $updatedProducts,
             'updated_warehouses' => $updatedWarehouses,
         ]);
+
+        ActivityLogger::forIntegration(
+            $integrationId,
+            'sales_sync_completed',
+            'Синхронизация продаж Ozon завершена',
+            "Обновлено товаров: {$updatedProducts}, складов: {$updatedWarehouses} (FBO + FBS)",
+            [
+                'entity_type' => 'integration',
+                'entity_id' => $integrationId,
+                'marketplace' => 'ozon',
+                'sync_type' => 'sales',
+                'updated_products' => $updatedProducts,
+                'updated_warehouses' => $updatedWarehouses,
+            ]
+        );
     }
 
     /**
