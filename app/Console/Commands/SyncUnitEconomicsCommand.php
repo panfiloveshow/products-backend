@@ -9,6 +9,7 @@ use App\Models\Product;
 use App\Models\UnitEconomics;
 use App\Services\LocalizationIndexService;
 use App\Services\Ozon\OzonOrderUnitEconomicsService;
+use App\Services\Ozon\OzonPostingsBuyoutCalculator;
 use App\Services\Ozon\OzonSupplyFixationService;
 use App\Services\Ozon\OzonSupplySyncService;
 use App\Services\PostingService;
@@ -449,6 +450,20 @@ class SyncUnitEconomicsCommand extends Command
                     }
 
                     // === ПОЛУЧЕНИЕ ПРОЦЕНТА ВЫКУПА ===
+                    // Шаг 0: пытаемся посчитать выкуп по реальным заказам из postings
+                    // (28 дней). Это самый точный источник — матчит Ozon UI и не зависит
+                    // от Premium-статуса / квот /v1/analytics/data. Работает, если postings
+                    // успешно синкаются (syncOzonOperational до этого шага).
+                    $postingsCalculator = app(\App\Services\Ozon\OzonPostingsBuyoutCalculator::class);
+                    $postingsBuyoutMap = $postingsCalculator->calculateForIntegration((int) $integrationId, 28);
+                    foreach ($postingsBuyoutMap as $sku => $buyout) {
+                        $redemptionData[$sku] = $buyout;
+                    }
+                    if (! empty($postingsBuyoutMap)) {
+                        $fullFromPostings = count(array_filter($postingsBuyoutMap, fn ($d) => ($d['has_full_data'] ?? false)));
+                        $this->info('  По postings (28д): выкуп для '.count($postingsBuyoutMap)." SKU (полных: {$fullFromPostings})");
+                    }
+
                     if ($isPremium) {
                         // Создаём маппинг ozon_sku -> offer_id для сопоставления данных из API
                         // API аналитики возвращает ozon_data['sku'] (числовой ID в системе Ozon)
@@ -471,17 +486,21 @@ class SyncUnitEconomicsCommand extends Command
 
                         $this->info('  Создан маппинг ozon_sku -> offer_id для '.count($ozonSkuToOfferIdMap).' товаров');
 
-                        // Premium: получаем данные автоматически из API аналитики с маппингом
-                        $redemptionData = $ozonService->getRedemptionRateFromAnalytics(null, null, $ozonSkuToOfferIdMap);
-
-                        if (! empty($redemptionData)) {
-                            $fullDataCount = count(array_filter($redemptionData, fn ($d) => ($d['has_full_data'] ?? false)));
-                            $this->info('  Получен выкуп для '.count($redemptionData)." товаров (полных: {$fullDataCount})");
-
-                            // Логируем примеры для диагностики
-                            $sampleKeys = array_slice(array_keys($redemptionData), 0, 5);
-                            $this->info('  Примеры ключей redemptionData: '.implode(', ', $sampleKeys));
-                        } else {
+                        // Premium: тянем API analytics только для SKU, по которым postings
+                        // не дали полных данных (has_full_data=false или запись отсутствует).
+                        // Так мы не переписываем точные postings-числа агрегатами из API.
+                        $analyticsData = $ozonService->getRedemptionRateFromAnalytics(null, null, $ozonSkuToOfferIdMap);
+                        $fromApi = 0;
+                        foreach ($analyticsData as $key => $item) {
+                            $existing = $redemptionData[$key] ?? null;
+                            if ($existing === null || ! ($existing['has_full_data'] ?? false)) {
+                                $redemptionData[$key] = $item;
+                                $fromApi++;
+                            }
+                        }
+                        if ($fromApi > 0) {
+                            $this->info("  API аналитики: добавлен/обновлён выкуп для {$fromApi} SKU (там, где postings пустые)");
+                        } elseif (empty($analyticsData)) {
                             $this->warn('  ⚠ API аналитики не вернул данных о выкупе');
                         }
                     } else {
@@ -505,6 +524,11 @@ class SyncUnitEconomicsCommand extends Command
 
                             foreach ($ordersMap as $offerId => $ordersCount) {
                                 if ($ordersCount <= 0) {
+                                    continue;
+                                }
+
+                                // Если по этому SKU уже есть полные данные из postings — не трогаем.
+                                if (($redemptionData[$offerId]['has_full_data'] ?? false)) {
                                     continue;
                                 }
 
