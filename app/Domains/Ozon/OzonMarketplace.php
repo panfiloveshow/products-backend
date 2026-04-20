@@ -907,6 +907,11 @@ class OzonMarketplace implements MarketplaceInterface
         return $this->sales->getReturnsStatsBySku($dateFrom, $dateTo);
     }
 
+    public function getCancellationsStatsBySku(string $dateFrom, string $dateTo): array
+    {
+        return $this->sales->getCancellationsStatsBySku($dateFrom, $dateTo);
+    }
+
     // === Analytics ===
 
     public function checkPremiumStatus(): array

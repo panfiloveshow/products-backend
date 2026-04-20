@@ -88,76 +88,92 @@ class AnalyticsApi
         $dateFrom = $dateFrom ?? now()->subDays(30)->format('Y-m-d');
         $dateTo = $dateTo ?? now()->format('Y-m-d');
 
+        $result = [];
+        $pageSize = 1000;
+        $offset = 0;
+        $maxPages = 50; // hard-cap: 50 000 SKU — страхует от зависания при кривом ответе API
+        $page = 0;
+
         try {
-            $response = $this->client->post('/v1/analytics/data', [
-                'date_from' => $dateFrom,
-                'date_to' => $dateTo,
-                'metrics' => ['ordered_units', 'delivered_units', 'returns', 'cancellations'],
-                'dimension' => ['sku'],
-                'filters' => [],
-                'sort' => [['key' => 'ordered_units', 'order' => 'DESC']],
-                'limit' => 1000,
-                'offset' => 0,
-            ]);
-
-            $result = [];
-            $rawData = $response['result']['data'] ?? [];
-            
-            // Логируем первые 3 записи для диагностики формата
-            if (!empty($rawData)) {
-                $sampleRows = array_slice($rawData, 0, 3);
-                Log::info('Ozon getRedemptionRateFromAnalytics sample data', [
-                    'sample_rows' => $sampleRows,
-                    'map_keys_sample' => array_slice(array_keys($productIdToSkuMap), 0, 5),
+            while ($page < $maxPages) {
+                $response = $this->client->post('/v1/analytics/data', [
+                    'date_from' => $dateFrom,
+                    'date_to' => $dateTo,
+                    'metrics' => ['ordered_units', 'delivered_units', 'returns', 'cancellations'],
+                    'dimension' => ['sku'],
+                    'filters' => [],
+                    'sort' => [['key' => 'ordered_units', 'order' => 'DESC']],
+                    'limit' => $pageSize,
+                    'offset' => $offset,
                 ]);
+
+                $rawData = $response['result']['data'] ?? [];
+
+                if ($page === 0 && !empty($rawData)) {
+                    Log::info('Ozon getRedemptionRateFromAnalytics sample data', [
+                        'sample_rows' => array_slice($rawData, 0, 3),
+                        'map_keys_sample' => array_slice(array_keys($productIdToSkuMap), 0, 5),
+                    ]);
+                }
+
+                foreach ($rawData as $row) {
+                    $ozonSku = $row['dimensions'][0]['id'] ?? null;
+                    if (!$ozonSku) continue;
+
+                    $ordered = (int)($row['metrics'][0] ?? 0);
+                    $delivered = (int)($row['metrics'][1] ?? 0);
+                    $returns = (int)($row['metrics'][2] ?? 0);
+                    $cancellations = (int)($row['metrics'][3] ?? 0);
+
+                    // % выкупа = (ordered − cancellations − returns) / ordered × 100
+                    // Ozon в своём отчёте «redemptions_report» считает ровно так же —
+                    // вычитает и отмены, и возвраты (колонка N «Сумма отмен и возвратов»).
+                    $redemptionRate = 100;
+                    if ($ordered > 0) {
+                        $notRedeemed = min($ordered, max(0, $cancellations) + max(0, $returns));
+                        $redemptionRate = round((($ordered - $notRedeemed) / $ordered) * 100, 2);
+                    }
+
+                    $data = [
+                        'ozon_sku' => $ozonSku,
+                        'ordered_units' => $ordered,
+                        'delivered_units' => $delivered,
+                        'returns' => $returns,
+                        'cancellations' => $cancellations,
+                        'redemption_rate' => $redemptionRate,
+                        'orders_count' => $ordered,
+                        'returns_count' => $returns,
+                        'source' => 'api',
+                        'has_full_data' => ($delivered + $returns) > 0 || $ordered > 0,
+                    ];
+
+                    $result[(string)$ozonSku] = $data;
+
+                    if (isset($productIdToSkuMap[(string)$ozonSku])) {
+                        $offerSku = $productIdToSkuMap[(string)$ozonSku];
+                        $result[$offerSku] = $data;
+                    }
+                }
+
+                $batchSize = count($rawData);
+                if ($batchSize < $pageSize) {
+                    break;
+                }
+
+                $offset += $pageSize;
+                $page++;
             }
-            
-            foreach ($rawData as $row) {
-                // API возвращает SKU в dimensions[0]['id'] (числовой ID товара в Ozon)
-                $ozonSku = $row['dimensions'][0]['id'] ?? null;
-                if (!$ozonSku) continue;
 
-                $ordered = (int)($row['metrics'][0] ?? 0);
-                $delivered = (int)($row['metrics'][1] ?? 0);
-                $returns = (int)($row['metrics'][2] ?? 0);
-                $cancellations = (int)($row['metrics'][3] ?? 0);
-
-                // % выкупа = (ordered − cancellations − returns) / ordered × 100
-                // Ozon в своём отчёте «redemptions_report» считает ровно так же —
-                // вычитает и отмены, и возвраты (колонка N «Сумма отмен и возвратов»).
-                // Раньше код учитывал только cancellations — из-за этого наш выкуп
-                // был завышен на ~процент возвратов (для одежды/обуви это 10–15%).
-                $redemptionRate = 100;
-                if ($ordered > 0) {
-                    $notRedeemed = min($ordered, max(0, $cancellations) + max(0, $returns));
-                    $redemptionRate = round((($ordered - $notRedeemed) / $ordered) * 100, 2);
-                }
-
-                $data = [
-                    'ozon_sku' => $ozonSku,
-                    'ordered_units' => $ordered,
-                    'delivered_units' => $delivered,
-                    'returns' => $returns,
-                    'cancellations' => $cancellations,
-                    'redemption_rate' => $redemptionRate,
-                    'orders_count' => $ordered,
-                    'returns_count' => $returns,
-                    'source' => 'api',
-                    'has_full_data' => ($delivered + $returns) > 0 || $ordered > 0,
-                ];
-
-                // Сохраняем по ozon_sku (числовой ID)
-                $result[(string)$ozonSku] = $data;
-                
-                // Если есть маппинг ozon_sku -> offer_id, также сохраняем по offer_id (SKU продавца)
-                if (isset($productIdToSkuMap[(string)$ozonSku])) {
-                    $offerSku = $productIdToSkuMap[(string)$ozonSku];
-                    $result[$offerSku] = $data;
-                }
+            if ($page >= $maxPages) {
+                Log::warning('Ozon getRedemptionRateFromAnalytics hit page cap', [
+                    'max_pages' => $maxPages,
+                    'page_size' => $pageSize,
+                ]);
             }
 
             Log::info('Ozon getRedemptionRateFromAnalytics success', [
                 'count' => count($result),
+                'pages_fetched' => $page + 1,
                 'date_from' => $dateFrom,
                 'date_to' => $dateTo,
                 'result_keys_sample' => array_slice(array_keys($result), 0, 10),
@@ -165,8 +181,12 @@ class AnalyticsApi
 
             return $result;
         } catch (\Exception $e) {
-            Log::error('Ozon getRedemptionRateFromAnalytics error', ['error' => $e->getMessage()]);
-            return [];
+            Log::error('Ozon getRedemptionRateFromAnalytics error', [
+                'error' => $e->getMessage(),
+                'offset' => $offset,
+                'partial_count' => count($result),
+            ]);
+            return $result;
         }
     }
 

@@ -1572,8 +1572,16 @@ class UnitEconomicsCacheController extends Controller
         // Комиссии по схемам из ozon_data
         $data['commissions'] = $commissions;
 
-        // Данные выкупа из ozon_data
-        $data['redemption'] = $redemption;
+        // Данные выкупа: каноничные значения берём из кэша (rate/source/counts),
+        // ozon_data['redemption'] оставляем как сырое поле на случай, если фронт
+        // всё ещё смотрит туда — но авторитет у полей верхнего уровня из кэша.
+        $data['redemption'] = array_merge(is_array($redemption) ? $redemption : [], [
+            'redemption_rate' => $cache->redemption_rate !== null ? (float) $cache->redemption_rate : null,
+            'redemption_source' => $cache->redemption_source,
+            'orders_count' => $cache->orders_count,
+            'returns_count' => $cache->returns_count,
+            'is_default' => ($cache->redemption_source ?? 'default') === 'default',
+        ]);
 
         // Поля *_per_unit
         $data['logistics_per_unit'] = round((float) $cache->logistics_cost, 2);

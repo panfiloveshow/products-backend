@@ -298,31 +298,7 @@ class SalesApi
      */
     public function getOrdersStatsBySku(string $dateFrom, string $dateTo): array
     {
-        try {
-            $response = $this->client->post('/v1/analytics/data', [
-                'date_from' => $dateFrom,
-                'date_to' => $dateTo,
-                'metrics' => ['ordered_units'],
-                'dimension' => ['sku'],
-                'filters' => [],
-                'sort' => [['key' => 'ordered_units', 'order' => 'DESC']],
-                'limit' => 1000,
-                'offset' => 0,
-            ]);
-
-            $result = [];
-            foreach ($response['result']['data'] ?? [] as $row) {
-                $sku = $row['dimensions'][0]['id'] ?? null;
-                if ($sku) {
-                    $result[$sku] = (int)($row['metrics'][0] ?? 0);
-                }
-            }
-
-            return $result;
-        } catch (\Exception $e) {
-            Log::error('Ozon getOrdersStatsBySku error', ['error' => $e->getMessage()]);
-            return [];
-        }
+        return $this->fetchMetricBySku('ordered_units', $dateFrom, $dateTo);
     }
 
     /**
@@ -330,30 +306,63 @@ class SalesApi
      */
     public function getReturnsStatsBySku(string $dateFrom, string $dateTo): array
     {
-        try {
-            $response = $this->client->post('/v1/analytics/data', [
-                'date_from' => $dateFrom,
-                'date_to' => $dateTo,
-                'metrics' => ['returns'],
-                'dimension' => ['sku'],
-                'filters' => [],
-                'sort' => [['key' => 'returns', 'order' => 'DESC']],
-                'limit' => 1000,
-                'offset' => 0,
-            ]);
+        return $this->fetchMetricBySku('returns', $dateFrom, $dateTo);
+    }
 
-            $result = [];
-            foreach ($response['result']['data'] ?? [] as $row) {
-                $sku = $row['dimensions'][0]['id'] ?? null;
-                if ($sku) {
-                    $result[$sku] = (int)($row['metrics'][0] ?? 0);
+    /**
+     * Получить статистику отмен по SKU (доступно не всегда — только Premium).
+     * Возвращает [] при отсутствии доступа, чтобы вызывающий мог безопасно деградировать.
+     */
+    public function getCancellationsStatsBySku(string $dateFrom, string $dateTo): array
+    {
+        return $this->fetchMetricBySku('cancellations', $dateFrom, $dateTo);
+    }
+
+    private function fetchMetricBySku(string $metric, string $dateFrom, string $dateTo): array
+    {
+        $result = [];
+        $pageSize = 1000;
+        $offset = 0;
+        $maxPages = 50;
+        $page = 0;
+
+        try {
+            while ($page < $maxPages) {
+                $response = $this->client->post('/v1/analytics/data', [
+                    'date_from' => $dateFrom,
+                    'date_to' => $dateTo,
+                    'metrics' => [$metric],
+                    'dimension' => ['sku'],
+                    'filters' => [],
+                    'sort' => [['key' => $metric, 'order' => 'DESC']],
+                    'limit' => $pageSize,
+                    'offset' => $offset,
+                ]);
+
+                $rows = $response['result']['data'] ?? [];
+                foreach ($rows as $row) {
+                    $sku = $row['dimensions'][0]['id'] ?? null;
+                    if ($sku) {
+                        $result[$sku] = (int) ($row['metrics'][0] ?? 0);
+                    }
                 }
+
+                if (count($rows) < $pageSize) {
+                    break;
+                }
+
+                $offset += $pageSize;
+                $page++;
             }
 
             return $result;
         } catch (\Exception $e) {
-            Log::error('Ozon getReturnsStatsBySku error', ['error' => $e->getMessage()]);
-            return [];
+            Log::error("Ozon fetchMetricBySku({$metric}) error", [
+                'error' => $e->getMessage(),
+                'offset' => $offset,
+                'partial_count' => count($result),
+            ]);
+            return $result;
         }
     }
 }

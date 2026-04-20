@@ -498,22 +498,33 @@ class SyncUnitEconomicsCommand extends Command
 
                             $ordersMap = $ozonService->getOrdersStatsBySku($dateFrom, $dateTo);
                             $returnsMap = $ozonService->getReturnsStatsBySku($dateFrom, $dateTo);
+                            // Пробуем догрузить отмены — в non-Premium может вернуться []
+                            // и формула деградирует до (orders - returns) / orders.
+                            $cancellationsMap = $ozonService->getCancellationsStatsBySku($dateFrom, $dateTo);
+                            $hasCancellations = ! empty($cancellationsMap);
 
                             foreach ($ordersMap as $offerId => $ordersCount) {
-                                $returnsCount = $returnsMap[$offerId] ?? 0;
-                                $deliveredCount = $ordersCount - $returnsCount;
-
-                                if ($ordersCount > 0) {
-                                    $redemptionRate = round(($deliveredCount / $ordersCount) * 100, 1);
-                                    $redemptionData[$offerId] = [
-                                        'redemption_rate' => $redemptionRate,
-                                        'orders_count' => $ordersCount,
-                                        'returns_count' => $returnsCount,
-                                        'delivered_count' => $deliveredCount,
-                                        'has_full_data' => true,
-                                        'source' => 'fallback',
-                                    ];
+                                if ($ordersCount <= 0) {
+                                    continue;
                                 }
+
+                                $returnsCount = $returnsMap[$offerId] ?? 0;
+                                $cancellationsCount = $cancellationsMap[$offerId] ?? 0;
+
+                                // Формула Ozon: (ordered − cancellations − returns) / ordered × 100.
+                                // Тот же расчёт, что и для Premium — единый источник истины.
+                                $notRedeemed = min($ordersCount, max(0, $cancellationsCount) + max(0, $returnsCount));
+                                $redemptionRate = round((($ordersCount - $notRedeemed) / $ordersCount) * 100, 2);
+
+                                $redemptionData[$offerId] = [
+                                    'redemption_rate' => $redemptionRate,
+                                    'orders_count' => $ordersCount,
+                                    'returns_count' => $returnsCount,
+                                    'cancellations' => $cancellationsCount,
+                                    'delivered_count' => max(0, $ordersCount - $notRedeemed),
+                                    'has_full_data' => true,
+                                    'source' => $hasCancellations ? 'fallback' : 'fallback_partial',
+                                ];
                             }
 
                             if (! empty($redemptionData)) {
