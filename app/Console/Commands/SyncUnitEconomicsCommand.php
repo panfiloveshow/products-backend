@@ -501,24 +501,47 @@ class SyncUnitEconomicsCommand extends Command
                             $fromApi++;
                         }
                         if ($fromApi > 0) {
-                            $this->info("  API аналитики: выкуп для {$fromApi} SKU (основной источник, совпадает с виджетом Ozon)");
+                            $this->info("  API аналитики: выкуп для {$fromApi} SKU (основной источник)");
                         } elseif (empty($analyticsData)) {
                             $this->warn('  ⚠ API аналитики не вернул данных о выкупе — используем postings как основной источник');
                         }
 
-                        // Шаг 2: postings как fallback — по SKU, которых нет в Analytics API.
+                        // Шаг 2: postings применяются в двух случаях:
+                        //   a) по SKU нет записи из Analytics API — fallback;
+                        //   b) postings показывают больше выкупленных заказов, чем Analytics API,
+                        //      т.е. API по этому SKU вернул некорректные cancellations/returns
+                        //      (известный баг /v1/analytics/data для отдельных артикулов).
+                        //      Postings в этом случае ближе к виджету Ozon.
                         $fromPostingsFallback = 0;
+                        $overriddenByPostings = 0;
                         foreach ($postingsBuyoutMap as $sku => $buyout) {
-                            if (! isset($redemptionData[$sku])) {
-                                $redemptionData[$sku] = $buyout;
+                            $ozonKey = $offerIdToOzonSkuMap[$sku] ?? null;
+                            $existing = $redemptionData[$sku] ?? ($ozonKey !== null ? ($redemptionData[$ozonKey] ?? null) : null);
+
+                            $useBuyout = false;
+                            if ($existing === null) {
+                                $useBuyout = true;
                                 $fromPostingsFallback++;
+                            } elseif (
+                                ($buyout['has_full_data'] ?? false)
+                                && (int) ($buyout['delivered_count'] ?? 0) > (int) ($existing['delivered_count'] ?? 0)
+                            ) {
+                                $useBuyout = true;
+                                $overriddenByPostings++;
                             }
-                            if (isset($offerIdToOzonSkuMap[$sku]) && ! isset($redemptionData[$offerIdToOzonSkuMap[$sku]])) {
-                                $redemptionData[$offerIdToOzonSkuMap[$sku]] = $buyout;
+
+                            if ($useBuyout) {
+                                $redemptionData[$sku] = $buyout;
+                                if ($ozonKey !== null) {
+                                    $redemptionData[$ozonKey] = $buyout;
+                                }
                             }
                         }
                         if ($fromPostingsFallback > 0) {
                             $this->info("  Postings fallback: выкуп для {$fromPostingsFallback} SKU (Analytics API пуст по ним)");
+                        }
+                        if ($overriddenByPostings > 0) {
+                            $this->info("  Postings override: {$overriddenByPostings} SKU — Analytics API занижает выкуп, postings ближе к виджету");
                         }
                     } else {
                         // Не Premium: Analytics API недоступен, используем postings как основной источник.
