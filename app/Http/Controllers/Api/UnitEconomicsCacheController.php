@@ -1550,6 +1550,8 @@ class UnitEconomicsCacheController extends Controller
         // Убираем relation чтобы не дублировать
         unset($data['product']);
 
+        $marketplaceData = is_array($data['marketplace_data'] ?? null) ? $data['marketplace_data'] : [];
+
         // Добавляем поля для совместимости с v1
         $data['actual_weight'] = $product ? (float) ($product->weight ?? 0) / 1000 : 0;
         $data['turnover_days'] = $product?->turnover_days ?? 30;
@@ -1580,6 +1582,22 @@ class UnitEconomicsCacheController extends Controller
             'redemption_source' => $cache->redemption_source,
             'orders_count' => $cache->orders_count,
             'returns_count' => $cache->returns_count,
+            'delivered_count' => $marketplaceData['delivered_count']
+                ?? $redemption['delivered_count']
+                ?? null,
+            'cancelled_count' => $marketplaceData['cancelled_count']
+                ?? $marketplaceData['cancellations_count']
+                ?? $marketplaceData['cancellations']
+                ?? $redemption['cancelled_count']
+                ?? $redemption['cancellations_count']
+                ?? $redemption['cancellations']
+                ?? null,
+            'not_redeemed_count' => $marketplaceData['not_redeemed_count']
+                ?? $redemption['not_redeemed_count']
+                ?? null,
+            'in_flight_count' => $marketplaceData['in_flight_count']
+                ?? $redemption['in_flight_count']
+                ?? null,
             'is_default' => ($cache->redemption_source ?? 'default') === 'default',
         ]);
 

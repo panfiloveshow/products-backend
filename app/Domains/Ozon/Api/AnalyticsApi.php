@@ -85,8 +85,11 @@ class AnalyticsApi
      */
     public function getRedemptionRateFromAnalytics(?string $dateFrom = null, ?string $dateTo = null, array $productIdToSkuMap = []): array
     {
-        $dateFrom = $dateFrom ?? now()->subDays(30)->format('Y-m-d');
-        $dateTo = $dateTo ?? now()->format('Y-m-d');
+        // Окно D-28…D-1 — совпадает с виджетом Ozon «Выкупы по товару».
+        $defaultDateTo = now()->subDays(1)->toDateString();
+        $defaultDateFrom = now()->subDays(28)->toDateString();
+        $dateFrom = $dateFrom ?? $defaultDateFrom;
+        $dateTo = $dateTo ?? $defaultDateTo;
 
         $result = [];
         $pageSize = 1000;
@@ -125,10 +128,12 @@ class AnalyticsApi
                     $returns = (int)($row['metrics'][2] ?? 0);
                     $cancellations = (int)($row['metrics'][3] ?? 0);
 
-                    // % выкупа = (ordered − cancellations − returns) / ordered × 100
-                    // Ozon в своём отчёте «redemptions_report» считает ровно так же —
-                    // вычитает и отмены, и возвраты (колонка N «Сумма отмен и возвратов»).
+                    // Выкуп в Ozon Seller считаем как:
+                    // (ordered - cancellations - returns) / ordered.
+                    // delivered_units из analytics API часто не совпадает с блоком
+                    // "Выкуплено товаров" в ЛК, поэтому для buyout не используем его напрямую.
                     $redemptionRate = 100;
+                    $notRedeemed = 0;
                     if ($ordered > 0) {
                         $notRedeemed = min($ordered, max(0, $cancellations) + max(0, $returns));
                         $redemptionRate = round((($ordered - $notRedeemed) / $ordered) * 100, 2);
@@ -143,6 +148,12 @@ class AnalyticsApi
                         'redemption_rate' => $redemptionRate,
                         'orders_count' => $ordered,
                         'returns_count' => $returns,
+                        // delivered_count в нашем API = "выкуплено" (как в виджете Ozon),
+                        // а сырой delivered_units сохраняем отдельно для отладки.
+                        'delivered_count' => max(0, $ordered - $notRedeemed),
+                        'delivered_units_raw' => $delivered,
+                        'cancelled_count' => $cancellations,
+                        'cancellations_count' => $cancellations,
                         'source' => 'api',
                         'has_full_data' => ($delivered + $returns) > 0 || $ordered > 0,
                     ];

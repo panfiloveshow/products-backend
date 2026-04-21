@@ -469,48 +469,66 @@ class SyncUnitEconomicsCommand extends Command
                         });
 
                     // === ПОЛУЧЕНИЕ ПРОЦЕНТА ВЫКУПА ===
-                    // Шаг 0: пытаемся посчитать выкуп по реальным заказам из postings
-                    // (28 дней). Это самый точный источник — матчит Ozon UI и не зависит
-                    // от Premium-статуса / квот /v1/analytics/data. Работает, если postings
-                    // успешно синкаются (syncOzonOperational до этого шага).
+                    // Приоритет источников:
+                    //   1. Analytics API (Premium) — основной: его формула
+                    //      (ordered − cancellations − returns) / ordered × 100
+                    //      один-в-один совпадает с виджетом Ozon «Выкупы по товару»,
+                    //      потому что считается из того же агрегата на стороне Ozon.
+                    //   2. Postings (28д) — fallback: реальные postings.status.
+                    //      Используются, когда Analytics API пуст по SKU или
+                    //      аккаунт не Premium. Формула
+                    //      delivered / (delivered + cancelled + not_accepted)
+                    //      даёт расхождение с виджетом Ozon, если часть заказов
+                    //      ещё в статусе `delivering`, потому что Ozon считает их
+                    //      выкупленными, а у нас они не попадают в знаменатель.
+
                     $postingsCalculator = app(\App\Services\Ozon\OzonPostingsBuyoutCalculator::class);
                     $postingsBuyoutMap = $postingsCalculator->calculateForIntegration((int) $integrationId, 28);
-                    foreach ($postingsBuyoutMap as $sku => $buyout) {
-                        // Ключ из posting_items.sku = offer_id. Дублируем под ozon_sku (числовой),
-                        // чтобы downstream lookup по ozon_sku тоже получил postings-данные,
-                        // а не перезаписанные analytics API.
-                        $redemptionData[$sku] = $buyout;
-                        if (isset($offerIdToOzonSkuMap[$sku])) {
-                            $redemptionData[$offerIdToOzonSkuMap[$sku]] = $buyout;
-                        }
-                    }
                     if (! empty($postingsBuyoutMap)) {
                         $fullFromPostings = count(array_filter($postingsBuyoutMap, fn ($d) => ($d['has_full_data'] ?? false)));
-                        $this->info('  По postings (28д): выкуп для '.count($postingsBuyoutMap)." SKU (полных: {$fullFromPostings})");
+                        $this->info('  По postings (28д): рассчитано '.count($postingsBuyoutMap)." SKU (полных: {$fullFromPostings}) — используется как fallback");
                     }
 
                     if ($isPremium) {
 
                         $this->info('  Создан маппинг ozon_sku -> offer_id для '.count($ozonSkuToOfferIdMap).' товаров');
 
-                        // Premium: тянем API analytics только для SKU, по которым postings
-                        // не дали полных данных (has_full_data=false или запись отсутствует).
-                        // Так мы не переписываем точные postings-числа агрегатами из API.
+                        // Шаг 1: Analytics API — основной источник.
                         $analyticsData = $ozonService->getRedemptionRateFromAnalytics(null, null, $ozonSkuToOfferIdMap);
                         $fromApi = 0;
                         foreach ($analyticsData as $key => $item) {
-                            $existing = $redemptionData[$key] ?? null;
-                            if ($existing === null || ! ($existing['has_full_data'] ?? false)) {
-                                $redemptionData[$key] = $item;
-                                $fromApi++;
-                            }
+                            $redemptionData[$key] = $item;
+                            $fromApi++;
                         }
                         if ($fromApi > 0) {
-                            $this->info("  API аналитики: добавлен/обновлён выкуп для {$fromApi} SKU (там, где postings пустые)");
+                            $this->info("  API аналитики: выкуп для {$fromApi} SKU (основной источник, совпадает с виджетом Ozon)");
                         } elseif (empty($analyticsData)) {
-                            $this->warn('  ⚠ API аналитики не вернул данных о выкупе');
+                            $this->warn('  ⚠ API аналитики не вернул данных о выкупе — используем postings как основной источник');
+                        }
+
+                        // Шаг 2: postings как fallback — по SKU, которых нет в Analytics API.
+                        $fromPostingsFallback = 0;
+                        foreach ($postingsBuyoutMap as $sku => $buyout) {
+                            if (! isset($redemptionData[$sku])) {
+                                $redemptionData[$sku] = $buyout;
+                                $fromPostingsFallback++;
+                            }
+                            if (isset($offerIdToOzonSkuMap[$sku]) && ! isset($redemptionData[$offerIdToOzonSkuMap[$sku]])) {
+                                $redemptionData[$offerIdToOzonSkuMap[$sku]] = $buyout;
+                            }
+                        }
+                        if ($fromPostingsFallback > 0) {
+                            $this->info("  Postings fallback: выкуп для {$fromPostingsFallback} SKU (Analytics API пуст по ним)");
                         }
                     } else {
+                        // Не Premium: Analytics API недоступен, используем postings как основной источник.
+                        foreach ($postingsBuyoutMap as $sku => $buyout) {
+                            $redemptionData[$sku] = $buyout;
+                            if (isset($offerIdToOzonSkuMap[$sku])) {
+                                $redemptionData[$offerIdToOzonSkuMap[$sku]] = $buyout;
+                            }
+                        }
+
                         // Не Premium: используем ручной ввод или fallback через заказы/возвраты
                         if ($manualRedemptionRate !== null && $manualRedemptionRate > 0) {
                             $this->info("  Используем ручной процент выкупа: {$manualRedemptionRate}%");
@@ -1518,6 +1536,13 @@ class SyncUnitEconomicsCommand extends Command
                     $data['redemption_rate'] = $redemptionData['redemption_rate'];
                     $data['orders_count'] = $redemptionData['orders_count'] ?? null;
                     $data['returns_count'] = $redemptionData['returns_count'] ?? null;
+                    $data['delivered_count'] = $redemptionData['delivered_count'] ?? null;
+                    $data['cancelled_count'] = $redemptionData['cancelled_count']
+                        ?? $redemptionData['cancellations_count']
+                        ?? $redemptionData['cancellations']
+                        ?? null;
+                    $data['not_redeemed_count'] = $redemptionData['not_redeemed_count'] ?? null;
+                    $data['in_flight_count'] = $redemptionData['in_flight_count'] ?? null;
                     $data['redemption_source'] = $redemptionData['source'] ?? 'api';
                 } elseif ($manualRedemptionRate !== null && $manualRedemptionRate > 0) {
                     // Ручной ввод для не-Premium аккаунтов

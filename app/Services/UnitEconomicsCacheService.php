@@ -703,6 +703,13 @@ class UnitEconomicsCacheService
                 'redemption_source' => $existingUE?->redemption_source ?? 'default',
                 'orders_count' => $existingUE?->orders_count ?? null,
                 'returns_count' => $existingUE?->returns_count ?? null,
+                'delivered_count' => $existingMarketplaceData['delivered_count'] ?? null,
+                'cancelled_count' => $existingMarketplaceData['cancelled_count']
+                    ?? $existingMarketplaceData['cancellations_count']
+                    ?? $existingMarketplaceData['cancellations']
+                    ?? null,
+                'not_redeemed_count' => $existingMarketplaceData['not_redeemed_count'] ?? null,
+                'in_flight_count' => $existingMarketplaceData['in_flight_count'] ?? null,
                 'spp_percent' => $sppPercent,
             ],
         ];
