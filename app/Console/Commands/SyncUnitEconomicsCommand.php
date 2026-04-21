@@ -533,7 +533,11 @@ class SyncUnitEconomicsCommand extends Command
                                 $fromPostingsFallback++;
                             } elseif (
                                 ($buyout['has_full_data'] ?? false)
-                                && (int) ($buyout['delivered_count'] ?? 0) > (int) ($existing['delivered_count'] ?? 0)
+                                // Сравниваем именно confirmed delivered (без оптимистичного in_flight),
+                                // иначе postings-override сработает всегда при наличии delivering-заказов
+                                // и переопределит корректные данные Analytics API.
+                                && (int) ($buyout['delivered_confirmed_count'] ?? $buyout['delivered_count'] ?? 0)
+                                    > (int) ($existing['delivered_count'] ?? 0)
                             ) {
                                 $useBuyout = true;
                                 $overriddenByPostings++;
