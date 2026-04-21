@@ -12,13 +12,13 @@ use Illuminate\Support\Facades\DB;
  * по SKU 2099/black1 API вернул 9 заказов за 30д, а в postings их 47.
  *
  * Группировка статусов:
- *   delivered       → выкупили
- *   cancelled       → отменили
- *   not_accepted    → не выкупили
- *   delivering / awaiting_* → в пути, в знаменатель не кладём
+ *   delivered                → выкупили
+ *   cancelled                → отменили
+ *   not_accepted             → не выкупили
+ *   delivering / awaiting_*  → в пути, оптимистично считаем выкупленными
  *
- * Формула:
- *   rate = delivered / (delivered + cancelled + not_accepted) * 100
+ * Формула (как у виджета Ozon «Выкупы за 28 дней»):
+ *   rate = (delivered + in_flight) / (delivered + cancelled + not_accepted + in_flight) * 100
  *
  * Возвраты Ozon отдаёт отдельным API (/v1/returns/*), здесь не учтены —
  * их доля по каталогу в среднем <5% и в postings.status они почти не встречаются.
@@ -77,17 +77,23 @@ class OzonPostingsBuyoutCalculator
         }
 
         $finalized = $delivered + $cancelled + $notRedeemed;
-        if ($finalized === 0) {
-            // Все заказы ещё в пути — корректный выкуп посчитать нельзя.
+        $totalOrders = $finalized + $inFlight;
+        if ($totalOrders === 0) {
             return null;
         }
 
-        $rate = round(($delivered / $finalized) * 100, 2);
+        // Оптимистичная формула (как виджет Ozon «Выкупы за 28 дней»):
+        // delivering считаем уже выкупленными. Ozon сам так делает в виджете,
+        // даже когда его /v2/posting/fbo/get по этому же заказу ещё отдаёт
+        // delivering. Статусы догонятся при следующем refresh / sync.
+        $optimisticDelivered = $delivered + $inFlight;
+        $rate = round(($optimisticDelivered / $totalOrders) * 100, 2);
 
         return [
             'redemption_rate' => $rate,
-            'orders_count' => $finalized + $inFlight,
-            'delivered_count' => $delivered,
+            'orders_count' => $totalOrders,
+            'delivered_count' => $optimisticDelivered,
+            'delivered_confirmed_count' => $delivered,
             'cancelled_count' => $cancelled,
             'cancellations_count' => $cancelled,
             'not_redeemed_count' => $notRedeemed,
@@ -96,7 +102,7 @@ class OzonPostingsBuyoutCalculator
             'postings_count' => $totalPostings,
             'period_days' => $days,
             'source' => 'postings',
-            'has_full_data' => $finalized >= 3,
+            'has_full_data' => $totalOrders >= 3,
         ];
     }
 
@@ -147,14 +153,19 @@ class OzonPostingsBuyoutCalculator
         $result = [];
         foreach ($perSku as $sku => $buckets) {
             $finalized = $buckets['delivered'] + $buckets['cancelled'] + $buckets['not_redeemed'];
-            if ($finalized === 0) {
+            $totalOrders = $finalized + $buckets['in_flight'];
+            if ($totalOrders === 0) {
                 continue;
             }
 
+            // Оптимистичная формула — см. calculateForSku().
+            $optimisticDelivered = $buckets['delivered'] + $buckets['in_flight'];
+
             $result[$sku] = [
-                'redemption_rate' => round(($buckets['delivered'] / $finalized) * 100, 2),
-                'orders_count' => $finalized + $buckets['in_flight'],
-                'delivered_count' => $buckets['delivered'],
+                'redemption_rate' => round(($optimisticDelivered / $totalOrders) * 100, 2),
+                'orders_count' => $totalOrders,
+                'delivered_count' => $optimisticDelivered,
+                'delivered_confirmed_count' => $buckets['delivered'],
                 'cancelled_count' => $buckets['cancelled'],
                 'cancellations_count' => $buckets['cancelled'],
                 'not_redeemed_count' => $buckets['not_redeemed'],
@@ -163,7 +174,7 @@ class OzonPostingsBuyoutCalculator
                 'postings_count' => $buckets['postings'],
                 'period_days' => $days,
                 'source' => 'postings',
-                'has_full_data' => $finalized >= 3,
+                'has_full_data' => $totalOrders >= 3,
             ];
         }
 

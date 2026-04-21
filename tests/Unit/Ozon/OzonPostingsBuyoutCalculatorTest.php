@@ -32,8 +32,10 @@ class OzonPostingsBuyoutCalculatorTest extends TestCase
         $this->assertSame(0, $result['returns_count']);
     }
 
-    public function test_in_flight_orders_are_reported_but_not_used_in_rate(): void
+    public function test_in_flight_orders_are_counted_optimistically_as_delivered(): void
     {
+        // Виджет Ozon считает delivering-заказы уже выкупленными,
+        // поэтому и мы делаем так же: (delivered + in_flight) / total.
         $integrationId = 59;
         $sku = '2082/brown';
 
@@ -44,8 +46,10 @@ class OzonPostingsBuyoutCalculatorTest extends TestCase
         $result = (new OzonPostingsBuyoutCalculator())->calculateForSku($integrationId, $sku, 28);
 
         $this->assertNotNull($result);
-        $this->assertSame(50.0, $result['redemption_rate']);
+        $this->assertSame(80.0, $result['redemption_rate']); // (1+3) / 5
         $this->assertSame(5, $result['orders_count']);
+        $this->assertSame(4, $result['delivered_count']);
+        $this->assertSame(1, $result['delivered_confirmed_count']);
         $this->assertSame(3, $result['in_flight_count']);
     }
 
