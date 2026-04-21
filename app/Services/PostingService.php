@@ -814,4 +814,106 @@ class PostingService
 
         throw new \RuntimeException("Acts not supported for {$integration->marketplace}");
     }
+
+    /**
+     * Освежить статусы «в пути» постингов Ozon за окно $windowDays.
+     *
+     * Ozon-виджет «Выкупы за 28 дней» иногда уже считает delivering-заказ
+     * выкупленным, хотя в /v2/posting/fbo/list он ещё delivering. Чтобы
+     * максимально приблизиться к виджету, перед расчётом выкупа точечно
+     * перезапрашиваем каждый висящий постинг через /v2/posting/fbo/get
+     * (или /v3/posting/fbs/get) и обновляем статус.
+     *
+     * Ограничение $limit — чтобы один кривой магазин не съел всё время синка.
+     *
+     * @return array{refreshed:int, changed:int, skipped:int, errors:int}
+     */
+    public function refreshInFlightOzonPostings(Integration $integration, int $windowDays = 28, int $limit = 200): array
+    {
+        if ($integration->marketplace !== 'ozon') {
+            return ['refreshed' => 0, 'changed' => 0, 'skipped' => 0, 'errors' => 0];
+        }
+
+        $dateTo = now()->subDay()->endOfDay();
+        $dateFrom = (clone $dateTo)->subDays($windowDays - 1)->startOfDay();
+
+        $inFlightStatuses = [
+            Posting::STATUS_DELIVERING,
+            Posting::STATUS_AWAITING_DELIVER,
+            Posting::STATUS_AWAITING_PACKAGING,
+        ];
+
+        $inFlight = Posting::where('integration_id', $integration->id)
+            ->where('marketplace', 'ozon')
+            ->whereIn('status', $inFlightStatuses)
+            ->whereBetween('in_process_at', [$dateFrom, $dateTo])
+            ->orderByDesc('in_process_at')
+            ->limit($limit)
+            ->get(['id', 'posting_number', 'delivery_type', 'status']);
+
+        if ($inFlight->isEmpty()) {
+            return ['refreshed' => 0, 'changed' => 0, 'skipped' => 0, 'errors' => 0];
+        }
+
+        $marketplace = OzonMarketplace::fromIntegration($integration);
+        $fbo = $marketplace->fboPostings();
+        $fbs = $marketplace->fbsPostings();
+
+        $refreshed = 0;
+        $changed = 0;
+        $skipped = 0;
+        $errors = 0;
+
+        foreach ($inFlight as $posting) {
+            $deliveryType = $posting->delivery_type === 'fbs' ? 'fbs' : 'fbo';
+            $previousStatus = $posting->status;
+
+            try {
+                $data = $deliveryType === 'fbs'
+                    ? $fbs->get($posting->posting_number)
+                    : $fbo->get($posting->posting_number);
+            } catch (\Throwable $e) {
+                $errors++;
+                Log::warning('refreshInFlightOzonPostings: API error', [
+                    'integration_id' => $integration->id,
+                    'posting_number' => $posting->posting_number,
+                    'error' => $e->getMessage(),
+                ]);
+                continue;
+            }
+
+            if (empty($data) || ! isset($data['status'])) {
+                $skipped++;
+                continue;
+            }
+
+            try {
+                $this->upsertOzonPosting($integration, $data, $deliveryType);
+                $refreshed++;
+                $newStatus = $this->mapOzonStatus($data['status']);
+                if ($newStatus !== $previousStatus) {
+                    $changed++;
+                }
+            } catch (\Throwable $e) {
+                $errors++;
+                Log::warning('refreshInFlightOzonPostings: upsert error', [
+                    'integration_id' => $integration->id,
+                    'posting_number' => $posting->posting_number,
+                    'error' => $e->getMessage(),
+                ]);
+            }
+        }
+
+        Log::info('refreshInFlightOzonPostings: done', [
+            'integration_id' => $integration->id,
+            'window_days' => $windowDays,
+            'total' => $inFlight->count(),
+            'refreshed' => $refreshed,
+            'changed' => $changed,
+            'skipped' => $skipped,
+            'errors' => $errors,
+        ]);
+
+        return compact('refreshed', 'changed', 'skipped', 'errors');
+    }
 }

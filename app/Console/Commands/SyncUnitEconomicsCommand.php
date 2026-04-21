@@ -470,17 +470,26 @@ class SyncUnitEconomicsCommand extends Command
 
                     // === ПОЛУЧЕНИЕ ПРОЦЕНТА ВЫКУПА ===
                     // Приоритет источников:
-                    //   1. Analytics API (Premium) — основной: его формула
-                    //      (ordered − cancellations − returns) / ordered × 100
-                    //      один-в-один совпадает с виджетом Ozon «Выкупы по товару»,
-                    //      потому что считается из того же агрегата на стороне Ozon.
-                    //   2. Postings (28д) — fallback: реальные postings.status.
-                    //      Используются, когда Analytics API пуст по SKU или
-                    //      аккаунт не Premium. Формула
-                    //      delivered / (delivered + cancelled + not_accepted)
-                    //      даёт расхождение с виджетом Ozon, если часть заказов
-                    //      ещё в статусе `delivering`, потому что Ozon считает их
-                    //      выкупленными, а у нас они не попадают в знаменатель.
+                    //   1. Analytics API (Premium) — основной.
+                    //   2. Postings (28д) — fallback и override, если postings
+                    //      показывают больше выкупов, чем Analytics (API лжёт
+                    //      про cancellations для отдельных SKU).
+                    //
+                    // Перед расчётом по postings точечно обновляем статусы свежих
+                    // «в пути» постингов через /v2/posting/fbo/get — /v2/posting/fbo/list
+                    // иногда отдаёт устаревший delivering по заказам, которые на стороне
+                    // Ozon уже доставлены и попадают в виджет «Выкупы» как выкупленные.
+                    try {
+                        $integrationModel = \App\Models\Integration::find($integrationId);
+                        if ($integrationModel) {
+                            $refreshStats = $postingService->refreshInFlightOzonPostings($integrationModel, 28);
+                            if (($refreshStats['changed'] ?? 0) > 0 || ($refreshStats['refreshed'] ?? 0) > 0) {
+                                $this->info('  Освежили «в пути» постинги: '.json_encode($refreshStats, JSON_UNESCAPED_UNICODE));
+                            }
+                        }
+                    } catch (\Throwable $refreshException) {
+                        $this->warn('  Не удалось освежить in-flight постинги: '.$refreshException->getMessage());
+                    }
 
                     $postingsCalculator = app(\App\Services\Ozon\OzonPostingsBuyoutCalculator::class);
                     $postingsBuyoutMap = $postingsCalculator->calculateForIntegration((int) $integrationId, 28);
