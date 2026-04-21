@@ -122,7 +122,16 @@ class OzonService implements MarketplaceInterface
             'reviews_count' => $item['reviews_count'] ?? 0,
             'marketplace' => 'ozon',
             'marketplace_id' => (string)$item['id'],
-            'url' => "https://www.ozon.ru/product/{$item['id']}",
+            // Ozon public URL использует каталожный sku (общий для всего маркетплейса),
+            // а не seller-side product_id из $item['id'] — иначе по ссылке открывается
+            // чужой товар с совпавшим product_id. fbo_sku/fbs_sku — deprecated fallback
+            // для старых карточек.
+            'url' => 'https://www.ozon.ru/product/'.(
+                $item['sku']
+                    ?? $item['fbo_sku']
+                    ?? $item['fbs_sku']
+                    ?? $item['id']
+            ),
             'ozon_data' => [
                 'product_id' => $item['id'],
                 'offer_id' => $item['offer_id'] ?? null,
