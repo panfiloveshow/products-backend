@@ -298,10 +298,37 @@ class UnitEconomicsCacheService
             'yandex', 'yandex_market' => 90,
             default => 90,
         };
-        $redemptionRate = $settings?->redemption_rate_override
-            ?? $existingUE?->redemption_rate
-            ?? $redemption['redemption_rate']
-            ?? $defaultRedemptionRate;
+
+        // Для Ozon фиксируем source в цепочке — фронту нужно понимать откуда
+        // пришло значение (postings_28d, analytics_api_28d, no_sales_28d, manual, default).
+        // Также пробрасываем period_days (28 для Ozon, 30 для не-Premium fallback).
+        $existingUESource = $existingUE?->redemption_source ?? null;
+        $existingUERate = $existingUE?->redemption_rate !== null
+            ? (float) $existingUE->redemption_rate
+            : null;
+        $apiSource = $redemption['source'] ?? null;
+
+        if ($settings?->redemption_rate_override !== null) {
+            $redemptionRate = (float) $settings->redemption_rate_override;
+            $redemptionSource = 'manual';
+        } elseif ($existingUERate !== null) {
+            // Включая 0.0 для no_sales_28d — именно это user просил (0% и в расчётах тоже).
+            $redemptionRate = $existingUERate;
+            $redemptionSource = $existingUESource ?? 'default';
+        } elseif (array_key_exists('redemption_rate', $redemption) && $redemption['redemption_rate'] !== null) {
+            $redemptionRate = (float) $redemption['redemption_rate'];
+            $redemptionSource = $apiSource ?? 'api';
+        } else {
+            $redemptionRate = (float) $defaultRedemptionRate;
+            $redemptionSource = 'default';
+        }
+
+        $redemptionPeriodDays = (int) ($redemption['period_days']
+            ?? match ($redemptionSource) {
+                'postings_28d', 'analytics_api_28d', 'no_sales_28d' => 28,
+                'fallback_orders_returns', 'fallback_partial' => 30,
+                default => 28,
+            });
 
         $integration = $this->getIntegrationCached($product->integration_id);
         $integrationSettings = $integration?->settings ?? [];
@@ -601,6 +628,8 @@ class UnitEconomicsCacheService
             'category_id' => $product->category ?? 'default',
             'commission_rate' => (float) $commissionPercent,
             'redemption_rate' => (float) $redemptionRate,
+            'redemption_source' => $redemptionSource,
+            'redemption_period_days' => $redemptionPeriodDays,
             'delivery_coefficient' => null,
             'warehouse_coefficient' => (float) $warehouseCoefficient,
             'localization_index' => (float) $localizationIndex,
@@ -700,7 +729,8 @@ class UnitEconomicsCacheService
                 'acquiring_percent' => $acquiringPercent,
                 'is_in_promotion' => $marketplaceData['is_in_promotion'] ?? $commissions['is_in_promotion'] ?? false,
                 'promotion_discount' => $marketplaceData['promotion_discount'] ?? $commissions['promotion_discount'] ?? 0,
-                'redemption_source' => $existingUE?->redemption_source ?? 'default',
+                'redemption_source' => $redemptionSource,
+                'redemption_period_days' => $redemptionPeriodDays,
                 'orders_count' => $existingUE?->orders_count ?? null,
                 'returns_count' => $existingUE?->returns_count ?? null,
                 'delivered_count' => $existingMarketplaceData['delivered_count'] ?? null,

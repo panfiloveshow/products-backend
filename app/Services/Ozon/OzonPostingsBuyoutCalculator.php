@@ -101,7 +101,7 @@ class OzonPostingsBuyoutCalculator
             'returns_count' => 0,
             'postings_count' => $totalPostings,
             'period_days' => $days,
-            'source' => 'postings',
+            'source' => 'postings_28d',
             // Доверяем постингам при любом количестве заказов — пусть даже 1.
 // Раньше ставили >=3, из-за чего 2 заказа считались «неполными»
 // и API analytics перезаписывал их дефолтом 100%.
@@ -176,7 +176,7 @@ class OzonPostingsBuyoutCalculator
                 'returns_count' => 0,
                 'postings_count' => $buckets['postings'],
                 'period_days' => $days,
-                'source' => 'postings',
+                'source' => 'postings_28d',
                 // Доверяем постингам при любом количестве заказов — пусть даже 1.
 // Раньше ставили >=3, из-за чего 2 заказа считались «неполными»
 // и API analytics перезаписывал их дефолтом 100%.

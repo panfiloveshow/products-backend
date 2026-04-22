@@ -1598,7 +1598,16 @@ class UnitEconomicsCacheController extends Controller
             'in_flight_count' => $marketplaceData['in_flight_count']
                 ?? $redemption['in_flight_count']
                 ?? null,
-            'is_default' => ($cache->redemption_source ?? 'default') === 'default',
+            'period_days' => $marketplaceData['redemption_period_days']
+                ?? $marketplaceData['redemption']['period_days']
+                ?? $redemption['period_days']
+                ?? 28,
+            'is_default' => in_array(
+                $cache->redemption_source ?? 'default',
+                ['default', 'no_sales_28d'],
+                true
+            ),
+            'is_no_sales' => ($cache->redemption_source ?? null) === 'no_sales_28d',
         ]);
 
         // Поля *_per_unit

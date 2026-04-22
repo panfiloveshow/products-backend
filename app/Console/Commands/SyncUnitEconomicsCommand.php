@@ -492,6 +492,8 @@ class SyncUnitEconomicsCommand extends Command
                     $postingsCalculator = app(\App\Services\Ozon\OzonPostingsBuyoutCalculator::class);
                     $postingsBuyoutMap = $postingsCalculator->calculateForIntegration((int) $integrationId, 28);
                     foreach ($postingsBuyoutMap as $sku => $buyout) {
+                        $buyout['period_days'] = 28;
+                        $buyout['source'] = 'postings_28d';
                         $redemptionData[$sku] = $buyout;
                         if (isset($offerIdToOzonSkuMap[$sku])) {
                             $redemptionData[$offerIdToOzonSkuMap[$sku]] = $buyout;
@@ -512,6 +514,8 @@ class SyncUnitEconomicsCommand extends Command
                         $fromApi = 0;
                         foreach ($analyticsData as $key => $item) {
                             if (! isset($redemptionData[$key])) {
+                                $item['source'] = 'analytics_api_28d';
+                                $item['period_days'] = 28;
                                 $redemptionData[$key] = $item;
                                 $fromApi++;
                             }
@@ -567,7 +571,8 @@ class SyncUnitEconomicsCommand extends Command
                                     'cancellations' => $cancellationsCount,
                                     'delivered_count' => max(0, $ordersCount - $notRedeemed),
                                     'has_full_data' => true,
-                                    'source' => $hasCancellations ? 'fallback' : 'fallback_partial',
+                                    'source' => $hasCancellations ? 'fallback_orders_returns' : 'fallback_partial',
+                                    'period_days' => 30,
                                 ];
                             }
 
@@ -577,6 +582,35 @@ class SyncUnitEconomicsCommand extends Command
                                 $this->warn('  ⚠ Нет данных о выкупе. Установите manual_redemption_rate в настройках интеграции.');
                             }
                         }
+                    }
+
+                    // Шаг 3: no_sales_28d sweep. Для SKU без ЛЮБЫХ данных ставим 0% —
+                    // user хочет честное «0% (нет продаж за 28 дней)» вместо 100%/85% дефолтов.
+                    // Этот 0% идёт и в юнит-экономику: expectedReturnCost = logistics × 100%
+                    // (нет продаж ⇒ считаем худший сценарий).
+                    $noSalesCount = 0;
+                    foreach ($ozonSkuToOfferIdMap as $ozonSku => $offerId) {
+                        if (isset($redemptionData[$offerId]) || isset($redemptionData[$ozonSku])) {
+                            continue;
+                        }
+                        $empty = [
+                            'redemption_rate' => 0,
+                            'orders_count' => 0,
+                            'delivered_count' => 0,
+                            'cancelled_count' => 0,
+                            'in_flight_count' => 0,
+                            'returns_count' => 0,
+                            'postings_count' => 0,
+                            'has_full_data' => false,
+                            'source' => 'no_sales_28d',
+                            'period_days' => 28,
+                        ];
+                        $redemptionData[$offerId] = $empty;
+                        $redemptionData[$ozonSku] = $empty;
+                        $noSalesCount++;
+                    }
+                    if ($noSalesCount > 0) {
+                        $this->info("  Без продаж за 28д: {$noSalesCount} SKU → 0%");
                     }
 
                     // TODO: Эквайринг из финансовых транзакций отключён (слишком много данных, OOM)
