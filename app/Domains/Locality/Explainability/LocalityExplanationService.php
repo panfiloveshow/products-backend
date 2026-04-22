@@ -41,8 +41,16 @@ class LocalityExplanationService
         ?int $counterfactualQty = null,
         ?string $counterfactualClusterId = null,
     ): SkuExplanationDto {
+        // Версия тарифной матрицы включена в ключ: если деплоим новые наценки
+        // (например, Омск 8→12 с 18.04.2026), кэш становится недоступен
+        // автоматически и следующий запрос пересчитается. Иначе до истечения TTL
+        // (30 мин) попап показывал бы старые цифры даже после `cache:clear`.
+        $markupVersion = (string) (config('ozon_logistics_matrix.markups_effective_from')
+            ?? config('ozon_logistics_matrix.generated_at')
+            ?? 'unversioned');
         $cacheKey = sprintf(
-            'locality:explain:%d:%s:%s:%s:%s',
+            'locality:explain:v%s:%d:%s:%s:%s:%s',
+            $markupVersion,
             $integrationId,
             $sku,
             $from->toDateString(),

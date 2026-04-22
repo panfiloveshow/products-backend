@@ -3,6 +3,7 @@
 namespace App\Domains\Locality;
 
 use App\Domains\Locality\Console\LocalityBackfillCommand;
+use App\Domains\Locality\Console\LocalityHealthCheckCommand;
 use App\Domains\Locality\Console\LocalityReconcileCommand;
 use App\Domains\Locality\Console\LocalityRecomputeCommand;
 use App\Domains\Locality\Console\LocalitySyncClustersCommand;
@@ -31,6 +32,7 @@ class LocalityServiceProvider extends ServiceProvider
                 LocalityBackfillCommand::class,
                 LocalityRecomputeCommand::class,
                 LocalityReconcileCommand::class,
+                LocalityHealthCheckCommand::class,
             ]);
         }
     }

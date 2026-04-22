@@ -34,10 +34,30 @@ class LocalityAggregator
         $to = $date->copy()->endOfDay();
         $from = $to->copy()->subDays($periodDays)->startOfDay();
 
+        // Shadow-update: фиксируем старт, updateOrCreate'им актуальные SKU/кластеры,
+        // в конце удаляем осиротевшие snapshot'ы этого (integration, date, period),
+        // у которых updated_at остался до старта. Иначе SKU, которые перестали
+        // продаваться за последние 28 дней, навсегда сохраняли бы старые orders_count.
+        $startedAt = now();
+
         $items = $this->reader->queryForPeriod($integrationId, $from, $to)->get();
 
         $skusProcessed = $this->aggregateBySku($integrationId, $date, $periodDays, $items);
         $clustersProcessed = $this->aggregateByCluster($integrationId, $date, $periodDays, $items);
+
+        $skuOrphansPruned = LocalityMetricDaily::query()
+            ->where('integration_id', $integrationId)
+            ->where('snapshot_date', $date->toDateString())
+            ->where('period_days', $periodDays)
+            ->where('updated_at', '<', $startedAt)
+            ->delete();
+
+        $clusterOrphansPruned = LocalityMetricClusterDaily::query()
+            ->where('integration_id', $integrationId)
+            ->where('snapshot_date', $date->toDateString())
+            ->where('period_days', $periodDays)
+            ->where('updated_at', '<', $startedAt)
+            ->delete();
 
         Log::channel('locality')->info('LocalityAggregator runDaily completed', [
             'integration_id' => $integrationId,
@@ -46,9 +66,16 @@ class LocalityAggregator
             'items_scanned' => $items->count(),
             'skus' => $skusProcessed,
             'clusters' => $clustersProcessed,
+            'sku_orphans_pruned' => $skuOrphansPruned,
+            'cluster_orphans_pruned' => $clusterOrphansPruned,
         ]);
 
-        return ['skus_processed' => $skusProcessed, 'clusters_processed' => $clustersProcessed];
+        return [
+            'skus_processed' => $skusProcessed,
+            'clusters_processed' => $clustersProcessed,
+            'sku_orphans_pruned' => $skuOrphansPruned,
+            'cluster_orphans_pruned' => $clusterOrphansPruned,
+        ];
     }
 
     /** @param Collection<int,OzonOrderUnitEconomics> $items */
