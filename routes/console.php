@@ -49,6 +49,15 @@ if (filter_var(env('LOCALITY_SCHEDULE', false), FILTER_VALIDATE_BOOLEAN)) {
         ->weeklyOn(0, '03:30')
         ->withoutOverlapping()
         ->name('locality.purge-stale-recommendations');
+
+    // Health-check инвариантов (дубликаты в ozon_order_unit_economics,
+    // свежесть snapshot'ов, drift orders_count). Пишет в лог, exit != 0
+    // при проблемах — можно связать с alerting'ом через onFailure().
+    \Illuminate\Support\Facades\Schedule::command('locality:health-check')
+        ->hourly()
+        ->withoutOverlapping()
+        ->appendOutputTo(storage_path('logs/locality-health.log'))
+        ->name('locality.health-check');
 }
 
 // Платное хранение Ozon FBO — пишет в inventory_warehouses.storage_fee_prev_month.
