@@ -218,12 +218,16 @@ class LocalityHealthCheckCommand extends Command
 
         $stalePercent = $total > 0 ? round(($stale / $total) * 100, 1) : 0;
 
-        // Порог 20% — ниже норма (некоторые SKU ещё не пересчитывались),
-        // выше — явный сигнал что scheduled recompute не работает.
-        if ($stalePercent > 20) {
+        // Пороги:
+        // - до 50% = норма: SKU с активной Ozon-fixation (60 дней freeze от даты
+        //   заявки на поставку) легитимно используют старую тарифную версию.
+        // - 50-80% = WARN: что-то подозрительное, возможно забыли запустить sync.
+        // - >80%  = FAIL: скорее всего scheduled recompute не работает /
+        //   версия config обновилась, а данные нет.
+        if ($stalePercent > 80) {
             $this->error(sprintf(
                 '  [FAIL] locality_metrics_daily @%s: %d из %d snapshot (%.1f%%) с устаревшим tariff_version_used '
-                . '(текущая версия: %s). Починить: php artisan locality:recompute --scope=aggregation',
+                . '(текущая версия: %s). Починить: php artisan unit-economics:sync --all --marketplace=ozon && php artisan locality:recompute',
                 $latestDate,
                 $stale,
                 $total,
@@ -233,8 +237,19 @@ class LocalityHealthCheckCommand extends Command
             return 1;
         }
 
+        if ($stalePercent > 50) {
+            $this->warn(sprintf(
+                '  [WARN] locality_metrics_daily @%s: %d из %d snapshot (%.1f%%) устарели — возможно надо прогнать sync',
+                $latestDate,
+                $stale,
+                $total,
+                $stalePercent
+            ));
+            return 0; // не fail — часть может быть legit-fixation
+        }
+
         $this->line(sprintf(
-            '  [OK] tariff_version_used @%s: %.1f%% устаревших (порог 20%%), текущая версия %s',
+            '  [OK] tariff_version_used @%s: %.1f%% устаревших (норма ≤50%% из-за fixation), текущая версия %s',
             $latestDate,
             $stalePercent,
             $currentVersion
