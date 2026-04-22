@@ -158,12 +158,44 @@ class OzonPricingMatrix
         return $value;
     }
 
-    public function resolveDestinationMarkupPercent(?string $destinationCluster): float
+    /**
+     * Наценка за нелокальную продажу на кластер назначения.
+     *
+     * Если передана дата — сначала проверяем `non_local_markup_windows`
+     * (временные акции Ozon, например «ДВ 0% c 18.04 по 18.05.2026»).
+     * Если окно не подошло — берём постоянное значение из
+     * `non_local_markup_by_destination`.
+     *
+     * По умолчанию $date = сегодня; для исторических расчётов по конкретному
+     * заказу передавайте дату его создания (order.in_process_at).
+     */
+    public function resolveDestinationMarkupPercent(?string $destinationCluster, ?string $date = null): float
     {
         $canonical = $this->resolveClusterName($destinationCluster);
-        $map = $this->logisticsMatrix['non_local_markup_by_destination'] ?? [];
+        if ($canonical === null) {
+            return 0.0;
+        }
 
-        if ($canonical !== null && array_key_exists($canonical, $map)) {
+        $checkDate = $date ?? (function_exists('now') ? now()->toDateString() : date('Y-m-d'));
+
+        $windows = $this->logisticsMatrix['non_local_markup_windows'] ?? [];
+        foreach ($windows as $window) {
+            if (($window['destination'] ?? null) !== $canonical) {
+                continue;
+            }
+            $from = (string) ($window['from'] ?? '');
+            $to = (string) ($window['to'] ?? '');
+            if ($from !== '' && $checkDate < $from) {
+                continue;
+            }
+            if ($to !== '' && $checkDate > $to) {
+                continue;
+            }
+            return (float) ($window['percent'] ?? 0.0);
+        }
+
+        $map = $this->logisticsMatrix['non_local_markup_by_destination'] ?? [];
+        if (array_key_exists($canonical, $map)) {
             return (float) $map[$canonical];
         }
 

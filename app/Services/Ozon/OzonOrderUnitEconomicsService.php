@@ -309,7 +309,11 @@ class OzonOrderUnitEconomicsService
             return [false, 'fbo_lt_50_orders_7d', 'Надбавка не применяется: за 7 дней по FBO меньше 50 заказов', 'confirmed'];
         }
 
-        $markupPercent = $this->pricing->resolveDestinationMarkupPercent($destinationClusterName);
+        // Для per-order расчёта передаём дату заказа — это важно для временных окон
+        // Ozon (напр. ДВ 0% с 18.04 по 18.05.2026): заказ от 17.04 должен получить
+        // постоянные 8%, а заказ от 20.04 — временные 0%.
+        $orderDate = ($posting->in_process_at ?? $posting->created_at)?->toDateString();
+        $markupPercent = $this->pricing->resolveDestinationMarkupPercent($destinationClusterName, $orderDate);
         if ($markupPercent <= 0) {
             return [false, 'zero_markup_cluster', 'Надбавка не применяется: для кластера назначения ставка 0%', 'confirmed'];
         }

@@ -510,15 +510,22 @@ class SyncUnitEconomicsCommand extends Command
 
                         // Шаг 2: Analytics API — только для SKU без постингов в 28-дневном окне.
                         // Не перезаписываем postings-данные: они точнее матчат виджет Ozon UI.
+                        // Игнорируем записи с orders_count=0 (API возвращает пустышку с rate=100% —
+                        // это не реальные данные, пусть no_sales_28d sweep поставит честный 0%).
                         $analyticsData = $ozonService->getRedemptionRateFromAnalytics(null, null, $ozonSkuToOfferIdMap);
                         $fromApi = 0;
                         foreach ($analyticsData as $key => $item) {
-                            if (! isset($redemptionData[$key])) {
-                                $item['source'] = 'analytics_api_28d';
-                                $item['period_days'] = 28;
-                                $redemptionData[$key] = $item;
-                                $fromApi++;
+                            if (isset($redemptionData[$key])) {
+                                continue;
                             }
+                            $orders = (int) ($item['orders_count'] ?? $item['ordered_units'] ?? 0);
+                            if ($orders <= 0) {
+                                continue; // нет реальных заказов — это не данные, пропускаем
+                            }
+                            $item['source'] = 'analytics_api_28d';
+                            $item['period_days'] = 28;
+                            $redemptionData[$key] = $item;
+                            $fromApi++;
                         }
                         if ($fromApi > 0) {
                             $this->info("  API аналитики: выкуп для {$fromApi} SKU (fallback для SKU без постингов в 28д)");
