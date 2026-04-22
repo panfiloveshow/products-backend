@@ -17,6 +17,7 @@ use App\Models\UnitEconomicsCache;
 use Carbon\Carbon;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Log;
 
 /**
  * Собирает SkuExplanationDto: summary, per-cluster breakdown, attribution, counterfactual, timeline.
@@ -46,12 +47,28 @@ class LocalityExplanationService
         // (например, Омск 8→12 с 18.04.2026), кэш становится недоступен
         // автоматически и следующий запрос пересчитается. Иначе до истечения TTL
         // (30 мин) попап показывал бы старые цифры даже после `cache:clear`.
-        $markupVersion = (string) (config('ozon_logistics_matrix.markups_effective_from')
-            ?? config('ozon_logistics_matrix.generated_at')
-            ?? 'unversioned');
+        $markupVersion = config('ozon_logistics_matrix.markups_effective_from')
+            ?? config('ozon_logistics_matrix.generated_at');
+        $markupVersionMissing = $markupVersion === null;
+
+        // Observability: если оба ключа в config пустые — конфиг markup-матрицы
+        // сгенерирован неправильно. Стабильный fallback на 'unversioned' маскирует
+        // это: кэш становится stable для ВСЕХ релизов новых тарифов, инвалидация
+        // ломается. Логируем WARN (раз в 5 минут, чтобы не засорять логи).
+        if ($markupVersionMissing) {
+            $logKey = 'locality:markup-version-missing-warned';
+            if (Cache::add($logKey, 1, 300)) {
+                Log::channel('locality')->warning(
+                    'markups_effective_from AND generated_at отсутствуют в config/ozon_logistics_matrix.php — '
+                    . 'explainForSku кэш не будет инвалидироваться при обновлении матрицы. '
+                    . 'Проверь скрипт регенерации config.'
+                );
+            }
+        }
+
         $cacheKey = sprintf(
             'locality:explain:v%s:%d:%s:%s:%s:%s',
-            $markupVersion,
+            (string) ($markupVersion ?? 'unversioned'),
             $integrationId,
             $sku,
             $from->toDateString(),
@@ -495,7 +512,17 @@ class LocalityExplanationService
             return 'no_local_stock';
         }
 
-        $orderDate = $item->order_date !== null ? Carbon::parse($item->order_date) : now();
+        // Если order_date null (редкий кейс — PostingService не получил ни
+        // in_process_at, ни delivered_at), раньше fallback'ились на now().
+        // Это делало atribution неверным: для заказа, который физически был
+        // год назад, смотрели сегодняшние остатки. Теперь помечаем 'unknown_attribution',
+        // чтобы фронт мог отобразить это как «недостаточно данных для атрибуции»,
+        // а не врать про «no_local_stock».
+        if ($item->order_date === null) {
+            return 'unknown_attribution';
+        }
+
+        $orderDate = Carbon::parse($item->order_date);
         $snapshot = $this->inventoryHistory->stockByClusterOnDate($integrationId, $sku, $orderDate);
         $stockInDest = $snapshot['by_cluster'][$destCluster] ?? 0;
 

@@ -41,6 +41,10 @@ class LocalityHealthCheckCommand extends Command
             $this->option('integration') !== null ? (int) $this->option('integration') : null
         );
 
+        $errors += $this->checkTariffVersionDrift(
+            $this->option('integration') !== null ? (int) $this->option('integration') : null
+        );
+
         if ($errors > 0) {
             $this->error("Health check failed: {$errors} issue(s)");
             return self::FAILURE;
@@ -163,5 +167,64 @@ class LocalityHealthCheckCommand extends Command
 
         $this->line('    Починить: php artisan locality:recompute --scope=aggregation');
         return 1;
+    }
+
+    /**
+     * Расхождение между текущей версией config/ozon_logistics_matrix.php
+     * и tariff_version_used в unit_economics_cache. Если деплой новой матрицы
+     * прошёл, но recalculateIntegration не запустили — кэш показывает старые
+     * тарифы/наценки. Health-check предупреждает, не падая сразу.
+     */
+    private function checkTariffVersionDrift(?int $integrationId): int
+    {
+        $currentVersion = (string) (config('ozon_logistics_matrix.markups_effective_from')
+            ?? config('ozon_logistics_matrix.generated_at')
+            ?? '');
+
+        if ($currentVersion === '') {
+            $this->line('  [SKIP] ozon_logistics_matrix не имеет версии — пропускаю tariff drift');
+            return 0;
+        }
+
+        $q = DB::table('unit_economics_cache')
+            ->where('marketplace', 'ozon');
+        if ($integrationId !== null) {
+            $q->where('integration_id', $integrationId);
+        }
+
+        $total = (clone $q)->count();
+        if ($total === 0) {
+            return 0;
+        }
+
+        $stale = (clone $q)
+            ->where(function ($w) use ($currentVersion) {
+                $w->whereNull('tariff_version_used')
+                  ->orWhere('tariff_version_used', '!=', $currentVersion);
+            })
+            ->count();
+
+        $stalePercent = $total > 0 ? round(($stale / $total) * 100, 1) : 0;
+
+        // Порог 20% — ниже норма (некоторые SKU ещё не пересчитывались),
+        // выше — явный сигнал что scheduled recompute не работает.
+        if ($stalePercent > 20) {
+            $this->error(sprintf(
+                '  [FAIL] unit_economics_cache: %d из %d строк (%.1f%%) с устаревшим tariff_version_used '
+                . '(текущая версия: %s). Починить: php artisan unit-economics:sync --all --marketplace=ozon',
+                $stale,
+                $total,
+                $stalePercent,
+                $currentVersion
+            ));
+            return 1;
+        }
+
+        $this->line(sprintf(
+            '  [OK] tariff_version_used: %.1f%% устаревших (порог 20%%), текущая версия %s',
+            $stalePercent,
+            $currentVersion
+        ));
+        return 0;
     }
 }
