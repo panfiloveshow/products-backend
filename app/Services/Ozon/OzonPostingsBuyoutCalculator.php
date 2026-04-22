@@ -17,8 +17,16 @@ use Illuminate\Support\Facades\DB;
  *   not_accepted             → не выкупили
  *   delivering / awaiting_*  → в пути, оптимистично считаем выкупленными
  *
- * Формула (как у виджета Ozon «Выкупы за 28 дней»):
- *   rate = (delivered + in_flight) / (delivered + cancelled + not_accepted + in_flight) * 100
+ * Формула Ozon Seller UI «Выкупы по товару»:
+ *   rate = delivered / (delivered + cancelled + not_redeemed + in_flight) * 100
+ *
+ * in_flight (delivering / awaiting_*) считается «заказано», но НЕ «выкуплено»
+ * до подтверждения — так виджет Ozon и отдаёт. Раньше мы суммировали in_flight
+ * в числитель (оптимистично), это давало завышенную картину для товаров
+ * с большой долей в пути (напр. 2082/brown: наши 51.72% vs Ozon 17.24%).
+ *
+ * При >50% in_flight has_full_data=false — цифра будет скакать пока
+ * статусы Ozon догоняются. Фронту показать «данные уточняются».
  *
  * Возвраты Ozon отдаёт отдельным API (/v1/returns/*), здесь не учтены —
  * их доля по каталогу в среднем <5% и в postings.status они почти не встречаются.
@@ -91,17 +99,27 @@ class OzonPostingsBuyoutCalculator
             return null;
         }
 
-        // Оптимистичная формула (как виджет Ozon «Выкупы за 28 дней»):
-        // delivering считаем уже выкупленными. Ozon сам так делает в виджете,
-        // даже когда его /v2/posting/fbo/get по этому же заказу ещё отдаёт
-        // delivering. Статусы догонятся при следующем refresh / sync.
-        $optimisticDelivered = $delivered + $inFlight;
-        $rate = round(($optimisticDelivered / $totalOrders) * 100, 2);
+        // Ozon Seller UI формула «Выкупы по товару»:
+        //   rate = выкуплено / заказано
+        //   где выкуплено = delivered (только подтверждённые доставки)
+        //         заказано = delivered + cancelled + not_redeemed + in_flight
+        //
+        // Раньше было оптимистично (delivered + in_flight) / total — случайно
+        // совпадало с Ozon в случаях когда статусы Ozon уже обновились,
+        // но давало завышенную картину для товаров с большой долей in_flight
+        // (напр. 2082/brown: 5 del + 14 cancel + 10 in_flight → наши 51.7%,
+        // Ozon реально 17.2%).
+        //
+        // При >50% in_flight помечаем has_full_data=false — фронт может
+        // показать «данные неполные, статусы ещё догоняются» и подсказать
+        // refreshInFlightOzonPostings.
+        $rate = $totalOrders > 0 ? round(($delivered / $totalOrders) * 100, 2) : 0.0;
+        $inFlightShare = $totalOrders > 0 ? $inFlight / $totalOrders : 0.0;
 
         return [
             'redemption_rate' => $rate,
             'orders_count' => $totalOrders,
-            'delivered_count' => $optimisticDelivered,
+            'delivered_count' => $delivered,
             'delivered_confirmed_count' => $delivered,
             'cancelled_count' => $cancelled,
             'cancellations_count' => $cancelled,
@@ -111,10 +129,9 @@ class OzonPostingsBuyoutCalculator
             'postings_count' => $totalPostings,
             'period_days' => $days,
             'source' => 'postings_28d',
-            // Доверяем постингам при любом количестве заказов — пусть даже 1.
-// Раньше ставили >=3, из-за чего 2 заказа считались «неполными»
-// и API analytics перезаписывал их дефолтом 100%.
-'has_full_data' => $totalOrders >= 1,
+            // has_full_data=false если >50% заказов ещё в пути: цифра будет
+            // скакать когда статусы Ozon догоняют наши postings.
+            'has_full_data' => $totalOrders >= 1 && $inFlightShare <= 0.5,
         ];
     }
 
@@ -175,13 +192,14 @@ class OzonPostingsBuyoutCalculator
                 continue;
             }
 
-            // Оптимистичная формула — см. calculateForSku().
-            $optimisticDelivered = $buckets['delivered'] + $buckets['in_flight'];
+            // Ozon-like формула: delivered / (delivered + cancelled + not_redeemed + in_flight).
+            // in_flight считается «заказано», но НЕ «выкуплено» до подтверждения.
+            $inFlightShare = $totalOrders > 0 ? $buckets['in_flight'] / $totalOrders : 0.0;
 
             $result[$sku] = [
-                'redemption_rate' => round(($optimisticDelivered / $totalOrders) * 100, 2),
+                'redemption_rate' => round(($buckets['delivered'] / $totalOrders) * 100, 2),
                 'orders_count' => $totalOrders,
-                'delivered_count' => $optimisticDelivered,
+                'delivered_count' => $buckets['delivered'],
                 'delivered_confirmed_count' => $buckets['delivered'],
                 'cancelled_count' => $buckets['cancelled'],
                 'cancellations_count' => $buckets['cancelled'],
@@ -191,10 +209,8 @@ class OzonPostingsBuyoutCalculator
                 'postings_count' => $buckets['postings'],
                 'period_days' => $days,
                 'source' => 'postings_28d',
-                // Доверяем постингам при любом количестве заказов — пусть даже 1.
-// Раньше ставили >=3, из-за чего 2 заказа считались «неполными»
-// и API analytics перезаписывал их дефолтом 100%.
-'has_full_data' => $totalOrders >= 1,
+                // >50% in_flight = статусы Ozon ещё не подтянулись, цифра будет скакать.
+                'has_full_data' => $totalOrders >= 1 && $inFlightShare <= 0.5,
             ];
         }
 
