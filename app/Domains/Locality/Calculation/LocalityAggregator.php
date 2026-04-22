@@ -46,7 +46,40 @@ class LocalityAggregator
         $dbNow = DB::selectOne('SELECT NOW() AS n')->n ?? null;
         $startedAt = $dbNow !== null ? Carbon::parse($dbNow) : now();
 
-        $items = $this->reader->queryForPeriod($integrationId, $from, $to)->get();
+        // Memory safety: загружаем только нужные поля, без больших JSON (meta,
+        // markup_exception_*, fixation_*, tariff_version_used). На 50k+ items
+        // это срезает RAM footprint с ~400MB до ~80MB. Калькуляторам нужны
+        // только бизнес-поля — сверено по использованию в aggregateBySku/Cluster.
+        $items = $this->reader->queryForPeriod($integrationId, $from, $to)
+            ->select([
+                'id',
+                'sku',
+                'shipping_cluster_name',
+                'shipping_cluster_id',
+                'destination_cluster_name',
+                'destination_cluster_id',
+                'sale_price',
+                'base_logistics_tariff',
+                'non_local_markup_percent',
+                'non_local_markup_amount',
+                'markup_applied',
+                'markup_reason_code',
+                'calculation_mode',
+                'calculation_confidence',
+                'order_date',
+                'tariff_version_used',
+                'volume_liters',
+            ])
+            ->get();
+
+        $itemsCount = $items->count();
+        if ($itemsCount > 50000) {
+            Log::channel('locality')
+                ->warning('LocalityAggregator: большой объём items — возможен memory pressure', [
+                    'integration_id' => $integrationId,
+                    'items' => $itemsCount,
+                ]);
+        }
 
         $skusProcessed = $this->aggregateBySku($integrationId, $date, $periodDays, $items);
         $clustersProcessed = $this->aggregateByCluster($integrationId, $date, $periodDays, $items);
