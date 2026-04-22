@@ -136,14 +136,21 @@ class OzonOrderUnitEconomicsService
             default => 'low',
         };
 
+        // Ключ updateOrCreate — бизнес-ключ (posting_number + sku + offer_id),
+        // а не posting_item_id. Причина: PostingService::syncOzonPostingItems
+        // пересоздаёт posting_items с новыми UUID при каждом синке, из-за чего
+        // старый ключ по posting_item_id плодил по 30+ дубликатов на реальный
+        // заказ. Бизнес-ключ устойчив: posting_number от Ozon, sku/offer_id из товара.
         return OzonOrderUnitEconomics::updateOrCreate(
-            ['posting_item_id' => $item->id],
             [
                 'integration_id' => $posting->integration_id,
-                'posting_id' => $posting->id,
                 'posting_number' => $posting->posting_number,
                 'sku' => $sku,
                 'offer_id' => $item->offer_id,
+            ],
+            [
+                'posting_id' => $posting->id,
+                'posting_item_id' => $item->id,
                 'order_date' => $orderDate?->toDateTimeString(),
                 'sale_price' => (float) ($item->price ?? 0),
                 'volume_liters' => $volumeLiters,
@@ -185,7 +192,18 @@ class OzonOrderUnitEconomicsService
 
     private function resolveOrderDate(Posting $posting): ?Carbon
     {
-        foreach ([$posting->delivered_at, $posting->shipped_at, $posting->shipment_date, $posting->created_at] as $candidate) {
+        // Приоритет: in_process_at (реальное время заказа на Ozon) → delivered_at →
+        // shipped_at → shipment_date. Раньше первым был delivered_at и цепочка
+        // заканчивалась на `created_at` (= время нашего INSERT в postings). Из-за
+        // этого order_date в ozon_order_unit_economics всегда был временем sync'а,
+        // и фильтр «за 28 дней» ловил ВСЕ исторические заказы магазина.
+        // created_at из cascade убран как заведомо неправильный.
+        foreach ([
+            $posting->in_process_at,
+            $posting->delivered_at,
+            $posting->shipped_at,
+            $posting->shipment_date,
+        ] as $candidate) {
             if ($candidate !== null) {
                 return Carbon::parse($candidate);
             }
