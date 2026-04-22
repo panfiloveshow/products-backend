@@ -26,19 +26,27 @@ class OzonOrderUnitEconomicsService
     {
         $rows = collect();
 
+        // Каждый чанк оборачиваем в DB::transaction — гарантия атомарности
+        // per-chunk: если chunkN упадёт на item'е #57, первые 56 откатятся,
+        // ранее закоммиченные чанки 1..N-1 остаются. Раньше вся цепочка шла
+        // без транзакций — при падении половина пересчитывалась с новыми
+        // tariff_version_used, половина оставалась со старыми, и
+        // LocalityAggregator потом брал микс.
         Posting::query()
             ->with(['items', 'items.product'])
             ->where('integration_id', $integrationId)
             ->where('marketplace', 'ozon')
             ->chunk(100, function ($postings) use (&$rows): void {
-                foreach ($postings as $posting) {
-                    foreach ($posting->items as $item) {
-                        $row = $this->upsertForPostingItem($posting, $item);
-                        if ($row !== null) {
-                            $rows->push($row);
+                \DB::transaction(function () use ($postings, &$rows): void {
+                    foreach ($postings as $posting) {
+                        foreach ($posting->items as $item) {
+                            $row = $this->upsertForPostingItem($posting, $item);
+                            if ($row !== null) {
+                                $rows->push($row);
+                            }
                         }
                     }
-                }
+                });
             });
 
         return $rows;

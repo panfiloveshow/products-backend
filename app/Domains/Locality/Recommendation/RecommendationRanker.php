@@ -74,7 +74,23 @@ class RecommendationRanker
             ->all();
 
         if (empty($topSkus)) {
-            return ['cohort_id' => '', 'generated' => 0, 'skipped' => 0, 'stale_marked' => 0];
+            // У интеграции больше нет кандидатов на рекомендации (все продажи
+            // локальные, или не хватает данных). Помечаем все существующие
+            // NEW-рекомендации как STALE, иначе старые записи в state='new'
+            // остаются навсегда — тот же класс orphan-бага, что у locality_metrics_daily.
+            $staleMarked = LocalityRecommendation::query()
+                ->where('integration_id', $integrationId)
+                ->where('state', LocalityRecommendation::STATE_NEW)
+                ->update(['state' => LocalityRecommendation::STATE_STALE]);
+
+            if ($staleMarked > 0) {
+                Log::channel('locality')->info('RecommendationRanker: empty topSkus → marked old NEW stale', [
+                    'integration_id' => $integrationId,
+                    'stale_marked' => $staleMarked,
+                ]);
+            }
+
+            return ['cohort_id' => '', 'generated' => 0, 'skipped' => 0, 'stale_marked' => $staleMarked];
         }
 
         $demand = $this->forecaster->forIntegration($integrationId, $periodDays);

@@ -38,7 +38,12 @@ class LocalityAggregator
         // в конце удаляем осиротевшие snapshot'ы этого (integration, date, period),
         // у которых updated_at остался до старта. Иначе SKU, которые перестали
         // продаваться за последние 28 дней, навсегда сохраняли бы старые orders_count.
-        $startedAt = now();
+        //
+        // Берём время БД (NOW()), а не PHP now() — иначе при расхождении часов между
+        // app-сервером и БД shadow-delete может удалить записи, только что
+        // созданные в параллельном прогоне для той же (integration, date, period).
+        $dbNow = DB::selectOne('SELECT NOW() AS n')->n ?? null;
+        $startedAt = $dbNow !== null ? Carbon::parse($dbNow) : now();
 
         $items = $this->reader->queryForPeriod($integrationId, $from, $to)->get();
 
