@@ -1,10 +1,13 @@
 <?php
 
 return [
-    'effective_from' => '2026-04-06',
-    'version' => '2026-04-06',
+    // Актуальная версия тарифов Ozon: с 18.04.2026 — новые наценки
+    // Омск/Пермь/Оренбург/Самара 12%, Воронеж/Ярославль 8% + окно ДВ 0%.
+    'effective_from' => '2026-04-18',
+    'version' => '2026-04-18',
     'announcement_dates' => [
         '2026-04-06' => '2026-02-05', // Tariffs announced Feb 5, effective Apr 6
+        '2026-04-18' => '2026-04-06', // Markup update announced Apr 6 (вместе с тарифами), effective Apr 18
     ],
     'transitional_periods' => [
         [
@@ -16,9 +19,8 @@ return [
     'version_history' => [
         // Each entry: version => effective_from date
         // Sorted chronologically, latest first
+        '2026-04-18' => '2026-04-18',
         '2026-04-06' => '2026-04-06',
-        // Future entries will be added here as tariffs change, e.g.:
-        // '2026-07-01' => '2026-07-01',
     ],
     'default_route' => [
         'key' => 'cluster_msk',
