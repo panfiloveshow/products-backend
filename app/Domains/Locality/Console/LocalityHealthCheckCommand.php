@@ -186,11 +186,23 @@ class LocalityHealthCheckCommand extends Command
             return 0;
         }
 
-        $q = DB::table('unit_economics_cache')
-            ->where('marketplace', 'ozon');
+        // Проверяем по locality_metrics_daily (там есть tariff_version_used),
+        // а не unit_economics_cache (там этой колонки нет — писали по ошибке).
+        // Daily-snapshot отражает актуальную тарифную версию: если после деплоя
+        // новых тарифов не запустили recompute, snapshot'ы хранят старую версию.
+        $q = DB::table('locality_metrics_daily')
+            ->where('period_days', 28);
         if ($integrationId !== null) {
             $q->where('integration_id', $integrationId);
         }
+
+        // Берём только сегодняшние snapshot'ы — иначе исторические с разными
+        // версиями портят картину.
+        $latestDate = (clone $q)->max('snapshot_date');
+        if ($latestDate === null) {
+            return 0;
+        }
+        $q->where('snapshot_date', $latestDate);
 
         $total = (clone $q)->count();
         if ($total === 0) {
@@ -210,8 +222,9 @@ class LocalityHealthCheckCommand extends Command
         // выше — явный сигнал что scheduled recompute не работает.
         if ($stalePercent > 20) {
             $this->error(sprintf(
-                '  [FAIL] unit_economics_cache: %d из %d строк (%.1f%%) с устаревшим tariff_version_used '
-                . '(текущая версия: %s). Починить: php artisan unit-economics:sync --all --marketplace=ozon',
+                '  [FAIL] locality_metrics_daily @%s: %d из %d snapshot (%.1f%%) с устаревшим tariff_version_used '
+                . '(текущая версия: %s). Починить: php artisan locality:recompute --scope=aggregation',
+                $latestDate,
                 $stale,
                 $total,
                 $stalePercent,
@@ -221,7 +234,8 @@ class LocalityHealthCheckCommand extends Command
         }
 
         $this->line(sprintf(
-            '  [OK] tariff_version_used: %.1f%% устаревших (порог 20%%), текущая версия %s',
+            '  [OK] tariff_version_used @%s: %.1f%% устаревших (порог 20%%), текущая версия %s',
+            $latestDate,
             $stalePercent,
             $currentVersion
         ));
