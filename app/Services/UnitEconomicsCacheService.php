@@ -312,14 +312,14 @@ class UnitEconomicsCacheService
         // имеют приоритет над existingUE. Иначе stale default=85% из unit_economics
         // вечно перекрывал свежий postings_28d. Это был баг: cache 2099/black1
         // отдавал ord=3 из старого sync, хотя новый postings за 28д показывал 2.
-        $freshSources = ['postings_28d', 'analytics_api_28d', 'no_sales_28d',
-                         'fallback_orders_returns', 'fallback_partial'];
+        // Список «свежих» источников централизован в RedemptionSource::isFresh().
+        $apiSourceEnum = \App\Domains\Ozon\UnitEconomics\RedemptionSource::fromStringSafe($apiSource);
+        $apiIsFresh = $apiSource !== null && $apiSourceEnum->isFresh();
 
         if ($settings?->redemption_rate_override !== null) {
             $redemptionRate = (float) $settings->redemption_rate_override;
             $redemptionSource = 'manual';
-        } elseif ($apiSource !== null
-            && in_array($apiSource, $freshSources, true)
+        } elseif ($apiIsFresh
             && array_key_exists('redemption_rate', $redemption)
             && $redemption['redemption_rate'] !== null
         ) {

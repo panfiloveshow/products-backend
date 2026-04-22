@@ -1601,7 +1601,11 @@ class UnitEconomicsCacheController extends Controller
             'period_days' => $marketplaceData['redemption_period_days']
                 ?? $marketplaceData['redemption']['period_days']
                 ?? $redemption['period_days']
-                ?? 28,
+                ?? \App\Domains\Ozon\UnitEconomics\RedemptionSource::fromStringSafe($cache->redemption_source)->periodDays(),
+            // Семейство источника — стабильный фронт-контракт независимо от
+            // конкретного sub-источника (postings_28d/analytics_api_28d/… → 'postings'/'api'/…)
+            'source_family' => \App\Domains\Ozon\UnitEconomics\RedemptionSource::fromStringSafe($cache->redemption_source)->family()->value,
+            'is_reliable' => \App\Domains\Ozon\UnitEconomics\RedemptionSource::fromStringSafe($cache->redemption_source)->family()->isReliable(),
             'is_default' => in_array(
                 $cache->redemption_source ?? 'default',
                 ['default', 'no_sales_28d'],
