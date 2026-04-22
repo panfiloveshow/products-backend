@@ -469,16 +469,13 @@ class SyncUnitEconomicsCommand extends Command
                         });
 
                     // === ПОЛУЧЕНИЕ ПРОЦЕНТА ВЫКУПА ===
-                    // Приоритет источников:
-                    //   1. Analytics API (Premium) — основной.
-                    //   2. Postings (28д) — fallback и override, если postings
-                    //      показывают больше выкупов, чем Analytics (API лжёт
-                    //      про cancellations для отдельных SKU).
+                    // Единый источник истины: постинги за 28 дней. Точно матчит виджет
+                    // Ozon «Выкупы по товару за 28 дней». Analytics API используется только
+                    // для тех SKU, по которым в 28д нет ни одного постинга.
                     //
-                    // Перед расчётом по postings точечно обновляем статусы свежих
-                    // «в пути» постингов через /v2/posting/fbo/get — /v2/posting/fbo/list
-                    // иногда отдаёт устаревший delivering по заказам, которые на стороне
-                    // Ozon уже доставлены и попадают в виджет «Выкупы» как выкупленные.
+                    // Перед расчётом освежаем статусы «в пути» постингов — /v2/posting/fbo/list
+                    // иногда отдаёт устаревший delivering по заказам, которые на Ozon
+                    // уже доставлены и учтены в виджете «Выкупы» как выкупленные.
                     try {
                         $integrationModel = \App\Models\Integration::find($integrationId);
                         if ($integrationModel) {
@@ -491,95 +488,43 @@ class SyncUnitEconomicsCommand extends Command
                         $this->warn('  Не удалось освежить in-flight постинги: '.$refreshException->getMessage());
                     }
 
+                    // Шаг 1: Postings (28д) — основной источник по всем SKU с заказами за окно.
                     $postingsCalculator = app(\App\Services\Ozon\OzonPostingsBuyoutCalculator::class);
                     $postingsBuyoutMap = $postingsCalculator->calculateForIntegration((int) $integrationId, 28);
-
-                    // Для SKU без постингов в 28-дневном окне расширяемся до 90 дней.
-                    // Иначе по редко-продающимся товарам мы бы отдали default 100%,
-                    // а исторический выкуп (напр. 60%) подсказывает пользователю реальное ожидание.
-                    $postingsBuyout90Map = $postingsCalculator->calculateForIntegration((int) $integrationId, 90);
-                    $from90d = 0;
-                    foreach ($postingsBuyout90Map as $sku => $buyout90) {
-                        if (! isset($postingsBuyoutMap[$sku])) {
-                            $buyout90['source'] = 'postings_90d';
-                            $postingsBuyoutMap[$sku] = $buyout90;
-                            $from90d++;
+                    foreach ($postingsBuyoutMap as $sku => $buyout) {
+                        $redemptionData[$sku] = $buyout;
+                        if (isset($offerIdToOzonSkuMap[$sku])) {
+                            $redemptionData[$offerIdToOzonSkuMap[$sku]] = $buyout;
                         }
                     }
-
                     if (! empty($postingsBuyoutMap)) {
                         $fullFromPostings = count(array_filter($postingsBuyoutMap, fn ($d) => ($d['has_full_data'] ?? false)));
-                        $this->info('  По postings (28д): рассчитано '.count($postingsBuyoutMap)." SKU (полных: {$fullFromPostings}, +{$from90d} из 90д для редких SKU) — используется как fallback");
+                        $this->info('  По postings (28д): выкуп для '.count($postingsBuyoutMap)." SKU (полных: {$fullFromPostings}) — основной источник");
                     }
 
                     if ($isPremium) {
 
                         $this->info('  Создан маппинг ozon_sku -> offer_id для '.count($ozonSkuToOfferIdMap).' товаров');
 
-                        // Шаг 1: Analytics API — основной источник.
+                        // Шаг 2: Analytics API — только для SKU без постингов в 28-дневном окне.
+                        // Не перезаписываем postings-данные: они точнее матчат виджет Ozon UI.
                         $analyticsData = $ozonService->getRedemptionRateFromAnalytics(null, null, $ozonSkuToOfferIdMap);
                         $fromApi = 0;
                         foreach ($analyticsData as $key => $item) {
-                            $redemptionData[$key] = $item;
-                            $fromApi++;
+                            if (! isset($redemptionData[$key])) {
+                                $redemptionData[$key] = $item;
+                                $fromApi++;
+                            }
                         }
                         if ($fromApi > 0) {
-                            $this->info("  API аналитики: выкуп для {$fromApi} SKU (основной источник)");
+                            $this->info("  API аналитики: выкуп для {$fromApi} SKU (fallback для SKU без постингов в 28д)");
                         } elseif (empty($analyticsData)) {
-                            $this->warn('  ⚠ API аналитики не вернул данных о выкупе — используем postings как основной источник');
+                            $this->warn('  ⚠ API аналитики не вернул данных о выкупе');
                         }
 
-                        // Шаг 2: postings применяются в двух случаях:
-                        //   a) по SKU нет записи из Analytics API — fallback;
-                        //   b) postings показывают больше выкупленных заказов, чем Analytics API,
-                        //      т.е. API по этому SKU вернул некорректные cancellations/returns
-                        //      (известный баг /v1/analytics/data для отдельных артикулов).
-                        //      Postings в этом случае ближе к виджету Ozon.
-                        $fromPostingsFallback = 0;
-                        $overriddenByPostings = 0;
-                        foreach ($postingsBuyoutMap as $sku => $buyout) {
-                            $ozonKey = $offerIdToOzonSkuMap[$sku] ?? null;
-                            $existing = $redemptionData[$sku] ?? ($ozonKey !== null ? ($redemptionData[$ozonKey] ?? null) : null);
-
-                            $useBuyout = false;
-                            if ($existing === null) {
-                                $useBuyout = true;
-                                $fromPostingsFallback++;
-                            } elseif (
-                                ($buyout['has_full_data'] ?? false)
-                                // Сравниваем именно confirmed delivered (без оптимистичного in_flight),
-                                // иначе postings-override сработает всегда при наличии delivering-заказов
-                                // и переопределит корректные данные Analytics API.
-                                && (int) ($buyout['delivered_confirmed_count'] ?? $buyout['delivered_count'] ?? 0)
-                                    > (int) ($existing['delivered_count'] ?? 0)
-                            ) {
-                                $useBuyout = true;
-                                $overriddenByPostings++;
-                            }
-
-                            if ($useBuyout) {
-                                $redemptionData[$sku] = $buyout;
-                                if ($ozonKey !== null) {
-                                    $redemptionData[$ozonKey] = $buyout;
-                                }
-                            }
-                        }
-                        if ($fromPostingsFallback > 0) {
-                            $this->info("  Postings fallback: выкуп для {$fromPostingsFallback} SKU (Analytics API пуст по ним)");
-                        }
-                        if ($overriddenByPostings > 0) {
-                            $this->info("  Postings override: {$overriddenByPostings} SKU — Analytics API занижает выкуп, postings ближе к виджету");
-                        }
                     } else {
-                        // Не Premium: Analytics API недоступен, используем postings как основной источник.
-                        foreach ($postingsBuyoutMap as $sku => $buyout) {
-                            $redemptionData[$sku] = $buyout;
-                            if (isset($offerIdToOzonSkuMap[$sku])) {
-                                $redemptionData[$offerIdToOzonSkuMap[$sku]] = $buyout;
-                            }
-                        }
-
-                        // Не Premium: используем ручной ввод или fallback через заказы/возвраты
+                        // Не Premium: Analytics API недоступен. Postings (28д) уже записаны выше.
+                        // Далее — ручной ввод или fallback через /v1/analytics/data отдельными метриками.
                         if ($manualRedemptionRate !== null && $manualRedemptionRate > 0) {
                             $this->info("  Используем ручной процент выкупа: {$manualRedemptionRate}%");
                             // Ручной ввод будет применён в buildCalculationData
