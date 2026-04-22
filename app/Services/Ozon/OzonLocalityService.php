@@ -114,7 +114,8 @@ class OzonLocalityService
             FROM postings p
             JOIN posting_items pi ON pi.posting_id = p.id
             WHERE p.integration_id = ?::text
-                AND p.created_at > now() - make_interval(days => ?)
+                AND p.in_process_at IS NOT NULL
+                AND p.in_process_at > now() - make_interval(days => ?)
                 AND p.financial_data->>'cluster_from' IS NOT NULL
                 AND p.financial_data->>'cluster_to' IS NOT NULL
             GROUP BY pi.offer_id, cluster_from, cluster_to
@@ -158,7 +159,8 @@ class OzonLocalityService
                 count(*) as orders_count
             FROM postings p
             WHERE p.integration_id = ?::text
-                AND p.created_at > now() - make_interval(days => ?)
+                AND p.in_process_at IS NOT NULL
+                AND p.in_process_at > now() - make_interval(days => ?)
                 AND p.financial_data->>'cluster_to' IS NOT NULL
                 AND EXISTS (
                     SELECT 1 FROM posting_items pi
@@ -186,7 +188,8 @@ class OzonLocalityService
             FROM postings p
             JOIN posting_items pi ON pi.posting_id = p.id
             WHERE p.integration_id = ?::text
-                AND p.created_at > now() - make_interval(days => ?)
+                AND p.in_process_at IS NOT NULL
+                AND p.in_process_at > now() - make_interval(days => ?)
                 AND p.financial_data->>'cluster_to' IS NOT NULL
             GROUP BY pi.offer_id, cluster_name
             ORDER BY pi.offer_id, orders_count DESC
@@ -350,7 +353,8 @@ class OzonLocalityService
                 ) as local_count
             FROM postings p
             WHERE p.integration_id = ?::text
-                AND p.created_at > now() - make_interval(days => ?)
+                AND p.in_process_at IS NOT NULL
+                AND p.in_process_at > now() - make_interval(days => ?)
                 AND p.financial_data->>'cluster_from' IS NOT NULL
                 AND EXISTS (
                     SELECT 1 FROM posting_items pi
@@ -382,7 +386,8 @@ class OzonLocalityService
             FROM postings p
             JOIN posting_items pi ON pi.posting_id = p.id
             WHERE p.integration_id = ?::text
-                AND p.created_at > now() - make_interval(days => ?)
+                AND p.in_process_at IS NOT NULL
+                AND p.in_process_at > now() - make_interval(days => ?)
                 AND p.financial_data->>'cluster_from' IS NOT NULL
             GROUP BY pi.offer_id
         ", [$integrationId, $periodDays]);

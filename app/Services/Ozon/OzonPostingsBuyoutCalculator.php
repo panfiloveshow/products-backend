@@ -47,7 +47,12 @@ class OzonPostingsBuyoutCalculator
             ->where('postings.marketplace', 'ozon')
             ->where('posting_items.sku', $sku)
             ->whereBetween('postings.in_process_at', [$dateFrom, $dateTo])
-            ->selectRaw('postings.status, SUM(posting_items.quantity) AS qty, COUNT(*) AS postings_count')
+            // Считаем заказы (COUNT DISTINCT по posting_id), а не штуки (SUM quantity):
+            // виджет Ozon "Выкупы за 28 дней" оперирует количеством отправлений.
+            // Для SKU с qty=1 это эквивалентно, для multi-qty заказов — даёт корректный
+            // процент выкупа (разные распределения qty между delivered/cancelled ломают
+            // оптимистичную формулу, если считать в штуках).
+            ->selectRaw('postings.status, COUNT(DISTINCT postings.id) AS qty, COUNT(*) AS postings_count')
             ->groupBy('postings.status')
             ->get();
 
@@ -123,7 +128,8 @@ class OzonPostingsBuyoutCalculator
             ->where('postings.integration_id', (string) $integrationId)
             ->where('postings.marketplace', 'ozon')
             ->whereBetween('postings.in_process_at', [$dateFrom, $dateTo])
-            ->selectRaw('posting_items.sku, postings.status, SUM(posting_items.quantity) AS qty, COUNT(*) AS postings_count')
+            // COUNT(DISTINCT posting_id) — считаем заказы, не штуки (см. calculateForSku).
+            ->selectRaw('posting_items.sku, postings.status, COUNT(DISTINCT postings.id) AS qty, COUNT(*) AS postings_count')
             ->groupBy('posting_items.sku', 'postings.status')
             ->get();
 

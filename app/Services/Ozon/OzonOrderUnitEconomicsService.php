@@ -330,7 +330,10 @@ class OzonOrderUnitEconomicsService
         // Для per-order расчёта передаём дату заказа — это важно для временных окон
         // Ozon (напр. ДВ 0% с 18.04 по 18.05.2026): заказ от 17.04 должен получить
         // постоянные 8%, а заказ от 20.04 — временные 0%.
-        $orderDate = ($posting->in_process_at ?? $posting->created_at)?->toDateString();
+        // Используем $this->resolveOrderDate() (in_process_at → delivered → shipped → shipment),
+        // а НЕ inline fallback на created_at (время нашего INSERT), иначе заказ с NULL
+        // in_process_at получил бы наценку на момент нашего sync'а, а не реальную.
+        $orderDate = $this->resolveOrderDate($posting)?->toDateString();
         $markupPercent = $this->pricing->resolveDestinationMarkupPercent($destinationClusterName, $orderDate);
         if ($markupPercent <= 0) {
             return [false, 'zero_markup_cluster', 'Надбавка не применяется: для кластера назначения ставка 0%', 'confirmed'];

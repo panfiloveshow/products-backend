@@ -308,14 +308,31 @@ class UnitEconomicsCacheService
             : null;
         $apiSource = $redemption['source'] ?? null;
 
+        // «Свежие» источники из текущего sync'а (передаются через $redemption) —
+        // имеют приоритет над existingUE. Иначе stale default=85% из unit_economics
+        // вечно перекрывал свежий postings_28d. Это был баг: cache 2099/black1
+        // отдавал ord=3 из старого sync, хотя новый postings за 28д показывал 2.
+        $freshSources = ['postings_28d', 'analytics_api_28d', 'no_sales_28d',
+                         'fallback_orders_returns', 'fallback_partial'];
+
         if ($settings?->redemption_rate_override !== null) {
             $redemptionRate = (float) $settings->redemption_rate_override;
             $redemptionSource = 'manual';
+        } elseif ($apiSource !== null
+            && in_array($apiSource, $freshSources, true)
+            && array_key_exists('redemption_rate', $redemption)
+            && $redemption['redemption_rate'] !== null
+        ) {
+            // Свежий пайплайн Sync*Command → новое значение выигрывает.
+            // Включая 0.0 для no_sales_28d (user explicit: worst case в расчёты).
+            $redemptionRate = (float) $redemption['redemption_rate'];
+            $redemptionSource = $apiSource;
         } elseif ($existingUERate !== null) {
-            // Включая 0.0 для no_sales_28d — именно это user просил (0% и в расчётах тоже).
+            // Нет свежих данных — сохраняем последнее известное значение.
             $redemptionRate = $existingUERate;
             $redemptionSource = $existingUESource ?? 'default';
         } elseif (array_key_exists('redemption_rate', $redemption) && $redemption['redemption_rate'] !== null) {
+            // Остался старый API-источник (Yandex/WB), не из свежего списка.
             $redemptionRate = (float) $redemption['redemption_rate'];
             $redemptionSource = $apiSource ?? 'api';
         } else {
