@@ -102,7 +102,10 @@ class OzonPostingsBuyoutCalculator
             'postings_count' => $totalPostings,
             'period_days' => $days,
             'source' => 'postings',
-            'has_full_data' => $totalOrders >= 3,
+            // Доверяем постингам при любом количестве заказов — пусть даже 1.
+// Раньше ставили >=3, из-за чего 2 заказа считались «неполными»
+// и API analytics перезаписывал их дефолтом 100%.
+'has_full_data' => $totalOrders >= 1,
         ];
     }
 
@@ -174,7 +177,10 @@ class OzonPostingsBuyoutCalculator
                 'postings_count' => $buckets['postings'],
                 'period_days' => $days,
                 'source' => 'postings',
-                'has_full_data' => $totalOrders >= 3,
+                // Доверяем постингам при любом количестве заказов — пусть даже 1.
+// Раньше ставили >=3, из-за чего 2 заказа считались «неполными»
+// и API analytics перезаписывал их дефолтом 100%.
+'has_full_data' => $totalOrders >= 1,
             ];
         }
 

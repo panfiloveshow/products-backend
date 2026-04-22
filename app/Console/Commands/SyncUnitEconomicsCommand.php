@@ -493,9 +493,23 @@ class SyncUnitEconomicsCommand extends Command
 
                     $postingsCalculator = app(\App\Services\Ozon\OzonPostingsBuyoutCalculator::class);
                     $postingsBuyoutMap = $postingsCalculator->calculateForIntegration((int) $integrationId, 28);
+
+                    // Для SKU без постингов в 28-дневном окне расширяемся до 90 дней.
+                    // Иначе по редко-продающимся товарам мы бы отдали default 100%,
+                    // а исторический выкуп (напр. 60%) подсказывает пользователю реальное ожидание.
+                    $postingsBuyout90Map = $postingsCalculator->calculateForIntegration((int) $integrationId, 90);
+                    $from90d = 0;
+                    foreach ($postingsBuyout90Map as $sku => $buyout90) {
+                        if (! isset($postingsBuyoutMap[$sku])) {
+                            $buyout90['source'] = 'postings_90d';
+                            $postingsBuyoutMap[$sku] = $buyout90;
+                            $from90d++;
+                        }
+                    }
+
                     if (! empty($postingsBuyoutMap)) {
                         $fullFromPostings = count(array_filter($postingsBuyoutMap, fn ($d) => ($d['has_full_data'] ?? false)));
-                        $this->info('  По postings (28д): рассчитано '.count($postingsBuyoutMap)." SKU (полных: {$fullFromPostings}) — используется как fallback");
+                        $this->info('  По postings (28д): рассчитано '.count($postingsBuyoutMap)." SKU (полных: {$fullFromPostings}, +{$from90d} из 90д для редких SKU) — используется как fallback");
                     }
 
                     if ($isPremium) {
@@ -1588,7 +1602,11 @@ class SyncUnitEconomicsCommand extends Command
                     $data['redemption_source'] = 'manual';
                 } else {
                     // Fallback на ozon_data или дефолт
-                    $data['redemption_rate'] = $redemption['redemption_rate'] ?? 100;
+                    // Default 85% — средний уровень выкупа по Ozon (согласовано с
+                    // UnitEconomicsCacheService::prepareCalculationInput). Раньше стоял 100%
+                    // и это вводило пользователей в заблуждение: товары без продаж/данных
+                    // показывали идеальный выкуп, что занижало риск в юнит-экономике.
+                    $data['redemption_rate'] = $redemption['redemption_rate'] ?? 85;
                     $data['orders_count'] = $redemption['orders_count'] ?? null;
                     $data['returns_count'] = $redemption['returns_count'] ?? null;
                     $data['redemption_source'] = 'default';
