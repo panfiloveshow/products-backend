@@ -2,6 +2,8 @@
 
 namespace App\Domains\Locality\Calculation;
 
+use App\Domains\Ozon\UnitEconomics\MarkupReasonCode;
+
 /**
  * Считает долю локальных продаж по ФАКТИЧЕСКОЙ маршрутизации (shipping_cluster vs destination_cluster),
  * а НЕ по markup_reason_code. Это принципиально:
@@ -18,7 +20,14 @@ namespace App\Domains\Locality\Calculation;
  */
 class LocalityShareCalculator
 {
-    private const EXCLUDED_REASONS = ['cancelled_order', 'not_redeemed'];
+    // Источник истины — MarkupReasonCode::excludedValues(). Кэшируем в приватный
+    // массив, чтобы не вызывать метод на каждом item (экономия на 50k+ заказах).
+    private static ?array $excludedReasonsCache = null;
+
+    private static function excludedReasons(): array
+    {
+        return self::$excludedReasonsCache ??= MarkupReasonCode::excludedValues();
+    }
 
     /**
      * @param iterable<object|array{
@@ -37,7 +46,7 @@ class LocalityShareCalculator
 
         foreach ($items as $item) {
             $reason = $this->reasonCode($item);
-            if (in_array($reason, self::EXCLUDED_REASONS, true)) {
+            if (in_array($reason, self::excludedReasons(), true)) {
                 $excluded++;
                 continue;
             }

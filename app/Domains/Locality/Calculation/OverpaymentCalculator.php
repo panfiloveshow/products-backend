@@ -3,6 +3,7 @@
 namespace App\Domains\Locality\Calculation;
 
 use App\Domains\Ozon\Tariffs\OzonPricingMatrix;
+use App\Domains\Ozon\UnitEconomics\MarkupReasonCode;
 
 /**
  * Считает ПОТЕНЦИАЛЬНУЮ переплату за non-local продажи по таблице наценок Ozon
@@ -23,7 +24,12 @@ use App\Domains\Ozon\Tariffs\OzonPricingMatrix;
  */
 class OverpaymentCalculator
 {
-    private const EXCLUDED_REASONS = ['cancelled_order', 'not_redeemed'];
+    private static ?array $excludedReasonsCache = null;
+
+    private static function excludedReasons(): array
+    {
+        return self::$excludedReasonsCache ??= MarkupReasonCode::excludedValues();
+    }
 
     public function __construct(
         private readonly OzonPricingMatrix $pricing = new OzonPricingMatrix(),
@@ -45,7 +51,7 @@ class OverpaymentCalculator
 
         foreach ($items as $item) {
             $reason = $this->reasonCode($item);
-            if (in_array($reason, self::EXCLUDED_REASONS, true)) {
+            if (in_array($reason, self::excludedReasons(), true)) {
                 continue;
             }
 

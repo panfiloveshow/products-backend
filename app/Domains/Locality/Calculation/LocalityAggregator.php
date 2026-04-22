@@ -3,6 +3,7 @@
 namespace App\Domains\Locality\Calculation;
 
 use App\Domains\Locality\Ingestion\PostingEnrichmentReader;
+use App\Domains\Ozon\UnitEconomics\MarkupReasonCode;
 use App\Models\LocalityMetricClusterDaily;
 use App\Models\LocalityMetricDaily;
 use App\Models\OzonOrderUnitEconomics;
@@ -193,7 +194,7 @@ class LocalityAggregator
             $nonLocalItems = $group->filter(fn ($i) => $i->shipping_cluster_name !== null
                 && $i->destination_cluster_name !== null
                 && $i->shipping_cluster_name !== $i->destination_cluster_name
-                && ! in_array($i->markup_reason_code, ['cancelled_order', 'not_redeemed'], true));
+                && ! in_array($i->markup_reason_code, MarkupReasonCode::excludedValues(), true));
 
             $topSkus = $nonLocalItems
                 ->groupBy('sku')
@@ -258,7 +259,7 @@ class LocalityAggregator
      */
     private function coverageConfidence(Collection $items): string
     {
-        $considered = $items->whereNotIn('markup_reason_code', ['cancelled_order', 'not_redeemed']);
+        $considered = $items->whereNotIn('markup_reason_code', MarkupReasonCode::excludedValues());
         $total = $considered->count();
         if ($total === 0) {
             return 'low';

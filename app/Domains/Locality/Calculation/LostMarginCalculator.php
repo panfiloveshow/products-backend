@@ -3,6 +3,7 @@
 namespace App\Domains\Locality\Calculation;
 
 use App\Domains\Ozon\Tariffs\OzonPricingMatrix;
+use App\Domains\Ozon\UnitEconomics\MarkupReasonCode;
 use App\Models\OzonOrderUnitEconomics;
 use App\Models\Product;
 
@@ -16,7 +17,12 @@ use App\Models\Product;
  */
 class LostMarginCalculator
 {
-    private const EXCLUDED_REASONS = ['cancelled_order', 'not_redeemed'];
+    private static ?array $excludedReasonsCache = null;
+
+    private static function excludedReasons(): array
+    {
+        return self::$excludedReasonsCache ??= MarkupReasonCode::excludedValues();
+    }
 
     public function __construct(
         private readonly OzonPricingMatrix $pricing = new OzonPricingMatrix(),
@@ -28,7 +34,7 @@ class LostMarginCalculator
      */
     public function computePerItem(OzonOrderUnitEconomics $item, ?Product $product = null): array
     {
-        if (in_array($item->markup_reason_code, self::EXCLUDED_REASONS, true)) {
+        if (in_array($item->markup_reason_code, self::excludedReasons(), true)) {
             return ['amount' => 0.0, 'degraded' => false];
         }
 

@@ -7,6 +7,7 @@ use App\Domains\Locality\Ingestion\PostingEnrichmentReader;
 use App\Domains\Locality\Legacy\LegacyLocalityFacade;
 use App\Domains\Locality\Presentation\DTO\SkuExplanationDto;
 use App\Domains\Ozon\Tariffs\OzonPricingMatrix;
+use App\Domains\Ozon\UnitEconomics\MarkupReasonCode;
 use App\Models\LocalityMetricDaily;
 use App\Models\LocalityRecommendation;
 use App\Models\OzonOrderUnitEconomics;
@@ -257,7 +258,7 @@ class LocalityExplanationService
     /** @param Collection<int,OzonOrderUnitEconomics> $items */
     private function buildSummary(Collection $items): array
     {
-        $considered = $items->whereNotIn('markup_reason_code', ['cancelled_order', 'not_redeemed']);
+        $considered = $items->whereNotIn('markup_reason_code', MarkupReasonCode::excludedValues());
         $total = $considered->count();
         $local = $considered->filter(fn ($i) => $i->shipping_cluster_name !== null
             && $i->destination_cluster_name !== null
@@ -515,7 +516,7 @@ class LocalityExplanationService
             if ($item->order_date === null) {
                 continue;
             }
-            if (in_array($item->markup_reason_code, ['cancelled_order', 'not_redeemed'], true)) {
+            if (in_array($item->markup_reason_code, MarkupReasonCode::excludedValues(), true)) {
                 continue;
             }
             $day = Carbon::parse($item->order_date)->toDateString();
@@ -605,7 +606,7 @@ class LocalityExplanationService
             return 'low';
         }
 
-        $considered = $items->whereNotIn('markup_reason_code', ['cancelled_order', 'not_redeemed']);
+        $considered = $items->whereNotIn('markup_reason_code', MarkupReasonCode::excludedValues());
         $total = $considered->count();
         if ($total === 0) {
             return 'low';

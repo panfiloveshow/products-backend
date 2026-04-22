@@ -2,6 +2,7 @@
 
 namespace App\Http\Controllers\Api;
 
+use App\Domains\Ozon\UnitEconomics\MarkupReasonCode;
 use App\Http\Controllers\Controller;
 use App\Http\Requests\UnitEconomics\IndexUnitEconomicsRequest;
 use App\Http\Requests\UnitEconomics\CalculateRequest;
@@ -68,7 +69,7 @@ class UnitEconomicsController extends Controller
                 ->selectRaw('sku, COUNT(*) AS recent_orders_28d')
                 ->where('integration_id', $integrationIdForSort)
                 ->where('order_date', '>=', now()->subDays(28))
-                ->whereNotIn('markup_reason_code', ['cancelled_order', 'not_redeemed'])
+                ->whereNotIn('markup_reason_code', MarkupReasonCode::excludedValues())
                 ->groupBy('sku');
 
             $query->leftJoinSub($recentOrdersSub, 'recent', function ($join) {
@@ -176,7 +177,7 @@ class UnitEconomicsController extends Controller
                 ->selectRaw('sku, COUNT(*) AS recent_orders_28d')
                 ->where('integration_id', $integrationId)
                 ->where('order_date', '>=', now()->subDays(28))
-                ->whereNotIn('markup_reason_code', ['cancelled_order', 'not_redeemed'])
+                ->whereNotIn('markup_reason_code', MarkupReasonCode::excludedValues())
                 ->groupBy('sku');
 
             $query->leftJoinSub($recentOrdersSub, 'recent', function ($join) {

@@ -3,6 +3,7 @@
 namespace App\Domains\Locality\Recommendation;
 
 use App\Domains\Ozon\Tariffs\OzonPricingMatrix;
+use App\Domains\Ozon\UnitEconomics\MarkupReasonCode;
 use App\Models\LocalityMetricDaily;
 use App\Models\LocalityRecommendation;
 use App\Models\OzonOrderUnitEconomics;
@@ -280,7 +281,7 @@ class RecommendationRanker
             ->where('integration_id', $integrationId)
             ->whereIn('sku', $skus)
             ->whereBetween('order_date', [$from->toDateTimeString(), $to->toDateTimeString()])
-            ->whereNotIn('markup_reason_code', ['cancelled_order', 'not_redeemed'])
+            ->whereNotIn('markup_reason_code', MarkupReasonCode::excludedValues())
             ->whereNotNull('shipping_cluster_name')
             ->whereNotNull('destination_cluster_name')
             ->whereColumn('shipping_cluster_name', '!=', 'destination_cluster_name')
