@@ -64,9 +64,11 @@ class LocalitySkuController extends Controller
         $total = (clone $query)->count();
         $rows = $query->limit($limit)->offset($offset)->get();
 
+        $skuList = $rows->pluck('sku')->all();
+
         $productNames = Product::query()
             ->where('integration_id', $integration->id)
-            ->whereIn('sku', $rows->pluck('sku')->all())
+            ->whereIn('sku', $skuList)
             ->get([
                 'sku',
                 'name',
@@ -79,26 +81,35 @@ class LocalitySkuController extends Controller
             ])
             ->keyBy('sku');
 
-        $data = $rows->map(function ($row) use ($productNames, $integration) {
+        // Batch-загрузка UnitEconomicsCache для всех SKU сразу (1 SQL вместо N).
+        // Сохраняем ту же логику сортировки (приоритет текущей интеграции + свежесть),
+        // но выбираем «победителя» на стороне PHP после groupBy.
+        $cacheBySku = UnitEconomicsCache::query()
+            ->where('marketplace', 'ozon')
+            ->whereIn('sku', $skuList)
+            ->orderByRaw('CASE WHEN integration_id = ? THEN 0 ELSE 1 END', [$integration->id])
+            ->orderByDesc('calculated_at')
+            ->orderByDesc('id')
+            ->get([
+                'sku',
+                'integration_id',
+                'volume_liters',
+                'volume_weight',
+                'depth',
+                'width',
+                'height',
+                'weight',
+                'marketplace_data',
+                'calculated_at',
+            ])
+            ->groupBy('sku')
+            ->map->first(); // первый после order = победитель
+
+        $data = $rows->map(function ($row) use ($productNames, $integration, $cacheBySku) {
             $meta = is_array($row->meta) ? $row->meta : [];
             /** @var Product|null $product */
             $product = $productNames->get($row->sku);
-            $cache = UnitEconomicsCache::query()
-                ->where('marketplace', 'ozon')
-                ->where('sku', $row->sku)
-                ->orderByRaw('CASE WHEN integration_id = ? THEN 0 ELSE 1 END', [$integration->id])
-                ->orderByDesc('calculated_at')
-                ->orderByDesc('id')
-                ->first([
-                    'integration_id',
-                    'volume_liters',
-                    'volume_weight',
-                    'depth',
-                    'width',
-                    'height',
-                    'weight',
-                    'marketplace_data',
-                ]);
+            $cache = $cacheBySku->get($row->sku);
 
             $ozonData = is_array($product?->ozon_data) ? $product->ozon_data : [];
             $cacheData = is_array($cache?->marketplace_data) ? $cache->marketplace_data : [];
