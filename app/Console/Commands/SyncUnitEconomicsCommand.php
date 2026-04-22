@@ -488,65 +488,52 @@ class SyncUnitEconomicsCommand extends Command
                         $this->warn('  Не удалось освежить in-flight постинги: '.$refreshException->getMessage());
                     }
 
-                    // Стратегия для Premium:
-                    //   ШАГ 1: Analytics API — PRIMARY. Использует delivered_units/ordered_units —
-                    //   те же поля, что Ozon Seller UI показывает в виджете «Выкупы по товару».
-                    //   Точно матчит UI-цифру (формула (ordered−cancel−returns)/ordered).
-                    //
-                    //   ШАГ 2: Postings — FALLBACK только для SKU без Analytics-данных
-                    //   (или с orders_count=0 в API). Оптимистическая (delivered+in_flight)/total
-                    //   используется ТОЛЬКО когда Ozon нам ничего не сказал.
-                    //
-                    // Стратегия для non-Premium: Analytics недоступна → Postings PRIMARY.
+                    // Шаг 1: Postings (28д) — основной источник по всем SKU с заказами за окно.
                     $postingsCalculator = app(\App\Services\Ozon\OzonPostingsBuyoutCalculator::class);
+                    $postingsBuyoutMap = $postingsCalculator->calculateForIntegration((int) $integrationId, 28);
+                    foreach ($postingsBuyoutMap as $sku => $buyout) {
+                        $buyout['period_days'] = 28;
+                        $buyout['source'] = 'postings_28d';
+                        $redemptionData[$sku] = $buyout;
+                        if (isset($offerIdToOzonSkuMap[$sku])) {
+                            $redemptionData[$offerIdToOzonSkuMap[$sku]] = $buyout;
+                        }
+                    }
+                    if (! empty($postingsBuyoutMap)) {
+                        $fullFromPostings = count(array_filter($postingsBuyoutMap, fn ($d) => ($d['has_full_data'] ?? false)));
+                        $this->info('  По postings (28д): выкуп для '.count($postingsBuyoutMap)." SKU (полных: {$fullFromPostings}) — основной источник");
+                    }
 
-                    $analyticsBuyoutMap = [];
                     if ($isPremium) {
+
                         $this->info('  Создан маппинг ozon_sku -> offer_id для '.count($ozonSkuToOfferIdMap).' товаров');
+
+                        // Шаг 2: Analytics API — только для SKU без постингов в 28-дневном окне.
+                        // Не перезаписываем postings-данные: они точнее матчат виджет Ozon UI.
+                        // Игнорируем записи с orders_count=0 (API возвращает пустышку с rate=100% —
+                        // это не реальные данные, пусть no_sales_28d sweep поставит честный 0%).
                         $analyticsData = $ozonService->getRedemptionRateFromAnalytics(null, null, $ozonSkuToOfferIdMap);
+                        $fromApi = 0;
                         foreach ($analyticsData as $key => $item) {
+                            if (isset($redemptionData[$key])) {
+                                continue;
+                            }
                             $orders = (int) ($item['orders_count'] ?? $item['ordered_units'] ?? 0);
                             if ($orders <= 0) {
-                                continue; // API пустышка — пусть fallback/sweep работает
+                                continue; // нет реальных заказов — это не данные, пропускаем
                             }
                             $item['source'] = 'analytics_api_28d';
                             $item['period_days'] = 28;
                             $redemptionData[$key] = $item;
-                            $analyticsBuyoutMap[$key] = $item;
+                            $fromApi++;
                         }
-                        if (! empty($analyticsBuyoutMap)) {
-                            $this->info('  Analytics API (28д): выкуп для '.count($analyticsBuyoutMap).' SKU (PRIMARY — матч виджета Ozon UI)');
-                        } else {
-                            $this->warn('  ⚠ Analytics API не вернул данных — переключаемся на postings');
-                        }
-                    }
-
-                    // Postings — FALLBACK (для Premium) или PRIMARY (для non-Premium).
-                    $postingsBuyoutMap = $postingsCalculator->calculateForIntegration((int) $integrationId, 28);
-                    $fromPostings = 0;
-                    foreach ($postingsBuyoutMap as $sku => $buyout) {
-                        $buyout['period_days'] = 28;
-                        $buyout['source'] = 'postings_28d';
-
-                        $ozonKey = $offerIdToOzonSkuMap[$sku] ?? null;
-                        $hasAnalytics = isset($redemptionData[$sku]) || ($ozonKey !== null && isset($redemptionData[$ozonKey]));
-
-                        if ($hasAnalytics) {
-                            continue; // Analytics API (Ozon-authoritative) уже есть
+                        if ($fromApi > 0) {
+                            $this->info("  API аналитики: выкуп для {$fromApi} SKU (fallback для SKU без постингов в 28д)");
+                        } elseif (empty($analyticsData)) {
+                            $this->warn('  ⚠ API аналитики не вернул данных о выкупе');
                         }
 
-                        $redemptionData[$sku] = $buyout;
-                        if ($ozonKey !== null) {
-                            $redemptionData[$ozonKey] = $buyout;
-                        }
-                        $fromPostings++;
-                    }
-                    if ($fromPostings > 0) {
-                        $label = $isPremium ? 'fallback для SKU без Analytics' : 'основной источник (non-Premium)';
-                        $this->info("  Postings (28д): выкуп для {$fromPostings} SKU ({$label})");
-                    }
-
-                    if (! $isPremium) {
+                    } else {
                         // Не Premium: Analytics API недоступен. Postings (28д) уже записаны выше.
                         // Далее — ручной ввод или fallback через /v1/analytics/data отдельными метриками.
                         if ($manualRedemptionRate !== null && $manualRedemptionRate > 0) {
