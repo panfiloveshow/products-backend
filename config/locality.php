@@ -57,4 +57,15 @@ return [
         'max_last_mile_cost_rub' => 25,
     ],
 
+    /*
+    |--------------------------------------------------------------------------
+    | Scheduled jobs flag
+    |--------------------------------------------------------------------------
+    | Включает locality-расписание (aggregate-daily, sync-finance, health-check, …).
+    | Читать через config() а не через env() напрямую в routes/console.php —
+    | иначе после `php artisan config:cache` env() возвращает default и
+    | расписание всегда остаётся выключенным.
+    */
+    'schedule_enabled' => filter_var(env('LOCALITY_SCHEDULE', false), FILTER_VALIDATE_BOOLEAN),
+
 ];

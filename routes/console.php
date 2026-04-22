@@ -14,7 +14,8 @@ Artisan::command('inspire', function () {
 // non-local переплат и рекомендаций поставок. Включи через ENV LOCALITY_SCHEDULE=true,
 // запусти `php artisan schedule:work` (или systemd cron по артизану).
 
-if (filter_var(env('LOCALITY_SCHEDULE', false), FILTER_VALIDATE_BOOLEAN)) {
+// NB: читаем через config(), а не env() — чтобы флаг работал после config:cache.
+if (config('locality.schedule_enabled', false)) {
     \Illuminate\Support\Facades\Schedule::job(new \App\Domains\Locality\Jobs\SyncClusterMapJob())
         ->weeklyOn(1, '03:00')
         ->withoutOverlapping()
