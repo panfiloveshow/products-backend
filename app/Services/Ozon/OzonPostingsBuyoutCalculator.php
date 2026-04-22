@@ -41,19 +41,23 @@ class OzonPostingsBuyoutCalculator
         $dateTo = now()->subDays(1)->endOfDay();
         $dateFrom = (clone $dateTo)->subDays($days - 1)->startOfDay();
 
-        $rows = DB::table('postings')
-            ->join('posting_items', 'postings.id', '=', 'posting_items.posting_id')
-            ->where('postings.integration_id', (string) $integrationId)
-            ->where('postings.marketplace', 'ozon')
-            ->where('posting_items.sku', $sku)
-            ->whereBetween('postings.in_process_at', [$dateFrom, $dateTo])
-            // Считаем заказы (COUNT DISTINCT по posting_id), а не штуки (SUM quantity):
-            // виджет Ozon "Выкупы за 28 дней" оперирует количеством отправлений.
-            // Для SKU с qty=1 это эквивалентно, для multi-qty заказов — даёт корректный
-            // процент выкупа (разные распределения qty между delivered/cancelled ломают
-            // оптимистичную формулу, если считать в штуках).
-            ->selectRaw('postings.status, COUNT(DISTINCT postings.id) AS qty, COUNT(*) AS postings_count')
-            ->groupBy('postings.status')
+        // Единый источник истины: ozon_order_unit_economics (order_date).
+        // Status берём из postings (обновляется через refreshInFlightOzonPostings).
+        // Period по oue.order_date (уже чистый после dedup-миграции 2026-04-22).
+        // Это устраняет расхождение двух источников (postings.in_process_at vs
+        // oue.order_date) — теперь локальность и выкуп считают одно и то же
+        // множество заказов.
+        $rows = DB::table('ozon_order_unit_economics AS oue')
+            ->join('postings AS p', function ($join) {
+                $join->on('p.id', '=', 'oue.posting_id')
+                     ->where('p.marketplace', '=', 'ozon');
+            })
+            ->where('oue.integration_id', $integrationId)
+            ->where('oue.sku', $sku)
+            ->whereBetween('oue.order_date', [$dateFrom, $dateTo])
+            // COUNT(DISTINCT oue.posting_number) — уникальные заказы Ozon.
+            ->selectRaw('p.status, COUNT(DISTINCT oue.posting_number) AS qty, COUNT(*) AS postings_count')
+            ->groupBy('p.status')
             ->get();
 
         if ($rows->isEmpty()) {
@@ -123,14 +127,18 @@ class OzonPostingsBuyoutCalculator
         $dateTo = now()->subDays(1)->endOfDay();
         $dateFrom = (clone $dateTo)->subDays($days - 1)->startOfDay();
 
-        $rows = DB::table('postings')
-            ->join('posting_items', 'postings.id', '=', 'posting_items.posting_id')
-            ->where('postings.integration_id', (string) $integrationId)
-            ->where('postings.marketplace', 'ozon')
-            ->whereBetween('postings.in_process_at', [$dateFrom, $dateTo])
-            // COUNT(DISTINCT posting_id) — считаем заказы, не штуки (см. calculateForSku).
-            ->selectRaw('posting_items.sku, postings.status, COUNT(DISTINCT postings.id) AS qty, COUNT(*) AS postings_count')
-            ->groupBy('posting_items.sku', 'postings.status')
+        // Тот же единый источник что и в calculateForSku — oue для period,
+        // postings для актуального status.
+        $rows = DB::table('ozon_order_unit_economics AS oue')
+            ->join('postings AS p', function ($join) {
+                $join->on('p.id', '=', 'oue.posting_id')
+                     ->where('p.marketplace', '=', 'ozon');
+            })
+            ->where('oue.integration_id', $integrationId)
+            ->whereBetween('oue.order_date', [$dateFrom, $dateTo])
+            ->whereNotNull('oue.sku')
+            ->selectRaw('oue.sku, p.status, COUNT(DISTINCT oue.posting_number) AS qty, COUNT(*) AS postings_count')
+            ->groupBy('oue.sku', 'p.status')
             ->get();
 
         $perSku = [];
