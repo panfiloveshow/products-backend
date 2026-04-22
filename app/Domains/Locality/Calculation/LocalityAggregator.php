@@ -81,22 +81,33 @@ class LocalityAggregator
                 ]);
         }
 
-        $skusProcessed = $this->aggregateBySku($integrationId, $date, $periodDays, $items);
-        $clustersProcessed = $this->aggregateByCluster($integrationId, $date, $periodDays, $items);
+        // Вся работа aggregation + shadow-delete — в одной транзакции.
+        // Иначе падение на N-м SKU (например, из-за disk-full в логах) оставит
+        // только первые N обновлёнными, а shadow-delete удалит легитимные
+        // snapshot'ы остальных SKU → snapshot из 13 строк вместо 200+.
+        // Ровно это случилось 2026-04-22 при запуске job-а от пользователя
+        // «Пересчитать».
+        [$skusProcessed, $clustersProcessed, $skuOrphansPruned, $clusterOrphansPruned] =
+            DB::transaction(function () use ($integrationId, $date, $periodDays, $items, $startedAt) {
+                $skus = $this->aggregateBySku($integrationId, $date, $periodDays, $items);
+                $clusters = $this->aggregateByCluster($integrationId, $date, $periodDays, $items);
 
-        $skuOrphansPruned = LocalityMetricDaily::query()
-            ->where('integration_id', $integrationId)
-            ->where('snapshot_date', $date->toDateString())
-            ->where('period_days', $periodDays)
-            ->where('updated_at', '<', $startedAt)
-            ->delete();
+                $skuPruned = LocalityMetricDaily::query()
+                    ->where('integration_id', $integrationId)
+                    ->where('snapshot_date', $date->toDateString())
+                    ->where('period_days', $periodDays)
+                    ->where('updated_at', '<', $startedAt)
+                    ->delete();
 
-        $clusterOrphansPruned = LocalityMetricClusterDaily::query()
-            ->where('integration_id', $integrationId)
-            ->where('snapshot_date', $date->toDateString())
-            ->where('period_days', $periodDays)
-            ->where('updated_at', '<', $startedAt)
-            ->delete();
+                $clusterPruned = LocalityMetricClusterDaily::query()
+                    ->where('integration_id', $integrationId)
+                    ->where('snapshot_date', $date->toDateString())
+                    ->where('period_days', $periodDays)
+                    ->where('updated_at', '<', $startedAt)
+                    ->delete();
+
+                return [$skus, $clusters, $skuPruned, $clusterPruned];
+            });
 
         Log::channel('locality')->info('LocalityAggregator runDaily completed', [
             'integration_id' => $integrationId,
