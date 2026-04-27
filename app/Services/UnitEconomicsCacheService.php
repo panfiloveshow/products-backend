@@ -226,6 +226,13 @@ class UnitEconomicsCacheService
 
     /**
      * Обновить кэш при изменении настроек пользователя
+     *
+     * Пересчитывает ВСЕ схемы маркетплейса (а не только Product.fulfillment_type).
+     * Иначе при ручном переопределении redemption_rate_override обновляется
+     * только cache-строка для актуальной схемы товара (Ozon: FBO для FBO-товара),
+     * а строки FBS/RFBS/EXPRESS остаются stale. Тогда при переключении вкладки
+     * или после refresh пользователь видит старое API-значение, а не свой ручной
+     * ввод. Settings change — редкое действие, доп. 3 пересчёта приемлемы.
      */
     public function onSettingsChanged(int $integrationId, string $sku): void
     {
@@ -233,10 +240,10 @@ class UnitEconomicsCacheService
         $product = Product::where('integration_id', $integrationId)
             ->where('sku', $sku)
             ->first();
-        
+
         if ($product) {
-            $this->recalculateProduct($product);
-            $this->forgetStatsCache($integrationId, $product->marketplace, $this->getSchemesForProduct($product));
+            $this->recalculateProductAllSchemes($product);
+            $this->forgetStatsCache($integrationId, $product->marketplace, $this->getSchemesForMarketplace($product->marketplace));
         }
     }
 
@@ -252,7 +259,7 @@ class UnitEconomicsCacheService
             ->whereIn('sku', $skus)
             ->chunk(50, function ($products) {
                 foreach ($products as $product) {
-                    $this->recalculateProduct($product);
+                    $this->recalculateProductAllSchemes($product);
                 }
             });
 
@@ -260,6 +267,24 @@ class UnitEconomicsCacheService
         if ($integration) {
             $this->forgetStatsCache($integrationId, $integration->marketplace, $this->getSchemesForMarketplace($integration->marketplace));
         }
+    }
+
+    /**
+     * Пересчитать кэш для товара по ВСЕМ схемам его маркетплейса.
+     * Используется при изменении settings (redemption_rate_override, cost_price и т.д.),
+     * чтобы все cache-строки SKU были консистентны независимо от Product.fulfillment_type.
+     */
+    private function recalculateProductAllSchemes(Product $product): array
+    {
+        $this->forgetUnitEconomicsCache($product->integration_id, $product->sku);
+        $schemes = $this->getSchemesForMarketplace($product->marketplace);
+        $results = [];
+
+        foreach ($schemes as $scheme) {
+            $results[$scheme] = $this->calculateAndCache($product, $scheme);
+        }
+
+        return $results;
     }
 
     private function prepareCalculationInput(Product $product, ?UnitEconomicsSettings $settings, string $fulfillmentType): array
