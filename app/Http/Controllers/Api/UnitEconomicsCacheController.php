@@ -484,6 +484,14 @@ class UnitEconomicsCacheController extends Controller
         $validated = Validator::make($request->all(), [
             'integration_id' => 'required|integer',
             'fulfillment_type' => 'required|string|in:FBO,FBS,RFBS,EXPRESS,DBS,EDBS,DBW,MIXED,FBY,fbo,fbs,rfbs,express,dbs,edbs,dbw,mixed,fby',
+            // Те же фильтры, что принимает index() — чтобы выгрузка матчила
+            // ровно то, что менеджер видит на странице, без листания пагинации.
+            'search' => 'nullable|string|max:255',
+            'profitable' => 'nullable|boolean',
+            'margin_min' => 'nullable|numeric',
+            'margin_max' => 'nullable|numeric',
+            'price_min' => 'nullable|numeric',
+            'price_max' => 'nullable|numeric',
         ])->validate();
 
         $resolution = $this->integrationAccessService->ensureAccessibleIntegration(
@@ -498,11 +506,16 @@ class UnitEconomicsCacheController extends Controller
         $fulfillmentType = $validated['fulfillment_type'];
         $integrationId = (int) $validated['integration_id'];
 
-        // Получаем ВСЕ записи без пагинации
+        // Те же фильтры, что в index — выгружаем «то что видит менеджер»
+        // (без пагинации: Excel должен содержать ВСЕ отфильтрованные строки).
         $items = UnitEconomicsCache::query()
             ->forIntegration($integrationId)
             ->forMarketplace($marketplace)
             ->forScheme($fulfillmentType)
+            ->search($validated['search'] ?? null)
+            ->profitable($validated['profitable'] ?? null)
+            ->marginRange($validated['margin_min'] ?? null, $validated['margin_max'] ?? null)
+            ->priceRange($validated['price_min'] ?? null, $validated['price_max'] ?? null)
             ->with('product')
             ->orderBy('sku')
             ->get();
@@ -518,23 +531,13 @@ class UnitEconomicsCacheController extends Controller
 
         $pageContext = $this->buildWildberriesUnitEconomicsPageContext($marketplace, $items);
 
-        $paidStorageMap = $this->buildPaidStorageMap($items, $integrationId, $marketplace);
-
-        // Обогащаем данные
-        $enrichedItems = $items->map(function ($cache) use ($fulfillmentType, $settingsMap, $pageContext, $paidStorageMap) {
+        // Обогащаем данные. Финансовый пересчёт под фронт-формулу делается
+        // позже в buildUnitEconomicsSpreadsheet, чтобы Excel показывал ровно
+        // те же net_profit/margin/to_settlement, что менеджер видит в UI.
+        $enrichedItems = $items->map(function ($cache) use ($fulfillmentType, $settingsMap, $pageContext) {
             $settings = $settingsMap->get($cache->sku);
-            $enriched = $this->enrichCacheItem($cache, $fulfillmentType, $settings, $pageContext);
-            $paidStorageAmount = round((float) ($paidStorageMap[$cache->sku] ?? 0), 2);
-            $enriched['paid_storage_amount'] = $paidStorageAmount;
 
-            // В Excel не оставляем «Хранение» нулём, если фактическое платное
-            // хранение по SKU уже найдено в отчётах/остатках.
-            $storageCost = round((float) ($enriched['storage_cost'] ?? 0), 2);
-            if ($storageCost <= 0 && $paidStorageAmount > 0) {
-                $enriched = $this->applyExportStorageDelta($enriched, $paidStorageAmount);
-            }
-
-            return $enriched;
+            return $this->enrichCacheItem($cache, $fulfillmentType, $settings, $pageContext);
         })->toArray();
 
         // Получаем имя интеграции
@@ -572,6 +575,14 @@ class UnitEconomicsCacheController extends Controller
         string $marketplace,
         string $fulfillmentType
     ): Spreadsheet {
+        // Финансовые поля считаем по той же формуле, что фронт
+        // (UnitEconomicsPage.tsx mapOzonItemsToRows): амуны процентов = % × price,
+        // toSettlement = price - все_аммы - effectiveLogistics, profit = toSettlement - costPrice.
+        // Иначе Excel показывает cache.net_profit (со своими корректировками типа
+        // marketplace_compensation), а UI — локально пересчитанное значение,
+        // и менеджеры видят разные цифры по одному и тому же SKU.
+        $items = $this->recalculateFinanceFieldsForExport($items);
+
         $spreadsheet = new Spreadsheet();
         $sheet = $spreadsheet->getActiveSheet();
         $sheet->setTitle('Юнит-экономика');
@@ -914,113 +925,58 @@ class UnitEconomicsCacheController extends Controller
         return $spreadsheet;
     }
 
-    private function applyExportStorageDelta(array $item, float $storageCost): array
-    {
-        $oldStorageCost = round((float) ($item['storage_cost'] ?? 0), 2);
-        $delta = round($storageCost - $oldStorageCost, 2);
-        if ($delta <= 0) {
-            return $item;
-        }
-
-        $item['storage_cost'] = $storageCost;
-        $item['total_costs'] = round((float) ($item['total_costs'] ?? 0) + $delta, 2);
-        $item['net_profit'] = round((float) ($item['net_profit'] ?? 0) - $delta, 2);
-        $item['profit_min'] = round((float) ($item['profit_min'] ?? 0) - $delta, 2);
-        $item['profit_max'] = round((float) ($item['profit_max'] ?? 0) - $delta, 2);
-        $item['to_settlement_account'] = round((float) ($item['to_settlement_account'] ?? 0) - $delta, 2);
-
-        $price = (float) ($item['price'] ?? 0);
-        $costPrice = (float) ($item['cost_price'] ?? 0);
-        $item['margin_percent'] = $price > 0 ? round($item['net_profit'] / $price * 100, 2) : 0;
-        $item['roi_percent'] = $costPrice > 0 ? round($item['net_profit'] / $costPrice * 100, 2) : 0;
-
-        return $item;
-    }
-
     /**
-     * Платное хранение для Excel: ищем не только по cache.sku, но и по карточке товара
-     * (sku / barcode / vendor_code), потому что Ozon-отчёты могут приходить под offer_id.
+     * Пересчёт финансовых полей под фронт-формулу (UnitEconomicsPage.tsx mapOzonItemsToRows).
      *
-     * @param Collection<int, UnitEconomicsCache> $items
-     * @return array<string, float>
+     * Фронт считает амуны процентов как % × price (а не использует cache.commission_amount),
+     * затем toSettlement = price - sum(амунов) - effectiveLogistics,
+     * net_profit = toSettlement - cost_price. Без этого пересчёта Excel и UI расходятся
+     * по одному и тому же SKU: Excel пишет cache (со своими корректировками типа
+     * marketplace_compensation), UI — собственный пересчёт.
+     *
+     * @param  array<int, array<string, mixed>>  $items
+     * @return array<int, array<string, mixed>>
      */
-    private function buildPaidStorageMap(Collection $items, int $integrationId, string $marketplace): array
+    private function recalculateFinanceFieldsForExport(array $items): array
     {
-        if ($items->isEmpty()) {
-            return [];
+        foreach ($items as &$item) {
+            $price = (float) ($item['price'] ?? 0);
+            $costPrice = (float) ($item['cost_price'] ?? 0);
+            $commissionPercent = (float) ($item['commission_percent'] ?? 0);
+            $acquiringPercent = (float) ($item['acquiring_percent'] ?? 0);
+            $taxPercent = (float) ($item['tax_percent'] ?? 0);
+            $vatPercent = (float) ($item['vat_percent'] ?? 0);
+            $drrPercent = (float) ($item['drr_percent'] ?? 0);
+            $ourSharePercent = (float) ($item['our_share_percent'] ?? 0);
+            $effectiveLogistics = (float) ($item['effective_logistics'] ?? 0);
+
+            $commissionAmount = $price * $commissionPercent / 100;
+            $acquiringAmount = $price * $acquiringPercent / 100;
+            $taxAmount = $price * $taxPercent / 100;
+            $vatAmount = $price * $vatPercent / 100;
+            $drrAmount = $price * $drrPercent / 100;
+            $ourShareAmount = $price * $ourSharePercent / 100;
+
+            $toSettlement = $price - $commissionAmount - $effectiveLogistics
+                - $acquiringAmount - $taxAmount - $vatAmount
+                - $ourShareAmount - $drrAmount;
+            $netProfit = $toSettlement - $costPrice;
+
+            $item['commission_amount'] = round($commissionAmount, 2);
+            $item['acquiring_amount'] = round($acquiringAmount, 2);
+            $item['tax_amount'] = round($taxAmount, 2);
+            $item['vat_amount'] = round($vatAmount, 2);
+            $item['drr_amount'] = round($drrAmount, 2);
+            $item['our_share_amount'] = round($ourShareAmount, 2);
+            $item['to_settlement_account'] = round($toSettlement, 2);
+            $item['net_profit'] = round($netProfit, 2);
+
+            // margin_percent / roi_percent в Excel считаются формулами AC/C*100 и AC/D*100,
+            // так что их перезаписывать не нужно — Excel сам пересчитает по новому AC.
         }
+        unset($item);
 
-        $lookupKeysBySku = $items->mapWithKeys(function (UnitEconomicsCache $cache) {
-            return [$cache->sku => collect($this->resolveInventoryLookupKeys($cache, $cache->product))
-                ->map(fn (string $key) => $this->normalizeStorageLookupKey($key))
-                ->filter()
-                ->unique()
-                ->values()
-                ->all()];
-        });
-
-        $normalizedLookupKeys = $lookupKeysBySku
-            ->flatten()
-            ->unique()
-            ->values()
-            ->all();
-
-        $storageByKey = collect();
-        if ($normalizedLookupKeys !== []) {
-            $placeholders = implode(',', array_fill(0, count($normalizedLookupKeys), '?'));
-            $storageByKey = InventoryWarehouse::query()
-                ->where('integration_id', $integrationId)
-                ->where('marketplace', $marketplace)
-                ->whereRaw("LOWER(TRIM(sku)) IN ({$placeholders})", $normalizedLookupKeys)
-                ->selectRaw('
-                    sku,
-                    COALESCE(SUM(COALESCE(storage_fee_prev_month, 0)), 0) AS fee_prev_month,
-                    COALESCE(SUM(COALESCE(storage_fee_last_week, 0)), 0) AS fee_last_week,
-                    COALESCE(SUM(COALESCE(storage_fee_total, 0)), 0) AS fee_total,
-                    COALESCE(SUM(COALESCE(storage_cost_per_month, 0)), 0) AS storage_monthly,
-                    COALESCE(SUM(COALESCE(paid_storage_fee, 0) + COALESCE(paid_storage_penalty, 0)), 0) AS fee_legacy
-                ')
-                ->groupBy('sku')
-                ->get()
-                ->mapWithKeys(function ($row) {
-                    $best = (float) $row->fee_prev_month;
-                    if ($best <= 0) {
-                        $best = (float) $row->fee_last_week * 4; // неделя -> ~месяц
-                    }
-                    if ($best <= 0) {
-                        $best = (float) $row->fee_total;
-                    }
-                    if ($best <= 0) {
-                        $best = (float) $row->storage_monthly;
-                    }
-                    if ($best <= 0) {
-                        $best = (float) $row->fee_legacy;
-                    }
-
-                    $normalizedSku = $this->normalizeStorageLookupKey((string) $row->sku);
-
-                    return $normalizedSku ? [$normalizedSku => $best] : [];
-                });
-        }
-
-        return $items->mapWithKeys(function (UnitEconomicsCache $cache) use ($lookupKeysBySku, $storageByKey) {
-            $amount = collect($lookupKeysBySku->get($cache->sku, []))
-                ->unique()
-                ->sum(fn (string $lookupKey) => (float) ($storageByKey[$lookupKey] ?? 0));
-
-            if ($amount <= 0 && $cache->product) {
-                $amount = (float) ($cache->product->storage_cost ?? 0);
-            }
-
-            return [$cache->sku => round($amount, 2)];
-        })->toArray();
-    }
-
-    private function normalizeStorageLookupKey(?string $value): ?string
-    {
-        $normalized = mb_strtolower(trim((string) $value));
-
-        return $normalized !== '' ? $normalized : null;
+        return $items;
     }
 
     /**
