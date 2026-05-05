@@ -8,6 +8,7 @@ use App\Models\UnitEconomics;
 use App\Models\UnitEconomicsCache;
 use App\Models\InventoryWarehouse;
 use App\Services\InventoryService;
+use App\Services\LimitsSyncService;
 use App\Services\Marketplace\MarketplaceFactory;
 use App\Support\ActivityLogger;
 use Illuminate\Bus\Queueable;
@@ -56,7 +57,7 @@ class SyncProductsJob implements ShouldBeUnique, ShouldQueue
         ]);
     }
 
-    public function handle(InventoryService $inventoryService): void
+    public function handle(InventoryService $inventoryService, LimitsSyncService $limitsSync): void
     {
         $this->syncLog->start();
 
@@ -138,6 +139,7 @@ class SyncProductsJob implements ShouldBeUnique, ShouldQueue
                     'previous_catalog_total_from_api' => $previousCatalogSize,
                 ]);
                 $this->syncLog->complete(0, 0);
+                $this->syncProductsLimit($limitsSync);
 
                 return;
             }
@@ -241,6 +243,8 @@ class SyncProductsJob implements ShouldBeUnique, ShouldQueue
                 'pruned' => $pruned,
                 'failed' => $failed,
             ]);
+
+            $this->syncProductsLimit($limitsSync);
 
             // Автоматически запускаем синхронизацию остатков после товаров (через сервис: lock + дедуп)
             $credentials = $this->syncLog->credentials ?? [];
@@ -624,6 +628,33 @@ class SyncProductsJob implements ShouldBeUnique, ShouldQueue
         $last = $query->orderByDesc('completed_at')->orderByDesc('created_at')->first();
 
         return (int) ($last?->metadata['total_from_api'] ?? 0);
+    }
+
+    private function syncProductsLimit(LimitsSyncService $limitsSync): void
+    {
+        if (! $this->syncLog->integration_id) {
+            return;
+        }
+
+        $workspaceId = (int) (\App\Models\Integration::where('id', $this->syncLog->integration_id)
+            ->value('work_space_id') ?? 0);
+
+        if ($workspaceId <= 0) {
+            Log::info('Products limit sync skipped: integration has no workspace_id', [
+                'integration_id' => $this->syncLog->integration_id,
+            ]);
+            return;
+        }
+
+        try {
+            $limitsSync->syncWorkspaceProductsLimit($workspaceId);
+        } catch (\Throwable $e) {
+            Log::warning('Products limit sync failed after products sync', [
+                'workspace_id' => $workspaceId,
+                'integration_id' => $this->syncLog->integration_id,
+                'error' => $e->getMessage(),
+            ]);
+        }
     }
 
     public function failed(\Throwable $exception): void

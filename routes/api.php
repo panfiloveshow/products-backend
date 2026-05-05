@@ -2,6 +2,7 @@
 
 use App\Http\Controllers\Api\AuthController;
 use App\Http\Controllers\Api\IntegrationController;
+use App\Http\Controllers\Api\WorkSpaceController;
 use App\Http\Controllers\Api\AutoSupplyPlanController;
 use App\Http\Controllers\Api\CostPriceController;
 use App\Http\Controllers\Api\ProductController;
@@ -59,6 +60,18 @@ Route::prefix('auth')->group(function () {
     Route::get('/me', [AuthController::class, 'me'])->middleware('throttle:60,1');
     Route::get('/workspaces', [AuthController::class, 'workspaces'])->middleware('throttle:60,1');
     Route::get('/workspaces/{workspaceId}/integrations', [AuthController::class, 'integrations'])->middleware('throttle:60,1');
+});
+
+Route::middleware('throttle:60,1')->group(function () {
+    Route::get('/workspaces/{workspace}/limits-external', [WorkSpaceController::class, 'getLimitsExternal'])
+        ->whereNumber('workspace')
+        ->name('workspaces.limits-external.show');
+    Route::post('/workspaces/{workspace}/limits-external', [WorkSpaceController::class, 'storeLimitExternal'])
+        ->whereNumber('workspace')
+        ->name('workspaces.limits-external.store');
+    Route::put('/workspaces/{workspace}/limits-external/sync', [WorkSpaceController::class, 'syncLimitExternal'])
+        ->whereNumber('workspace')
+        ->name('workspaces.limits-external.sync');
 });
 
 /*

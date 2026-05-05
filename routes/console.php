@@ -70,6 +70,19 @@ if (filter_var(env('OZON_STORAGE_SCHEDULE', false), FILTER_VALIDATE_BOOLEAN)) {
         ->name('ozon.sync-storage-cost');
 }
 
+// Sanity-check unit_economics_cache запускается через системный cron
+// (/etc/cron.d/ue-sanity-check) — не через Laravel scheduler, потому что
+// schedule:run на этом сервере не настроен. См. `php artisan ue:sanity-check`.
+
+// Синхронизация фактического количества товаров по workspace в лимиты Sellico.
+// Запускается часто и безопасно: только считает локальные products и отправляет
+// абсолютное value в /workspaces/{workspace}/limits-external/sync.
+\Illuminate\Support\Facades\Schedule::command('limits:sync-products')
+    ->everyTenMinutes()
+    ->withoutOverlapping()
+    ->appendOutputTo(storage_path('logs/limits-sync.log'))
+    ->name('limits.sync-products');
+
 // Ad-hoc запуск синхронизации платного хранения Ozon (для проверки/первого прогрева кэша).
 // Использование: php artisan sync:ozon-storage --days=30 --integration_id=59 --wait=60
 Artisan::command('sync:ozon-storage {--days=30 : Окно периода в днях для отчёта Ozon Placement} {--integration_id= : ID интеграции Ozon} {--wait=60 : Максимальное ожидание отчёта, секунд}', function () {

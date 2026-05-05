@@ -694,6 +694,222 @@ class SellicoApiService
     }
 
     /**
+     * Получить внешние лимиты workspace из основного PlaceSales backend.
+     *
+     * GET /workspaces/{workspace}/limits-external
+     *
+     * @param  int $workspaceId
+     * @return array<string,mixed>
+     */
+    public function getWorkspaceLimitsExternal(int $workspaceId, ?string $type = null): array
+    {
+        if ($workspaceId <= 0) {
+            return [
+                'success' => false,
+                'error' => 'workspace_id обязателен для получения лимитов',
+                'status' => 422,
+            ];
+        }
+
+        $token = $this->getServiceToken();
+
+        if (! $token) {
+            return [
+                'success' => false,
+                'error' => 'Не удалось получить service account token Sellico API',
+                'status' => 401,
+            ];
+        }
+
+        try {
+            $response = Http::timeout(8)
+                ->withToken($token)
+                ->acceptJson()
+                ->get("{$this->baseUrl}/workspaces/{$workspaceId}/limits-external", array_filter([
+                    'type' => $type,
+                ]));
+
+            if ($response->successful()) {
+                return [
+                    'success' => true,
+                    'limits' => $response->json(),
+                    'status' => $response->status(),
+                ];
+            }
+
+            Log::warning('Sellico getWorkspaceLimitsExternal failed', [
+                'workspace_id' => $workspaceId,
+                'status' => $response->status(),
+                'body' => substr($response->body(), 0, 300),
+            ]);
+
+            return [
+                'success' => false,
+                'error' => $response->json('message', "HTTP {$response->status()}"),
+                'status' => $response->status(),
+            ];
+        } catch (\Exception $e) {
+            Log::error('Sellico getWorkspaceLimitsExternal exception', [
+                'workspace_id' => $workspaceId,
+                'error' => $e->getMessage(),
+            ]);
+
+            return [
+                'success' => false,
+                'error' => $e->getMessage(),
+                'status' => 502,
+            ];
+        }
+    }
+
+    /**
+     * Сохранить внешние лимиты workspace в основном PlaceSales backend.
+     *
+     * POST /workspaces/{workspace}/limits-external
+     *
+     * @param  int                 $workspaceId
+     * @param  array<string,mixed> $payload Accepts current_value internally, sends value to PlaceSales.
+     * @return array<string,mixed>
+     */
+    public function storeWorkspaceLimitExternal(int $workspaceId, array $payload): array
+    {
+        if ($workspaceId <= 0) {
+            return [
+                'success' => false,
+                'error' => 'workspace_id обязателен для сохранения лимитов',
+                'status' => 422,
+            ];
+        }
+
+        $token = $this->getServiceToken();
+
+        if (! $token) {
+            return [
+                'success' => false,
+                'error' => 'Не удалось получить service account token Sellico API',
+                'status' => 401,
+            ];
+        }
+
+        try {
+            $response = Http::timeout(8)
+                ->withToken($token)
+                ->acceptJson()
+                ->post("{$this->baseUrl}/workspaces/{$workspaceId}/limits-external", $payload);
+
+            if ($response->successful()) {
+                return [
+                    'success' => true,
+                    'limits' => $response->json(),
+                    'status' => $response->status(),
+                ];
+            }
+
+            Log::warning('Sellico storeWorkspaceLimitExternal failed', [
+                'workspace_id' => $workspaceId,
+                'status' => $response->status(),
+                'body' => substr($response->body(), 0, 300),
+            ]);
+
+            return [
+                'success' => false,
+                'error' => $response->json('message', "HTTP {$response->status()}"),
+                'errors' => $response->json('errors'),
+                'status' => $response->status(),
+            ];
+        } catch (\Exception $e) {
+            Log::error('Sellico storeWorkspaceLimitExternal exception', [
+                'workspace_id' => $workspaceId,
+                'error' => $e->getMessage(),
+            ]);
+
+            return [
+                'success' => false,
+                'error' => $e->getMessage(),
+                'status' => 502,
+            ];
+        }
+    }
+
+    /**
+     * Синхронизировать абсолютное значение внешнего лимита workspace.
+     *
+     * PUT /workspaces/{workspace}/limits-external/sync
+     *
+     * @param  int                 $workspaceId
+     * @param  array<string,mixed> $payload
+     * @return array<string,mixed>
+     */
+    public function syncWorkspaceLimitExternal(int $workspaceId, array $payload): array
+    {
+        if ($workspaceId <= 0) {
+            return [
+                'success' => false,
+                'error' => 'workspace_id обязателен для синхронизации лимита',
+                'status' => 422,
+            ];
+        }
+
+        $token = $this->getServiceToken();
+
+        if (! $token) {
+            return [
+                'success' => false,
+                'error' => 'Не удалось получить service account token Sellico API',
+                'status' => 401,
+            ];
+        }
+
+        try {
+            $externalPayload = [
+                'type' => $payload['type'] ?? null,
+                'value' => $payload['current_value'] ?? $payload['value'] ?? null,
+            ];
+
+            $response = Http::timeout(8)
+                ->withToken($token)
+                ->acceptJson()
+                ->put("{$this->baseUrl}/workspaces/{$workspaceId}/limits-external/sync", $externalPayload);
+
+            if ($response->successful()) {
+                return [
+                    'success' => true,
+                    'limits' => $response->json(),
+                    'status' => $response->status(),
+                ];
+            }
+
+            Log::warning('Sellico syncWorkspaceLimitExternal failed', [
+                'workspace_id' => $workspaceId,
+                'type' => $externalPayload['type'] ?? null,
+                'value' => $externalPayload['value'] ?? null,
+                'status' => $response->status(),
+                'body' => substr($response->body(), 0, 300),
+            ]);
+
+            return [
+                'success' => false,
+                'error' => $response->json('message', "HTTP {$response->status()}"),
+                'errors' => $response->json('errors'),
+                'status' => $response->status(),
+            ];
+        } catch (\Exception $e) {
+            Log::error('Sellico syncWorkspaceLimitExternal exception', [
+                'workspace_id' => $workspaceId,
+                'type' => $payload['type'] ?? null,
+                'value' => $payload['current_value'] ?? $payload['value'] ?? null,
+                'error' => $e->getMessage(),
+            ]);
+
+            return [
+                'success' => false,
+                'error' => $e->getMessage(),
+                'status' => 502,
+            ];
+        }
+    }
+
+    /**
      * Получить список товаров (SKU) интеграции из Sellico
      */
     public function getIntegrationProducts(int $integrationId): array
