@@ -8,6 +8,7 @@ use App\Http\Requests\Integration\UpdateIntegrationRequest;
 use App\Models\Integration;
 use App\Models\SyncLog;
 use App\Services\IntegrationAccessService;
+use App\Services\LimitsSyncService;
 use App\Services\ProductService;
 use App\Services\SellicoApiService;
 use App\Support\ActivityLogger;
@@ -269,7 +270,7 @@ class IntegrationController extends Controller
      * Запустить синхронизацию для интеграции
      * Получает credentials из Sellico API по integration_id
      */
-    public function sync(Request $request, int $id, ProductService $productService, SellicoApiService $sellicoApi, IntegrationAccessService $integrationAccess): JsonResponse
+    public function sync(Request $request, int $id, ProductService $productService, SellicoApiService $sellicoApi, IntegrationAccessService $integrationAccess, LimitsSyncService $limitsSync): JsonResponse
     {
         $token = $request->bearerToken()
             ?? $request->header('X-Sellico-Token')
@@ -308,6 +309,7 @@ class IntegrationController extends Controller
         $credentials = $result['credentials'];
         $credentials['_sellico_token'] = $token; // Прокидываем токен для фоновых задач
         $workspaceId = IntegrationAccessService::extractRemoteWorkspaceIdFromSellicoPayload($integrationData);
+        $workspaceId = $workspaceId ?: (int) ($access['integration']->work_space_id ?? 0);
         $marketplace = strtolower($integrationData['type'] ?? '');
 
         // Нормализуем тип маркетплейса
@@ -335,6 +337,16 @@ class IntegrationController extends Controller
         }
 
         $syncType = $request->input('type', 'products');
+
+        if ($syncType === 'products' && $workspaceId) {
+            $limitCheck = $limitsSync->ensureLimitAvailable((int) $workspaceId, 'products', 1);
+            if (! ($limitCheck['success'] ?? false)) {
+                return response()->json(
+                    $limitsSync->limitResponsePayload($limitCheck),
+                    (int) ($limitCheck['status'] ?? 403)
+                );
+            }
+        }
 
         try {
             Log::info('Starting sync from Sellico integration', [

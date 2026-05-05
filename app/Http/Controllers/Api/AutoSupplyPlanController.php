@@ -10,6 +10,7 @@ use App\Models\Integration;
 use App\Models\OzonWarehouseCluster;
 use App\Models\Product;
 use App\Services\IntegrationAccessService;
+use App\Services\LimitsSyncService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use PhpOffice\PhpSpreadsheet\Spreadsheet;
@@ -19,7 +20,8 @@ use Symfony\Component\HttpFoundation\StreamedResponse;
 class AutoSupplyPlanController extends Controller
 {
     public function __construct(
-        private IntegrationAccessService $integrationAccessService
+        private IntegrationAccessService $integrationAccessService,
+        private LimitsSyncService $limitsSync
     ) {}
 
     /**
@@ -79,6 +81,10 @@ class AutoSupplyPlanController extends Controller
 
         /** @var Integration $integration */
         $integration = $integrationAccess['integration'];
+        $limitResponse = $this->ensureAutoplanningLimitAvailable($integration);
+        if ($limitResponse !== null) {
+            return $limitResponse;
+        }
 
         $plan = AutoSupplyPlan::create([
             'integration_id' => $integration->id,
@@ -104,12 +110,34 @@ class AutoSupplyPlanController extends Controller
             ]),
         ]);
 
+        if ((int) ($integration->work_space_id ?? 0) > 0) {
+            $this->limitsSync->syncWorkspaceAutoplanningLimit((int) $integration->work_space_id);
+        }
+
         CalculateAutoSupplyPlanJob::dispatch($plan->id);
 
         return response()->json([
             'message' => 'План создан, расчёт запущен',
             'data' => $plan->load('integration'),
         ], 201);
+    }
+
+    private function ensureAutoplanningLimitAvailable(Integration $integration): ?JsonResponse
+    {
+        $workspaceId = (int) ($integration->work_space_id ?? 0);
+        if ($workspaceId <= 0) {
+            return null;
+        }
+
+        $limitCheck = $this->limitsSync->ensureLimitAvailable($workspaceId, 'autoplanning', 1);
+        if ($limitCheck['success'] ?? false) {
+            return null;
+        }
+
+        return response()->json(
+            $this->limitsSync->limitResponsePayload($limitCheck),
+            (int) ($limitCheck['status'] ?? 403)
+        );
     }
 
     /**

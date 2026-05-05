@@ -4,6 +4,7 @@ namespace App\Console\Commands;
 
 use App\Models\Integration;
 use App\Models\SyncLog;
+use App\Services\LimitsSyncService;
 use App\Services\ProductService;
 use App\Services\SellicoApiService;
 use Illuminate\Console\Command;
@@ -14,7 +15,7 @@ class AutoSync extends Command
     protected $signature = 'sync:auto {--marketplace= : Конкретный маркетплейс} {--type=products : Тип синхронизации (products/inventory)}';
     protected $description = 'Автоматическая синхронизация всех активных интеграций';
 
-    public function handle(ProductService $productService): int
+    public function handle(ProductService $productService, LimitsSyncService $limitsSync): int
     {
         $marketplace = $this->option('marketplace');
         $syncType = $this->option('type');
@@ -110,6 +111,18 @@ class AutoSync extends Command
                     $this->warn("  ⚠️  {$integration->name}: credentials не найдены");
                     $skipped++;
                     continue;
+                }
+
+                if ($syncType === 'products' && (int) ($integration->work_space_id ?? 0) > 0) {
+                    $limitCheck = $limitsSync->ensureLimitAvailable((int) $integration->work_space_id, 'products', 1);
+                    if (! ($limitCheck['success'] ?? false)) {
+                        $this->warn(
+                            "  ⚠️  {$integration->name}: лимит товаров исчерпан "
+                            ."({$limitCheck['current_value']}/{$limitCheck['limit']})"
+                        );
+                        $skipped++;
+                        continue;
+                    }
                 }
 
                 $syncLog = $productService->startSync(

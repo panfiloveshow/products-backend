@@ -9,6 +9,7 @@ use App\Http\Requests\Product\UpdateProductRequest;
 use App\Models\Integration;
 use App\Models\Product;
 use App\Services\IntegrationAccessService;
+use App\Services\LimitsSyncService;
 use App\Services\ProductService;
 use App\Services\SellicoApiService;
 use Illuminate\Http\JsonResponse;
@@ -18,7 +19,8 @@ class ProductController extends Controller
 {
     public function __construct(
         private ProductService $productService,
-        private IntegrationAccessService $integrationAccessService
+        private IntegrationAccessService $integrationAccessService,
+        private LimitsSyncService $limitsSync
     ) {}
 
     public function index(IndexProductRequest $request): JsonResponse
@@ -197,15 +199,22 @@ class ProductController extends Controller
             $syncLogs = $this->startMarketplaceSyncAcrossWorkspaces($request, $marketplace);
 
             if (! empty($syncLogs)) {
+                $startedCount = count(array_filter(
+                    $syncLogs,
+                    static fn (array $sync) => ($sync['status'] ?? null) !== 'skipped'
+                ));
+
                 return response()->json([
                     'data' => [
-                        'status' => 'pending',
+                        'status' => $startedCount > 0 ? 'pending' : 'skipped',
                         'marketplace' => $marketplace,
-                        'started' => count($syncLogs),
+                        'started' => $startedCount,
                         'syncs' => $syncLogs,
-                        'message' => "Sync started for {$marketplace} in ".count($syncLogs).' integrations',
+                        'message' => $startedCount > 0
+                            ? "Sync started for {$marketplace} in {$startedCount} integrations"
+                            : 'Синхронизация не запущена: лимиты тарифа исчерпаны',
                     ],
-                ]);
+                ], $startedCount > 0 ? 200 : 403);
             }
         }
 
@@ -231,6 +240,11 @@ class ProductController extends Controller
 
             /** @var Integration $integration */
             $integration = $resolution['integration'];
+            $limitResponse = $this->ensureProductsLimitAvailable($integration);
+            if ($limitResponse !== null) {
+                return $limitResponse;
+            }
+
             $credentials = $integration->credentials ?? [];
         } else {
             // Валидация credentials в зависимости от маркетплейса
@@ -358,6 +372,29 @@ class ProductController extends Controller
 
                 $this->upsertLocalIntegration($integrationData, $workspaceId, $marketplace, $credentials);
 
+                $localIntegration = Integration::find($remoteIntegrationId);
+                if ($localIntegration instanceof Integration) {
+                    $limitCheck = $this->limitsSync->ensureLimitAvailable((int) $localIntegration->work_space_id, 'products', 1);
+                    if (! ($limitCheck['success'] ?? false)) {
+                        \Log::info('ProductController::sync - workspace products limit exhausted, sync skipped', [
+                            'workspace_id' => $workspaceId,
+                            'integration_id' => $remoteIntegrationId,
+                            'current_value' => $limitCheck['current_value'] ?? null,
+                            'limit' => $limitCheck['limit'] ?? null,
+                        ]);
+
+                        $started[] = array_merge(
+                            [
+                                'integration_id' => $remoteIntegrationId,
+                                'workspace_id' => $workspaceId,
+                                'status' => 'skipped',
+                            ],
+                            $this->limitsSync->limitResponsePayload($limitCheck)
+                        );
+                        continue;
+                    }
+                }
+
                 $syncLog = $this->productService->startSync(
                     $marketplace,
                     $credentials,
@@ -375,6 +412,24 @@ class ProductController extends Controller
         }
 
         return $started;
+    }
+
+    private function ensureProductsLimitAvailable(Integration $integration): ?JsonResponse
+    {
+        $workspaceId = (int) ($integration->work_space_id ?? 0);
+        if ($workspaceId <= 0) {
+            return null;
+        }
+
+        $limitCheck = $this->limitsSync->ensureLimitAvailable($workspaceId, 'products', 1);
+        if ($limitCheck['success'] ?? false) {
+            return null;
+        }
+
+        return response()->json(
+            $this->limitsSync->limitResponsePayload($limitCheck),
+            (int) ($limitCheck['status'] ?? 403)
+        );
     }
 
     /**

@@ -74,8 +74,8 @@ if (filter_var(env('OZON_STORAGE_SCHEDULE', false), FILTER_VALIDATE_BOOLEAN)) {
 // (/etc/cron.d/ue-sanity-check) — не через Laravel scheduler, потому что
 // schedule:run на этом сервере не настроен. См. `php artisan ue:sanity-check`.
 
-// Синхронизация фактического количества товаров по workspace в лимиты Sellico.
-// Запускается часто и безопасно: только считает локальные products и отправляет
+// Синхронизация фактических количеств по workspace в лимиты Sellico.
+// Запускается часто и безопасно: считает локальные usage и отправляет
 // абсолютное value в /workspaces/{workspace}/limits-external/sync.
 \Illuminate\Support\Facades\Schedule::command('limits:sync-products')
     ->everyTenMinutes()
