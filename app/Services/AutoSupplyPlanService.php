@@ -748,7 +748,7 @@ class AutoSupplyPlanService
      *
      * @param \App\Models\Integration $integration
      * @param \Illuminate\Support\Collection $products Коллекция Product моделей (keyBy sku)
-     * @return array ['stock_analytics' => [offer_id => [wh_name => data]], 'turnover' => [offer_id => data]]
+     * @return array ['stock_analytics' => [offer_id => [wh_name => data]], 'stock_analytics_cluster' => [offer_id => [cluster_id => data]], 'turnover' => [offer_id => data]]
      */
     public function loadOzonStockAnalytics(\App\Models\Integration $integration, $products): array
     {
@@ -768,11 +768,12 @@ class AutoSupplyPlanService
 
             if (empty($ozonSkus)) {
                 \Illuminate\Support\Facades\Log::info('AutoSupplyPlanService: нет Ozon SKU для аналитики');
-                return ['stock_analytics' => [], 'turnover' => []];
+                return ['stock_analytics' => [], 'stock_analytics_cluster' => [], 'turnover' => []];
             }
 
             // 1. Аналитика остатков по SKU × склад (ads_cluster, idc_cluster, turnover_grade_cluster)
             $stockAnalytics = $api->getStockAnalyticsByOfferWarehouse($ozonSkus);
+            $stockAnalyticsCluster = $api->getStockAnalyticsByOfferCluster($ozonSkus);
 
             // 2. Оборачиваемость по SKU (ads за 60д, turnover, idc_grade)
             $turnover = $api->getTurnoverByOfferId($ozonSkus);
@@ -781,11 +782,13 @@ class AutoSupplyPlanService
                 'integration_id' => $integration->id,
                 'ozon_skus_count' => count($ozonSkus),
                 'stock_analytics_skus' => count($stockAnalytics),
+                'stock_analytics_cluster_skus' => count($stockAnalyticsCluster),
                 'turnover_skus' => count($turnover),
             ]);
 
             return [
                 'stock_analytics' => $stockAnalytics,
+                'stock_analytics_cluster' => $stockAnalyticsCluster,
                 'turnover' => $turnover,
             ];
         } catch (\Exception $e) {
@@ -793,7 +796,7 @@ class AutoSupplyPlanService
                 'integration_id' => $integration->id,
                 'error' => $e->getMessage(),
             ]);
-            return ['stock_analytics' => [], 'turnover' => []];
+            return ['stock_analytics' => [], 'stock_analytics_cluster' => [], 'turnover' => []];
         }
     }
 }

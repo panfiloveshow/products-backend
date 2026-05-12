@@ -74,7 +74,12 @@ class OzonService implements MarketplaceInterface
 
                 if ($infoResponse->successful()) {
                     $infoData = $infoResponse->json();
+                    $attributesByProductId = $this->getProductAttributesByIds($productIds);
                     foreach ($infoData['items'] ?? [] as $productInfo) {
+                        $productId = (int) ($productInfo['id'] ?? 0);
+                        if ($productId > 0 && isset($attributesByProductId[$productId])) {
+                            $productInfo = array_merge($productInfo, $attributesByProductId[$productId]);
+                        }
                         $products[] = $this->transformProduct($productInfo);
                     }
                 }
@@ -107,6 +112,12 @@ class OzonService implements MarketplaceInterface
             $oldPrice = (float)str_replace(' ', '', $item['old_price']);
         }
 
+        $depth = $this->normalizeDimensionMm($item['depth'] ?? null, $item['dimension_unit'] ?? 'mm');
+        $width = $this->normalizeDimensionMm($item['width'] ?? null, $item['dimension_unit'] ?? 'mm');
+        $height = $this->normalizeDimensionMm($item['height'] ?? null, $item['dimension_unit'] ?? 'mm');
+        $weight = $this->normalizeWeightG($item['weight'] ?? null, $item['weight_unit'] ?? 'g');
+        $volumeWeight = isset($item['volume_weight']) ? (float) $item['volume_weight'] : null;
+
         return [
             'sku' => $item['offer_id'] ?? (string)$item['id'],
             'name' => $item['name'] ?? 'Без названия',
@@ -114,6 +125,11 @@ class OzonService implements MarketplaceInterface
             'price' => $price,
             'old_price' => $oldPrice,
             'stock' => 0, // Остатки получаем отдельно через getInventory
+            'depth' => $depth,
+            'width' => $width,
+            'height' => $height,
+            'weight' => $weight,
+            'volume_weight' => $volumeWeight,
             'description' => $item['description'] ?? null,
             'images' => $item['images'] ?? [],
             'category' => $item['description_category_id'] ?? $item['category_id'] ?? null,
@@ -141,8 +157,94 @@ class OzonService implements MarketplaceInterface
                 'status' => $item['status'] ?? null,
                 'visible' => $item['visible'] ?? null,
                 'primary_image' => $item['primary_image'] ?? null,
+                'length_mm' => $depth,
+                'width_mm' => $width,
+                'height_mm' => $height,
+                'weight_g' => $weight,
+                'volume_weight' => $volumeWeight,
+                'dimension_unit' => $item['dimension_unit'] ?? null,
+                'weight_unit' => $item['weight_unit'] ?? null,
+                'dimensions' => [
+                    'depth' => $depth,
+                    'width' => $width,
+                    'height' => $height,
+                    'weight' => $weight,
+                ],
             ],
         ];
+    }
+
+    /**
+     * /v3/product/info/list не возвращает линейные габариты, только volume_weight.
+     * Для расчётов Ozon нужны реальные размеры из /v4/product/info/attributes.
+     *
+     * @param  list<int|string>  $productIds
+     * @return array<int, array<string, mixed>>
+     */
+    private function getProductAttributesByIds(array $productIds): array
+    {
+        $productIds = array_values(array_filter(array_map(static fn ($id) => (int) $id, $productIds)));
+        if ($productIds === []) {
+            return [];
+        }
+
+        $result = [];
+        foreach (array_chunk($productIds, 1000) as $chunk) {
+            $response = Http::withHeaders([
+                'Client-Id' => $this->clientId,
+                'Api-Key' => $this->apiKey,
+            ])->post("{$this->baseUrl}/v4/product/info/attributes", [
+                'filter' => [
+                    'product_id' => $chunk,
+                    'visibility' => 'ALL',
+                ],
+                'limit' => 1000,
+            ]);
+
+            if (! $response->successful()) {
+                Log::warning('Ozon API error (getProductAttributesByIds)', [
+                    'status' => $response->status(),
+                    'body' => $response->body(),
+                ]);
+                continue;
+            }
+
+            foreach ($response->json('result', []) as $item) {
+                $productId = (int) ($item['id'] ?? 0);
+                if ($productId > 0) {
+                    $result[$productId] = $item;
+                }
+            }
+        }
+
+        return $result;
+    }
+
+    private function normalizeDimensionMm(mixed $value, mixed $unit): ?float
+    {
+        if ($value === null || $value === '') {
+            return null;
+        }
+
+        $dimension = (float) $value;
+        return match (strtolower((string) $unit)) {
+            'cm' => $dimension * 10,
+            'm' => $dimension * 1000,
+            default => $dimension,
+        };
+    }
+
+    private function normalizeWeightG(mixed $value, mixed $unit): ?float
+    {
+        if ($value === null || $value === '') {
+            return null;
+        }
+
+        $weight = (float) $value;
+        return match (strtolower((string) $unit)) {
+            'kg' => $weight * 1000,
+            default => $weight,
+        };
     }
 
     /**

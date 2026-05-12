@@ -543,13 +543,16 @@ class UnitEconomicsCacheService
                 // markupAllowed учитывает правило Ozon >=50 FBO/7д и ручные исключения
                 // (Select-only, size_restricted) — при них наценка не применяется независимо от продаж.
                 $manualMarkupOverride = (bool) ($settings?->is_select_only || $settings?->is_size_restricted);
+                $isFboScheme = strtoupper($fulfillmentType) === 'FBO';
                 $markupAllowed = ! $manualMarkupOverride
-                    && (strtoupper($fulfillmentType) !== 'FBO' || $sales7Days === null || $sales7Days >= 50);
+                    && $isFboScheme
+                    && ($sales7Days === null || $sales7Days >= 50);
                 $clustersSummary = $this->mergeOzonRealOrdersClustersSummary(
                     $skuLocality['clusters_summary'],
                     $baseClustersSummary,
                     $stockProfile,
-                    $markupAllowed
+                    $markupAllowed,
+                    $isFboScheme ? 'fbo_lt_50_orders_7d' : 'non_fbo_no_nonlocal_markup'
                 );
                 $salesProfile = ! empty($skuLocality['sales_profile'])
                     ? $this->mergeOzonSalesProfileWithClustersSummary($skuLocality['sales_profile'], $clustersSummary)
@@ -569,6 +572,29 @@ class UnitEconomicsCacheService
                 $localityResolutionStatus = 'resolved';
             } else {
                 $clustersSummary = $baseClustersSummary;
+            }
+
+            if ($this->ozonOrderEconomicsHasOnlyExcludedMarkup($orderEconomicsSummary)) {
+                $firstReason = (string) array_key_first($orderEconomicsSummary['markup_reason_codes']);
+                $nonLocalMarkupPercent = 0.0;
+                $weightedNonLocalMarkupPercent = 0.0;
+                $clustersSummary = $this->zeroOzonEffectiveMarkup($clustersSummary, $firstReason);
+                $salesProfile = $this->zeroOzonEffectiveMarkup(
+                    is_array($salesProfile['clusters'] ?? null) ? $salesProfile['clusters'] : (is_array($salesProfile) ? $salesProfile : []),
+                    $firstReason
+                );
+            }
+
+            if (strtoupper($fulfillmentType) !== 'FBO') {
+                $nonLocalMarkupPercent = 0.0;
+                $weightedNonLocalMarkupPercent = 0.0;
+                $clustersSummary = $this->zeroOzonEffectiveMarkup($clustersSummary, 'non_fbo_no_nonlocal_markup');
+                $salesProfile = $this->zeroOzonEffectiveMarkup(
+                    is_array($salesProfile['clusters'] ?? null) ? $salesProfile['clusters'] : (is_array($salesProfile) ? $salesProfile : []),
+                    'non_fbo_no_nonlocal_markup'
+                );
+                $markupRuleReason = 'non_fbo_no_nonlocal_markup';
+                $markupRuleReasonLabel = 'Надбавка за нелокальность применяется только к FBO';
             }
         }
 
@@ -672,6 +698,18 @@ class UnitEconomicsCacheService
             'redemption_rate' => (float) $redemptionRate,
             'redemption_source' => $redemptionSource,
             'redemption_period_days' => $redemptionPeriodDays,
+            'orders_count' => $redemption['orders_count'] ?? $existingUE?->orders_count ?? null,
+            'returns_count' => $redemption['returns_count'] ?? $existingUE?->returns_count ?? null,
+            'delivered_count' => $redemption['delivered_count'] ?? $existingMarketplaceData['delivered_count'] ?? null,
+            'cancelled_count' => $redemption['cancelled_count']
+                ?? $redemption['cancellations_count']
+                ?? $redemption['cancellations']
+                ?? $existingMarketplaceData['cancelled_count']
+                ?? $existingMarketplaceData['cancellations_count']
+                ?? $existingMarketplaceData['cancellations']
+                ?? null,
+            'not_redeemed_count' => $redemption['not_redeemed_count'] ?? $existingMarketplaceData['not_redeemed_count'] ?? null,
+            'in_flight_count' => $redemption['in_flight_count'] ?? $existingMarketplaceData['in_flight_count'] ?? null,
             'delivery_coefficient' => null,
             'warehouse_coefficient' => (float) $warehouseCoefficient,
             'localization_index' => (float) $localizationIndex,
@@ -773,15 +811,18 @@ class UnitEconomicsCacheService
                 'promotion_discount' => $marketplaceData['promotion_discount'] ?? $commissions['promotion_discount'] ?? 0,
                 'redemption_source' => $redemptionSource,
                 'redemption_period_days' => $redemptionPeriodDays,
-                'orders_count' => $existingUE?->orders_count ?? null,
-                'returns_count' => $existingUE?->returns_count ?? null,
-                'delivered_count' => $existingMarketplaceData['delivered_count'] ?? null,
-                'cancelled_count' => $existingMarketplaceData['cancelled_count']
+                'orders_count' => $redemption['orders_count'] ?? $existingUE?->orders_count ?? null,
+                'returns_count' => $redemption['returns_count'] ?? $existingUE?->returns_count ?? null,
+                'delivered_count' => $redemption['delivered_count'] ?? $existingMarketplaceData['delivered_count'] ?? null,
+                'cancelled_count' => $redemption['cancelled_count']
+                    ?? $redemption['cancellations_count']
+                    ?? $redemption['cancellations']
+                    ?? $existingMarketplaceData['cancelled_count']
                     ?? $existingMarketplaceData['cancellations_count']
                     ?? $existingMarketplaceData['cancellations']
                     ?? null,
-                'not_redeemed_count' => $existingMarketplaceData['not_redeemed_count'] ?? null,
-                'in_flight_count' => $existingMarketplaceData['in_flight_count'] ?? null,
+                'not_redeemed_count' => $redemption['not_redeemed_count'] ?? $existingMarketplaceData['not_redeemed_count'] ?? null,
+                'in_flight_count' => $redemption['in_flight_count'] ?? $existingMarketplaceData['in_flight_count'] ?? null,
                 'spp_percent' => $sppPercent,
             ],
         ];
@@ -846,6 +887,18 @@ class UnitEconomicsCacheService
                 ? max((float) $volumeLiters, (float) (($volumeWeight ?? 0) * 5))
                 : null);
 
+        $profitBaseBeforePostCosts = isset($result->metadata['profit_base'])
+            ? (float) $result->metadata['profit_base']
+            : (float) $result->netProfit;
+        $profitRangeDelta = $netProfit - $profitBaseBeforePostCosts;
+        $profitMin = isset($result->metadata['profit_min'])
+            ? (float) $result->metadata['profit_min'] + $profitRangeDelta
+            : $netProfit;
+        $profitMax = isset($result->metadata['profit_max'])
+            ? (float) $result->metadata['profit_max'] + $profitRangeDelta
+            : $netProfit;
+        $profitRangeValues = [$profitMin, $netProfit, $profitMax];
+
         return [
             'product_id' => $product->id,
             'product_name' => $result->productName ?? $product->name,
@@ -892,6 +945,9 @@ class UnitEconomicsCacheService
                     'is_premium' => $extra['is_premium'] ?? false,
                     'premium_mode' => $extra['premium_mode'] ?? 'fallback',
                     'premium_recommendation' => $extra['premium_recommendation'] ?? null,
+                    'profit_min' => round(min($profitRangeValues), 2),
+                    'profit_base' => round($netProfit, 2),
+                    'profit_max' => round(max($profitRangeValues), 2),
                 ]
             ),
             'price' => $result->price,
@@ -1221,8 +1277,13 @@ class UnitEconomicsCacheService
             ->delete();
     }
 
-    private function mergeOzonRealOrdersClustersSummary(array $realOrderClusters, array $baseClustersSummary, array $stockProfile, bool $markupAllowed = true): array
-    {
+    private function mergeOzonRealOrdersClustersSummary(
+        array $realOrderClusters,
+        array $baseClustersSummary,
+        array $stockProfile,
+        bool $markupAllowed = true,
+        string $markupDisabledReason = 'fbo_lt_50_orders_7d'
+    ): array {
         $lookup = $this->buildOzonClusterLookup($baseClustersSummary);
         $pricing = app(OzonPricingMatrix::class);
         // Канонизация имён остатков через pricing matrix (единый источник с Calculator).
@@ -1235,18 +1296,26 @@ class UnitEconomicsCacheService
             ->values()
             ->all();
 
-        return array_map(function (array $cluster) use ($lookup, $stockClusterCanonical, $pricing, $markupAllowed): array {
+        return array_map(function (array $cluster) use ($lookup, $stockClusterCanonical, $pricing, $markupAllowed, $markupDisabledReason): array {
             $matched = $this->findOzonClusterMatch($cluster, $lookup);
             $clusterName = $cluster['cluster_name'] ?? $matched['cluster_name'] ?? null;
             $canonicalName = is_string($clusterName) ? $pricing->resolveClusterName($clusterName) : null;
-            $isLocalCluster = $canonicalName !== null && in_array($canonicalName, $stockClusterCanonical, true);
+            $isLocalCluster = array_key_exists('is_local_cluster', $cluster)
+                ? (bool) $cluster['is_local_cluster']
+                : ($canonicalName !== null && in_array($canonicalName, $stockClusterCanonical, true));
             $resolvedRoute = $pricing->resolveRoute(null, is_string($clusterName) ? $clusterName : null);
             $nonLocalMarkupPercent = $pricing->resolveDestinationMarkupPercent(is_string($clusterName) ? $clusterName : null);
-            $effectiveMarkupPercent = (! $markupAllowed || $isLocalCluster) ? 0.0 : $nonLocalMarkupPercent;
+            if (! $markupAllowed || $isLocalCluster) {
+                $effectiveMarkupPercent = 0.0;
+            } elseif (array_key_exists('effective_markup_percent', $cluster) && $cluster['effective_markup_percent'] !== null) {
+                $effectiveMarkupPercent = (float) $cluster['effective_markup_percent'];
+            } else {
+                $effectiveMarkupPercent = $nonLocalMarkupPercent;
+            }
             $markupReason = $cluster['markup_reason']
                 ?? $matched['markup_reason']
                 ?? (! $markupAllowed
-                    ? 'fbo_lt_50_orders_7d'
+                    ? $markupDisabledReason
                     : ($isLocalCluster ? 'local_cluster' : ($nonLocalMarkupPercent > 0 ? 'non_local_markup_applied' : 'no_markup_for_cluster')));
 
             return [
@@ -1265,6 +1334,44 @@ class UnitEconomicsCacheService
                 'markup_reason' => $markupReason,
             ];
         }, $realOrderClusters);
+    }
+
+    private function ozonOrderEconomicsHasOnlyExcludedMarkup(array $summary): bool
+    {
+        $ordersCount = (int) ($summary['orders_count'] ?? 0);
+        $markupAmount = (float) ($summary['avg_non_local_markup_amount'] ?? 0);
+        $reasonCodes = is_array($summary['markup_reason_codes'] ?? null)
+            ? $summary['markup_reason_codes']
+            : [];
+        if ($ordersCount <= 0 || abs($markupAmount) > 0.0001 || $reasonCodes === []) {
+            return false;
+        }
+
+        $excludedReasons = [
+            'cancelled_order',
+            'not_redeemed',
+            'local_cluster',
+            'fbo_lt_50_orders_7d',
+            'zero_markup_cluster',
+        ];
+        $excludedCount = 0;
+        foreach ($reasonCodes as $reason => $count) {
+            if (in_array((string) $reason, $excludedReasons, true)) {
+                $excludedCount += (int) $count;
+            }
+        }
+
+        return $excludedCount >= $ordersCount;
+    }
+
+    private function zeroOzonEffectiveMarkup(array $clusters, string $reason): array
+    {
+        return array_map(static function (array $cluster) use ($reason): array {
+            $cluster['effective_markup_percent'] = 0.0;
+            $cluster['markup_reason'] = $reason;
+
+            return $cluster;
+        }, $clusters);
     }
 
     private function mergeOzonSalesProfileWithClustersSummary(array $salesProfile, array $clustersSummary): array

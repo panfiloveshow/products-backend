@@ -15,7 +15,8 @@ use Illuminate\Support\Facades\Log;
 
 /**
  * Дневной rollup per-SKU и per-cluster_destination метрик локальности.
- * Читает ozon_order_unit_economics за [date - periodDays, date], упаковывает в snapshot.
+ * Читает ozon_order_unit_economics за последние periodDays завершённых дней
+ * (D-periodDays...D-1), упаковывает в snapshot с датой D.
  */
 class LocalityAggregator
 {
@@ -32,8 +33,10 @@ class LocalityAggregator
      */
     public function runDaily(int $integrationId, Carbon $date, int $periodDays = 28): array
     {
-        $to = $date->copy()->endOfDay();
-        $from = $to->copy()->subDays($periodDays)->startOfDay();
+        // Ozon в виджетах «28 дней» показывает завершённое окно D-28...D-1.
+        // Например для snapshot 2026-05-04 период — 2026-04-06...2026-05-03.
+        $to = $date->copy()->subDay()->endOfDay();
+        $from = $to->copy()->subDays(max(0, $periodDays - 1))->startOfDay();
 
         // Shadow-update: фиксируем старт, updateOrCreate'им актуальные SKU/кластеры,
         // в конце удаляем осиротевшие snapshot'ы этого (integration, date, period),
@@ -43,7 +46,9 @@ class LocalityAggregator
         // Берём время БД (NOW()), а не PHP now() — иначе при расхождении часов между
         // app-сервером и БД shadow-delete может удалить записи, только что
         // созданные в параллельном прогоне для той же (integration, date, period).
-        $dbNow = DB::selectOne('SELECT NOW() AS n')->n ?? null;
+        $dbNow = DB::connection()->getDriverName() === 'sqlite'
+            ? (DB::selectOne("SELECT CURRENT_TIMESTAMP AS n")->n ?? null)
+            : (DB::selectOne('SELECT NOW() AS n')->n ?? null);
         $startedAt = $dbNow !== null ? Carbon::parse($dbNow) : now();
 
         // Memory safety: загружаем только нужные поля, без больших JSON (meta,
@@ -171,7 +176,7 @@ class LocalityAggregator
                 ->keys()
                 ->first();
 
-            LocalityMetricDaily::query()->updateOrCreate(
+            $metric = LocalityMetricDaily::query()->updateOrCreate(
                 [
                     'integration_id' => $integrationId,
                     'sku' => (string) $sku,
@@ -203,6 +208,9 @@ class LocalityAggregator
                     ],
                 ]
             );
+            // updateOrCreate does not bump updated_at when values are identical.
+            // Shadow-delete relies on updated_at to mark rows seen in this run.
+            $metric->touch();
             $processed++;
         }
 
@@ -255,7 +263,7 @@ class LocalityAggregator
                 ->take(10)
                 ->all();
 
-            LocalityMetricClusterDaily::query()->updateOrCreate(
+            $metric = LocalityMetricClusterDaily::query()->updateOrCreate(
                 [
                     'integration_id' => $integrationId,
                     'destination_cluster_name' => (string) $clusterName,
@@ -280,6 +288,8 @@ class LocalityAggregator
                     ],
                 ]
             );
+            // Keep unchanged rows from being pruned by the shadow-delete pass.
+            $metric->touch();
             $processed++;
         }
 

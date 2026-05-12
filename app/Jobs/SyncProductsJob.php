@@ -554,6 +554,7 @@ class SyncProductsJob implements ShouldBeUnique, ShouldQueue
             'height',
             'weight',
             'volume_weight',
+            'fulfillment_type',
         ];
 
         foreach ($fieldsToCompare as $field) {

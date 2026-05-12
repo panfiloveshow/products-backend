@@ -316,16 +316,16 @@ class OzonOrderUnitEconomicsService
         ?string $destinationClusterName,
         float $price
     ): array {
-        if ($destinationClusterName !== null && $shippingClusterName !== null && $destinationClusterName === $shippingClusterName) {
-            return [false, 'local_cluster', 'Надбавка не применяется: продажа локальная', 'confirmed'];
-        }
-
         if ($posting->status === Posting::STATUS_CANCELLED || $posting->cancelled_at !== null) {
             return [false, 'cancelled_order', 'Надбавка не применяется: заказ отменён', 'confirmed'];
         }
 
         if (in_array($posting->status, [Posting::STATUS_NOT_ACCEPTED], true)) {
             return [false, 'not_redeemed', 'Надбавка не применяется: заказ не выкуплен', 'confirmed'];
+        }
+
+        if ($destinationClusterName !== null && $shippingClusterName !== null && $destinationClusterName === $shippingClusterName) {
+            return [false, 'local_cluster', 'Надбавка не применяется: продажа локальная', 'confirmed'];
         }
 
         // Seller-level total FBO sales in 7 days (Ozon rule applies per-seller, not per-SKU)

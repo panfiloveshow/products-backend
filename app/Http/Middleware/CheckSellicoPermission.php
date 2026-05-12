@@ -74,6 +74,7 @@ class CheckSellicoPermission
         'auto-supply-plans.lines'        => 'auto_supply.view',
         'auto-supply-plans.lines.update' => 'auto_supply.view',
         'auto-supply-plans.warehouses'   => 'auto_supply.view',
+        'auto-supply-plans.data-health'  => 'auto_supply.view',
         'auto-supply-plans.simulate'     => 'auto_supply.simulate',
         'auto-supply-plans.store'        => 'auto_supply.create',
         'auto-supply-plans.destroy'      => 'auto_supply.delete',

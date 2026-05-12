@@ -5,8 +5,11 @@ namespace Tests\Feature;
 use App\Models\AutoSupplyPlan;
 use App\Models\AutoSupplyPlanLine;
 use App\Models\Integration;
+use App\Models\Product;
+use App\Domains\Locality\Recommendation\LocalityDraftApplier;
 use Illuminate\Foundation\Testing\LazilyRefreshDatabase;
 use Illuminate\Support\Facades\Config;
+use Mockery;
 use Tests\TestCase;
 
 class AutoSupplyPlanShowTest extends TestCase
@@ -105,6 +108,215 @@ class AutoSupplyPlanShowTest extends TestCase
         $response->assertOk()
             ->assertJsonPath('message', 'OK')
             ->assertJsonPath('data.total', 1);
+    }
+
+    public function test_ozon_show_keeps_same_sku_separate_by_cluster(): void
+    {
+        Config::set('services.sellico.skip_permission_check', true);
+
+        $integration = Integration::factory()->ozon()->create(['id' => 9010]);
+
+        $plan = AutoSupplyPlan::create([
+            'integration_id' => $integration->id,
+            'mp_account_id' => $integration->id,
+            'marketplace' => 'ozon',
+            'status' => AutoSupplyPlan::STATUS_READY,
+            'mode' => AutoSupplyPlan::MODE_BALANCED,
+            'params' => [],
+            'total_lines' => 2,
+            'total_qty' => 15,
+        ]);
+
+        $base = [
+            'auto_supply_plan_id' => $plan->id,
+            'sku' => 'SKU-CLUSTERED',
+            'offer_id' => 'OFF-CLUSTERED',
+            'product_name' => 'Clustered product',
+            'destination_type' => 'cluster',
+            'qty_recommended' => 1,
+            'current_stock' => 0,
+            'in_transit' => 0,
+            'risk_level' => 'high',
+            'priority' => 'high',
+        ];
+
+        AutoSupplyPlanLine::create(array_merge($base, [
+            'warehouse_id' => 'cluster:1',
+            'warehouse_name' => 'Москва',
+            'cluster_id' => 1,
+            'cluster_name' => 'Москва',
+            'destination' => 'Москва',
+            'destination_id' => 'cluster:1',
+            'qty_rounded' => 10,
+        ]));
+        AutoSupplyPlanLine::create(array_merge($base, [
+            'warehouse_id' => 'cluster:2',
+            'warehouse_name' => 'Санкт-Петербург',
+            'cluster_id' => 2,
+            'cluster_name' => 'Санкт-Петербург',
+            'destination' => 'Санкт-Петербург',
+            'destination_id' => 'cluster:2',
+            'qty_rounded' => 5,
+        ]));
+
+        $response = $this->getJson("/api/auto-supply-plans/{$plan->id}?per_page=50");
+
+        $response->assertOk()
+            ->assertJsonPath('data.lines.total', 2)
+            ->assertJsonPath('data.lines.data.0.destination_type', 'cluster')
+            ->assertJsonPath('data.lines.data.1.destination_type', 'cluster');
+
+        $clusters = collect($response->json('data.lines.data'))->pluck('cluster_id')->sort()->values()->all();
+        $this->assertSame([1, 2], $clusters);
+    }
+
+    public function test_ozon_show_normalizes_old_cluster_rows_without_destination_type(): void
+    {
+        Config::set('services.sellico.skip_permission_check', true);
+
+        $integration = Integration::factory()->ozon()->create(['id' => 9011]);
+
+        $plan = AutoSupplyPlan::create([
+            'integration_id' => $integration->id,
+            'mp_account_id' => $integration->id,
+            'marketplace' => 'ozon',
+            'status' => AutoSupplyPlan::STATUS_READY,
+            'mode' => AutoSupplyPlan::MODE_BALANCED,
+            'params' => [],
+            'total_lines' => 1,
+            'total_qty' => 7,
+        ]);
+
+        AutoSupplyPlanLine::create([
+            'auto_supply_plan_id' => $plan->id,
+            'sku' => 'SKU-OLD',
+            'offer_id' => 'OFF-OLD',
+            'product_name' => 'Old product',
+            'warehouse_id' => 'spb-wh',
+            'warehouse_name' => 'Склад СПБ',
+            'cluster_id' => 55,
+            'cluster_name' => 'Санкт-Петербург',
+            'destination_type' => 'all',
+            'qty_recommended' => 7,
+            'qty_rounded' => 7,
+            'risk_level' => 'low',
+            'priority' => 'low',
+        ]);
+
+        $response = $this->getJson("/api/auto-supply-plans/{$plan->id}");
+
+        $response->assertOk()
+            ->assertJsonPath('data.lines.data.0.cluster_id', 55)
+            ->assertJsonPath('data.lines.data.0.cluster_name', 'Санкт-Петербург')
+            ->assertJsonPath('data.lines.data.0.warehouse_name', 'Санкт-Петербург')
+            ->assertJsonPath('data.lines.data.0.destination', 'Санкт-Петербург')
+            ->assertJsonPath('data.lines.data.0.destination_id', 'cluster:55')
+            ->assertJsonPath('data.lines.data.0.destination_type', 'cluster');
+    }
+
+    public function test_wb_show_still_aggregates_same_sku_into_single_line(): void
+    {
+        Config::set('services.sellico.skip_permission_check', true);
+
+        $integration = Integration::factory()->create(['id' => 9012, 'marketplace' => 'wildberries']);
+
+        $plan = AutoSupplyPlan::create([
+            'integration_id' => $integration->id,
+            'mp_account_id' => $integration->id,
+            'marketplace' => 'wildberries',
+            'status' => AutoSupplyPlan::STATUS_READY,
+            'mode' => AutoSupplyPlan::MODE_BALANCED,
+            'params' => [],
+            'total_lines' => 2,
+            'total_qty' => 12,
+        ]);
+
+        foreach ([1 => 5, 2 => 7] as $warehouse => $qty) {
+            AutoSupplyPlanLine::create([
+                'auto_supply_plan_id' => $plan->id,
+                'sku' => 'SKU-WB',
+                'offer_id' => 'OFF-WB',
+                'product_name' => 'WB product',
+                'warehouse_id' => 'wb-' . $warehouse,
+                'warehouse_name' => 'WB ' . $warehouse,
+                'destination_type' => 'warehouse',
+                'qty_recommended' => $qty,
+                'qty_rounded' => $qty,
+                'risk_level' => 'low',
+                'priority' => 'low',
+            ]);
+        }
+
+        $response = $this->getJson("/api/auto-supply-plans/{$plan->id}");
+
+        $response->assertOk()
+            ->assertJsonPath('data.lines.total', 1)
+            ->assertJsonPath('data.lines.data.0.qty_rounded', 12);
+    }
+
+    public function test_create_cluster_drafts_respects_selected_cluster_ids(): void
+    {
+        Config::set('services.sellico.skip_permission_check', true);
+
+        $integration = Integration::factory()->ozon()->create(['id' => 9013]);
+
+        $plan = AutoSupplyPlan::create([
+            'integration_id' => $integration->id,
+            'mp_account_id' => $integration->id,
+            'marketplace' => 'ozon',
+            'status' => AutoSupplyPlan::STATUS_READY,
+            'mode' => AutoSupplyPlan::MODE_BALANCED,
+            'params' => ['cluster_ids' => [1]],
+            'total_lines' => 2,
+            'total_qty' => 15,
+        ]);
+
+        Product::factory()->ozon()->create([
+            'integration_id' => $integration->id,
+            'sku' => 'SKU-DRAFT-1',
+            'ozon_data' => ['sku' => 111],
+        ]);
+        Product::factory()->ozon()->create([
+            'integration_id' => $integration->id,
+            'sku' => 'SKU-DRAFT-2',
+            'ozon_data' => ['sku' => 222],
+        ]);
+
+        foreach ([1 => 'SKU-DRAFT-1', 2 => 'SKU-DRAFT-2'] as $clusterId => $sku) {
+            AutoSupplyPlanLine::create([
+                'auto_supply_plan_id' => $plan->id,
+                'sku' => $sku,
+                'offer_id' => $sku,
+                'product_name' => $sku,
+                'warehouse_id' => 'cluster:' . $clusterId,
+                'warehouse_name' => 'Cluster ' . $clusterId,
+                'cluster_id' => $clusterId,
+                'cluster_name' => 'Cluster ' . $clusterId,
+                'destination_type' => 'cluster',
+                'qty_recommended' => 5,
+                'qty_rounded' => 5,
+                'risk_level' => 'low',
+                'priority' => 'low',
+            ]);
+        }
+
+        $applier = Mockery::mock(LocalityDraftApplier::class);
+        $applier->shouldReceive('applyBatch')
+            ->once()
+            ->withArgs(function (Integration $passedIntegration, array $items, int $clusterId) use ($integration) {
+                return $passedIntegration->id === $integration->id
+                    && $clusterId === 1
+                    && $items === [['sku' => 111, 'quantity' => 5]];
+            })
+            ->andReturn(['success' => true, 'draft_id' => 'draft-1', 'error' => null]);
+        $this->app->instance(LocalityDraftApplier::class, $applier);
+
+        $response = $this->postJson("/api/auto-supply-plans/{$plan->id}/create-cluster-drafts");
+
+        $response->assertOk()
+            ->assertJsonPath('data.drafts.0.cluster_id', '1')
+            ->assertJsonCount(1, 'data.drafts')
+            ->assertJsonCount(0, 'data.errors');
     }
 
     public function test_show_summary_financials_match_line_aggregates(): void

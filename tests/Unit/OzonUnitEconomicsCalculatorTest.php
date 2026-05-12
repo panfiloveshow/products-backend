@@ -115,6 +115,152 @@ class OzonUnitEconomicsCalculatorTest extends TestCase
         $this->assertSame(60.0, $result['base_logistics']);
     }
 
+    public function test_fbs_profile_never_applies_non_local_markup(): void
+    {
+        $calculator = new OzonUnitEconomicsCalculator();
+        $input = CalculationInput::fromArray([
+            'sku' => 'sku-fbs',
+            'integration_id' => 1,
+            'marketplace' => 'ozon',
+            'fulfillment_type' => 'FBS',
+            'price' => 500,
+            'cost_price' => 200,
+            'length' => 5,
+            'width' => 5,
+            'height' => 8,
+            'sales_7_days' => 80,
+            'route_key' => 'cluster_regional',
+            'route_label' => 'Казань',
+            'stock_profile' => [
+                ['cluster_name' => 'Казань', 'share_percent' => 100],
+            ],
+            'clusters_summary' => [
+                ['cluster_id' => '154', 'cluster_name' => 'Москва, МО и Дальние регионы', 'orders_percent' => 100],
+            ],
+        ]);
+
+        $result = $calculator->calculate($input)->toArray();
+
+        $this->assertSame(0.0, $result['non_local_markup_percent']);
+        $this->assertSame(0.0, $result['non_local_markup_amount']);
+        $this->assertSame($result['base_logistics'], $result['costs']['logistics']);
+    }
+
+    public function test_no_sales_source_does_not_add_expected_return_to_logistics(): void
+    {
+        $calculator = new OzonUnitEconomicsCalculator();
+        $input = CalculationInput::fromArray([
+            'sku' => 'sku-no-sales',
+            'integration_id' => 1,
+            'marketplace' => 'ozon',
+            'fulfillment_type' => 'FBS',
+            'price' => 1000,
+            'cost_price' => 200,
+            'length' => 20,
+            'width' => 20,
+            'height' => 20,
+            'redemption_rate' => 0,
+            'redemption_source' => 'no_sales_28d',
+            'orders_count' => 0,
+        ]);
+
+        $result = $calculator->calculate($input)->toArray();
+
+        $this->assertSame(0.0, $result['expected_return_cost']);
+        $this->assertSame(0.0, $result['return_logistics']);
+        $this->assertSame(
+            $result['costs']['logistics'] + $result['last_mile'] + $result['processing_fee'],
+            $result['effective_logistics']
+        );
+    }
+
+    public function test_no_sales_source_ignores_stale_profile_and_uses_volume_tariff(): void
+    {
+        $calculator = new OzonUnitEconomicsCalculator();
+        $input = CalculationInput::fromArray([
+            'sku' => 'sku-no-sales-profile',
+            'integration_id' => 1,
+            'marketplace' => 'ozon',
+            'fulfillment_type' => 'FBO',
+            'price' => 1000,
+            'cost_price' => 200,
+            'length' => 43,
+            'width' => 30.5,
+            'height' => 10,
+            'redemption_rate' => 0,
+            'redemption_source' => 'no_sales_28d',
+            'orders_count' => 0,
+            'weighted_logistics_cost' => 999,
+            'route_key' => 'cluster_far',
+            'clusters_summary' => [
+                ['cluster_name' => 'Дальний Восток', 'orders_count' => 1, 'orders_percent' => 100, 'effective_markup_percent' => 8],
+            ],
+        ]);
+
+        $result = $calculator->calculate($input)->toArray();
+
+        $this->assertNotSame(999.0, $result['base_logistics']);
+        $this->assertSame($result['base_logistics'], $result['costs']['logistics']);
+        $this->assertSame(0.0, $result['non_local_markup_percent']);
+        $this->assertSame('unknown', $result['route_resolution_status']);
+        $this->assertSame('unknown', $result['locality_resolution_status']);
+    }
+
+    public function test_cancelled_only_orders_do_not_add_expected_return_to_logistics(): void
+    {
+        $calculator = new OzonUnitEconomicsCalculator();
+        $input = CalculationInput::fromArray([
+            'sku' => 'sku-cancelled',
+            'integration_id' => 1,
+            'marketplace' => 'ozon',
+            'fulfillment_type' => 'FBS',
+            'price' => 1000,
+            'cost_price' => 200,
+            'length' => 20,
+            'width' => 20,
+            'height' => 20,
+            'redemption_rate' => 0,
+            'redemption_source' => 'postings_28d',
+            'orders_count' => 1,
+            'cancelled_count' => 1,
+            'delivered_count' => 0,
+        ]);
+
+        $result = $calculator->calculate($input)->toArray();
+
+        $this->assertSame(0.0, $result['expected_return_cost']);
+        $this->assertSame(0.0, $result['return_processing']);
+    }
+
+    public function test_cancelled_only_fbo_orders_do_not_apply_non_local_markup(): void
+    {
+        $calculator = new OzonUnitEconomicsCalculator();
+        $input = CalculationInput::fromArray([
+            'sku' => 'sku-cancelled-fbo',
+            'integration_id' => 1,
+            'marketplace' => 'ozon',
+            'fulfillment_type' => 'FBO',
+            'price' => 1000,
+            'cost_price' => 200,
+            'length' => 20,
+            'width' => 20,
+            'height' => 20,
+            'redemption_rate' => 0,
+            'redemption_source' => 'postings_28d',
+            'orders_count' => 1,
+            'cancelled_count' => 1,
+            'delivered_count' => 0,
+            'shipping_cluster_name' => 'Невинномысск',
+            'destination_cluster_name' => 'Краснодар',
+        ]);
+
+        $result = $calculator->calculate($input)->toArray();
+
+        $this->assertSame(0.0, $result['non_local_markup_percent']);
+        $this->assertSame(0.0, $result['non_local_markup_amount']);
+        $this->assertSame($result['base_logistics'], $result['costs']['logistics']);
+    }
+
     public function test_fbo_exact_cluster_fixation_context_uses_matrix_and_explicit_markup_disable(): void
     {
         $calculator = new OzonUnitEconomicsCalculator();

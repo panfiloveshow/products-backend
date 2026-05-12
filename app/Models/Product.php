@@ -37,6 +37,7 @@ class Product extends Model
         'reviews_count',
         'marketplace',
         'marketplace_id',
+        'fulfillment_type',
         'integration_id',
         'url',
         'characteristics',

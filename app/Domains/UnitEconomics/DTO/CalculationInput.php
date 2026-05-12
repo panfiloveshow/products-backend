@@ -91,6 +91,13 @@ class CalculationInput
         public readonly ?string $markupReasonLabel = null,
         public readonly ?string $markupExceptionStatus = null,
         public readonly ?string $calculationMode = null,
+        public readonly ?string $redemptionSource = null,
+        public readonly ?int $ordersCount = null,
+        public readonly ?int $deliveredCount = null,
+        public readonly ?int $cancelledCount = null,
+        public readonly ?int $notRedeemedCount = null,
+        public readonly ?int $inFlightCount = null,
+        public readonly ?int $returnsCount = null,
 
         // Название товара (для отображения)
         public readonly ?string $productName = null,
@@ -214,6 +221,13 @@ class CalculationInput
             markupReasonLabel: $data['markup_reason_label'] ?? null,
             markupExceptionStatus: $data['markup_exception_status'] ?? null,
             calculationMode: $data['calculation_mode'] ?? null,
+            redemptionSource: $data['redemption_source'] ?? null,
+            ordersCount: isset($data['orders_count']) ? (int) $data['orders_count'] : null,
+            deliveredCount: isset($data['delivered_count']) ? (int) $data['delivered_count'] : null,
+            cancelledCount: isset($data['cancelled_count']) ? (int) $data['cancelled_count'] : null,
+            notRedeemedCount: isset($data['not_redeemed_count']) ? (int) $data['not_redeemed_count'] : null,
+            inFlightCount: isset($data['in_flight_count']) ? (int) $data['in_flight_count'] : null,
+            returnsCount: isset($data['returns_count']) ? (int) $data['returns_count'] : null,
             productName: $data['product_name'] ?? null,
         );
     }

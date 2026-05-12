@@ -6,6 +6,8 @@ use App\Http\Controllers\Controller;
 use App\Http\Requests\AutoSupplyPlan\StoreAutoSupplyPlanRequest;
 use App\Jobs\CalculateAutoSupplyPlanJob;
 use App\Models\AutoSupplyPlan;
+use App\Models\AutoSupplyPlanLine;
+use App\Models\InventoryWarehouse;
 use App\Models\Integration;
 use App\Models\OzonWarehouseCluster;
 use App\Models\Product;
@@ -81,6 +83,20 @@ class AutoSupplyPlanController extends Controller
 
         /** @var Integration $integration */
         $integration = $integrationAccess['integration'];
+
+        if ($integration->marketplace === 'ozon') {
+            $clusterIds = array_values(array_filter(
+                array_map('intval', (array) $request->input('cluster_ids', []))
+            ));
+
+            if ($clusterIds === []) {
+                return response()->json([
+                    'message' => 'Для Ozon-плана нужно выбрать хотя бы один кластер поставки',
+                    'error' => 'ozon_cluster_required',
+                ], 422);
+            }
+        }
+
         $limitResponse = $this->ensureAutoplanningLimitAvailable($integration);
         if ($limitResponse !== null) {
             return $limitResponse;
@@ -107,7 +123,20 @@ class AutoSupplyPlanController extends Controller
                 'lead_time_days' => $request->input('lead_time_days', 7),
                 'ewma_alpha' => 0.35,
                 'warehouse_ids' => $request->input('warehouse_ids'),
-            ]),
+                'cluster_ids' => $request->input('cluster_ids'),
+
+                // Advanced (используются алгоритмом расчёта — см. CalculateAutoSupplyPlanJob)
+                'ozon_qty_anchor' => $request->input('ozon_qty_anchor'),
+                'demand_seasonality_multiplier' => $request->input('demand_seasonality_multiplier'),
+                'skip_negative_profit' => $request->input('skip_negative_profit'),
+                'include_wb_supplies_api_in_transit' => $request->input('include_wb_supplies_api_in_transit'),
+
+                // Locality integration (читаются в CalculateAutoSupplyPlanJob и LocalityEnrichmentService)
+                'split_by_cluster' => $request->input('split_by_cluster'),
+                'minimum_locality_confidence' => $request->input('minimum_locality_confidence'),
+                'include_locality_recommendations' => $request->input('include_locality_recommendations'),
+                'locality_distribution_strategy' => $request->input('locality_distribution_strategy'),
+            ], static fn ($v) => $v !== null),
         ]);
 
         if ((int) ($integration->work_space_id ?? 0) > 0) {
@@ -184,50 +213,8 @@ class AutoSupplyPlanController extends Controller
             $query->where('offer_id', $request->input('offer_id'));
         }
 
-        // Агрегируем по SKU: суммируем qty_rounded, берём MAX для финансовых полей
-        $aggregated = $query
-            ->selectRaw('
-                sku,
-                MAX(offer_id) as offer_id,
-                MAX(product_name) as product_name,
-                MAX(barcode) as barcode,
-                MAX(warehouse_id) as warehouse_id,
-                MAX(warehouse_name) as warehouse_name,
-                SUM(qty_rounded) as qty_rounded,
-                SUM(qty_recommended) as qty_recommended,
-                SUM(current_stock) as current_stock,
-                SUM(in_transit) as in_transit,
-                SUM(sales_7_days) as sales_7_days,
-                SUM(sales_14_days) as sales_14_days,
-                SUM(sales_30_days) as sales_30_days,
-                MAX(avg_daily_sales) as avg_daily_sales,
-                MAX(ewma_daily_sales) as ewma_daily_sales,
-                MAX(demand_daily) as demand_daily,
-                MAX(cover_days_before) as cover_days_before,
-                MAX(cover_days_after) as cover_days_after,
-                MAX(oos_date) as oos_date,
-                MAX(risk_level) as risk_level,
-                MAX(priority) as priority,
-                MAX(priority_score) as priority_score,
-                MAX(sales_trend) as sales_trend,
-                MAX(sales_trend_percent) as sales_trend_percent,
-                MAX(price) as price,
-                MAX(cost_price) as cost_price,
-                SUM(supply_cost_estimate) as supply_cost_estimate,
-                SUM(expected_revenue) as expected_revenue,
-                SUM(expected_profit) as expected_profit,
-                MAX(roi_percent) as roi_percent,
-                MAX(turnover_days) as turnover_days,
-                SUM(storage_cost_daily) as storage_cost_daily,
-                SUM(storage_cost_monthly) as storage_cost_monthly,
-                SUM(lost_revenue_daily) as lost_revenue_daily
-            ')
-            ->groupBy('sku')
-            ->orderByRaw("CASE MAX(risk_level) WHEN 'high' THEN 0 WHEN 'med' THEN 1 ELSE 2 END")
-            ->orderByRaw('SUM(qty_rounded) DESC');
-
         $perPage = $request->input('per_page', 50);
-        $lines = $aggregated->paginate($perPage);
+        $lines = $this->paginateAggregatedPlanLines($plan, $query, (int) $perPage);
 
         return response()->json([
             'message' => 'OK',
@@ -286,48 +273,7 @@ class AutoSupplyPlanController extends Controller
         }
 
         $perPage = $request->input('per_page', 50);
-        // Агрегируем по SKU: одна строка на товар, qty суммируется по всем складам
-        $lines = $plan->lines()
-            ->selectRaw('
-                sku,
-                MAX(offer_id) as offer_id,
-                MAX(product_name) as product_name,
-                MAX(barcode) as barcode,
-                MAX(warehouse_id) as warehouse_id,
-                MAX(warehouse_name) as warehouse_name,
-                SUM(qty_rounded) as qty_rounded,
-                SUM(qty_recommended) as qty_recommended,
-                SUM(current_stock) as current_stock,
-                SUM(in_transit) as in_transit,
-                SUM(sales_7_days) as sales_7_days,
-                SUM(sales_14_days) as sales_14_days,
-                SUM(sales_30_days) as sales_30_days,
-                MAX(avg_daily_sales) as avg_daily_sales,
-                MAX(ewma_daily_sales) as ewma_daily_sales,
-                MAX(demand_daily) as demand_daily,
-                MAX(cover_days_before) as cover_days_before,
-                MAX(cover_days_after) as cover_days_after,
-                MAX(oos_date) as oos_date,
-                MAX(risk_level) as risk_level,
-                MAX(priority) as priority,
-                MAX(priority_score) as priority_score,
-                MAX(sales_trend) as sales_trend,
-                MAX(sales_trend_percent) as sales_trend_percent,
-                MAX(price) as price,
-                MAX(cost_price) as cost_price,
-                SUM(supply_cost_estimate) as supply_cost_estimate,
-                SUM(expected_revenue) as expected_revenue,
-                SUM(expected_profit) as expected_profit,
-                MAX(roi_percent) as roi_percent,
-                MAX(turnover_days) as turnover_days,
-                SUM(storage_cost_daily) as storage_cost_daily,
-                SUM(storage_cost_monthly) as storage_cost_monthly,
-                SUM(lost_revenue_daily) as lost_revenue_daily
-            ')
-            ->groupBy('sku')
-            ->orderByRaw("CASE MAX(risk_level) WHEN 'high' THEN 0 WHEN 'med' THEN 1 ELSE 2 END")
-            ->orderByRaw('SUM(qty_rounded) DESC')
-            ->paginate($perPage);
+        $lines = $this->paginateAggregatedPlanLines($plan, $plan->lines(), (int) $perPage);
 
         // Финансовые агрегаты
         $allLines = $plan->lines();
@@ -382,6 +328,217 @@ class AutoSupplyPlanController extends Controller
                 ],
             ],
         ]);
+    }
+
+    private function paginateAggregatedPlanLines(AutoSupplyPlan $plan, $query, int $perPage)
+    {
+        $warehouseBreakdownMap = $this->buildWarehouseBreakdownMap($plan);
+        $paginator = $this->aggregatedPlanLinesQuery($plan, $query)->paginate($perPage);
+        $paginator->getCollection()->transform(function (AutoSupplyPlanLine $line) use ($plan, $warehouseBreakdownMap) {
+            return $this->normalizeAggregatedPlanLine($plan, $line, $warehouseBreakdownMap);
+        });
+
+        return $paginator;
+    }
+
+    private function aggregatedPlanLinesQuery(AutoSupplyPlan $plan, $query)
+    {
+        $isOzon = $plan->marketplace === 'ozon';
+        $clusterSelect = $isOzon ? 'cluster_id' : 'MAX(cluster_id) as cluster_id';
+        $driver = \DB::connection()->getDriverName();
+        $idSelect = 'MIN(id) as id';
+        $planIdSelect = $driver === 'pgsql'
+            ? 'MIN(auto_supply_plan_id::text) as auto_supply_plan_id'
+            : 'MIN(auto_supply_plan_id) as auto_supply_plan_id';
+
+        return $query
+            ->selectRaw("
+                {$idSelect},
+                {$planIdSelect},
+                sku,
+                MAX(offer_id) as offer_id,
+                MAX(product_name) as product_name,
+                MAX(barcode) as barcode,
+                MAX(warehouse_id) as warehouse_id,
+                MAX(warehouse_name) as warehouse_name,
+                {$clusterSelect},
+                MAX(cluster_name) as cluster_name,
+                MAX(region) as region,
+                MAX(destination) as destination,
+                MAX(destination_id) as destination_id,
+                MAX(destination_type) as destination_type,
+                SUM(qty_rounded) as qty_rounded,
+                SUM(qty_recommended) as qty_recommended,
+                SUM(current_stock) as current_stock,
+                SUM(in_transit) as in_transit,
+                SUM(sales_7_days) as sales_7_days,
+                SUM(sales_14_days) as sales_14_days,
+                SUM(sales_30_days) as sales_30_days,
+                MAX(avg_daily_sales) as avg_daily_sales,
+                MAX(ewma_daily_sales) as ewma_daily_sales,
+                MAX(demand_daily) as demand_daily,
+                MAX(cover_days_before) as cover_days_before,
+                MAX(cover_days_after) as cover_days_after,
+                MAX(oos_date) as oos_date,
+                MAX(risk_level) as risk_level,
+                MAX(priority) as priority,
+                MAX(priority_score) as priority_score,
+                MAX(sales_trend) as sales_trend,
+                MAX(sales_trend_percent) as sales_trend_percent,
+                MAX(price) as price,
+                MAX(cost_price) as cost_price,
+                SUM(supply_cost_estimate) as supply_cost_estimate,
+                SUM(expected_revenue) as expected_revenue,
+                SUM(expected_profit) as expected_profit,
+                MAX(roi_percent) as roi_percent,
+                MAX(turnover_days) as turnover_days,
+                SUM(storage_cost_daily) as storage_cost_daily,
+                SUM(storage_cost_monthly) as storage_cost_monthly,
+                SUM(lost_revenue_daily) as lost_revenue_daily
+            ")
+            ->when($isOzon, fn ($q) => $q->groupBy('sku', 'cluster_id'), fn ($q) => $q->groupBy('sku'))
+            ->orderByRaw("CASE MAX(risk_level) WHEN 'high' THEN 0 WHEN 'med' THEN 1 ELSE 2 END")
+            ->orderByRaw('SUM(qty_rounded) DESC');
+    }
+
+    private function normalizeAggregatedPlanLine(
+        AutoSupplyPlan $plan,
+        AutoSupplyPlanLine $line,
+        array $warehouseBreakdownMap = []
+    ): AutoSupplyPlanLine
+    {
+        if ($plan->marketplace !== 'ozon') {
+            return $line;
+        }
+
+        $key = $line->sku . '|' . ($line->cluster_id ?? 'no-cluster');
+        if (isset($warehouseBreakdownMap[$key])) {
+            $line->setAttribute('warehouse_breakdown', $warehouseBreakdownMap[$key]);
+        } else {
+            $line->setAttribute('warehouse_breakdown', []);
+        }
+
+        if ($line->cluster_id === null) {
+            return $line;
+        }
+
+        $clusterName = $line->cluster_name
+            ?: $line->destination
+            ?: ($line->cluster_id ? 'Кластер ' . $line->cluster_id : null);
+
+        $line->setAttribute('destination_type', 'cluster');
+        $line->setAttribute('destination_id', 'cluster:' . $line->cluster_id);
+        $line->setAttribute('destination', $clusterName);
+
+        if ($clusterName) {
+            $line->setAttribute('warehouse_id', 'cluster:' . $line->cluster_id);
+            $line->setAttribute('warehouse_name', $clusterName);
+            $line->setAttribute('cluster_name', $clusterName);
+        }
+
+        return $line;
+    }
+
+    private function buildWarehouseBreakdownMap(AutoSupplyPlan $plan): array
+    {
+        if ($plan->marketplace !== 'ozon') {
+            return [];
+        }
+
+        $planKeys = $plan->lines()
+            ->whereNotNull('cluster_id')
+            ->get(['sku', 'cluster_id']);
+
+        if ($planKeys->isEmpty()) {
+            return [];
+        }
+
+        $skus = $planKeys->pluck('sku')->filter()->unique()->values();
+        $clusterIds = $planKeys->pluck('cluster_id')->filter()->map(fn ($id) => (int) $id)->unique()->values();
+
+        $inventoryBySkuAndWarehouse = [];
+        InventoryWarehouse::query()
+            ->where('integration_id', $plan->integration_id)
+            ->where('marketplace', 'ozon')
+            ->whereIn('sku', $skus)
+            ->get(['sku', 'warehouse_id', 'warehouse_name', 'quantity', 'in_transit', 'sales_7_days', 'sales_30_days'])
+            ->each(function (InventoryWarehouse $warehouse) use (&$inventoryBySkuAndWarehouse) {
+                if (! $warehouse->warehouse_name) {
+                    return;
+                }
+
+                $key = $warehouse->sku . '|' . OzonWarehouseCluster::normalizeWarehouseName($warehouse->warehouse_name);
+                $inventoryBySkuAndWarehouse[$key] ??= [
+                    'warehouse_id' => $warehouse->warehouse_id,
+                    'warehouse_name' => $warehouse->warehouse_name,
+                    'current_stock' => 0,
+                    'in_transit' => 0,
+                    'sales_7_days' => 0,
+                    'sales_30_days' => 0,
+                ];
+
+                $inventoryBySkuAndWarehouse[$key]['current_stock'] += (int) $warehouse->quantity;
+                $inventoryBySkuAndWarehouse[$key]['in_transit'] += (int) $warehouse->in_transit;
+                $inventoryBySkuAndWarehouse[$key]['sales_7_days'] += (int) $warehouse->sales_7_days;
+                $inventoryBySkuAndWarehouse[$key]['sales_30_days'] += (int) $warehouse->sales_30_days;
+            });
+
+        $clusterWarehouses = [];
+        foreach ($clusterIds as $clusterId) {
+            $clusterWarehouses[$clusterId] = OzonWarehouseCluster::getWarehousesByCluster($clusterId)
+                ->filter(fn (OzonWarehouseCluster $warehouse) => $this->isRegularOzonClusterWarehouse($warehouse))
+                ->map(fn (OzonWarehouseCluster $warehouse) => [
+                    'warehouse_id' => null,
+                    'warehouse_name' => $warehouse->warehouse_name,
+                    'warehouse_name_normalized' => $warehouse->warehouse_name_normalized
+                        ?: OzonWarehouseCluster::normalizeWarehouseName($warehouse->warehouse_name),
+                ])
+                ->values()
+                ->all();
+        }
+
+        $map = [];
+        foreach ($planKeys as $line) {
+            $clusterId = (int) $line->cluster_id;
+            $key = $line->sku . '|' . $clusterId;
+            $map[$key] = [];
+
+            foreach ($clusterWarehouses[$clusterId] ?? [] as $warehouse) {
+                $inventoryKey = $line->sku . '|' . $warehouse['warehouse_name_normalized'];
+                $inventory = $inventoryBySkuAndWarehouse[$inventoryKey] ?? null;
+
+                $map[$key][] = [
+                    'warehouse_id' => $inventory['warehouse_id'] ?? $warehouse['warehouse_id'],
+                    'warehouse_name' => $inventory['warehouse_name'] ?? $warehouse['warehouse_name'],
+                    'current_stock' => (int) ($inventory['current_stock'] ?? 0),
+                    'in_transit' => (int) ($inventory['in_transit'] ?? 0),
+                    'sales_7_days' => (int) ($inventory['sales_7_days'] ?? 0),
+                    'sales_30_days' => (int) ($inventory['sales_30_days'] ?? 0),
+                    'has_inventory' => $inventory !== null,
+                ];
+            }
+
+            usort($map[$key], fn ($a, $b) => ($b['current_stock'] + $b['in_transit']) <=> ($a['current_stock'] + $a['in_transit']));
+        }
+
+        return $map;
+    }
+
+    private function isRegularOzonClusterWarehouse(OzonWarehouseCluster $warehouse): bool
+    {
+        if ($warehouse->is_negabarit || $warehouse->is_jewelry) {
+            return false;
+        }
+
+        $name = OzonWarehouseCluster::normalizeWarehouseName($warehouse->warehouse_name);
+
+        foreach (['АПТЕКА', 'ФОТОСТУДИЯ', 'ВОЗВРАТ', 'КГТ', 'ПАЛЛЕТ'] as $specialMarker) {
+            if (str_contains($name, $specialMarker)) {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     /**
@@ -453,6 +610,47 @@ class AutoSupplyPlanController extends Controller
                 'marketplace' => $plan->marketplace,
                 'clusters' => $result,
                 'total_clusters' => count($clusters),
+            ],
+        ]);
+    }
+
+    /**
+     * GET /api/auto-supply-plans/data-health?integration_id=X
+     * Lightweight freshness metadata for the plan details screen.
+     */
+    public function dataHealth(Request $request): JsonResponse
+    {
+        $request->validate([
+            'integration_id' => 'required|integer',
+        ]);
+
+        $integrationAccess = $this->integrationAccessService
+            ->ensureAccessibleIntegration($request, (int) $request->input('integration_id'));
+
+        if (! ($integrationAccess['success'] ?? false)) {
+            return response()->json([
+                'message' => $integrationAccess['message'] ?? 'Интеграция не найдена',
+            ], $integrationAccess['status'] ?? 404);
+        }
+
+        /** @var Integration $integration */
+        $integration = $integrationAccess['integration'];
+
+        $inventoryLastUpdated = InventoryWarehouse::query()
+            ->where('integration_id', $integration->id)
+            ->where('marketplace', $integration->marketplace)
+            ->max('last_updated');
+
+        return response()->json([
+            'message' => 'OK',
+            'data' => [
+                'integration_id' => $integration->id,
+                'marketplace' => $integration->marketplace,
+                'freshness' => [
+                    'inventory_warehouses_last_updated' => $inventoryLastUpdated,
+                    'last_inventory_sync_completed_at' => null,
+                ],
+                'ozon_delivery_analytics_cache_active' => null,
             ],
         ]);
     }
@@ -539,6 +737,37 @@ class AutoSupplyPlanController extends Controller
                 'total_storage_fee' => round((float) ($wh->total_storage_fee ?? 0), 2),
             ];
         });
+
+        if ($integration->marketplace === 'ozon') {
+            $result = $result
+                ->groupBy(fn (array $row) => $row['cluster_id'] !== null ? 'cluster:' . $row['cluster_id'] : 'warehouse:' . $row['warehouse_id'])
+                ->map(function ($rows) {
+                    $first = $rows->first();
+                    $isCluster = $first['cluster_id'] !== null;
+
+                    return [
+                        'warehouse_id' => $isCluster ? 'cluster:' . $first['cluster_id'] : $first['warehouse_id'],
+                        'warehouse_name' => $isCluster ? $first['cluster_name'] : $first['warehouse_name'],
+                        'cluster_id' => $first['cluster_id'],
+                        'cluster_name' => $first['cluster_name'],
+                        'region' => $first['region'],
+                        'destination_type' => $isCluster ? 'cluster' : 'warehouse',
+                        'warehouses' => $rows->pluck('warehouse_name')->filter()->unique()->values()->all(),
+                        'sku_count' => (int) $rows->sum('sku_count'),
+                        'total_stock' => (int) $rows->sum('total_stock'),
+                        'total_sales_30d' => (int) $rows->sum('total_sales_30d'),
+                        'total_sales_7d' => (int) $rows->sum('total_sales_7d'),
+                        'avg_daily_sales' => round((float) $rows->sum('avg_daily_sales'), 1),
+                        'turnover_days' => $rows->sum('avg_daily_sales') > 0
+                            ? round($rows->sum('total_stock') / max($rows->sum('avg_daily_sales'), 0.1), 1)
+                            : null,
+                        'storage_cost_daily' => round((float) $rows->sum('storage_cost_daily'), 2),
+                        'total_storage_fee' => round((float) $rows->sum('total_storage_fee'), 2),
+                    ];
+                })
+                ->sortByDesc('total_stock')
+                ->values();
+        }
 
         return response()->json([
             'message' => 'OK',
@@ -727,9 +956,10 @@ class AutoSupplyPlanController extends Controller
             return response()->json(['message' => $access['message'] ?? 'Доступ запрещён'], $access['status'] ?? 403);
         }
 
-        $groups = $plan->lines()
-            ->whereNotNull('cluster_id')
-            ->where('is_cluster_split', true)
+        $groups = $this->clusterDraftLinesQuery($plan)
+            ->when($this->selectedPlanClusterIds($plan) !== [], function ($query) use ($plan) {
+                $query->whereIn('cluster_id', $this->selectedPlanClusterIds($plan));
+            })
             ->orderBy('cluster_id')
             ->get()
             ->groupBy('cluster_id')
@@ -778,16 +1008,17 @@ class AutoSupplyPlanController extends Controller
             return response()->json(['message' => 'Только для Ozon-планов', 'error' => 'not_ozon'], 422);
         }
 
-        $groups = $plan->lines()
-            ->whereNotNull('cluster_id')
-            ->where('is_cluster_split', true)
+        $groups = $this->clusterDraftLinesQuery($plan)
+            ->when($this->selectedPlanClusterIds($plan) !== [], function ($query) use ($plan) {
+                $query->whereIn('cluster_id', $this->selectedPlanClusterIds($plan));
+            })
             ->get()
             ->groupBy('cluster_id');
 
         if ($groups->isEmpty()) {
             return response()->json([
-                'message' => 'У плана нет split-строк с привязкой к кластерам',
-                'error' => 'no_cluster_split',
+                'message' => 'У плана нет строк поставки с привязкой к кластерам',
+                'error' => 'no_cluster_lines',
             ], 422);
         }
 
@@ -795,7 +1026,7 @@ class AutoSupplyPlanController extends Controller
         $results = ['drafts' => [], 'errors' => []];
 
         foreach ($groups as $clusterId => $lines) {
-            $items = [];
+            $itemsByOzonSku = [];
             foreach ($lines as $line) {
                 $product = \App\Models\Product::query()
                     ->where('integration_id', $plan->integration_id)
@@ -805,8 +1036,17 @@ class AutoSupplyPlanController extends Controller
                 if ($ozonSku <= 0) {
                     continue;
                 }
-                $items[] = ['sku' => $ozonSku, 'quantity' => (int) $line->qty_rounded];
+                $qty = (int) $line->qty_rounded;
+                if ($qty <= 0) {
+                    continue;
+                }
+                $itemsByOzonSku[$ozonSku] = ($itemsByOzonSku[$ozonSku] ?? 0) + $qty;
             }
+
+            $items = collect($itemsByOzonSku)
+                ->map(fn (int $quantity, int $sku) => ['sku' => $sku, 'quantity' => $quantity])
+                ->values()
+                ->all();
 
             if (empty($items)) {
                 $results['errors'][] = [
@@ -854,6 +1094,36 @@ class AutoSupplyPlanController extends Controller
             ),
             'data' => $results,
         ]);
+    }
+
+    /**
+     * Строки, из которых можно сформировать Ozon FBO draft по кластерам.
+     *
+     * Поддерживает оба режима:
+     * - старый locality split: is_cluster_split=true;
+     * - новый Ozon auto-planning: destination_type=cluster.
+     */
+    private function clusterDraftLinesQuery(AutoSupplyPlan $plan)
+    {
+        return $plan->lines()
+            ->whereNotNull('cluster_id')
+            ->where('qty_rounded', '>', 0)
+            ->where(function ($query) {
+                $query
+                    ->where('is_cluster_split', true)
+                    ->orWhere('destination_type', 'cluster');
+            });
+    }
+
+    /**
+     * @return list<int>
+     */
+    private function selectedPlanClusterIds(AutoSupplyPlan $plan): array
+    {
+        return array_values(array_filter(
+            array_map('intval', (array) ($plan->params['cluster_ids'] ?? [])),
+            fn (int $clusterId) => $clusterId > 0
+        ));
     }
 
     /**

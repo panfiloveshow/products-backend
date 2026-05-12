@@ -15,6 +15,7 @@ use Illuminate\Support\Facades\DB;
  *  - дубликаты по бизнес-ключу в ozon_order_unit_economics (после миграции
  *    2026_04_22_140000 должен быть UNIQUE constraint; это guard от drop'а).
  *  - свежесть snapshot'ов в locality_metrics_daily (max updated_at < 36h).
+ *  - зависшие queued locality jobs (guard от отсутствующего worker'а).
  *  - расхождение orders_count в snapshot'е с реальным COUNT в
  *    ozon_order_unit_economics для того же окна (допуск 10%).
  */
@@ -23,6 +24,7 @@ class LocalityHealthCheckCommand extends Command
     protected $signature = 'locality:health-check
                             {--integration= : Integration ID (по умолчанию все active Ozon)}
                             {--freshness-hours=36 : порог устаревания snapshot}
+                            {--queue-stale-minutes=15 : сколько минут locality job может ждать в очереди до FAIL}
                             {--count-tolerance=0.10 : допустимая разница orders_count, 0..1}';
 
     protected $description = 'Healthcheck инвариантов locality-пайплайна (для cron)';
@@ -32,6 +34,7 @@ class LocalityHealthCheckCommand extends Command
         $errors = 0;
 
         $errors += $this->checkNoDuplicatesByBusinessKey();
+        $errors += $this->checkLocalityQueueBacklog((int) $this->option('queue-stale-minutes'));
         $errors += $this->checkSnapshotFreshness(
             (int) $this->option('freshness-hours'),
             $this->option('integration') !== null ? (int) $this->option('integration') : null
@@ -82,6 +85,44 @@ class LocalityHealthCheckCommand extends Command
         $this->line('    Починить: php artisan migrate (если миграция ...dedup не применена)');
 
         return 1;
+    }
+
+    private function checkLocalityQueueBacklog(int $staleMinutes): int
+    {
+        try {
+            $count = DB::table('jobs')->where('queue', 'locality')->count();
+            $oldestAvailableAt = DB::table('jobs')->where('queue', 'locality')->min('available_at');
+        } catch (\Throwable $e) {
+            $this->warn('  [WARN] jobs table недоступна для проверки locality queue: ' . $e->getMessage());
+            return 0;
+        }
+
+        if ($count === 0) {
+            $this->line('  [OK] locality queue: нет ожидающих jobs');
+            return 0;
+        }
+
+        $oldestAgeMinutes = $oldestAvailableAt !== null
+            ? max(0, (int) floor((now()->timestamp - (int) $oldestAvailableAt) / 60))
+            : 0;
+
+        if ($oldestAgeMinutes >= $staleMinutes) {
+            $this->error(sprintf(
+                '  [FAIL] locality queue: %d job(s) ждут до %d мин. — вероятно не работает worker очереди locality',
+                $count,
+                $oldestAgeMinutes
+            ));
+            $this->line('    Починить: supervisorctl status | grep locality; supervisorctl restart products-backend-locality-worker:*');
+            return 1;
+        }
+
+        $this->warn(sprintf(
+            '  [WARN] locality queue: %d job(s) ждут до %d мин. (порог %d мин.)',
+            $count,
+            $oldestAgeMinutes,
+            $staleMinutes
+        ));
+        return 0;
     }
 
     private function checkSnapshotFreshness(int $thresholdHours, ?int $integrationId): int

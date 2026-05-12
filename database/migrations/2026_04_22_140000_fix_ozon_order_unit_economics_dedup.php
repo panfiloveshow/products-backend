@@ -24,6 +24,8 @@ return new class extends Migration
 {
     public function up(): void
     {
+        $driver = DB::connection()->getDriverName();
+
         DB::statement('ANALYZE ozon_order_unit_economics');
 
         // 1. Dedup: оставляем по одной записи на (integration_id, posting_number, sku, offer_id).
@@ -45,15 +47,40 @@ return new class extends Migration
 
         // 2. Обновить order_date из postings.in_process_at (реальная дата Ozon-заказа).
         // Трогаем только те строки, где есть соответствующий posting с непустым in_process_at.
-        DB::statement('
-            UPDATE ozon_order_unit_economics oue
-            SET order_date = p.in_process_at
-            FROM postings p
-            WHERE p.integration_id = oue.integration_id::text
-              AND p.posting_number = oue.posting_number
-              AND p.in_process_at IS NOT NULL
-              AND (oue.order_date IS NULL OR oue.order_date != p.in_process_at)
-        ');
+        if ($driver === 'sqlite') {
+            DB::statement('
+                UPDATE ozon_order_unit_economics
+                SET order_date = (
+                    SELECT p.in_process_at
+                    FROM postings p
+                    WHERE CAST(p.integration_id AS TEXT) = CAST(ozon_order_unit_economics.integration_id AS TEXT)
+                      AND p.posting_number = ozon_order_unit_economics.posting_number
+                      AND p.in_process_at IS NOT NULL
+                    LIMIT 1
+                )
+                WHERE EXISTS (
+                    SELECT 1
+                    FROM postings p
+                    WHERE CAST(p.integration_id AS TEXT) = CAST(ozon_order_unit_economics.integration_id AS TEXT)
+                      AND p.posting_number = ozon_order_unit_economics.posting_number
+                      AND p.in_process_at IS NOT NULL
+                      AND (
+                          ozon_order_unit_economics.order_date IS NULL
+                          OR ozon_order_unit_economics.order_date != p.in_process_at
+                      )
+                )
+            ');
+        } else {
+            DB::statement('
+                UPDATE ozon_order_unit_economics oue
+                SET order_date = p.in_process_at
+                FROM postings p
+                WHERE p.integration_id = oue.integration_id::text
+                  AND p.posting_number = oue.posting_number
+                  AND p.in_process_at IS NOT NULL
+                  AND (oue.order_date IS NULL OR oue.order_date != p.in_process_at)
+            ');
+        }
 
         // 3. Заменить индекс: старый UNIQUE по posting_item_id → новый по бизнес-ключу.
         // Старый оставим как обычный INDEX для lookup'ов по posting_item_id.

@@ -75,6 +75,7 @@ class LocalityEnrichmentService
         int $integrationId,
         array $skus,
         string $minConfidence = self::DEFAULT_MIN_CONFIDENCE,
+        ?array $allowedClusterIds = null,
     ): array {
         if (empty($skus)) {
             return [];
@@ -87,12 +88,17 @@ class LocalityEnrichmentService
             default => ['medium', 'high'],
         };
 
-        return LocalityRecommendation::query()
+        $query = LocalityRecommendation::query()
             ->where('integration_id', $integrationId)
             ->where('state', LocalityRecommendation::STATE_NEW)
             ->whereIn('sku', $skus)
-            ->whereIn('confidence', $allowedConfidence)
-            ->orderByDesc('rank_score')
+            ->whereIn('confidence', $allowedConfidence);
+
+        if (is_array($allowedClusterIds) && $allowedClusterIds !== []) {
+            $query->whereIn('target_cluster_id', array_map('strval', $allowedClusterIds));
+        }
+
+        return $query->orderByDesc('rank_score')
             ->get()
             ->groupBy(fn (LocalityRecommendation $r) => (string) $r->sku);
     }
@@ -231,6 +237,11 @@ class LocalityEnrichmentService
             $child = $line;
             $child['cluster_id'] = $split['cluster_id'];
             $child['cluster_name'] = $split['cluster_name'];
+            $child['warehouse_id'] = 'cluster:' . $split['cluster_id'];
+            $child['warehouse_name'] = $split['cluster_name'];
+            $child['destination'] = $split['cluster_name'];
+            $child['destination_id'] = 'cluster:' . $split['cluster_id'];
+            $child['destination_type'] = 'cluster';
             $child['qty_rounded'] = $qty;
             $child['qty_recommended'] = $qty;
             $child['parent_line_key'] = $parentKey;
@@ -320,18 +331,43 @@ class LocalityEnrichmentService
             ->values()
             ->all();
 
-        // Coverage рекомендаций: сколько LocalityRecommendation state=new покрывает этот план
-        $coveredIds = $lines
+        // Coverage рекомендаций (честная метрика):
+        // Рекомендация считается "покрытой планом", если в плане есть строка с тем же SKU
+        // И тем же target_cluster_id. Просто наличие SKU в плане недостаточно — рекомендация
+        // адресная, она про конкретную пару (SKU × кластер).
+        $explicitlyLinkedIds = $lines
             ->flatMap(fn ($l) => is_array($l->linked_locality_recommendation_ids)
                 ? $l->linked_locality_recommendation_ids
                 : [])
             ->unique()
             ->values();
 
-        $totalActive = LocalityRecommendation::query()
+        // Пары (sku, cluster_id), которые трогает план
+        $planSkuClusters = $lines
+            ->filter(fn ($l) => $l->sku && $l->cluster_id)
+            ->map(fn ($l) => (string) $l->sku . '|' . (string) $l->cluster_id)
+            ->unique()
+            ->values()
+            ->all();
+
+        $activeRecsQuery = LocalityRecommendation::query()
             ->where('integration_id', $integrationId)
-            ->where('state', LocalityRecommendation::STATE_NEW)
-            ->count();
+            ->where('state', LocalityRecommendation::STATE_NEW);
+
+        $totalActive = (clone $activeRecsQuery)->count();
+
+        $skuClusterCoveredIds = $planSkuClusters !== []
+            ? (clone $activeRecsQuery)
+                ->get(['id', 'sku', 'target_cluster_id'])
+                ->filter(fn ($r) => in_array(
+                    (string) $r->sku . '|' . (string) ($r->target_cluster_id ?? ''),
+                    $planSkuClusters,
+                    true
+                ))
+                ->pluck('id')
+            : collect();
+
+        $coveredIds = $explicitlyLinkedIds->concat($skuClusterCoveredIds)->unique()->values();
 
         $coveragePercent = $totalActive > 0
             ? round(($coveredIds->count() / $totalActive) * 100, 2)
@@ -487,22 +523,56 @@ class LocalityEnrichmentService
     }
 
     /**
-     * Оценка ожидаемого prir уплифта локальности для плана в п.п.
+     * Оценка ожидаемого уплифта локальности для плана в п.п.
+     *
+     * Источник uplift'a per SKU = max(uplift из явно залинкованных рекомендаций строк плана,
+     * uplift из всех активных рекомендаций по этому SKU).
+     * Это работает даже если cluster split не присвоил рекомендации напрямую к строкам
+     * (например, при малых qty или несовпадении target_cluster_id).
+     *
+     * Взвешивание по orders_count из LocalityMetricDaily.
      *
      * @param Collection $lines
      * @param array<string, LocalityMetricDaily> $metrics
      */
     private function estimatePlanUpliftPp(AutoSupplyPlan $plan, Collection $lines, array $metrics): float
     {
-        // Уплифт SKU × его вес (ordersCount) / суммарные orders по плану.
-        $totalOrders = 0;
-        $upliftWeighted = 0.0;
+        $integrationId = (int) ($plan->integration_id ?? 0);
+        $planSkus = $lines->pluck('sku')->filter()->unique()->values()->all();
 
-        $perSkuUplift = $lines
+        if ($planSkus === [] || $integrationId <= 0) {
+            return 0.0;
+        }
+
+        // 1) Uplift из явно залинкованных рекомендаций (приоритет — он отражает фактический cluster split)
+        $perSkuUpliftFromLines = $lines
             ->groupBy('sku')
             ->map(fn (Collection $linesForSku) => (float) $linesForSku->max('expected_local_share_after_pp'));
 
-        foreach ($perSkuUplift as $sku => $upliftPp) {
+        // 2) Uplift из активных рекомендаций, чья пара (sku, target_cluster_id) фактически в плане
+        $planSkuClusters = $lines
+            ->filter(fn ($l) => $l->sku && $l->cluster_id)
+            ->map(fn ($l) => (string) $l->sku . '|' . (string) $l->cluster_id)
+            ->unique()
+            ->values()
+            ->all();
+
+        $matchingRecs = LocalityRecommendation::query()
+            ->where('integration_id', $integrationId)
+            ->where('state', LocalityRecommendation::STATE_NEW)
+            ->whereIn('sku', $planSkus)
+            ->get(['sku', 'target_cluster_id', 'expected_local_share_uplift_pp'])
+            ->filter(fn ($r) => in_array(
+                (string) $r->sku . '|' . (string) ($r->target_cluster_id ?? ''),
+                $planSkuClusters,
+                true
+            ))
+            ->groupBy(fn ($r) => (string) $r->sku);
+
+        $totalOrders = 0;
+        $upliftWeighted = 0.0;
+
+        foreach ($planSkus as $sku) {
             $metric = $metrics[(string) $sku] ?? null;
             if ($metric === null) {
                 continue;
@@ -511,6 +581,15 @@ class LocalityEnrichmentService
             if ($orders <= 0) {
                 continue;
             }
+
+            $upliftFromLines = (float) ($perSkuUpliftFromLines[(string) $sku] ?? 0);
+            $upliftFromRecs = (float) ($matchingRecs->get((string) $sku)?->sum('expected_local_share_uplift_pp') ?? 0);
+            $upliftPp = max($upliftFromLines, $upliftFromRecs);
+
+            if ($upliftPp <= 0) {
+                continue;
+            }
+
             $totalOrders += $orders;
             $upliftWeighted += $orders * $upliftPp;
         }

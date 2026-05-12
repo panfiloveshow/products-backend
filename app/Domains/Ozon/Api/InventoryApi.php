@@ -460,13 +460,17 @@ class InventoryApi implements InventoryApiInterface
     /**
      * Получить аналитику остатков на складах
      * 
-     * GET /v2/analytics/stock_on_warehouses (v1 deprecated!)
+     * POST /v2/analytics/stock_on_warehouses
      * 
      * @see https://docs.ozon.ru/api/seller
      */
     public function getStockAnalytics(array $params = []): array
     {
-        $response = $this->client->get('/v2/analytics/stock_on_warehouses', $params);
+        $response = $this->client->post('/v2/analytics/stock_on_warehouses', array_merge([
+            'limit' => 100,
+            'offset' => 0,
+            'warehouse_type' => 'ALL',
+        ], $params));
         return $response['result'] ?? [];
     }
     

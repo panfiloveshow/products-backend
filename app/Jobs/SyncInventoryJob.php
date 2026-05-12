@@ -74,8 +74,24 @@ class SyncInventoryJob implements ShouldBeUnique, ShouldQueue
                     $inventory = array_merge($inventory, $fbsInventory);
                     Log::info('Ozon FBS inventory loaded', ['skus' => count($fbsInventory)]);
                 }
-                if (empty($inventory)) {
-                    $inventory = $marketplaceService->getInventory();
+                if (method_exists($marketplaceService, 'getInventory')) {
+                    $aggregateInventory = $marketplaceService->getInventory();
+                    $beforeMerge = count($inventory);
+                    $inventory = $this->mergeOzonAggregateInventory($inventory, $aggregateInventory);
+
+                    Log::info('Ozon aggregate inventory merged', [
+                        'detailed_skus' => $beforeMerge,
+                        'aggregate_skus' => count($aggregateInventory),
+                        'merged_skus' => count($inventory),
+                    ]);
+
+                    if ($beforeMerge > 0 && count($aggregateInventory) > $beforeMerge * 3) {
+                        Log::warning('Ozon detailed inventory looks partial; aggregate inventory kept missing fulfillment rows', [
+                            'integration_id' => $this->syncLog->integration_id,
+                            'detailed_skus' => $beforeMerge,
+                            'aggregate_skus' => count($aggregateInventory),
+                        ]);
+                    }
                 }
             } else {
                 $inventory = $marketplaceService->getInventory();
@@ -375,6 +391,10 @@ class SyncInventoryJob implements ShouldBeUnique, ShouldQueue
                 }
             }
 
+            if ($this->syncLog->integration_id && $this->syncLog->marketplace === 'ozon') {
+                $this->refreshProductFulfillmentTypesFromInventory((int) $this->syncLog->integration_id);
+            }
+
             // Сохраняем метаданные о синхронизации
             $this->syncLog->update([
                 'metadata' => [
@@ -604,6 +624,138 @@ class SyncInventoryJob implements ShouldBeUnique, ShouldQueue
         }
 
         return $query->exists();
+    }
+
+    private function mergeOzonAggregateInventory(array $detailedInventory, array $aggregateInventory): array
+    {
+        if (empty($detailedInventory)) {
+            return $aggregateInventory;
+        }
+
+        if (empty($aggregateInventory)) {
+            return $detailedInventory;
+        }
+
+        $coveredFulfillmentBySku = [];
+        foreach ($detailedInventory as $item) {
+            $sku = trim((string) ($item['sku'] ?? ''));
+            if ($sku === '') {
+                continue;
+            }
+
+            foreach (($item['warehouses'] ?? []) as $warehouse) {
+                $type = $this->normalizeOzonFulfillmentType(
+                    $warehouse['fulfillment_type']
+                        ?? $warehouse['warehouse_type']
+                        ?? $item['fulfillment_type']
+                        ?? null
+                );
+
+                if ($type !== null) {
+                    $coveredFulfillmentBySku[$sku][$type] = true;
+                }
+            }
+        }
+
+        $merged = $detailedInventory;
+        foreach ($aggregateInventory as $item) {
+            $sku = trim((string) ($item['sku'] ?? ''));
+            if ($sku === '') {
+                continue;
+            }
+
+            $warehousesToKeep = [];
+            foreach (($item['warehouses'] ?? []) as $warehouse) {
+                $type = $this->normalizeOzonFulfillmentType(
+                    $warehouse['fulfillment_type']
+                        ?? $warehouse['warehouse_type']
+                        ?? $item['fulfillment_type']
+                        ?? null
+                );
+
+                if ($type !== null && isset($coveredFulfillmentBySku[$sku][$type])) {
+                    continue;
+                }
+
+                $warehousesToKeep[] = $warehouse;
+                if ($type !== null) {
+                    $coveredFulfillmentBySku[$sku][$type] = true;
+                }
+            }
+
+            if ($warehousesToKeep === []) {
+                continue;
+            }
+
+            $fallbackItem = $item;
+            $fallbackItem['warehouses'] = $warehousesToKeep;
+            $fallbackItem['total'] = array_sum(array_map(
+                static fn (array $warehouse): int => (int) ($warehouse['quantity'] ?? 0),
+                $warehousesToKeep
+            ));
+            $merged[] = $fallbackItem;
+        }
+
+        return $merged;
+    }
+
+    private function normalizeOzonFulfillmentType(mixed $value): ?string
+    {
+        $type = strtolower(trim((string) $value));
+
+        if ($type === '') {
+            return null;
+        }
+
+        if (str_contains($type, 'fbs')) {
+            return 'FBS';
+        }
+
+        if (str_contains($type, 'fbo')) {
+            return 'FBO';
+        }
+
+        return strtoupper($type);
+    }
+
+    private function refreshProductFulfillmentTypesFromInventory(int $integrationId): void
+    {
+        $rows = InventoryWarehouse::query()
+            ->where('integration_id', $integrationId)
+            ->where('marketplace', 'ozon')
+            ->whereNotNull('fulfillment_type')
+            ->where('fulfillment_type', '!=', '')
+            ->selectRaw('sku, UPPER(fulfillment_type) as fulfillment_type, SUM(quantity) as total_quantity, COUNT(*) as rows_count')
+            ->groupByRaw('sku, UPPER(fulfillment_type)')
+            ->get()
+            ->groupBy('sku');
+
+        $updates = [];
+        foreach ($rows as $sku => $skuRows) {
+            $withStock = $skuRows->filter(fn ($row): bool => (float) ($row->total_quantity ?? 0) > 0);
+            $winner = ($withStock->isNotEmpty() ? $withStock : $skuRows)
+                ->sortByDesc('rows_count')
+                ->sortByDesc('total_quantity')
+                ->first();
+            $scheme = $this->normalizeOzonFulfillmentType($winner->fulfillment_type ?? null);
+            if ($scheme) {
+                $updates[$scheme][] = (string) $sku;
+            }
+        }
+
+        foreach ($updates as $scheme => $skus) {
+            foreach (array_chunk(array_values(array_unique($skus)), 500) as $chunk) {
+                Product::query()
+                    ->where('integration_id', $integrationId)
+                    ->where('marketplace', 'ozon')
+                    ->whereIn('sku', $chunk)
+                    ->where(function ($query) use ($scheme) {
+                        $query->whereNull('fulfillment_type')
+                            ->orWhere('fulfillment_type', '!=', $scheme);
+                    })
+                    ->update(['fulfillment_type' => $scheme]);
+            }
+        }
     }
 
     private function refreshWildberriesWarehouseCoefficients(object $marketplaceService): void

@@ -58,9 +58,9 @@ class UnitEconomicsCacheControllerTest extends TestCase
         $this->assertSame(0.0, $summary[0]['effective_markup_percent']);
         $this->assertSame(8.0, $summary[0]['non_local_markup_percent']);
         $this->assertSame('local_cluster', $summary[0]['markup_reason']);
-        $this->assertSame(8.0, $summary[1]['effective_markup_percent']);
+        $this->assertSame(12.0, $summary[1]['effective_markup_percent']);
         $this->assertSame(0.0, $salesProfile[0]['effective_markup_percent']);
-        $this->assertSame(8.0, $salesProfile[1]['effective_markup_percent']);
+        $this->assertSame(12.0, $salesProfile[1]['effective_markup_percent']);
         $this->assertSame('Самара', $salesProfile[1]['cluster_name']);
     }
 
@@ -126,5 +126,32 @@ class UnitEconomicsCacheControllerTest extends TestCase
         $this->assertSame(2.0, $result['chargeable_volume_liters']);
         $this->assertSame('0.4000', $result['dimensions']['volume_weight']);
         $this->assertSame('2.0000', $result['dimensions']['chargeable_volume']);
+    }
+
+    public function test_profit_range_is_aligned_with_current_net_profit(): void
+    {
+        $controller = new UnitEconomicsCacheController(
+            $this->createMock(UnitEconomicsCacheService::class),
+            $this->createMock(UnitEconomicsService::class),
+            $this->createMock(UnitEconomicsOrchestrator::class),
+            $this->createMock(IntegrationAccessService::class),
+        );
+
+        $method = new \ReflectionMethod(UnitEconomicsCacheController::class, 'normalizeProfitRangeForNetProfit');
+        $method->setAccessible(true);
+
+        $result = $method->invoke(
+            $controller,
+            [
+                'profit_min' => 10,
+                'profit_base' => 50,
+                'profit_max' => 90,
+            ],
+            35.0
+        );
+
+        $this->assertSame(-5.0, $result['profit_min']);
+        $this->assertSame(35.0, $result['profit_base']);
+        $this->assertSame(75.0, $result['profit_max']);
     }
 }

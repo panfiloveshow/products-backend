@@ -175,6 +175,8 @@ class UnitEconomicsService
 
     private function calculateOzon(array $data): array
     {
+        $data = $this->suppressOzonMarkupForExcludedOrderEconomics($data);
+
         $salesCount = max(1, (int) ($data['sales_count'] ?? 1));
         $volumeLiters = (float) ($data['volume_liters'] ?? 0);
         $sideCm = $volumeLiters > 0 ? pow($volumeLiters * 1000, 1 / 3) : 0;
@@ -233,6 +235,13 @@ class UnitEconomicsService
             'markup_reason_label' => $data['markup_reason_label'] ?? null,
             'markup_exception_status' => $data['markup_exception_status'] ?? null,
             'calculation_mode' => $data['calculation_mode'] ?? null,
+            'redemption_source' => $data['redemption_source'] ?? null,
+            'orders_count' => $data['orders_count'] ?? null,
+            'delivered_count' => $data['delivered_count'] ?? null,
+            'cancelled_count' => $data['cancelled_count'] ?? null,
+            'not_redeemed_count' => $data['not_redeemed_count'] ?? null,
+            'in_flight_count' => $data['in_flight_count'] ?? null,
+            'returns_count' => $data['returns_count'] ?? null,
         ]);
 
         $result = $this->orchestrator->calculate($input)->toArray();
@@ -317,6 +326,57 @@ class UnitEconomicsService
                 'to_settlement_account' => round($toSettlementAccount, 2),
             ],
         ];
+    }
+
+    private function suppressOzonMarkupForExcludedOrderEconomics(array $data): array
+    {
+        $summary = is_array($data['order_economics_summary'] ?? null)
+            ? $data['order_economics_summary']
+            : [];
+        if ($summary === []) {
+            return $data;
+        }
+
+        $ordersCount = (int) ($summary['orders_count'] ?? 0);
+        $markupAmount = (float) ($summary['avg_non_local_markup_amount'] ?? 0);
+        $reasonCodes = is_array($summary['markup_reason_codes'] ?? null)
+            ? $summary['markup_reason_codes']
+            : [];
+        if ($ordersCount <= 0 || abs($markupAmount) > 0.0001 || $reasonCodes === []) {
+            return $data;
+        }
+
+        $excludedReasons = [
+            'cancelled_order',
+            'not_redeemed',
+            'local_cluster',
+            'fbo_lt_50_orders_7d',
+            'zero_markup_cluster',
+        ];
+        $excludedCount = 0;
+        foreach ($reasonCodes as $reason => $count) {
+            if (in_array((string) $reason, $excludedReasons, true)) {
+                $excludedCount += (int) $count;
+            }
+        }
+
+        if ($excludedCount < $ordersCount) {
+            return $data;
+        }
+
+        $data['non_local_markup_percent'] = 0.0;
+        $data['weighted_non_local_markup_percent'] = 0.0;
+        if (isset($data['clusters_summary']) && is_array($data['clusters_summary'])) {
+            $firstReason = (string) array_key_first($reasonCodes);
+            $data['clusters_summary'] = array_map(static function (array $cluster) use ($firstReason): array {
+                $cluster['effective_markup_percent'] = 0.0;
+                $cluster['markup_reason'] = $firstReason;
+
+                return $cluster;
+            }, $data['clusters_summary']);
+        }
+
+        return $data;
     }
 
     public function enrichOzonInputWithProfile(array $data): array

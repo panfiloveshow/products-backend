@@ -2,6 +2,7 @@
 
 namespace App\Services\Ozon;
 
+use App\Domains\Ozon\UnitEconomics\MarkupReasonCode;
 use App\Models\InventoryWarehouse;
 use App\Models\OzonWarehouseCluster;
 use App\Models\Posting;
@@ -16,6 +17,11 @@ use Illuminate\Support\Facades\DB;
 class OzonLocalityService
 {
     private ?array $clusterIdByName = null;
+
+    private function excludedReasonPlaceholders(): string
+    {
+        return implode(',', array_fill(0, count(MarkupReasonCode::excludedValues()), '?'));
+    }
 
     /**
      * Кластеры спроса для конкретного SKU из реальных заказов.
@@ -105,22 +111,24 @@ class OzonLocalityService
      */
     public function buildShippingRoutesForIntegration(int $integrationId, int $periodDays = 30): array
     {
+        $excluded = MarkupReasonCode::excludedValues();
         $rows = DB::select("
             SELECT
-                pi.offer_id as sku,
-                p.financial_data->>'cluster_from' as cluster_from,
-                p.financial_data->>'cluster_to' as cluster_to,
+                sku,
+                shipping_cluster_name as cluster_from,
+                destination_cluster_name as cluster_to,
                 count(*) as cnt
-            FROM postings p
-            JOIN posting_items pi ON pi.posting_id = p.id
-            WHERE p.integration_id = ?::text
-                AND p.in_process_at IS NOT NULL
-                AND p.in_process_at > now() - make_interval(days => ?)
-                AND p.financial_data->>'cluster_from' IS NOT NULL
-                AND p.financial_data->>'cluster_to' IS NOT NULL
-            GROUP BY pi.offer_id, cluster_from, cluster_to
-            ORDER BY pi.offer_id, cluster_from, cnt DESC
-        ", [$integrationId, $periodDays]);
+            FROM ozon_order_unit_economics
+            WHERE integration_id = ?
+                AND order_date IS NOT NULL
+                AND order_date > now() - make_interval(days => ?)
+                AND shipping_cluster_name IS NOT NULL
+                AND destination_cluster_name IS NOT NULL
+                AND sku IS NOT NULL
+                AND COALESCE(markup_reason_code, '') NOT IN ({$this->excludedReasonPlaceholders()})
+            GROUP BY sku, cluster_from, cluster_to
+            ORDER BY sku, cluster_from, cnt DESC
+        ", array_merge([$integrationId, $periodDays], $excluded));
 
         $grouped = [];
         foreach ($rows as $row) {
@@ -153,22 +161,26 @@ class OzonLocalityService
      */
     private function buildDemandClusters(int $integrationId, string $sku, int $periodDays): array
     {
+        $excluded = MarkupReasonCode::excludedValues();
         $rows = DB::select("
             SELECT
-                p.financial_data->>'cluster_to' as cluster_name,
-                count(*) as orders_count
-            FROM postings p
-            WHERE p.integration_id = ?::text
-                AND p.in_process_at IS NOT NULL
-                AND p.in_process_at > now() - make_interval(days => ?)
-                AND p.financial_data->>'cluster_to' IS NOT NULL
-                AND EXISTS (
-                    SELECT 1 FROM posting_items pi
-                    WHERE pi.posting_id = p.id AND pi.offer_id = ?
-                )
+                destination_cluster_name as cluster_name,
+                count(*) as orders_count,
+                count(*) FILTER (
+                    WHERE shipping_cluster_name = destination_cluster_name
+                ) as local_count,
+                sum(non_local_markup_amount) as markup_total,
+                sum(sale_price) as revenue_total
+            FROM ozon_order_unit_economics
+            WHERE integration_id = ?
+                AND sku = ?
+                AND order_date IS NOT NULL
+                AND order_date > now() - make_interval(days => ?)
+                AND destination_cluster_name IS NOT NULL
+                AND COALESCE(markup_reason_code, '') NOT IN ({$this->excludedReasonPlaceholders()})
             GROUP BY cluster_name
             ORDER BY orders_count DESC
-        ", [$integrationId, $periodDays, $sku]);
+        ", array_merge([$integrationId, $sku, $periodDays], $excluded));
 
         return $this->formatDemandClusters($rows);
     }
@@ -180,20 +192,27 @@ class OzonLocalityService
      */
     private function buildDemandClustersForIntegration(int $integrationId, int $periodDays): array
     {
+        $excluded = MarkupReasonCode::excludedValues();
         $rows = DB::select("
             SELECT
-                pi.offer_id as sku,
-                p.financial_data->>'cluster_to' as cluster_name,
-                count(*) as orders_count
-            FROM postings p
-            JOIN posting_items pi ON pi.posting_id = p.id
-            WHERE p.integration_id = ?::text
-                AND p.in_process_at IS NOT NULL
-                AND p.in_process_at > now() - make_interval(days => ?)
-                AND p.financial_data->>'cluster_to' IS NOT NULL
-            GROUP BY pi.offer_id, cluster_name
-            ORDER BY pi.offer_id, orders_count DESC
-        ", [$integrationId, $periodDays]);
+                sku,
+                destination_cluster_name as cluster_name,
+                count(*) as orders_count,
+                count(*) FILTER (
+                    WHERE shipping_cluster_name = destination_cluster_name
+                ) as local_count,
+                sum(non_local_markup_amount) as markup_total,
+                sum(sale_price) as revenue_total
+            FROM ozon_order_unit_economics
+            WHERE integration_id = ?
+                AND order_date IS NOT NULL
+                AND order_date > now() - make_interval(days => ?)
+                AND destination_cluster_name IS NOT NULL
+                AND sku IS NOT NULL
+                AND COALESCE(markup_reason_code, '') NOT IN ({$this->excludedReasonPlaceholders()})
+            GROUP BY sku, cluster_name
+            ORDER BY sku, orders_count DESC
+        ", array_merge([$integrationId, $periodDays], $excluded));
 
         $grouped = [];
         foreach ($rows as $row) {
@@ -219,6 +238,13 @@ class OzonLocalityService
             'cluster_name' => $row->cluster_name,
             'orders_count' => (int) $row->orders_count,
             'orders_percent' => round(($row->orders_count / $totalOrders) * 100, 2),
+            'is_local_cluster' => (int) ($row->local_count ?? 0) >= (int) $row->orders_count,
+            'effective_markup_percent' => (float) ($row->revenue_total ?? 0) > 0
+                ? round(((float) ($row->markup_total ?? 0) / (float) $row->revenue_total) * 100, 2)
+                : 0.0,
+            'markup_reason' => (int) ($row->local_count ?? 0) >= (int) $row->orders_count
+                ? 'local_cluster'
+                : (((float) ($row->markup_total ?? 0)) > 0 ? 'non_local_markup_applied' : 'zero_markup_cluster'),
         ], $rows);
     }
 
@@ -345,22 +371,22 @@ class OzonLocalityService
      */
     private function calculateLocalityRate(int $integrationId, string $sku, int $periodDays): ?float
     {
+        $excluded = MarkupReasonCode::excludedValues();
         $row = DB::selectOne("
             SELECT
                 count(*) as total,
                 count(*) FILTER (
-                    WHERE p.financial_data->>'cluster_from' = p.financial_data->>'cluster_to'
+                    WHERE shipping_cluster_name = destination_cluster_name
                 ) as local_count
-            FROM postings p
-            WHERE p.integration_id = ?::text
-                AND p.in_process_at IS NOT NULL
-                AND p.in_process_at > now() - make_interval(days => ?)
-                AND p.financial_data->>'cluster_from' IS NOT NULL
-                AND EXISTS (
-                    SELECT 1 FROM posting_items pi
-                    WHERE pi.posting_id = p.id AND pi.offer_id = ?
-                )
-        ", [$integrationId, $periodDays, $sku]);
+            FROM ozon_order_unit_economics
+            WHERE integration_id = ?
+                AND sku = ?
+                AND order_date IS NOT NULL
+                AND order_date > now() - make_interval(days => ?)
+                AND shipping_cluster_name IS NOT NULL
+                AND destination_cluster_name IS NOT NULL
+                AND COALESCE(markup_reason_code, '') NOT IN ({$this->excludedReasonPlaceholders()})
+        ", array_merge([$integrationId, $sku, $periodDays], $excluded));
 
         if (! $row || $row->total == 0) {
             return null;
@@ -376,21 +402,24 @@ class OzonLocalityService
      */
     private function calculateLocalityRateForIntegration(int $integrationId, int $periodDays): array
     {
+        $excluded = MarkupReasonCode::excludedValues();
         $rows = DB::select("
             SELECT
-                pi.offer_id as sku,
+                sku,
                 count(*) as total,
                 count(*) FILTER (
-                    WHERE p.financial_data->>'cluster_from' = p.financial_data->>'cluster_to'
+                    WHERE shipping_cluster_name = destination_cluster_name
                 ) as local_count
-            FROM postings p
-            JOIN posting_items pi ON pi.posting_id = p.id
-            WHERE p.integration_id = ?::text
-                AND p.in_process_at IS NOT NULL
-                AND p.in_process_at > now() - make_interval(days => ?)
-                AND p.financial_data->>'cluster_from' IS NOT NULL
-            GROUP BY pi.offer_id
-        ", [$integrationId, $periodDays]);
+            FROM ozon_order_unit_economics
+            WHERE integration_id = ?
+                AND order_date IS NOT NULL
+                AND order_date > now() - make_interval(days => ?)
+                AND shipping_cluster_name IS NOT NULL
+                AND destination_cluster_name IS NOT NULL
+                AND sku IS NOT NULL
+                AND COALESCE(markup_reason_code, '') NOT IN ({$this->excludedReasonPlaceholders()})
+            GROUP BY sku
+        ", array_merge([$integrationId, $periodDays], $excluded));
 
         $result = [];
         foreach ($rows as $row) {

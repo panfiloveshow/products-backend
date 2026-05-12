@@ -292,8 +292,10 @@ class FboSupplyOrdersApi
 
         Log::info('Ozon FBO v2/draft/create/info response', ['draft_id' => $draftId, 'response' => $response]);
 
+        $result = $response['result'] ?? $response;
+
         // Нормализуем структуру — преобразуем availability_status в is_available
-        $clusters = $response['clusters'] ?? [];
+        $clusters = $result['clusters'] ?? [];
         foreach ($clusters as &$cluster) {
             if (isset($cluster['warehouses'])) {
                 foreach ($cluster['warehouses'] as &$warehouse) {
@@ -307,9 +309,9 @@ class FboSupplyOrdersApi
 
         return [
             'clusters' => $clusters,
-            'draft_id' => $response['draft_id'] ?? $draftId,
-            'status' => $response['status'] ?? null,
-            'total_items_count' => $response['total_items_count'] ?? 0,
+            'draft_id' => $result['draft_id'] ?? $draftId,
+            'status' => $result['status'] ?? null,
+            'total_items_count' => $result['total_items_count'] ?? 0,
         ];
     }
 

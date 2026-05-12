@@ -300,7 +300,6 @@ class UnitEconomicsCacheController extends Controller
             'our_share_percent' => 'nullable|numeric|min:0|max:100',
             'tax_percent' => 'nullable|numeric|min:0|max:100',
             'vat_percent' => 'nullable|numeric|min:0|max:100',
-            'redemption_rate' => 'nullable|numeric|min:0|max:100',
             'redemption_rate_override' => 'nullable|numeric|min:0|max:100',
             // WB-специфичные
             'spp_percent' => 'nullable|numeric|min:0|max:100',
@@ -325,11 +324,6 @@ class UnitEconomicsCacheController extends Controller
         $integrationId = $validated['integration_id'];
         $localizationIndex = $validated['localization_index'] ?? null;
         unset($validated['integration_id'], $validated['localization_index']);
-
-        if (array_key_exists('redemption_rate', $validated) && ! array_key_exists('redemption_rate_override', $validated)) {
-            $validated['redemption_rate_override'] = $validated['redemption_rate'];
-        }
-        unset($validated['redemption_rate']);
 
         // Если передан localization_index — обновляем интеграцию (это настройка магазина, не товара)
         if ($localizationIndex !== null) {
@@ -380,7 +374,6 @@ class UnitEconomicsCacheController extends Controller
             'items.*.our_share_percent' => 'nullable|numeric|min:0|max:100',
             'items.*.tax_percent' => 'nullable|numeric|min:0|max:100',
             'items.*.vat_percent' => 'nullable|numeric|min:0|max:100',
-            'items.*.redemption_rate' => 'nullable|numeric|min:0|max:100',
             'items.*.redemption_rate_override' => 'nullable|numeric|min:0|max:100',
             // Габариты (мм и г)
             'items.*.length_mm' => 'nullable|numeric|min:0',
@@ -410,11 +403,6 @@ class UnitEconomicsCacheController extends Controller
         foreach ($validated['items'] as $item) {
             $sku = $item['sku'];
             unset($item['sku']);
-
-            if (array_key_exists('redemption_rate', $item) && ! array_key_exists('redemption_rate_override', $item)) {
-                $item['redemption_rate_override'] = $item['redemption_rate'];
-            }
-            unset($item['redemption_rate']);
 
             UnitEconomicsSettings::updateOrCreate(
                 ['integration_id' => $integrationId, 'sku' => $sku],
@@ -742,15 +730,53 @@ class UnitEconomicsCacheController extends Controller
             foreach ($columns as $col => $def) {
                 $field = $def['field'];
 
-                if ($col === 'M') {
+                if ($col === 'E') {
+                    // E: Наценка — Excel-формула = Цена / Себестоимость
+                    $sheet->setCellValue("E{$currentRow}", "=IF(D{$currentRow}>0,C{$currentRow}/D{$currentRow},0)");
+                } elseif ($col === 'G') {
+                    // G: Выручка — меняется при ручной правке цены или продаж
+                    $sheet->setCellValue("G{$currentRow}", "=C{$currentRow}*F{$currentRow}");
+                } elseif ($col === 'J') {
+                    // J: Комиссия ₽ — зависит от цены и комиссии %
+                    $sheet->setCellValue("J{$currentRow}", "=C{$currentRow}*I{$currentRow}/100");
+                } elseif ($col === 'M') {
                     // M: Доставка — Excel-формула =K+L (логистика + посл. миля)
                     $sheet->setCellValue("M{$currentRow}", "=K{$currentRow}+L{$currentRow}");
+                } elseif ($col === 'AA') {
+                    // AA: Итого затраты — себестоимость + все видимые расходы.
+                    $sheet->setCellValue(
+                        "AA{$currentRow}",
+                        "=D{$currentRow}+J{$currentRow}+M{$currentRow}+N{$currentRow}+O{$currentRow}"
+                        . "+(C{$currentRow}*P{$currentRow}/100)+(C{$currentRow}*Q{$currentRow}/100)"
+                        . "+(C{$currentRow}*R{$currentRow}/100)+(C{$currentRow}*S{$currentRow}/100)"
+                        . "+(C{$currentRow}*T{$currentRow}/100)"
+                    );
+                } elseif ($col === 'AB') {
+                    // AB: Прибыль min — сохраняем сценарный спред относительно базовой прибыли.
+                    $delta = round((float) ($item['profit_min'] ?? 0) - (float) ($item['net_profit'] ?? 0), 2);
+                    $sheet->setCellValue("AB{$currentRow}", "=AC{$currentRow}" . ($delta >= 0 ? '+' : '') . $delta);
+                } elseif ($col === 'AC') {
+                    // AC: Прибыль — ключевая формула, меняется от цены/расходов/себестоимости.
+                    $sheet->setCellValue("AC{$currentRow}", "=AG{$currentRow}-D{$currentRow}");
+                } elseif ($col === 'AD') {
+                    // AD: Прибыль max — сохраняем сценарный спред относительно базовой прибыли.
+                    $delta = round((float) ($item['profit_max'] ?? 0) - (float) ($item['net_profit'] ?? 0), 2);
+                    $sheet->setCellValue("AD{$currentRow}", "=AC{$currentRow}" . ($delta >= 0 ? '+' : '') . $delta);
                 } elseif ($col === 'AE') {
                     // AE: Маржа — Excel-формула =IF(C>0, AC/C*100, 0)
                     $sheet->setCellValue("AE{$currentRow}", "=IF(C{$currentRow}>0,AC{$currentRow}/C{$currentRow}*100,0)");
                 } elseif ($col === 'AF') {
                     // AF: ROI — Excel-формула =IF(D>0, AC/D*100, 0)
                     $sheet->setCellValue("AF{$currentRow}", "=IF(D{$currentRow}>0,AC{$currentRow}/D{$currentRow}*100,0)");
+                } elseif ($col === 'AG') {
+                    // AG: На р/с — цена минус маркетплейс/процентные расходы без себестоимости.
+                    $sheet->setCellValue(
+                        "AG{$currentRow}",
+                        "=C{$currentRow}-J{$currentRow}-M{$currentRow}-N{$currentRow}-O{$currentRow}"
+                        . "-(C{$currentRow}*P{$currentRow}/100)-(C{$currentRow}*Q{$currentRow}/100)"
+                        . "-(C{$currentRow}*R{$currentRow}/100)-(C{$currentRow}*S{$currentRow}/100)"
+                        . "-(C{$currentRow}*T{$currentRow}/100)"
+                    );
                 } elseif ($col === 'U') {
                     // U: Локальность (лейбл)
                     $sheet->setCellValue("U{$currentRow}", $this->resolveLocalityLabel($item));
@@ -1350,7 +1376,14 @@ class UnitEconomicsCacheController extends Controller
         $cacheKey = "ue_actual_scheme_{$integrationId}_{$marketplace}";
 
         return Cache::remember($cacheKey, 300, function () use ($integrationId, $marketplace) {
-            // Сначала пробуем из unit_economics (более точные данные по остаткам)
+            // Остатки — самый свежий источник фактической схемы. unit_economics может
+            // быть stale после смены склада/схемы и тогда уводит экран в FBO.
+            $inventoryScheme = $this->resolveActualSchemeFromInventory($integrationId, $marketplace);
+            if ($inventoryScheme) {
+                return $inventoryScheme;
+            }
+
+            // Затем пробуем из unit_economics.
             $actualScheme = UnitEconomics::where('integration_id', $integrationId)
                 ->where('marketplace', $marketplace)
                 ->where('is_actual_scheme', true)
@@ -1373,6 +1406,71 @@ class UnitEconomicsCacheController extends Controller
                 ->orderByDesc('count')
                 ->value('fulfillment_type');
         });
+    }
+
+    private function resolveActualSchemeFromInventory(int $integrationId, string $marketplace, ?string $sku = null): ?string
+    {
+        $cacheKey = 'ue_inventory_actual_scheme_'
+            .$integrationId.'_'
+            .$marketplace.'_'
+            .($sku !== null ? md5($sku) : 'all');
+
+        return Cache::remember($cacheKey, 300, function () use ($integrationId, $marketplace, $sku) {
+            $query = InventoryWarehouse::query()
+                ->where('integration_id', $integrationId)
+                ->where('marketplace', $marketplace)
+                ->whereNotNull('fulfillment_type')
+                ->where('fulfillment_type', '!=', '');
+
+            if ($sku !== null && trim($sku) !== '') {
+                $query->where('sku', trim($sku));
+            }
+
+            $rows = $query
+                ->selectRaw('UPPER(fulfillment_type) as fulfillment_type, SUM(quantity) as total_quantity, COUNT(*) as rows_count')
+                ->groupByRaw('UPPER(fulfillment_type)')
+                ->get()
+                ->map(function ($row) {
+                    $scheme = $this->normalizeFulfillmentScheme($row->fulfillment_type);
+
+                    return [
+                        'scheme' => $scheme,
+                        'total_quantity' => (float) ($row->total_quantity ?? 0),
+                        'rows_count' => (int) ($row->rows_count ?? 0),
+                    ];
+                })
+                ->filter(fn (array $row): bool => $row['scheme'] !== null)
+                ->values();
+
+            if ($rows->isEmpty()) {
+                return null;
+            }
+
+            $withStock = $rows->filter(fn (array $row): bool => $row['total_quantity'] > 0);
+            $winner = ($withStock->isNotEmpty() ? $withStock : $rows)
+                ->sortByDesc('rows_count')
+                ->sortByDesc('total_quantity')
+                ->first();
+
+            return $winner['scheme'] ?? null;
+        });
+    }
+
+    private function normalizeFulfillmentScheme(mixed $value): ?string
+    {
+        $scheme = strtoupper(trim((string) $value));
+
+        if ($scheme === '') {
+            return null;
+        }
+
+        return match (true) {
+            str_contains($scheme, 'REALFBS'), str_contains($scheme, 'RFBS') => 'RFBS',
+            str_contains($scheme, 'EXPRESS') => 'EXPRESS',
+            str_contains($scheme, 'FBS') => 'FBS',
+            str_contains($scheme, 'FBO') => 'FBO',
+            default => $scheme,
+        };
     }
 
     /**
@@ -1494,8 +1592,13 @@ class UnitEconomicsCacheController extends Controller
         $redemption = $ozonData['redemption'] ?? [];
         $salesCount = max(1, (int) $cache->sales_count);
 
-        // Получаем реальную схему товара из Product (там актуальные данные из Ozon API)
-        $realScheme = $product?->fulfillment_type ?? match ($cache->marketplace) {
+        // Получаем реальную схему товара из остатков: Ozon product API не гарантирует
+        // fulfillment_type, а inventory показывает где товар реально продаётся сейчас.
+        $realScheme = $this->resolveActualSchemeFromInventory(
+            (int) $cache->integration_id,
+            (string) $cache->marketplace,
+            (string) $cache->sku
+        ) ?? $product?->fulfillment_type ?? match ($cache->marketplace) {
             'yandex', 'yandex_market' => 'FBY',
             default => 'FBO',
         };
@@ -1687,19 +1790,18 @@ class UnitEconomicsCacheController extends Controller
             $data['sales_7_days'] = isset($marketplaceData['sales_7_days'])
                 ? (int) $marketplaceData['sales_7_days']
                 : (isset($ozonData['sales_7_days']) ? (int) $ozonData['sales_7_days'] : null);
-            // markup_allowed считаем по актуальным sales_7_days, а не по stale значению из кеша
+            // markup_allowed считаем по актуальным sales_7_days, а не по stale значению из кеша.
+            // Наценка за нелокальную продажу Ozon относится к FBO; FBS-заказы не запускают её.
             $isFboScheme = strtoupper($cache->fulfillment_type ?? '') === 'FBO';
             $sellerSales7Days = $data['sales_7_days'];
-            $data['markup_allowed'] = !($isFboScheme && $sellerSales7Days !== null && $sellerSales7Days < 50);
-            $data['profit_min'] = isset($marketplaceData['profit_min'])
-                ? round((float) $marketplaceData['profit_min'], 2)
-                : round((float) $cache->net_profit, 2);
-            $data['profit_base'] = isset($marketplaceData['profit_base'])
-                ? round((float) $marketplaceData['profit_base'], 2)
-                : round((float) $cache->net_profit, 2);
-            $data['profit_max'] = isset($marketplaceData['profit_max'])
-                ? round((float) $marketplaceData['profit_max'], 2)
-                : round((float) $cache->net_profit, 2);
+            $data['markup_allowed'] = $isFboScheme && ($sellerSales7Days === null || $sellerSales7Days >= 50);
+            $profitRange = $this->normalizeProfitRangeForNetProfit($marketplaceData, (float) $cache->net_profit);
+            $data['profit_min'] = $profitRange['profit_min'];
+            $data['profit_base'] = $profitRange['profit_base'];
+            $data['profit_max'] = $profitRange['profit_max'];
+            $marketplaceData['profit_min'] = $data['profit_min'];
+            $marketplaceData['profit_base'] = $data['profit_base'];
+            $marketplaceData['profit_max'] = $data['profit_max'];
             $data['clusters_summary'] = is_array($marketplaceData['clusters_summary'] ?? null)
                 ? $marketplaceData['clusters_summary']
                 : (is_array($ozonData['clusters_summary'] ?? null)
@@ -1719,7 +1821,8 @@ class UnitEconomicsCacheController extends Controller
                 $data['clusters_summary'],
                 $data['sales_profile'],
                 $data['stock_profile'],
-                (bool) ($data['markup_allowed'] ?? true)
+                (bool) ($data['markup_allowed'] ?? true),
+                $isFboScheme ? 'fbo_lt_50_orders_7d' : 'non_fbo_no_nonlocal_markup'
             );
             $marketplaceData['clusters_summary'] = $data['clusters_summary'];
             $marketplaceData['sales_profile'] = $data['sales_profile'];
@@ -1772,7 +1875,9 @@ class UnitEconomicsCacheController extends Controller
             $data['raw_non_local_markup_percent'] = $weightedMarkup;
 
             $data['markup_rule_reason'] = null;
-            if ($data['markup_allowed'] === false) {
+            if (! $isFboScheme) {
+                $data['markup_rule_reason'] = 'non_fbo_no_nonlocal_markup';
+            } elseif ($data['markup_allowed'] === false) {
                 $data['markup_rule_reason'] = 'fbo_lt_50_orders_7d';
             } elseif (($data['expected_locality_rate'] ?? null) !== null && (float) $data['expected_locality_rate'] >= 99.99) {
                 $data['markup_rule_reason'] = 'local_cluster';
@@ -2081,6 +2186,34 @@ class UnitEconomicsCacheController extends Controller
         $data['vat_amount'] = round((float) ($cache->vat_amount ?? ($price * $data['vat_percent'] / 100)), 2);
 
         return $data;
+    }
+
+    /**
+     * Старые Ozon profit_min/profit_base/profit_max могли быть сохранены до
+     * пост-расходов (ДРР, налог, НДС, наша доля). Для отображения сдвигаем весь
+     * диапазон так, чтобы его база совпадала с текущей net_profit строки кэша.
+     *
+     * @return array{profit_min:float,profit_base:float,profit_max:float}
+     */
+    private function normalizeProfitRangeForNetProfit(array $marketplaceData, float $netProfit): array
+    {
+        $profitBase = isset($marketplaceData['profit_base'])
+            ? (float) $marketplaceData['profit_base']
+            : $netProfit;
+        $profitDelta = $netProfit - $profitBase;
+        $profitMin = isset($marketplaceData['profit_min'])
+            ? (float) $marketplaceData['profit_min'] + $profitDelta
+            : $netProfit;
+        $profitMax = isset($marketplaceData['profit_max'])
+            ? (float) $marketplaceData['profit_max'] + $profitDelta
+            : $netProfit;
+        $profitRangeValues = [$profitMin, $netProfit, $profitMax];
+
+        return [
+            'profit_min' => round(min($profitRangeValues), 2),
+            'profit_base' => round($netProfit, 2),
+            'profit_max' => round(max($profitRangeValues), 2),
+        ];
     }
 
     /**
@@ -2624,6 +2757,7 @@ class UnitEconomicsCacheController extends Controller
             'local_cluster' => 'Надбавка не применяется: товар продаётся в локальном кластере',
             'fbo_lt_50_orders_7d' => 'Надбавка не применяется: за 7 дней по FBO меньше 50 заказов'
                 .($sales7Days !== null ? " ({$sales7Days})" : ''),
+            'non_fbo_no_nonlocal_markup' => 'Надбавка за нелокальность применяется только к FBO',
             'no_markup_for_cluster' => 'Надбавка не применяется: для этого кластера ставка Ozon равна 0%',
             'non_local_markup_applied' => 'Надбавка применяется: продажа идёт вне локального кластера',
             default => null,
@@ -2634,7 +2768,8 @@ class UnitEconomicsCacheController extends Controller
         array $clustersSummary,
         array $salesProfile,
         array $stockProfile,
-        bool $markupAllowed
+        bool $markupAllowed,
+        string $markupDisabledReason = 'fbo_lt_50_orders_7d'
     ): array {
         $salesClusters = is_array($salesProfile['clusters'] ?? null) ? $salesProfile['clusters'] : $salesProfile;
         $pricing = app(OzonPricingMatrix::class);
@@ -2667,7 +2802,7 @@ class UnitEconomicsCacheController extends Controller
             }
         }
 
-        $enrichCluster = function (array $cluster) use ($pricing, $summaryLookup, $stockClusterCanonical, $markupAllowed): array {
+        $enrichCluster = function (array $cluster) use ($pricing, $summaryLookup, $stockClusterCanonical, $markupAllowed, $markupDisabledReason): array {
             $clusterId = isset($cluster['cluster_id']) && $cluster['cluster_id'] !== '' ? (string) $cluster['cluster_id'] : null;
             $clusterName = $cluster['cluster_name'] ?? null;
             $clusterNameKey = $this->normalizeClusterKey($clusterName);
@@ -2688,7 +2823,7 @@ class UnitEconomicsCacheController extends Controller
             $markupReason = $cluster['markup_reason']
                 ?? $matched['markup_reason']
                 ?? (! $markupAllowed
-                    ? 'fbo_lt_50_orders_7d'
+                    ? $markupDisabledReason
                     : ($isLocalCluster ? 'local_cluster' : ($nonLocalMarkupPercent > 0 ? 'non_local_markup_applied' : 'no_markup_for_cluster')));
 
             return array_merge($matched, $cluster, [

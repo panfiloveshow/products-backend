@@ -104,6 +104,10 @@ class WildberriesService implements MarketplaceInterface
     public function getProducts(): array
     {
         try {
+            if (trim($this->apiKey) === '') {
+                throw new \RuntimeException('Ключ API Wildberries не указан. Добавьте токен в настройках интеграции.');
+            }
+
             $allCards = [];
             $cursor = ['limit' => 100];
 
@@ -126,7 +130,7 @@ class WildberriesService implements MarketplaceInterface
                         'status' => $response->status(),
                         'body' => $response->body(),
                     ]);
-                    break;
+                    throw new \RuntimeException($this->formatProductsApiError($response));
                 }
 
                 $data = $response->json();
@@ -184,11 +188,48 @@ class WildberriesService implements MarketplaceInterface
 
             return $products;
 
-        } catch (\Exception $e) {
+        } catch (\RuntimeException $e) {
             Log::error('WB getProducts error: '.$e->getMessage());
 
-            return [];
+            throw $e;
+        } catch (\Throwable $e) {
+            Log::error('WB getProducts error: '.$e->getMessage());
+
+            throw new \RuntimeException(
+                'Не удалось получить товары Wildberries: '.$e->getMessage(),
+                previous: $e
+            );
         }
+    }
+
+    private function formatProductsApiError(\Illuminate\Http\Client\Response $response): string
+    {
+        $status = $response->status();
+        $body = $response->json();
+        $detail = is_array($body) ? (string) ($body['detail'] ?? $body['message'] ?? '') : '';
+        $rawBody = $response->body();
+        $searchText = mb_strtolower($detail.' '.$rawBody);
+
+        if ($status === 401 && str_contains($searchText, 'token expired')) {
+            return 'Ключ API Wildberries просрочен. Обновите токен в кабинете WB и сохраните его в настройках интеграции.';
+        }
+
+        if ($status === 401 && str_contains($searchText, 'empty authorization header')) {
+            return 'Ключ API Wildberries не указан. Добавьте токен в настройках интеграции.';
+        }
+
+        if ($status === 401) {
+            return 'Wildberries отклонил ключ API: проверьте токен в настройках интеграции.';
+        }
+
+        if ($status === 403) {
+            return 'У ключа API Wildberries нет доступа к товарам или он деактивирован. Проверьте права токена в кабинете WB.';
+        }
+
+        $message = $detail !== '' ? $detail : trim($response->body());
+        $message = $message !== '' ? ' '.$message : '';
+
+        return "Wildberries не вернул товары: HTTP {$status}.{$message}";
     }
 
     /**

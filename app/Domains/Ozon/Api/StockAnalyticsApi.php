@@ -124,6 +124,74 @@ class StockAnalyticsApi
     }
 
     /**
+     * Получить аналитику остатков, индексированную по offer_id × cluster_id.
+     *
+     * Для автопланирования Ozon важен именно кластерный срез: спрос и доступный
+     * остаток оцениваются по региону в целом, а не по одному складу внутри него.
+     *
+     * @param array $skus Ozon numeric SKU
+     * @return array [offer_id => [cluster_id => item_data, ...], ...]
+     */
+    public function getStockAnalyticsByOfferCluster(array $skus): array
+    {
+        $items = $this->getStockAnalytics($skus);
+        $result = [];
+
+        foreach ($items as $item) {
+            $offerId = $item['offer_id'] ?? null;
+            $clusterId = $item['cluster_id'] ?? null;
+            if (!$offerId || $clusterId === null) {
+                continue;
+            }
+
+            $clusterKey = (string) $clusterId;
+            if (!isset($result[$offerId][$clusterKey])) {
+                $result[$offerId][$clusterKey] = [
+                    'sku' => $item['sku'] ?? null,
+                    'cluster_id' => $clusterId,
+                    'cluster_name' => $item['cluster_name'] ?? null,
+                    'macrolocal_cluster_id' => $item['macrolocal_cluster_id'] ?? null,
+                    'ads' => $item['ads'] ?? 0,
+                    'ads_cluster' => $item['ads_cluster'] ?? 0,
+                    'idc' => $item['idc'] ?? 0,
+                    'idc_cluster' => $item['idc_cluster'] ?? 0,
+                    'days_without_sales' => $item['days_without_sales'] ?? 0,
+                    'days_without_sales_cluster' => $item['days_without_sales_cluster'] ?? 0,
+                    'turnover_grade' => $item['turnover_grade'] ?? null,
+                    'turnover_grade_cluster' => $item['turnover_grade_cluster'] ?? null,
+                    'valid_stock_count' => 0,
+                    'available_stock_count' => 0,
+                    'requested_stock_count' => 0,
+                    'transit_stock_count' => 0,
+                    'return_from_customer_stock_count' => 0,
+                    'warehouse_names' => [],
+                ];
+            }
+
+            $clusterData = &$result[$offerId][$clusterKey];
+            $clusterData['ads'] = max((float) ($clusterData['ads'] ?? 0), (float) ($item['ads'] ?? 0));
+            $clusterData['ads_cluster'] = max((float) ($clusterData['ads_cluster'] ?? 0), (float) ($item['ads_cluster'] ?? 0));
+            $clusterData['idc'] = max((float) ($clusterData['idc'] ?? 0), (float) ($item['idc'] ?? 0));
+            $clusterData['idc_cluster'] = max((float) ($clusterData['idc_cluster'] ?? 0), (float) ($item['idc_cluster'] ?? 0));
+            $clusterData['days_without_sales'] = max((int) ($clusterData['days_without_sales'] ?? 0), (int) ($item['days_without_sales'] ?? 0));
+            $clusterData['days_without_sales_cluster'] = max((int) ($clusterData['days_without_sales_cluster'] ?? 0), (int) ($item['days_without_sales_cluster'] ?? 0));
+            $clusterData['valid_stock_count'] += (int) ($item['valid_stock_count'] ?? 0);
+            $clusterData['available_stock_count'] += (int) ($item['available_stock_count'] ?? 0);
+            $clusterData['requested_stock_count'] += (int) ($item['requested_stock_count'] ?? 0);
+            $clusterData['transit_stock_count'] += (int) ($item['transit_stock_count'] ?? 0);
+            $clusterData['return_from_customer_stock_count'] += (int) ($item['return_from_customer_stock_count'] ?? 0);
+
+            $warehouseName = $item['warehouse_name'] ?? null;
+            if ($warehouseName && !in_array($warehouseName, $clusterData['warehouse_names'], true)) {
+                $clusterData['warehouse_names'][] = $warehouseName;
+            }
+            unset($clusterData);
+        }
+
+        return $result;
+    }
+
+    /**
      * Получить оборачиваемость по SKU
      *
      * POST /v1/analytics/turnover/stocks

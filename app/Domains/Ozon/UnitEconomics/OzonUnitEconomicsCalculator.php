@@ -47,7 +47,7 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
         $volume = $input->getChargeableVolumeInLiters();
         $context = $this->resolveMarketplaceContext('FBO', $input, $volume);
 
-        $returnCosts = $this->calculateExpectedReturnCosts('FBO', $context['base_logistics'], $input->redemptionRate);
+        $returnCosts = $this->calculateExpectedReturnCosts('FBO', $context['base_logistics'], $input->redemptionRate, $input);
 
         return $this->buildResult(
             $input,
@@ -94,7 +94,7 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
         $context = $this->resolveMarketplaceContext('FBS', $input, $volume);
         $schemeCosts = $this->pricing->getSchemeCosts('FBS');
         $processingFee = (float) ($schemeCosts['processing_fee'] ?? 0);
-        $returnCosts = $this->calculateExpectedReturnCosts('FBS', $context['base_logistics'], $input->redemptionRate);
+        $returnCosts = $this->calculateExpectedReturnCosts('FBS', $context['base_logistics'], $input->redemptionRate, $input);
 
         return $this->buildResult(
             $input,
@@ -418,9 +418,9 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
     /**
      * Рассчитать ожидаемые расходы на возвраты
      */
-    private function calculateExpectedReturnCosts(string $scheme, float $baseLogistics, ?float $redemptionRate): array
+    private function calculateExpectedReturnCosts(string $scheme, float $baseLogistics, ?float $redemptionRate, ?CalculationInput $input = null): array
     {
-        if ($redemptionRate === null || $redemptionRate >= 100) {
+        if ($redemptionRate === null || $redemptionRate >= 100 || ! $this->hasReturnRisk($input)) {
             return [
                 'expected' => 0.0,
                 'logistics' => 0.0,
@@ -440,10 +440,58 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
         ];
     }
 
+    private function hasReturnRisk(?CalculationInput $input): bool
+    {
+        if ($input === null) {
+            return true;
+        }
+
+        if ($input->redemptionSource === 'no_sales_28d') {
+            return false;
+        }
+
+        if ($input->ordersCount !== null && $input->ordersCount <= 0) {
+            return false;
+        }
+
+        $cancelled = max(0, (int) ($input->cancelledCount ?? 0));
+        if ($input->ordersCount !== null && $cancelled >= $input->ordersCount) {
+            return false;
+        }
+
+        return true;
+    }
+
+    private function hasRealizedSaleForMarkup(CalculationInput $input): bool
+    {
+        if ($input->redemptionSource === 'no_sales_28d') {
+            return false;
+        }
+
+        if ($input->ordersCount !== null && $input->ordersCount <= 0) {
+            return false;
+        }
+
+        $delivered = $input->deliveredCount;
+        $inFlight = $input->inFlightCount;
+        if ($delivered !== null || $inFlight !== null) {
+            return max(0, (int) $delivered) + max(0, (int) $inFlight) > 0;
+        }
+
+        $cancelled = max(0, (int) ($input->cancelledCount ?? 0));
+        if ($input->ordersCount !== null && $cancelled >= $input->ordersCount) {
+            return false;
+        }
+
+        return true;
+    }
+
     private function resolveMarketplaceContext(string $scheme, CalculationInput $input, float $volume): array
     {
+        $hasNoSales = $input->redemptionSource === 'no_sales_28d'
+            || ($input->ordersCount !== null && $input->ordersCount <= 0);
         $commissionData = $this->pricing->resolveCommission($scheme, $input->categoryId, $input->price);
-        $hasExactClusters = $input->shippingClusterName !== null || $input->destinationClusterName !== null;
+        $hasExactClusters = ! $hasNoSales && ($input->shippingClusterName !== null || $input->destinationClusterName !== null);
         $clusterLogisticsData = $hasExactClusters
             ? $this->pricing->resolveClusterLogistics(
                 $scheme,
@@ -453,7 +501,13 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
                 $input->destinationClusterName
             )
             : null;
-        $logisticsData = $clusterLogisticsData ?? $this->pricing->resolveLogistics($scheme, $volume, $input->routeKey, $input->routeLabel);
+        $logisticsData = $clusterLogisticsData
+            ?? $this->pricing->resolveLogistics(
+                $scheme,
+                $volume,
+                $hasNoSales ? null : $input->routeKey,
+                $hasNoSales ? null : $input->routeLabel
+            );
         $schemeCosts = $this->pricing->getSchemeCosts($scheme);
         $commissionRate = $input->commissionRate ?? (float) $commissionData['sales_fee_percent'];
         $acquiringRate = $input->acquiringPercent ?? 1.5;
@@ -467,12 +521,12 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
             $dominantClusterName = $dominant['cluster_name'];
         }
 
-        $routeWasProvided = !empty($input->routeKey) || !empty($input->routeLabel) || !empty($input->shippingClusterName) || !empty($input->destinationClusterName);
-        $hasProfile = !empty($input->clustersSummary) || !empty($dominantClusterId);
-        $routeResolutionStatus = $input->routeResolutionStatus ?? ($routeWasProvided ? 'resolved' : ($hasProfile ? 'estimated' : 'unknown'));
-        $localityResolutionStatus = $input->localityResolutionStatus ?? (($input->isLocalSale !== null || $input->expectedLocalityRate !== null) ? 'resolved' : ($hasProfile ? 'estimated' : 'unknown'));
+        $routeWasProvided = ! $hasNoSales && (!empty($input->routeKey) || !empty($input->routeLabel) || !empty($input->shippingClusterName) || !empty($input->destinationClusterName));
+        $hasProfile = ! $hasNoSales && (!empty($input->clustersSummary) || !empty($dominantClusterId));
+        $routeResolutionStatus = $hasNoSales ? 'unknown' : ($input->routeResolutionStatus ?? ($routeWasProvided ? 'resolved' : ($hasProfile ? 'estimated' : 'unknown')));
+        $localityResolutionStatus = $hasNoSales ? 'unknown' : ($input->localityResolutionStatus ?? (($input->isLocalSale !== null || $input->expectedLocalityRate !== null) ? 'resolved' : ($hasProfile ? 'estimated' : 'unknown')));
         $calculationConfidence = $input->calculationConfidence ?? $this->resolveConfidence($dominantClusterShare, $routeResolutionStatus);
-        $profileMetrics = $this->resolveWeightedProfileMetrics($scheme, $input, $volume);
+        $profileMetrics = $hasNoSales ? null : $this->resolveWeightedProfileMetrics($scheme, $input, $volume);
         $expectedLocalityRate = $profileMetrics['expected_locality_rate'] ?? $input->expectedLocalityRate ?? null;
         if ($expectedLocalityRate === null && $input->isLocalSale !== null && $localityResolutionStatus === 'resolved') {
             $expectedLocalityRate = $input->isLocalSale ? 100.0 : 0.0;
@@ -494,7 +548,7 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
         // Источник истины — Σ(share × effective_markup_percent) из clusters_summary (вариант A).
         // Без профиля — используем явный override из input (например, repo_fallback / user),
         // иначе остаётся null и финальная наценка упадёт на configMarkupPercent/0 ниже.
-        $weightedNonLocalMarkupPercent = $profileMetrics['weighted_markup_percent'] ?? $input->weightedNonLocalMarkupPercent ?? null;
+        $weightedNonLocalMarkupPercent = $hasNoSales ? 0.0 : ($profileMetrics['weighted_markup_percent'] ?? $input->weightedNonLocalMarkupPercent ?? null);
         if ($input->markupApplied === false) {
             $weightedNonLocalMarkupPercent = 0.0;
         }
@@ -502,12 +556,14 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
         $nonLocalMarkupPercent = $isLocalSale === true
             ? 0.0
             : ($weightedNonLocalMarkupPercent ?? $input->nonLocalMarkupPercent ?? $configMarkupPercent);
-        if ($input->markupApplied === false) {
+        if ($input->markupApplied === false || ! $this->hasRealizedSaleForMarkup($input)) {
             $nonLocalMarkupPercent = 0.0;
         }
-        $baseLogistics = $profileMetrics['base_logistics']
-            ?? $input->weightedLogisticsCost
-            ?? (float) $logisticsData['base_cost'];
+        $baseLogistics = $hasNoSales
+            ? (float) $logisticsData['base_cost']
+            : ($profileMetrics['base_logistics']
+                ?? $input->weightedLogisticsCost
+                ?? (float) $logisticsData['base_cost']);
         $nonLocalMarkupAmount = $input->price * ($nonLocalMarkupPercent / 100);
         $displayRouteKey = $routeResolutionStatus === 'resolved' ? ($logisticsData['route_key'] ?? null) : null;
         $displayRouteLabel = match ($routeResolutionStatus) {
@@ -578,7 +634,8 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
         // Локальная продажа без фиксации допустима только когда весь доступный сток
         // сосредоточен в одном кластере. Иначе не считаем продажу полностью локальной.
         $singleStockCluster = count($stockClusterNames) === 1 ? $stockClusterNames[0] : null;
-        $markupAllowed = !($scheme === 'FBO' && $input->sales7Days !== null && $input->sales7Days < 50);
+        $markupAllowed = $scheme === 'FBO'
+            && ($input->sales7Days === null || $input->sales7Days >= 50);
 
         $weightedBaseLogistics = 0.0;
         $weightedMarkupPercent = 0.0;
@@ -727,7 +784,7 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
             $schemeCosts = $this->pricing->getSchemeCosts($scheme);
             $markupPercent = (float) ($logisticsData['is_local_sale'] ? 0 : ($logisticsData['non_local_markup_percent'] ?? 0));
             $logistics = (float) $logisticsData['base_cost'] + $input->price * ($markupPercent / 100);
-            $returnCosts = $this->calculateExpectedReturnCosts($scheme, (float) $logisticsData['base_cost'], $input->redemptionRate);
+            $returnCosts = $this->calculateExpectedReturnCosts($scheme, (float) $logisticsData['base_cost'], $input->redemptionRate, $input);
 
             $totalCosts = $fixedCosts['commission']
                 + $fixedCosts['acquiring']

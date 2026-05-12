@@ -2115,8 +2115,11 @@ class SyncUnitEconomicsCommand extends Command
             $weightedNonLocalMarkupPercent = 0.0;
             $hasWeightedMarkup = false;
             $clustersSummary = [];
-            $markupAllowed = (string) ($item['delivery_schema'] ?? 'ALL') !== 'FBO' || $sellerFboSales7Days >= 50;
-            $markupRuleReason = $markupAllowed ? null : 'fbo_lt_50_orders_7d';
+            $deliverySchema = strtoupper((string) ($item['delivery_schema'] ?? 'ALL'));
+            $markupAllowed = $deliverySchema === 'FBO' && $sellerFboSales7Days >= 50;
+            $markupRuleReason = $markupAllowed
+                ? null
+                : ($deliverySchema === 'FBO' ? 'fbo_lt_50_orders_7d' : 'non_fbo_no_nonlocal_markup');
 
             foreach ($clusters as $cluster) {
                 $share = (float) ($cluster['orders_percent'] ?? 0);

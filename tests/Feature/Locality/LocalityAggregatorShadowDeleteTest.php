@@ -7,6 +7,7 @@ use App\Models\LocalityMetricDaily;
 use App\Models\OzonOrderUnitEconomics;
 use Carbon\Carbon;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Str;
 use Tests\TestCase;
 
 /**
@@ -119,5 +120,50 @@ class LocalityAggregatorShadowDeleteTest extends TestCase
                 ->first(),
             'Prune должен фильтроваться по period_days — snapshot другого периода трогать нельзя'
         );
+    }
+
+    public function test_aggregator_uses_last_28_completed_days_like_ozon_widget(): void
+    {
+        $integrationId = 59;
+        $snapshotDate = Carbon::parse('2026-05-04');
+        $sku = '5690/black-white';
+
+        $this->createOzonOrderUnitEconomics($integrationId, $sku, '2026-04-05 12:00:00');
+        $this->createOzonOrderUnitEconomics($integrationId, $sku, '2026-04-06 12:00:00');
+        $this->createOzonOrderUnitEconomics($integrationId, $sku, '2026-05-03 12:00:00');
+        $this->createOzonOrderUnitEconomics($integrationId, $sku, '2026-05-04 12:00:00');
+
+        app(LocalityAggregator::class)->runDaily($integrationId, $snapshotDate, 28);
+
+        $metric = LocalityMetricDaily::where('integration_id', $integrationId)
+            ->where('sku', $sku)
+            ->where('snapshot_date', $snapshotDate->toDateString())
+            ->where('period_days', 28)
+            ->first();
+
+        $this->assertNotNull($metric);
+        $this->assertSame(2, $metric->orders_count);
+    }
+
+    private function createOzonOrderUnitEconomics(int $integrationId, string $sku, string $orderDate): void
+    {
+        OzonOrderUnitEconomics::create([
+            'integration_id' => $integrationId,
+            'posting_id' => (string) Str::uuid(),
+            'posting_item_id' => (string) Str::uuid(),
+            'posting_number' => (string) Str::uuid(),
+            'sku' => $sku,
+            'offer_id' => $sku,
+            'order_date' => $orderDate,
+            'sale_price' => 1000,
+            'shipping_cluster_name' => 'Москва, МО и Дальние регионы',
+            'destination_cluster_name' => 'Москва, МО и Дальние регионы',
+            'base_logistics_tariff' => 100,
+            'non_local_markup_percent' => 0,
+            'non_local_markup_amount' => 0,
+            'markup_applied' => false,
+            'calculation_mode' => 'factual',
+            'calculation_confidence' => 'high',
+        ]);
     }
 }

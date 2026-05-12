@@ -21,6 +21,7 @@ use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
 use App\Models\OzonOrderReport;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Collection;
 
 class CalculateAutoSupplyPlanJob implements ShouldQueue
 {
@@ -215,6 +216,26 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
         // Load warehouse-to-cluster mapping for geo-distribution
         $clusterMapping = ($marketplace === 'ozon') ? OzonWarehouseCluster::getAllMapping() : [];
 
+        // Ozon now plans FBO supplies by delivery cluster. Calculate demand against
+        // the whole cluster stock instead of treating each warehouse as isolated.
+        $selectedOzonClusterIds = $marketplace === 'ozon'
+            ? $this->selectedOzonClusterIds($plan)
+            : [];
+
+        if ($marketplace === 'ozon' && ! empty($clusterMapping)) {
+            if ($selectedOzonClusterIds !== []) {
+                $warehouses = $warehouses
+                    ->filter(function (InventoryWarehouse $warehouse) use ($clusterMapping, $selectedOzonClusterIds): bool {
+                        $cluster = $this->resolveOzonCluster($warehouse, $clusterMapping);
+
+                        return $cluster !== null && in_array((int) $cluster['cluster_id'], $selectedOzonClusterIds, true);
+                    })
+                    ->values();
+            }
+
+            $warehouses = $this->aggregateOzonWarehousesByCluster($warehouses, $clusterMapping);
+        }
+
         // Load seller warehouse stocks (optional — if available, limits recommendations)
         $sellerStockMap = SellerWarehouseStock::getStockMap($integrationId);
         $hasSellerStocks = !empty($sellerStockMap);
@@ -254,6 +275,9 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
 
         // v2: Загружаем in-transit из активных заявок на поставку
         $supplyInTransit = $service->getInTransitFromSupplies($integrationId);
+        $supplyInTransitByCluster = ($marketplace === 'ozon' && ! empty($clusterMapping))
+            ? $this->getOzonInTransitFromSuppliesByCluster($integrationId, $clusterMapping)
+            : [];
 
         // v3: Проверяем, загружен ли CSV-отчёт заказов для этой интеграции
         $hasOzonReport = ($marketplace === 'ozon') && OzonOrderReport::where('integration_id', $integrationId)->exists();
@@ -262,6 +286,7 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
         $ozonAnalytics = [];
         // v3: Аналитика остатков и оборачиваемости по SKU×склад (ads_cluster, idc_cluster, turnover_grade_cluster)
         $ozonStockAnalytics = [];
+        $ozonStockAnalyticsCluster = [];
         $ozonTurnover = [];
         if ($marketplace === 'ozon') {
             $integration = Integration::find($integrationId);
@@ -271,6 +296,7 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
                 // v3: Загружаем аналитику остатков из /v1/analytics/stocks и /v1/analytics/turnover/stocks
                 $stockAnalyticsData = $service->loadOzonStockAnalytics($integration, $products);
                 $ozonStockAnalytics = $stockAnalyticsData['stock_analytics']; // [offer_id => [wh_name => data]]
+                $ozonStockAnalyticsCluster = $stockAnalyticsData['stock_analytics_cluster'] ?? []; // [offer_id => [cluster_id => data]]
                 $ozonTurnover = $stockAnalyticsData['turnover']; // [offer_id => data]
             }
         }
@@ -329,7 +355,14 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
             $ozonIdcCluster = null;
             $ozonTurnoverGradeCluster = null;
             $ozonDaysWithoutSalesCluster = null;
-            if (!empty($ozonStockAnalytics[$wh->sku])) {
+            $clusterIdForAnalytics = $wh->getAttribute('cluster_id');
+            if ($marketplace === 'ozon' && $clusterIdForAnalytics && !empty($ozonStockAnalyticsCluster[$wh->sku][(string) $clusterIdForAnalytics])) {
+                $ozonStockData = $ozonStockAnalyticsCluster[$wh->sku][(string) $clusterIdForAnalytics];
+                $ozonAdsCluster = $ozonStockData['ads_cluster'] ?? null;
+                $ozonIdcCluster = $ozonStockData['idc_cluster'] ?? null;
+                $ozonTurnoverGradeCluster = $ozonStockData['turnover_grade_cluster'] ?? null;
+                $ozonDaysWithoutSalesCluster = $ozonStockData['days_without_sales_cluster'] ?? null;
+            } elseif (!empty($ozonStockAnalytics[$wh->sku])) {
                 // Ищем данные для конкретного склада
                 $whName = $wh->warehouse_name ?? '';
                 $ozonStockData = $ozonStockAnalytics[$wh->sku][$whName] ?? null;
@@ -353,7 +386,22 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
 
             // v2: In-transit = API + заявки на поставку
             $inTransitApi = $wh->in_transit ?? 0;
-            $inTransitSupplies = $supplyInTransit[$wh->sku] ?? 0;
+            if ($marketplace === 'ozon' && $wh->getAttribute('is_cluster_aggregate') && $ozonStockData) {
+                $apiValidStock = (int) ($ozonStockData['valid_stock_count'] ?? 0);
+                $apiAvailableStock = (int) ($ozonStockData['available_stock_count'] ?? 0);
+                $apiTransitStock = (int) ($ozonStockData['transit_stock_count'] ?? 0);
+
+                if ($apiValidStock > 0 || $apiAvailableStock > 0) {
+                    $currentStock = max($apiValidStock, $apiAvailableStock);
+                }
+                if ($apiTransitStock > 0) {
+                    $inTransitApi = $apiTransitStock;
+                }
+            }
+            $clusterIdForTransit = $wh->getAttribute('cluster_id');
+            $inTransitSupplies = ($marketplace === 'ozon' && $clusterIdForTransit)
+                ? ($supplyInTransitByCluster[$wh->sku . '|' . $clusterIdForTransit] ?? 0)
+                : ($supplyInTransit[$wh->sku] ?? 0);
             $inTransit = $inTransitApi + $inTransitSupplies;
 
             // WB v4: Товары на возврате с клиентов — уже едут обратно на склад
@@ -534,7 +582,11 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
             $clusterId = null;
             $clusterName = null;
             $clusterRegion = null;
-            if (!empty($clusterMapping) && $wh->warehouse_name) {
+            if ($marketplace === 'ozon' && $wh->getAttribute('cluster_id')) {
+                $clusterId = $wh->getAttribute('cluster_id');
+                $clusterName = $wh->getAttribute('cluster_name');
+                $clusterRegion = $wh->getAttribute('cluster_region');
+            } elseif (!empty($clusterMapping) && $wh->warehouse_name) {
                 $normalizedName = OzonWarehouseCluster::normalizeWarehouseName($wh->warehouse_name);
                 if (isset($clusterMapping[$normalizedName])) {
                     $clusterId = $clusterMapping[$normalizedName]['cluster_id'];
@@ -580,26 +632,38 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
             $surplusDays = $coverAfter > $targetCoverDays ? (int) ($coverAfter - $targetCoverDays) : null;
             $riskLevel = $service->determineRiskLevel($oosDate, $coverBefore, $minCoverDays);
 
-            // v4: Матрица перераспределения — фиксируем избыток и дефицит по SKU×склад
+            // v5: Матрица перераспределения — surplus/deficit по реальному состоянию склада,
+            // взаимоисключающие. Один склад для одного SKU попадает либо в surplus, либо в deficit.
             $whKey = $wh->warehouse_id ?? $wh->warehouse_name ?? 'unknown';
-            if ($surplusDays !== null && $surplusDays > 0 && $dailyDemand > 0) {
-                $surplusQty = (int) round($surplusDays * $dailyDemand);
-                if ($surplusQty > 0) {
-                    $surplusMap[$wh->sku][$whKey] = [
-                        'qty'            => $surplusQty,
-                        'warehouse_name' => $wh->warehouse_name,
-                        'daily_demand'   => $dailyDemand,
-                        'current_stock'  => $currentStock,
-                    ];
+            if ($dailyDemand > 0) {
+                $availableNow = $currentStock + $inTransit;
+                $targetStockUnits = $targetCoverDays * $dailyDemand;
+                $minStockUnits = $minCoverDays * $dailyDemand;
+
+                if ($availableNow > $targetStockUnits) {
+                    // Реальный избыток сверх target_cover — кандидат на отгрузку другому складу
+                    $surplusQty = (int) floor($availableNow - $targetStockUnits);
+                    if ($surplusQty > 0) {
+                        $surplusMap[$wh->sku][$whKey] = [
+                            'qty'            => $surplusQty,
+                            'warehouse_name' => $wh->warehouse_name,
+                            'daily_demand'   => $dailyDemand,
+                            'current_stock'  => $currentStock,
+                        ];
+                    }
+                } elseif ($availableNow < $minStockUnits && $qtyRounded > 0) {
+                    // Реальная нехватка ниже min_cover, и план запросил поставку — можно покрыть
+                    // переброской вместо новой закупки. Берём минимум из плановой qty и нехватки.
+                    $deficitQty = (int) min($qtyRounded, ceil($minStockUnits - $availableNow));
+                    if ($deficitQty > 0) {
+                        $deficitMap[$wh->sku][$whKey] = [
+                            'qty'            => $deficitQty,
+                            'warehouse_name' => $wh->warehouse_name,
+                            'daily_demand'   => $dailyDemand,
+                            'current_stock'  => $currentStock,
+                        ];
+                    }
                 }
-            }
-            if ($qtyRounded > 0 && $dailyDemand > 0) {
-                $deficitMap[$wh->sku][$whKey] = [
-                    'qty'            => $qtyRounded,
-                    'warehouse_name' => $wh->warehouse_name,
-                    'daily_demand'   => $dailyDemand,
-                    'current_stock'  => $currentStock,
-                ];
             }
 
             // --- Финансовые метрики ---
@@ -659,6 +723,8 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
                 'inputs' => [
                     'supply_type' => $supplyType,
                     'stock_now' => $currentStock,
+                    'stock_scope' => $marketplace === 'ozon' && $wh->getAttribute('is_cluster_aggregate') ? 'cluster' : 'warehouse',
+                    'cluster_warehouse_names' => $wh->getAttribute('cluster_warehouse_names') ?? null,
                     'in_transit_api' => $inTransitApi,
                     'in_transit_supplies' => $inTransitSupplies,
                     'in_way_from_client' => $inWayFromClient,
@@ -789,7 +855,7 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
                 'deficit' => $deficit,
                 'destination' => $wh->warehouse_name,
                 'destination_id' => $destinationId,
-                'destination_type' => $destinationType,
+                'destination_type' => $marketplace === 'ozon' && $clusterId ? 'cluster' : $destinationType,
                 'qty_recommended' => round($needed, 2),
                 'qty_rounded' => $qtyRounded,
                 'current_stock' => $currentStock,
@@ -845,7 +911,15 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
 
                 $skuList = array_values(array_unique(array_column($lines, 'sku')));
                 $metrics = $enricher->loadMetricsForSkus((int) $integrationId, $skuList);
-                $recsPerSku = $enricher->loadRecommendationsForSkus((int) $integrationId, $skuList, (string) $minConfidence);
+                // Загружаем ВСЕ активные рекомендации по SKU плана, не фильтруя по выбранным кластерам.
+                // Иначе план в МСК+СПб теряет связь с рекомендациями про Краснодар/Самару — даже если
+                // там есть переплата. Cluster split всё равно применит только подходящие.
+                $recsPerSku = $enricher->loadRecommendationsForSkus(
+                    (int) $integrationId,
+                    $skuList,
+                    (string) $minConfidence,
+                    null
+                );
 
                 $enriched = [];
                 foreach ($lines as $line) {
@@ -904,6 +978,16 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
             }
         }
 
+        if ($marketplace === 'ozon' && $selectedOzonClusterIds !== []) {
+            $lines = array_values(array_filter($lines, function (array $line) use ($selectedOzonClusterIds): bool {
+                $clusterId = (int) ($line['cluster_id'] ?? 0);
+
+                return $clusterId > 0 && in_array($clusterId, $selectedOzonClusterIds, true);
+            }));
+            $totalLines = count($lines);
+            $totalQty = array_sum(array_map(fn (array $line) => (int) ($line['qty_rounded'] ?? 0), $lines));
+        }
+
         // Bulk insert lines
         if (!empty($lines)) {
             foreach (array_chunk($lines, 500) as $chunk) {
@@ -911,18 +995,45 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
             }
         }
 
-        // v4: Матрица перераспределения — SKU у которых есть и избыток на одном складе и дефицит на другом
+        // v6: Матрица перераспределения — отключена для Ozon/WB FBO.
+        // В FBO продавец физически не может перевозить товар между складами маркетплейса.
+        // Эта секция применима только для собственных складов / 3PL-режимов.
         $redistributionSuggestions = [];
-        foreach ($deficitMap as $sku => $deficitWarehouses) {
+        $redistributionAllowed = ! in_array($marketplace, ['ozon', 'wildberries'], true);
+
+        if ($redistributionAllowed) foreach ($deficitMap as $sku => $deficitWarehouses) {
             if (empty($surplusMap[$sku])) continue;
-            foreach ($deficitWarehouses as $defWhKey => $defInfo) {
-                foreach ($surplusMap[$sku] as $surWhKey => $surInfo) {
-                    if ($defWhKey === $surWhKey) continue;
-                    $transferQty = min($defInfo['qty'], $surInfo['qty']);
+
+            // Локальные копии, чтобы уменьшать остатки по мере матчинга
+            $surplusRemaining = [];
+            foreach ($surplusMap[$sku] as $sWhKey => $sInfo) {
+                $surplusRemaining[$sWhKey] = $sInfo;
+            }
+            $deficitRemaining = [];
+            foreach ($deficitWarehouses as $dWhKey => $dInfo) {
+                $deficitRemaining[$dWhKey] = $dInfo;
+            }
+
+            // Сортируем дефицит по убыванию qty (сначала самые «голодные» склады)
+            uasort($deficitRemaining, fn ($a, $b) => $b['qty'] <=> $a['qty']);
+
+            $product = $products->get($sku);
+            $ue = $unitEconomics->get($sku);
+            $costPrice = $ue?->cost_price ?? 0;
+
+            foreach ($deficitRemaining as $defWhKey => &$defInfo) {
+                if ($defInfo['qty'] <= 0) continue;
+
+                // Сортируем surplus по убыванию qty — отдаём приоритет самому большому донору
+                uasort($surplusRemaining, fn ($a, $b) => $b['qty'] <=> $a['qty']);
+
+                foreach ($surplusRemaining as $surWhKey => &$surInfo) {
+                    if ($surInfo['qty'] <= 0) continue;
+                    if ($surWhKey === $defWhKey) continue;
+
+                    $transferQty = (int) min($defInfo['qty'], $surInfo['qty']);
                     if ($transferQty <= 0) continue;
-                    $product = $products->get($sku);
-                    $ue = $unitEconomics->get($sku);
-                    $costPrice = $ue?->cost_price ?? 0;
+
                     $redistributionSuggestions[] = [
                         'sku'            => $sku,
                         'product_name'   => $product?->name,
@@ -933,8 +1044,17 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
                         'surplus_qty'    => $surInfo['qty'],
                         'deficit_qty'    => $defInfo['qty'],
                     ];
+
+                    // Уменьшаем остатки — больше эта пара не сматчится сама с собой
+                    // и не создастся симметричная (т.к. surplus/deficit взаимоисключающи на этапе сборки)
+                    $surInfo['qty'] -= $transferQty;
+                    $defInfo['qty'] -= $transferQty;
+
+                    if ($defInfo['qty'] <= 0) break;
                 }
+                unset($surInfo);
             }
+            unset($defInfo);
         }
 
         $resultJson = ['redistribution' => $redistributionSuggestions];
@@ -986,5 +1106,139 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
 
         $plan = AutoSupplyPlan::find($this->planId);
         $plan?->markError('Job failed: ' . $exception->getMessage());
+    }
+
+    /**
+     * Collapse Ozon inventory rows from SKU×warehouse to SKU×delivery cluster.
+     *
+     * Ozon's own planning/recommendation logic is cluster-oriented: demand and
+     * available stock should be evaluated across every warehouse in the same
+     * delivery cluster. Rows without a cluster mapping stay warehouse-scoped.
+     */
+    private function aggregateOzonWarehousesByCluster(Collection $warehouses, array $clusterMapping): Collection
+    {
+        return $warehouses
+            ->groupBy(function (InventoryWarehouse $warehouse) use ($clusterMapping): string {
+                $cluster = $this->resolveOzonCluster($warehouse, $clusterMapping);
+
+                if ($cluster !== null) {
+                    return $warehouse->sku . '|cluster|' . $cluster['cluster_id'];
+                }
+
+                return $warehouse->sku . '|warehouse|' . ($warehouse->warehouse_id ?? $warehouse->warehouse_name ?? $warehouse->id);
+            })
+            ->map(function (Collection $group) use ($clusterMapping): InventoryWarehouse {
+                /** @var InventoryWarehouse $first */
+                $first = $group->first();
+                $cluster = $this->resolveOzonCluster($first, $clusterMapping);
+
+                if ($cluster === null) {
+                    return $first;
+                }
+
+                $aggregate = $first->replicate();
+                $warehouseNames = $group
+                    ->pluck('warehouse_name')
+                    ->filter()
+                    ->unique()
+                    ->values()
+                    ->all();
+
+                $aggregate->forceFill([
+                    'warehouse_id' => 'cluster:' . $cluster['cluster_id'],
+                    'warehouse_name' => $cluster['cluster_name'],
+                    'region' => $cluster['region'] ?? null,
+                    'quantity' => (int) $group->sum('quantity'),
+                    'reserved' => (int) $group->sum('reserved'),
+                    'in_transit' => (int) $group->sum('in_transit'),
+                    'average_daily_sales' => (float) $group->sum('average_daily_sales'),
+                    'effective_daily_sales' => (float) $group->sum('effective_daily_sales'),
+                    'real_avg_daily_sales' => (float) $group->sum('real_avg_daily_sales'),
+                    'sales_7_days' => (int) $group->sum('sales_7_days'),
+                    'sales_14_days' => (int) $group->sum('sales_14_days'),
+                    'sales_30_days' => (int) $group->sum('sales_30_days'),
+                    'storage_cost_per_day' => (float) $group->sum('storage_cost_per_day'),
+                    'storage_cost_per_month' => (float) $group->sum('storage_cost_per_month'),
+                    'storage_fee_total' => (float) $group->sum('storage_fee_total'),
+                    'recommended_quantity' => (int) $group->sum('recommended_quantity'),
+                    'days_in_stock_30' => (int) $group->max('days_in_stock_30'),
+                    'days_of_stock' => null,
+                    'turnover_days' => null,
+                ]);
+
+                $aggregate->setAttribute('cluster_id', $cluster['cluster_id']);
+                $aggregate->setAttribute('cluster_name', $cluster['cluster_name']);
+                $aggregate->setAttribute('cluster_region', $cluster['region'] ?? null);
+                $aggregate->setAttribute('cluster_warehouse_names', $warehouseNames);
+                $aggregate->setAttribute('is_cluster_aggregate', true);
+
+                return $aggregate;
+            })
+            ->values();
+    }
+
+    /**
+     * @return list<int>
+     */
+    private function selectedOzonClusterIds(AutoSupplyPlan $plan): array
+    {
+        return array_values(array_filter(
+            array_map('intval', (array) ($plan->params['cluster_ids'] ?? [])),
+            fn (int $clusterId) => $clusterId > 0
+        ));
+    }
+
+    private function resolveOzonCluster(InventoryWarehouse $warehouse, array $clusterMapping): ?array
+    {
+        if (! $warehouse->warehouse_name) {
+            return null;
+        }
+
+        $normalizedName = OzonWarehouseCluster::normalizeWarehouseName($warehouse->warehouse_name);
+
+        return $clusterMapping[$normalizedName] ?? null;
+    }
+
+    /**
+     * @return array<string, int> keyed by "sku|cluster_id"
+     */
+    private function getOzonInTransitFromSuppliesByCluster(int $integrationId, array $clusterMapping): array
+    {
+        try {
+            $rows = \Illuminate\Support\Facades\DB::table('supply_items')
+                ->join('supplies', 'supply_items.supply_id', '=', 'supplies.id')
+                ->where('supplies.integration_id', $integrationId)
+                ->whereIn('supplies.status', [
+                    'draft_ozon',
+                    'slot_booked',
+                    'preparing',
+                    'ready_to_ship',
+                    'shipped',
+                    'in_transit',
+                ])
+                ->selectRaw('supply_items.sku, supplies.warehouse_name, SUM(supply_items.planned_qty) as qty')
+                ->groupBy('supply_items.sku', 'supplies.warehouse_name')
+                ->get();
+        } catch (\Throwable) {
+            return [];
+        }
+
+        $result = [];
+        foreach ($rows as $row) {
+            if (! $row->warehouse_name) {
+                continue;
+            }
+
+            $normalizedName = OzonWarehouseCluster::normalizeWarehouseName((string) $row->warehouse_name);
+            $cluster = $clusterMapping[$normalizedName] ?? null;
+            if ($cluster === null) {
+                continue;
+            }
+
+            $key = (string) $row->sku . '|' . (int) $cluster['cluster_id'];
+            $result[$key] = ($result[$key] ?? 0) + (int) $row->qty;
+        }
+
+        return $result;
     }
 }

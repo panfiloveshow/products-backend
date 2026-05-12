@@ -187,6 +187,7 @@ Route::prefix('unit-economics')->middleware('sellico.permission')->group(functio
     Route::put('/settings/bulk', [UnitEconomicsCacheController::class, 'bulkUpdateSettings'])
         ->name('unit-economics.settings.bulk');
     Route::put('/settings/{sku}', [UnitEconomicsCacheController::class, 'updateSettings'])
+        ->where('sku', '.*')
         ->name('unit-economics.settings.update');
 
     // Recalculate — закрываем IDOR: middleware проверяет доступ к integrationId
@@ -230,6 +231,7 @@ Route::prefix('unit-economics')->middleware('sellico.permission')->group(functio
 */
 Route::prefix('auto-supply-plans')->middleware('sellico.permission')->group(function () {
     Route::get('/warehouses', [AutoSupplyPlanController::class, 'warehouses'])->name('auto-supply-plans.warehouses');
+    Route::get('/data-health', [AutoSupplyPlanController::class, 'dataHealth'])->name('auto-supply-plans.data-health');
     Route::get('/', [AutoSupplyPlanController::class, 'index'])
         ->name('auto-supply-plans.index');
     Route::post('/', [AutoSupplyPlanController::class, 'store'])
