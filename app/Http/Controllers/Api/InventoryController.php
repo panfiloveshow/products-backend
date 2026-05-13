@@ -27,14 +27,14 @@ class InventoryController extends Controller
         $validated = $request->validated();
 
         $integrationId = !empty($validated['integration_id']) ? (int) $validated['integration_id'] : null;
-        $marketplace = $validated['marketplace'] ?? null;
+        $marketplace = $this->normalizeMarketplace($validated['marketplace'] ?? null);
 
         $warehouseScope = function ($q) use ($integrationId, $marketplace) {
             if ($integrationId) {
                 $q->where('integration_id', $integrationId);
             }
             if (!empty($marketplace) && $marketplace !== 'all') {
-                $q->where('marketplace', $marketplace);
+                $this->applyMarketplaceFilter($q, $marketplace);
             }
         };
 
@@ -131,10 +131,15 @@ class InventoryController extends Controller
         }
     }
 
-    public function show(string $sku): JsonResponse
+    public function show(Request $request, string $sku): JsonResponse
     {
+        $integrationId = $request->integer('integration_id') ?: null;
+        $marketplace = $this->normalizeMarketplace($request->input('marketplace'));
+
         $product = Product::with(['inventoryWarehouses', 'alerts'])
             ->where('sku', $sku)
+            ->when($integrationId, fn ($query) => $query->where('integration_id', $integrationId))
+            ->when($marketplace && $marketplace !== 'all', fn ($query) => $this->applyMarketplaceFilter($query, $marketplace))
             ->firstOrFail();
 
         $inventoryData = $this->inventoryService->formatProductInventory($product);
@@ -144,9 +149,12 @@ class InventoryController extends Controller
         ]);
     }
 
-    public function history(string $sku): JsonResponse
+    public function history(Request $request, string $sku): JsonResponse
     {
+        $integrationId = $request->integer('integration_id') ?: null;
+
         $history = InventoryHistory::where('sku', $sku)
+            ->when($integrationId, fn ($query) => $query->where('integration_id', $integrationId))
             ->orderBy('date', 'desc')
             ->limit(30)
             ->get();
@@ -156,9 +164,9 @@ class InventoryController extends Controller
         ]);
     }
 
-    public function forecast(string $sku): JsonResponse
+    public function forecast(Request $request, string $sku): JsonResponse
     {
-        $forecast = $this->inventoryService->getForecast($sku);
+        $forecast = $this->inventoryService->getForecast($sku, $request->integer('integration_id') ?: null);
 
         return response()->json([
             'data' => $forecast,
@@ -268,9 +276,9 @@ class InventoryController extends Controller
         ]);
     }
 
-    public function syncStatus(): JsonResponse
+    public function syncStatus(Request $request): JsonResponse
     {
-        $statuses = $this->inventoryService->getSyncStatuses();
+        $statuses = $this->inventoryService->getSyncStatuses($request->integer('integration_id') ?: null);
 
         return response()->json([
             'data' => $statuses,
@@ -320,6 +328,7 @@ class InventoryController extends Controller
     public function matrix(Request $request): JsonResponse
     {
         $integrationId    = $request->input('integration_id');
+        $marketplaceFilter = $this->normalizeMarketplace($request->input('marketplace'));
         $search           = $request->input('search');
         $sort             = $request->input('sort', 'total_stock');
         $sortOrder        = $request->input('sort_order', 'desc');
@@ -330,10 +339,12 @@ class InventoryController extends Controller
 
         $query = \App\Models\InventoryWarehouse::query()
             ->when($integrationId, fn($q) => $q->where('integration_id', $integrationId))
+            ->when($marketplaceFilter && $marketplaceFilter !== 'all', fn ($q) => $this->applyMarketplaceFilter($q, $marketplaceFilter))
             ->when($fulfillmentType && $fulfillmentType !== 'all', function ($q) use ($fulfillmentType) {
                 $q->whereRaw('LOWER(fulfillment_type) = ?', [strtolower($fulfillmentType)]);
             });
-        $marketplace = (clone $query)->value('marketplace');
+        $marketplace = $marketplaceFilter ?: (clone $query)->value('marketplace');
+        $marketplace = $this->normalizeMarketplace($marketplace);
 
         // Получаем ВСЕ склады (включая пустые) — сначала с остатком, потом пустые
         $warehouses = (clone $query)
@@ -396,6 +407,8 @@ class InventoryController extends Controller
 
         if (!empty($search)) {
             $matchingProducts = \App\Models\Product::whereIn('sku', $productSkus)
+                ->when($marketplace, fn ($q) => $this->applyMarketplaceFilter($q, $marketplace))
+                ->when($integrationId, fn ($q) => $q->where('integration_id', $integrationId))
                 ->where(fn($q) => $q->where('name', 'ilike', "%{$search}%")->orWhere('sku', 'ilike', "%{$search}%"))
                 ->pluck('sku')
                 ->toArray();
@@ -452,6 +465,9 @@ class InventoryController extends Controller
         $productsQuery = \App\Models\Product::where(function ($q) use ($pagedSkus) {
             $q->whereIn('sku', $pagedSkus)->orWhereIn('barcode', $pagedSkus);
         });
+        if ($marketplace) {
+            $this->applyMarketplaceFilter($productsQuery, $marketplace);
+        }
         if ($integrationId) {
             $productsQuery->where(function ($q) use ($integrationId) {
                 $q->where('integration_id', $integrationId)->orWhereNull('integration_id');
@@ -557,6 +573,7 @@ class InventoryController extends Controller
         // Загружаем строки складов для страницы (с учётом фильтра по fulfillment_type)
         $warehouseRows = \App\Models\InventoryWarehouse::whereIn('sku', $pagedSkus)
             ->when($integrationId, fn($q) => $q->where('integration_id', $integrationId))
+            ->when($marketplace, fn ($q) => $this->applyMarketplaceFilter($q, $marketplace))
             ->when($fulfillmentType && $fulfillmentType !== 'all', function ($q) use ($fulfillmentType) {
                 $q->whereRaw('LOWER(fulfillment_type) = ?', [strtolower($fulfillmentType)]);
             })
@@ -687,7 +704,11 @@ class InventoryController extends Controller
 
         // Summary
         $summaryQuery = \App\Models\InventoryWarehouse::query()
-            ->when($integrationId, fn($q) => $q->where('integration_id', $integrationId));
+            ->when($integrationId, fn($q) => $q->where('integration_id', $integrationId))
+            ->when($marketplace, fn ($q) => $this->applyMarketplaceFilter($q, $marketplace))
+            ->when($fulfillmentType && $fulfillmentType !== 'all', function ($q) use ($fulfillmentType) {
+                $q->whereRaw('LOWER(fulfillment_type) = ?', [strtolower($fulfillmentType)]);
+            });
 
         // Подсчёт статусов через правильный computedStatus (не MAX(stock_status))
         $outOfStockCount = 0;
@@ -879,5 +900,27 @@ class InventoryController extends Controller
         }
 
         return $sum > 0 ? $sum : $max;
+    }
+
+    private function normalizeMarketplace(?string $marketplace): ?string
+    {
+        if ($marketplace === null || $marketplace === '') {
+            return $marketplace;
+        }
+
+        return match (strtolower($marketplace)) {
+            'yandex' => 'yandex_market',
+            default => strtolower($marketplace),
+        };
+    }
+
+    private function applyMarketplaceFilter($query, string $marketplace): void
+    {
+        if ($marketplace === 'yandex_market') {
+            $query->whereIn('marketplace', ['yandex', 'yandex_market']);
+            return;
+        }
+
+        $query->where('marketplace', $marketplace);
     }
 }

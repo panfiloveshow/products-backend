@@ -84,7 +84,7 @@ class YandexMarketUnitEconomicsCalculator implements UnitEconomicsCalculatorInte
 
         // Хранение: из input или рассчитываем по тарифу
         $storageCost = $input->storageCost ?? 0;
-        if ($storageCost <= 0 && $volume > 0) {
+        if ($storageCost <= 0 && strtoupper($input->fulfillmentType) === 'FBY' && $volume > 0) {
             $turnoverDays = $input->turnoverDays ?? 30;
             $storageCost = $this->tariffs->calculateStorageCost($volume, $turnoverDays);
         }

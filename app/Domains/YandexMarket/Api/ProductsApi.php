@@ -99,15 +99,46 @@ class ProductsApi implements ProductsApiInterface
                     continue;
                 }
 
-                $allPrices[$sku] = [
-                    'price' => (float) ($item['price']['value'] ?? 0),
-                    'currency' => $item['price']['currencyId'] ?? 'RUR',
-                ];
+                $priceData = $this->extractPrice($item);
+                if ($priceData === null) {
+                    continue;
+                }
+
+                $allPrices[$sku] = $priceData;
             }
 
         } while (! empty($items) && $pageToken);
 
         return $allPrices;
+    }
+
+    private function extractPrice(array $item): ?array
+    {
+        $price = null;
+        $oldPrice = null;
+        $currency = 'RUR';
+
+        if (isset($item['basicPrice']['value'])) {
+            $price = (float) $item['basicPrice']['value'];
+            $oldPrice = isset($item['basicPrice']['discountBase'])
+                ? (float) $item['basicPrice']['discountBase']
+                : null;
+            $currency = $item['basicPrice']['currencyId'] ?? $currency;
+        } elseif (isset($item['price']['value'])) {
+            $price = (float) $item['price']['value'];
+            $currency = $item['price']['currencyId'] ?? $currency;
+        }
+
+        if ($price === null || $price <= 0) {
+            return null;
+        }
+
+        return [
+            'price' => $price,
+            'actual_price' => $price,
+            'old_price' => $oldPrice,
+            'currency' => $currency,
+        ];
     }
 
     /**

@@ -2,10 +2,12 @@
 
 namespace Tests\Unit;
 
+use App\Models\InventoryWarehouse;
 use App\Models\Product;
 use App\Models\SyncLog;
 use App\Services\InventoryService;
 use Illuminate\Foundation\Testing\LazilyRefreshDatabase;
+use Illuminate\Support\Collection;
 use Tests\TestCase;
 
 class InventoryServiceTest extends TestCase
@@ -67,6 +69,70 @@ class InventoryServiceTest extends TestCase
         $result = $this->service->formatProductInventory($product);
 
         $this->assertEquals(0, $result['total_stock']);
+    }
+
+    public function test_format_product_inventory_uses_warehouse_stock_without_adding_product_stock(): void
+    {
+        $product = Product::factory()->create([
+            'sku' => 'TEST-SKU-WH-001',
+            'stock' => 50,
+            'marketplace' => 'yandex',
+            'integration_id' => 101,
+        ]);
+
+        $product->setRelation('inventoryWarehouses', new Collection([
+            new InventoryWarehouse([
+                'sku' => 'TEST-SKU-WH-001',
+                'warehouse_id' => 'ym-warehouse-1',
+                'warehouse_name' => 'Yandex Warehouse',
+                'marketplace' => 'yandex',
+                'integration_id' => 101,
+                'quantity' => 7,
+                'average_daily_sales' => 1,
+                'last_updated' => now(),
+            ]),
+        ]));
+
+        $result = $this->service->formatProductInventory($product);
+
+        $this->assertEquals(7, $result['total_stock']);
+    }
+
+    public function test_format_product_inventory_ignores_same_sku_warehouses_from_other_integrations(): void
+    {
+        $product = Product::factory()->create([
+            'sku' => 'TEST-SKU-WH-002',
+            'stock' => 50,
+            'marketplace' => 'yandex',
+            'integration_id' => 201,
+        ]);
+
+        $product->setRelation('inventoryWarehouses', new Collection([
+            new InventoryWarehouse([
+                'sku' => 'TEST-SKU-WH-002',
+                'warehouse_id' => 'own-warehouse',
+                'warehouse_name' => 'Own Warehouse',
+                'marketplace' => 'yandex',
+                'integration_id' => 201,
+                'quantity' => 5,
+                'last_updated' => now(),
+            ]),
+            new InventoryWarehouse([
+                'sku' => 'TEST-SKU-WH-002',
+                'warehouse_id' => 'foreign-warehouse',
+                'warehouse_name' => 'Foreign Warehouse',
+                'marketplace' => 'yandex',
+                'integration_id' => 202,
+                'quantity' => 100,
+                'last_updated' => now(),
+            ]),
+        ]));
+
+        $result = $this->service->formatProductInventory($product);
+
+        $this->assertEquals(5, $result['total_stock']);
+        $this->assertCount(1, $result['marketplace_warehouses']);
+        $this->assertSame('own-warehouse', $result['marketplace_warehouses'][0]['warehouse_id']);
     }
 
     /**

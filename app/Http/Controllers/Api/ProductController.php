@@ -138,10 +138,14 @@ class ProductController extends Controller
         ]);
     }
 
-    public function show(string $id): JsonResponse
+    public function show(Request $request, string $id): JsonResponse
     {
-        $product = Product::with(['inventoryWarehouses', 'unitEconomics', 'alerts'])
-            ->findOrFail($id);
+        $product = Product::findOrFail($id);
+        if ($response = $this->ensureProductAccessible($request, $product)) {
+            return $response;
+        }
+
+        $this->loadProductScopedRelations($product);
 
         return response()->json([
             'data' => $product,
@@ -161,6 +165,10 @@ class ProductController extends Controller
     public function update(UpdateProductRequest $request, string $id): JsonResponse
     {
         $product = Product::findOrFail($id);
+        if ($response = $this->ensureProductAccessible($request, $product)) {
+            return $response;
+        }
+
         $product->update($request->validated());
 
         return response()->json([
@@ -169,9 +177,13 @@ class ProductController extends Controller
         ]);
     }
 
-    public function destroy(string $id): JsonResponse
+    public function destroy(Request $request, string $id): JsonResponse
     {
         $product = Product::findOrFail($id);
+        if ($response = $this->ensureProductAccessible($request, $product)) {
+            return $response;
+        }
+
         $product->delete();
 
         return response()->json([
@@ -412,6 +424,51 @@ class ProductController extends Controller
         }
 
         return $started;
+    }
+
+    private function ensureProductAccessible(Request $request, Product $product): ?JsonResponse
+    {
+        if (! $product->integration_id) {
+            return null;
+        }
+
+        $resolution = $this->integrationAccessService->ensureAccessibleIntegration(
+            $request,
+            (int) $product->integration_id,
+            $product->marketplace
+        );
+
+        if ($resolution['success'] ?? false) {
+            return null;
+        }
+
+        return response()->json([
+            'success' => false,
+            'message' => $resolution['message'] ?? 'Интеграция недоступна',
+        ], $resolution['status'] ?? 403);
+    }
+
+    private function loadProductScopedRelations(Product $product): void
+    {
+        $marketplaceAliases = in_array($product->marketplace, ['yandex', 'yandex_market'], true)
+            ? ['yandex', 'yandex_market']
+            : [$product->marketplace];
+
+        $product->load([
+            'inventoryWarehouses' => function ($query) use ($product, $marketplaceAliases) {
+                $query->whereIn('marketplace', $marketplaceAliases);
+                if ($product->integration_id) {
+                    $query->where('integration_id', $product->integration_id);
+                }
+            },
+            'unitEconomics' => function ($query) use ($product, $marketplaceAliases) {
+                $query->whereIn('marketplace', $marketplaceAliases);
+                if ($product->integration_id) {
+                    $query->where('integration_id', $product->integration_id);
+                }
+            },
+            'alerts',
+        ]);
     }
 
     private function ensureProductsLimitAvailable(Integration $integration): ?JsonResponse

@@ -10,6 +10,7 @@ use App\Models\InventoryWarehouse;
 use App\Services\InventoryService;
 use App\Services\LimitsSyncService;
 use App\Services\Marketplace\MarketplaceFactory;
+use App\Domains\Marketplace\MarketplaceFactory as DomainMarketplaceFactory;
 use App\Support\ActivityLogger;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldBeUnique;
@@ -90,7 +91,9 @@ class SyncProductsJob implements ShouldBeUnique, ShouldQueue
             $credentials = $this->syncLog->credentials ?? [];
 
             // Создаём сервис маркетплейса с credentials
-            $marketplace = MarketplaceFactory::create($this->syncLog->marketplace, $credentials);
+            $marketplace = in_array($this->syncLog->marketplace, ['yandex', 'yandex_market'], true)
+                ? DomainMarketplaceFactory::create($this->syncLog->marketplace, $credentials)
+                : MarketplaceFactory::create($this->syncLog->marketplace, $credentials);
             $products = $marketplace->getProducts();
 
             // Для Yandex: добавляем integration_id в каждый товар если он есть

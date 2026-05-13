@@ -129,19 +129,34 @@ class SalesApi
                         if (! isset($result[$sku])) {
                             $result[$sku] = ['total' => 0, 'cancelled' => 0, 'returned' => 0];
                         }
-                        $result[$sku]['total']++;
+                        $quantity = max(1, (int) (
+                            $item['count']
+                            ?? $item['quantity']
+                            ?? $item['offerCount']
+                            ?? $item['itemsCount']
+                            ?? 1
+                        ));
+                        $result[$sku]['total'] += $quantity;
                         if ($isCancelled) {
-                            $result[$sku]['cancelled']++;
+                            $result[$sku]['cancelled'] += $quantity;
                         }
                         if ($isReturned) {
-                            $result[$sku]['returned']++;
+                            $result[$sku]['returned'] += $quantity;
                         }
                     }
                 }
 
                 $hasMore = count($orders) === 200;
                 $page++;
-            } while ($hasMore && $page < 20); // max 4000 заказов
+            } while ($hasMore && $page < 100); // max 20 000 заказов за окно
+
+            if ($hasMore) {
+                Log::warning('YandexMarket sales pagination limit reached', [
+                    'dateFrom' => $dateFrom,
+                    'dateTo' => $dateTo,
+                    'pages' => $page,
+                ]);
+            }
 
             return $result;
         } catch (\Exception $e) {

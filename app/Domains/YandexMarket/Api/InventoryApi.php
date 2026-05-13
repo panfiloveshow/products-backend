@@ -120,16 +120,17 @@ class InventoryApi implements InventoryApiInterface
                         $allStocks[$sku]['warehouses'][$warehouseId] = $whRow;
                     }
 
+                    $stockCounts = [];
                     foreach ($offer['stocks'] ?? [] as $stock) {
-                        $quantity = (int) ($stock['count'] ?? 0);
-                        $type = $stock['type'] ?? 'FIT';
-
-                        // Суммируем только доступные к продаже остатки (FIT + AVAILABLE)
-                        if (in_array($type, ['FIT', 'AVAILABLE'], true)) {
-                            $allStocks[$sku]['warehouses'][$warehouseId]['quantity'] += $quantity;
-                            $allStocks[$sku]['total'] += $quantity;
-                        }
+                        $type = strtoupper((string) ($stock['type'] ?? 'FIT'));
+                        $stockCounts[$type] = ($stockCounts[$type] ?? 0) + (int) ($stock['count'] ?? 0);
                     }
+
+                    // AVAILABLE и FIT могут быть альтернативными представлениями продаваемого остатка.
+                    // Если есть AVAILABLE, берём его; иначе берём FIT. Так не удваиваем один склад.
+                    $quantity = $stockCounts['AVAILABLE'] ?? $stockCounts['FIT'] ?? 0;
+                    $allStocks[$sku]['warehouses'][$warehouseId]['quantity'] += $quantity;
+                    $allStocks[$sku]['total'] += $quantity;
                 }
             }
         } while ($pageToken);

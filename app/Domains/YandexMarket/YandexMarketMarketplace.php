@@ -67,7 +67,9 @@ class YandexMarketMarketplace implements MarketplaceInterface
             ));
 
             return match ($placementType) {
-                'FBS', 'DBS', 'EXPRESS' => 'FBS',
+                'FBS' => 'FBS',
+                'DBS' => 'DBS',
+                'EXPRESS' => 'EXPRESS',
                 'FBY', 'FBY_PLUS' => 'FBY',
                 default => 'FBY',
             };
@@ -148,6 +150,18 @@ class YandexMarketMarketplace implements MarketplaceInterface
         } while ($pageToken);
 
         \Illuminate\Support\Facades\Log::info('YM products loaded', ['count' => count($products)]);
+
+        $prices = $this->getProductPricesWithPagination();
+        if (! empty($prices)) {
+            foreach ($products as &$product) {
+                $sku = $product['sku'] ?? null;
+                if ($sku && isset($prices[$sku])) {
+                    $product['price'] = $prices[$sku]['price'];
+                    $product['old_price'] = $prices[$sku]['old_price'] ?? $product['old_price'] ?? null;
+                }
+            }
+            unset($product);
+        }
 
         // Получаем остатки и обогащаем
         $inventory = $this->getInventory();
@@ -251,14 +265,13 @@ class YandexMarketMarketplace implements MarketplaceInterface
 
     /**
      * Получить цены с пагинацией
-     * Ограничено 5 страницами для предотвращения зависания
      */
     private function getProductPricesWithPagination(): array
     {
         $allPrices = [];
         $pageToken = null;
         $iterations = 0;
-        $maxIterations = 5; // Ограничение для предотвращения бесконечного цикла
+        $maxIterations = 100; // Защита от бесконечного цикла без обрезания больших каталогов
 
         do {
             $result = $this->products->getPricesWithPagination($pageToken);
@@ -420,7 +433,7 @@ class YandexMarketMarketplace implements MarketplaceInterface
                         'sellingProgram' => $sellingProgram,
                     ],
                     'offers' => $chunkValues,
-                ], ['campaignId' => $campaignId]);
+                ]);
 
                 foreach ($response['result']['offers'] ?? [] as $idx => $item) {
                     // API возвращает offers в том же порядке — маппим по индексу

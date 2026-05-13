@@ -109,6 +109,18 @@ class Product extends Model
 
     public function getTotalMarketplaceStockAttribute(): int
     {
-        return $this->inventoryWarehouses()->sum('quantity');
+        $query = $this->inventoryWarehouses();
+
+        if ($this->integration_id !== null) {
+            $query->where('integration_id', $this->integration_id);
+        }
+
+        if (in_array($this->marketplace, ['yandex', 'yandex_market'], true)) {
+            $query->whereIn('marketplace', ['yandex', 'yandex_market']);
+        } else {
+            $query->where('marketplace', $this->marketplace);
+        }
+
+        return (int) $query->sum('quantity');
     }
 }

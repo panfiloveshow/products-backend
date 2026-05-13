@@ -346,15 +346,21 @@ class YandexMarketService implements MarketplaceInterface
 
         try {
             $sellingProgram = strtoupper((string) ($parameters['sellingProgram'] ?? $parameters['selling_program'] ?? 'FBY'));
+            $tariffParameters = [
+                'frequency' => strtoupper((string) ($parameters['frequency'] ?? 'DAILY')),
+                'paymentDelayWeeks' => (int) ($parameters['paymentDelayWeeks'] ?? $parameters['payment_delay_weeks'] ?? 0),
+                'currency' => (string) ($parameters['currency'] ?? $this->defaultCurrency),
+            ];
+
+            if (! empty($parameters['sellingProgram'] ?? $parameters['selling_program'] ?? null)) {
+                $tariffParameters['sellingProgram'] = $sellingProgram;
+            } else {
+                $tariffParameters['campaignId'] = (int) ($parameters['campaignId'] ?? $parameters['campaign_id'] ?? $this->campaignId);
+            }
+
             $response = Http::withHeaders($this->headers())
                 ->post("{$this->baseUrl}/v2/tariffs/calculate", [
-                    'parameters' => [
-                        'campaignId' => (int) ($parameters['campaignId'] ?? $parameters['campaign_id'] ?? $this->campaignId),
-                        'sellingProgram' => $sellingProgram,
-                        'frequency' => strtoupper((string) ($parameters['frequency'] ?? 'DAILY')),
-                        'paymentDelayWeeks' => (int) ($parameters['paymentDelayWeeks'] ?? $parameters['payment_delay_weeks'] ?? 0),
-                        'currency' => (string) ($parameters['currency'] ?? $this->defaultCurrency),
-                    ],
+                    'parameters' => $tariffParameters,
                     'offers' => array_map(function (array $offer) {
                         return [
                             'categoryId' => (int) ($offer['categoryId'] ?? $offer['category_id'] ?? 0),

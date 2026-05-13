@@ -132,7 +132,13 @@ class SyncUnitEconomicsCommand extends Command
         string $marketplace
     ): int
     {
-        $integrations = Product::where('marketplace', $marketplace)
+        if ($marketplace === 'yandex') {
+            $marketplace = 'yandex_market';
+        }
+
+        $marketplaceAliases = $this->marketplaceAliases($marketplace);
+
+        $integrations = Product::whereIn('marketplace', $marketplaceAliases)
             ->whereNotNull('integration_id')
             ->select('integration_id')
             ->distinct()
@@ -173,8 +179,10 @@ class SyncUnitEconomicsCommand extends Command
         string $marketplace
     ): array
     {
+        $marketplaceAliases = $this->marketplaceAliases($marketplace);
+
         $products = Product::where('integration_id', $integrationId)
-            ->where('marketplace', $marketplace)
+            ->whereIn('marketplace', $marketplaceAliases)
             ->whereNotNull('price')
             ->where('price', '>', 0)
             ->get();
@@ -205,7 +213,7 @@ class SyncUnitEconomicsCommand extends Command
         $vendorToSku = $products->filter(fn ($p) => $p->vendor_code)->pluck('sku', 'vendor_code');
 
         // Агрегируем данные по складам для каждого SKU
-        $inventoryRaw = InventoryWarehouse::where('marketplace', $marketplace)
+        $inventoryRaw = InventoryWarehouse::whereIn('marketplace', $marketplaceAliases)
             ->where('integration_id', $integrationId)
             ->whereIn('sku', $skus)
             ->get();
@@ -1115,6 +1123,13 @@ class SyncUnitEconomicsCommand extends Command
         return ['synced' => $synced, 'errors' => $errors];
     }
 
+    private function marketplaceAliases(string $marketplace): array
+    {
+        return in_array($marketplace, ['yandex', 'yandex_market'], true)
+            ? ['yandex', 'yandex_market']
+            : [$marketplace];
+    }
+
     private function buildCalculationData(
         Product $product,
         ?object $inventory,
@@ -1685,7 +1700,7 @@ class SyncUnitEconomicsCommand extends Command
                 $normalizedTariffs = $this->normalizeYandexTariffBreakdown($data['tariff_breakdown']);
                 $data['referral_fee_percent'] = isset($normalizedTariffs['FEE']) && $data['price'] > 0
                     ? round(($normalizedTariffs['FEE'] / $data['price']) * 100, 2)
-                    : 5;
+                    : 12;
                 $data['fby_delivery'] = (float) ($normalizedTariffs['DELIVERY_TO_CUSTOMER'] ?? 50);
                 $data['fbs_delivery'] = (float) ($normalizedTariffs['DELIVERY_TO_CUSTOMER'] ?? 40);
                 $data['acquiring_percent'] = $data['price'] > 0

@@ -138,8 +138,7 @@ class YandexMarketTariffs implements TariffsProviderInterface
      */
     private function calculateFbsLogistics(float $weight): float
     {
-        $logistics = $this->getWeightCost(self::FBS_WEIGHT_TARIFFS, $weight);
-        return $logistics + self::FBS_PROCESSING_FEE;
+        return $this->getWeightCost(self::FBS_WEIGHT_TARIFFS, $weight);
     }
 
     /**

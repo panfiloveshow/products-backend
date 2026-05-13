@@ -86,7 +86,7 @@ Route::prefix('products')->middleware('sellico.permission')->group(function () {
     // для sync всех интеграций workspace (см. test_products_sync_without_integration_id_*).
     // Проверка доступа — в ProductService::startSync / контроллере по workspace-заголовку.
     Route::post('/sync/{marketplace}', [ProductController::class, 'sync'])
-        ->whereIn('marketplace', ['wildberries', 'ozon', 'yandex_market'])
+        ->whereIn('marketplace', ['wildberries', 'ozon', 'yandex', 'yandex_market'])
         ->name('products.sync');
     Route::get('/cost-price', [CostPriceController::class, 'index'])->name('products.cost-price.index');
     Route::post('/cost-price/upload', [CostPriceController::class, 'upload'])->name('products.cost-price.upload');
@@ -114,7 +114,7 @@ Route::prefix('inventory')->middleware('sellico.permission')->group(function () 
     // integration.access: integration_id обязательно приходит в body,
     // проверяем доступ пользователя до вызова контроллера (закрывает IDOR).
     Route::post('/sync/{marketplace}', [InventoryController::class, 'sync'])
-        ->whereIn('marketplace', ['wildberries', 'ozon', 'yandex_market'])
+        ->whereIn('marketplace', ['wildberries', 'ozon', 'yandex', 'yandex_market'])
         ->middleware('integration.access')
         ->name('inventory.sync');
     Route::post('/sync-storage-fees', [InventoryController::class, 'syncStorageFees'])

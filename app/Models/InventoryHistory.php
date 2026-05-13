@@ -17,6 +17,7 @@ class InventoryHistory extends Model
 
     protected $fillable = [
         'sku',
+        'integration_id',
         'warehouse_id',
         'date',
         'quantity',

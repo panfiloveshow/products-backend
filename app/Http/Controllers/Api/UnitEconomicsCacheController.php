@@ -267,6 +267,11 @@ class UnitEconomicsCacheController extends Controller
         }
 
         $allSchemes = UnitEconomicsCache::where('integration_id', $validated['integration_id'])
+            ->when(
+                in_array($marketplace, ['yandex', 'yandex_market'], true),
+                fn ($query) => $query->whereIn('marketplace', ['yandex', 'yandex_market']),
+                fn ($query) => $query->where('marketplace', $marketplace)
+            )
             ->where('sku', $sku)
             ->get()
             ->map(function (UnitEconomicsCache $item) use ($marketplace) {

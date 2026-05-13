@@ -12,6 +12,7 @@ use App\Support\SyncStartGuard;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
 
 class InventoryService
 {
@@ -31,21 +32,59 @@ class InventoryService
             ];
         }
 
-        $maxIdRows = DB::table('unit_economics')
-            ->select('sku')
-            ->selectRaw('MAX(id) as max_id')
-            ->whereIn('sku', $skus)
-            ->groupBy('sku')
-            ->pluck('max_id', 'sku');
-
         $costPriceBySku = [];
-        $ids = $maxIdRows->filter()->values()->all();
-        if ($ids !== []) {
-            $rows = DB::table('unit_economics')
-                ->whereIn('id', $ids)
-                ->get(['sku', 'cost_price']);
-            foreach ($rows as $row) {
-                $costPriceBySku[$row->sku] = $row->cost_price;
+        $integrationIds = $products->pluck('integration_id')->filter()->unique()->values()->all();
+        $unitRowsQuery = DB::table('unit_economics')
+            ->whereIn('sku', $skus)
+            ->orderByDesc('id');
+
+        if ($integrationIds !== []) {
+            $unitRowsQuery->whereIn('integration_id', $integrationIds);
+        }
+
+        $rows = $unitRowsQuery->get(['sku', 'integration_id', 'cost_price']);
+        foreach ($rows as $row) {
+            $key = $this->inventoryLookupKey($row->integration_id, $row->sku);
+            if (! array_key_exists($key, $costPriceBySku)) {
+                $costPriceBySku[$key] = $row->cost_price;
+            }
+            if (! array_key_exists((string) $row->sku, $costPriceBySku)) {
+                $costPriceBySku[(string) $row->sku] = $row->cost_price;
+            }
+        }
+
+        $previousPeriodSalesBySku = [];
+        $skusNeedingTrend = $products->filter(function (Product $product) {
+            $sumAds = $product->inventoryWarehouses->sum('average_daily_sales');
+
+            return $sumAds * 28 > 0;
+        })->pluck('sku')->unique()->values()->all();
+
+        if ($skusNeedingTrend !== []) {
+            $dateFrom = now()->subDays(56)->toDateString();
+            $dateTo = now()->subDays(28)->toDateString();
+            $historyQuery = InventoryHistory::query()
+                ->whereIn('sku', $skusNeedingTrend)
+                ->whereBetween('date', [$dateFrom, $dateTo]);
+
+            if (Schema::hasColumn('inventory_history', 'integration_id') && $integrationIds !== []) {
+                $rows = $historyQuery
+                    ->whereIn('integration_id', $integrationIds)
+                    ->selectRaw('integration_id, sku, COALESCE(SUM(sales), 0) as total')
+                    ->groupBy('integration_id', 'sku')
+                    ->get();
+
+                foreach ($rows as $row) {
+                    $previousPeriodSalesBySku[$this->inventoryLookupKey($row->integration_id, $row->sku)] = (float) $row->total;
+                    $previousPeriodSalesBySku[(string) $row->sku] ??= (float) $row->total;
+                }
+            } else {
+                $previousPeriodSalesBySku = $historyQuery
+                    ->selectRaw('sku, COALESCE(SUM(sales), 0) as total')
+                    ->groupBy('sku')
+                    ->pluck('total', 'sku')
+                    ->map(fn ($v) => (float) $v)
+                    ->all();
             }
         }
 
@@ -54,26 +93,6 @@ class InventoryService
             ->active()
             ->get()
             ->groupBy('sku');
-
-        $skusNeedingTrend = $products->filter(function (Product $product) {
-            $sumAds = $product->inventoryWarehouses->sum('average_daily_sales');
-
-            return $sumAds * 28 > 0;
-        })->pluck('sku')->unique()->values()->all();
-
-        $previousPeriodSalesBySku = [];
-        if ($skusNeedingTrend !== []) {
-            $dateFrom = now()->subDays(56)->toDateString();
-            $dateTo = now()->subDays(28)->toDateString();
-            $previousPeriodSalesBySku = InventoryHistory::query()
-                ->whereIn('sku', $skusNeedingTrend)
-                ->whereBetween('date', [$dateFrom, $dateTo])
-                ->selectRaw('sku, COALESCE(SUM(sales), 0) as total')
-                ->groupBy('sku')
-                ->pluck('total', 'sku')
-                ->map(fn ($v) => (float) $v)
-                ->all();
-        }
 
         return [
             'cost_price_by_sku' => $costPriceBySku,
@@ -84,7 +103,9 @@ class InventoryService
 
     public function formatProductInventory(Product $product, array $preloaded = []): array
     {
-        $warehouses = $product->inventoryWarehouses;
+        $warehouses = $product->inventoryWarehouses
+            ->filter(fn ($warehouse): bool => $this->warehouseBelongsToProduct($warehouse, $product))
+            ->values();
         $totalMarketplaceStock = $warehouses->sum('quantity');
         $sales28Days = $warehouses->sum('average_daily_sales') * 28;
 
@@ -97,8 +118,10 @@ class InventoryService
         $salesTrend = 'stable';
         if ($sales28Days > 0) {
             $previousSales = $usePreload
-                ? (float) ($preloaded['previous_period_sales_by_sku'][$product->sku] ?? 0)
-                : $this->getPreviousPeriodSales($product->sku, 28);
+                ? (float) ($preloaded['previous_period_sales_by_sku'][$this->inventoryLookupKey($product->integration_id, $product->sku)]
+                    ?? $preloaded['previous_period_sales_by_sku'][$product->sku]
+                    ?? 0)
+                : $this->getPreviousPeriodSales($product->sku, 28, $product->integration_id);
             if ($previousSales > 0) {
                 $change = (($sales28Days - $previousSales) / $previousSales) * 100;
                 if ($change > 10) {
@@ -109,11 +132,16 @@ class InventoryService
             }
         }
 
-        $totalStock = $product->stock + $totalMarketplaceStock;
+        $totalStock = $warehouses->isNotEmpty() ? $totalMarketplaceStock : (int) $product->stock;
 
         $costPrice = $usePreload
-            ? ($preloaded['cost_price_by_sku'][$product->sku] ?? null)
-            : $product->unitEconomics()->latest()->value('cost_price');
+            ? ($preloaded['cost_price_by_sku'][$this->inventoryLookupKey($product->integration_id, $product->sku)]
+                ?? $preloaded['cost_price_by_sku'][$product->sku]
+                ?? null)
+            : $product->unitEconomics()
+                ->when($product->integration_id, fn ($query) => $query->where('integration_id', $product->integration_id))
+                ->latest()
+                ->value('cost_price');
 
         $alerts = $usePreload
             ? ($preloaded['alerts_by_sku'][$product->sku] ?? collect())
@@ -133,6 +161,7 @@ class InventoryService
             'sales_28_days' => round($sales28Days),
             'marketplace_warehouses' => $warehouses->map(fn ($w) => [
                 'id' => $w->id,
+                'warehouse_id' => $w->warehouse_id,
                 'name' => $w->warehouse_name,
                 'marketplace' => $w->marketplace,
                 'fulfillment_type' => $w->fulfillment_type,
@@ -155,9 +184,13 @@ class InventoryService
         ];
     }
 
-    private function getPreviousPeriodSales(string $sku, int $days): float
+    private function getPreviousPeriodSales(string $sku, int $days, ?int $integrationId = null): float
     {
         return InventoryHistory::where('sku', $sku)
+            ->when(
+                $integrationId && Schema::hasColumn('inventory_history', 'integration_id'),
+                fn ($query) => $query->where('integration_id', $integrationId)
+            )
             ->whereBetween('date', [
                 now()->subDays($days * 2)->toDateString(),
                 now()->subDays($days)->toDateString(),
@@ -169,8 +202,11 @@ class InventoryService
     {
         $costPrice = $resolvedCostPrice !== null
             ? $resolvedCostPrice
-            : (float) ($product->unitEconomics()->latest()->value('cost_price') ?? 0);
-        $totalStock = $product->stock + $warehouses->sum('quantity');
+            : (float) ($product->unitEconomics()
+                ->when($product->integration_id, fn ($query) => $query->where('integration_id', $product->integration_id))
+                ->latest()
+                ->value('cost_price') ?? 0);
+        $totalStock = $warehouses->isNotEmpty() ? $warehouses->sum('quantity') : (int) $product->stock;
         $totalValue = $totalStock * $costPrice;
 
         $storageCostPerDay = $warehouses->sum(function ($w) {
@@ -253,9 +289,13 @@ class InventoryService
         ];
     }
 
-    public function getForecast(string $sku): array
+    public function getForecast(string $sku, ?int $integrationId = null): array
     {
         $history = InventoryHistory::where('sku', $sku)
+            ->when(
+                $integrationId && Schema::hasColumn('inventory_history', 'integration_id'),
+                fn ($query) => $query->where('integration_id', $integrationId)
+            )
             ->orderBy('date', 'desc')
             ->limit(30)
             ->get();
@@ -350,7 +390,7 @@ class InventoryService
         });
     }
 
-    public function getSyncStatuses(): array
+    public function getSyncStatuses(?int $integrationId = null): array
     {
         $marketplaces = ['wildberries', 'ozon', 'yandex_market'];
         $statuses = [];
@@ -364,6 +404,10 @@ class InventoryService
                 $lastSyncQuery->where('marketplace', $marketplace);
             }
 
+            if ($integrationId) {
+                $lastSyncQuery->where('integration_id', $integrationId);
+            }
+
             $lastSync = $lastSyncQuery->first();
 
             $statuses[$marketplace] = [
@@ -374,6 +418,24 @@ class InventoryService
         }
 
         return $statuses;
+    }
+
+    private function inventoryLookupKey(mixed $integrationId, mixed $sku): string
+    {
+        return (string) ($integrationId ?? 0).'|'.(string) $sku;
+    }
+
+    private function warehouseBelongsToProduct(InventoryWarehouse $warehouse, Product $product): bool
+    {
+        if ($product->integration_id !== null && (string) $warehouse->integration_id !== (string) $product->integration_id) {
+            return false;
+        }
+
+        if (in_array($product->marketplace, ['yandex', 'yandex_market'], true)) {
+            return in_array($warehouse->marketplace, ['yandex', 'yandex_market'], true);
+        }
+
+        return $warehouse->marketplace === $product->marketplace;
     }
 
     public function getAIRecommendations(): array

@@ -307,11 +307,16 @@ class UnitEconomicsCacheService
             $schemeKey = 'rfbs';
         }
 
+        $defaultCommissionPercent = match ($marketplace) {
+            'yandex', 'yandex_market' => 12,
+            default => 15,
+        };
+
         $commissionPercent = $commissions[$schemeKey]['percent']
             ?? $commissions['fbs']['percent']
             ?? $commissions['fbo']['percent']
             ?? $existingUE?->commission_percent
-            ?? 15;
+            ?? $defaultCommissionPercent;
 
         // Дефолты по маркетплейсам — среднерыночные показатели, используются
         // только если нет данных ни из API, ни из ручного override. Раньше для Ozon

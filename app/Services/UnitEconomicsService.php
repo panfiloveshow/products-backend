@@ -490,7 +490,7 @@ class UnitEconomicsService
         $fulfillmentType = strtoupper((string) ($data['fulfillment_type'] ?? 'FBY'));
         $tariffBreakdown = $this->normalizeYandexTariffBreakdown($data['tariff_breakdown'] ?? []);
 
-        $referralFeePercent = $data['referral_fee_percent'] ?? 5;
+        $referralFeePercent = $data['referral_fee_percent'] ?? 12;
         $referralFeePerUnit = $tariffBreakdown['FEE'] ?? ($price * $referralFeePercent / 100);
         if (isset($tariffBreakdown['FEE']) && $price > 0) {
             $referralFeePercent = ($referralFeePerUnit / $price) * 100;
@@ -538,7 +538,7 @@ class UnitEconomicsService
         $storageCost = (float) ($data['storage_cost'] ?? 0);
 
         // Хранение: рассчитываем по тарифу если не задано
-        if ($storageCost <= 0) {
+        if ($storageCost <= 0 && $fulfillmentType === 'FBY') {
             $volumeLiters = (float) ($data['volume_liters'] ?? 0);
             $turnoverDays = (int) ($data['turnover_days'] ?? 30);
             if ($volumeLiters > 0) {
@@ -626,17 +626,21 @@ class UnitEconomicsService
 
     public function createOrUpdate(array $data): UnitEconomics
     {
-        $calculated = $this->calculate($data['marketplace'], $data);
+        $marketplace = $data['marketplace'] === 'yandex' ? 'yandex_market' : $data['marketplace'];
+        $data['marketplace'] = $marketplace;
+        $calculated = $this->calculate($marketplace, $data);
+        $fulfillmentType = strtoupper((string) ($data['fulfillment_type'] ?? $calculated['fulfillment_type'] ?? 'FBO'));
 
         return UnitEconomics::updateOrCreate(
             [
                 'sku' => $data['sku'],
-                'marketplace' => $data['marketplace'],
+                'marketplace' => $marketplace,
+                'integration_id' => $data['integration_id'] ?? null,
+                'fulfillment_type' => $fulfillmentType,
                 'period_start' => $data['period_start'] ?? now()->startOfMonth()->toDateString(),
                 'period_end' => $data['period_end'] ?? now()->endOfMonth()->toDateString(),
             ],
             [
-                'integration_id' => $data['integration_id'] ?? null,
                 'product_name' => $data['product_name'] ?? null,
                 'price' => $data['price'],
                 'cost_price' => $data['cost_price'],

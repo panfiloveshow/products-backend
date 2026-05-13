@@ -15,6 +15,8 @@ class YandexMarketClient
 
     private string $apiKey;
 
+    private string $authScheme;
+
     private ?string $campaignId;
 
     private ?string $businessId;
@@ -25,7 +27,9 @@ class YandexMarketClient
 
     public function __construct(?string $token = null, ?string $campaignId = null, ?string $businessId = null)
     {
-        $this->apiKey = $this->normalizeToken((string) ($token ?? config('services.yandex_market.token') ?? ''));
+        $rawToken = (string) ($token ?? config('services.yandex_market.token') ?? '');
+        $this->authScheme = $this->detectAuthScheme($rawToken);
+        $this->apiKey = $this->normalizeToken($rawToken);
         $this->campaignId = $campaignId ?? config('services.yandex_market.campaign_id');
         $this->businessId = $businessId ?? config('services.yandex_market.business_id');
     }
@@ -252,11 +256,18 @@ class YandexMarketClient
      */
     private function getHeaders(): array
     {
-        return [
-            'Api-Key' => $this->apiKey,
+        $headers = [
             'Content-Type' => 'application/json',
             'Accept' => 'application/json',
         ];
+
+        if ($this->authScheme === 'api_key') {
+            $headers['Api-Key'] = $this->apiKey;
+        } else {
+            $headers['Authorization'] = "Bearer {$this->apiKey}";
+        }
+
+        return $headers;
     }
 
     /**
@@ -286,6 +297,21 @@ class YandexMarketClient
         }
 
         return preg_replace('/^(oauth|bearer)\s+/i', '', $token) ?? $token;
+    }
+
+    private function detectAuthScheme(string $token): string
+    {
+        $token = trim($token);
+
+        if (str_starts_with($token, 'ACMA:')) {
+            return 'api_key';
+        }
+
+        if (preg_match('/^(oauth|bearer)\s+/i', $token) === 1) {
+            return 'oauth';
+        }
+
+        return str_contains($token, ':') ? 'api_key' : 'oauth';
     }
 
     private function formatHttpError(string $endpoint, int $status, string $body): string
