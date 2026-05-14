@@ -447,7 +447,7 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
         }
 
         if ($input->redemptionSource === 'no_sales_28d') {
-            return false;
+            return true;
         }
 
         if ($input->ordersCount !== null && $input->ordersCount <= 0) {

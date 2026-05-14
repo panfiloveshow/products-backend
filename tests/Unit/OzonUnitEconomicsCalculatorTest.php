@@ -146,7 +146,7 @@ class OzonUnitEconomicsCalculatorTest extends TestCase
         $this->assertSame($result['base_logistics'], $result['costs']['logistics']);
     }
 
-    public function test_no_sales_source_does_not_add_expected_return_to_logistics(): void
+    public function test_no_sales_source_adds_expected_return_to_logistics_as_worst_case(): void
     {
         $calculator = new OzonUnitEconomicsCalculator();
         $input = CalculationInput::fromArray([
@@ -166,10 +166,10 @@ class OzonUnitEconomicsCalculatorTest extends TestCase
 
         $result = $calculator->calculate($input)->toArray();
 
-        $this->assertSame(0.0, $result['expected_return_cost']);
-        $this->assertSame(0.0, $result['return_logistics']);
+        $this->assertGreaterThan(0.0, $result['expected_return_cost']);
+        $this->assertSame($result['base_logistics'], $result['return_logistics']);
         $this->assertSame(
-            $result['costs']['logistics'] + $result['last_mile'] + $result['processing_fee'],
+            $result['costs']['logistics'] + $result['last_mile'] + $result['processing_fee'] + $result['expected_return_cost'],
             $result['effective_logistics']
         );
     }
