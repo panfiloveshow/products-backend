@@ -143,9 +143,12 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
 
         // Своя доставка (из настроек пользователя)
         $ownDeliveryCost = $input->ownDeliveryCost ?? 0;
+        $ownReturnCost = ($input->ownReturnCost ?? 0) > 0
+            ? (float) $input->ownReturnCost
+            : (float) $ownDeliveryCost;
 
         $returnRate = $input->redemptionRate !== null ? max(0, (100 - $input->redemptionRate) / 100) : 0;
-        $expectedReturnCost = ($input->ownReturnCost ?? 0) * $returnRate;
+        $expectedReturnCost = $ownReturnCost * $returnRate;
 
         return $this->buildResult(
             $input,
@@ -168,7 +171,7 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
             salesFeePercent: $context['commission_rate'],
             agentFee: $agentFee,
             integrationFee: 0,
-            returnLogistics: 0,
+            returnLogistics: $ownReturnCost,
             returnProcessing: 0,
             routeResolutionStatus: $context['route_resolution_status'],
             localityResolutionStatus: $context['locality_resolution_status'],
@@ -195,9 +198,12 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
 
         // Своя доставка
         $ownDeliveryCost = $input->ownDeliveryCost ?? 0;
+        $ownReturnCost = ($input->ownReturnCost ?? 0) > 0
+            ? (float) $input->ownReturnCost
+            : (float) $ownDeliveryCost;
 
         $returnRate = $input->redemptionRate !== null ? max(0, (100 - $input->redemptionRate) / 100) : 0;
-        $expectedReturnCost = ($input->ownReturnCost ?? 0) * $returnRate;
+        $expectedReturnCost = $ownReturnCost * $returnRate;
 
         return $this->buildResult(
             $input,
@@ -220,7 +226,7 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
             salesFeePercent: $context['commission_rate'],
             agentFee: $agentFee,
             integrationFee: -$expressCompensation,
-            returnLogistics: 0,
+            returnLogistics: $ownReturnCost,
             returnProcessing: 0,
             routeResolutionStatus: $context['route_resolution_status'],
             localityResolutionStatus: $context['locality_resolution_status'],

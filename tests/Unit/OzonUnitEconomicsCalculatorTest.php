@@ -174,6 +174,39 @@ class OzonUnitEconomicsCalculatorTest extends TestCase
         );
     }
 
+    public function test_no_sales_real_fbs_schemes_use_own_delivery_as_return_logistics_fallback(): void
+    {
+        $calculator = new OzonUnitEconomicsCalculator();
+
+        foreach (['RFBS', 'EXPRESS'] as $scheme) {
+            $input = CalculationInput::fromArray([
+                'sku' => 'sku-no-sales-' . strtolower($scheme),
+                'integration_id' => 1,
+                'marketplace' => 'ozon',
+                'fulfillment_type' => $scheme,
+                'price' => 1000,
+                'cost_price' => 200,
+                'length' => 20,
+                'width' => 20,
+                'height' => 20,
+                'own_delivery_cost' => 250,
+                'redemption_rate' => 0,
+                'redemption_source' => 'no_sales_28d',
+                'orders_count' => 0,
+            ]);
+
+            $result = $calculator->calculate($input)->toArray();
+
+            $this->assertSame(250.0, $result['return_logistics'], $scheme);
+            $this->assertSame(250.0, $result['expected_return_cost'], $scheme);
+            $this->assertSame(
+                $result['costs']['logistics'] + $result['expected_return_cost'],
+                $result['effective_logistics'],
+                $scheme
+            );
+        }
+    }
+
     public function test_no_sales_source_ignores_stale_profile_and_uses_volume_tariff(): void
     {
         $calculator = new OzonUnitEconomicsCalculator();
