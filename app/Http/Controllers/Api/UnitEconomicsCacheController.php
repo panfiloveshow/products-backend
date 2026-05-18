@@ -1879,6 +1879,13 @@ class UnitEconomicsCacheController extends Controller
             $data['logistics_markup_amount'] = $data['non_local_markup_amount'];
             $data['raw_non_local_markup_percent'] = $weightedMarkup;
 
+            $marketplaceData['weighted_non_local_markup_percent'] = $weightedMarkup;
+            $marketplaceData['non_local_markup_percent'] = $weightedMarkup;
+            $marketplaceData['logistics_markup_percent'] = $weightedMarkup;
+            $marketplaceData['non_local_markup_amount'] = $data['non_local_markup_amount'];
+            $marketplaceData['logistics_markup_amount'] = $data['logistics_markup_amount'];
+            $marketplaceData['raw_non_local_markup_percent'] = $weightedMarkup;
+
             $data['markup_rule_reason'] = null;
             if (! $isFboScheme) {
                 $data['markup_rule_reason'] = 'non_fbo_no_nonlocal_markup';
@@ -1895,6 +1902,8 @@ class UnitEconomicsCacheController extends Controller
                 is_string($data['markup_rule_reason'] ?? null) ? $data['markup_rule_reason'] : null,
                 $data['sales_7_days'] ?? null
             );
+            $marketplaceData['markup_rule_reason'] = $data['markup_rule_reason'];
+            $marketplaceData['markup_rule_reason_label'] = $data['markup_rule_reason_label'];
             // Не отдаём «Кластер поставки» во фронт — поля используются только внутренне
             // (фиксации/локальность). Для маршрута используй route_label / route_key.
             unset(
