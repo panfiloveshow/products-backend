@@ -1011,6 +1011,33 @@ class UnitEconomicsCacheController extends Controller
     }
 
     /**
+     * For Ozon the visible non-local markup must be factual when order API data exists.
+     *
+     * @return array{0: float, 1: float, 2: bool}
+     */
+    private function resolveOzonDisplayNonLocalMarkup(
+        array $orderEconomicsSummary,
+        float $expectedMarkupPercent,
+        float $expectedMarkupAmount
+    ): array {
+        $ordersCount = (int) ($orderEconomicsSummary['orders_count'] ?? 0);
+        if ($ordersCount <= 0 || ! array_key_exists('avg_non_local_markup_percent', $orderEconomicsSummary)) {
+            return [
+                round($expectedMarkupPercent, 2),
+                round($expectedMarkupAmount, 2),
+                false,
+            ];
+        }
+
+        $factualPercent = round((float) $orderEconomicsSummary['avg_non_local_markup_percent'], 2);
+        $factualAmount = array_key_exists('avg_non_local_markup_amount', $orderEconomicsSummary)
+            ? round((float) $orderEconomicsSummary['avg_non_local_markup_amount'], 2)
+            : round($expectedMarkupAmount, 2);
+
+        return [$factualPercent, $factualAmount, true];
+    }
+
+    /**
      * Лист «Сводка» — KPI-блок + топ прибыльных/убыточных
      */
     private function buildSummarySheet(
@@ -1734,7 +1761,9 @@ class UnitEconomicsCacheController extends Controller
             $data['tariff_effective_from'] = optional($cache->tariff_effective_from)?->toDateString();
             $data['tariff_source'] = $cache->tariff_source;
             $activeFixation = is_array($ozonData['active_fixation'] ?? null) ? $ozonData['active_fixation'] : [];
-            $orderEconomicsSummary = is_array($ozonData['order_economics_summary'] ?? null) ? $ozonData['order_economics_summary'] : [];
+            $orderEconomicsSummary = is_array($marketplaceData['order_economics_summary'] ?? null)
+                ? $marketplaceData['order_economics_summary']
+                : (is_array($ozonData['order_economics_summary'] ?? null) ? $ozonData['order_economics_summary'] : []);
             $data['route_key'] = $cache->route_key
                 ?? $marketplaceData['route_key']
                 ?? ($activeFixation['shipping_cluster_id'] ?? null)
@@ -1872,19 +1901,37 @@ class UnitEconomicsCacheController extends Controller
                 $recalculatedWeighted += ($share / 100) * (float) ($clusterRow['effective_markup_percent'] ?? 0);
             }
             $weightedMarkup = round($recalculatedWeighted, 2);
+            [$displayMarkup, $displayMarkupAmount, $hasFactualMarkup] = $this->resolveOzonDisplayNonLocalMarkup(
+                $orderEconomicsSummary,
+                $weightedMarkup,
+                round((float) $cache->price * ($weightedMarkup / 100), 2)
+            );
+            $displayMarkupSource = $hasFactualMarkup ? 'order_economics_summary' : 'delivery_profile';
             $data['weighted_non_local_markup_percent'] = $weightedMarkup;
-            $data['non_local_markup_percent'] = $weightedMarkup;
-            $data['logistics_markup_percent'] = $weightedMarkup;
-            $data['non_local_markup_amount'] = round((float) $cache->price * ($weightedMarkup / 100), 2);
+            $data['expected_non_local_markup_percent'] = $weightedMarkup;
+            $data['non_local_markup_percent'] = $displayMarkup;
+            $data['logistics_markup_percent'] = $displayMarkup;
+            $data['non_local_markup_amount'] = $displayMarkupAmount;
             $data['logistics_markup_amount'] = $data['non_local_markup_amount'];
             $data['raw_non_local_markup_percent'] = $weightedMarkup;
+            $data['non_local_markup_source'] = $displayMarkupSource;
+            if ($hasFactualMarkup) {
+                $data['factual_non_local_markup_percent'] = $displayMarkup;
+                $data['factual_non_local_markup_amount'] = $displayMarkupAmount;
+            }
 
             $marketplaceData['weighted_non_local_markup_percent'] = $weightedMarkup;
-            $marketplaceData['non_local_markup_percent'] = $weightedMarkup;
-            $marketplaceData['logistics_markup_percent'] = $weightedMarkup;
+            $marketplaceData['expected_non_local_markup_percent'] = $weightedMarkup;
+            $marketplaceData['non_local_markup_percent'] = $displayMarkup;
+            $marketplaceData['logistics_markup_percent'] = $displayMarkup;
             $marketplaceData['non_local_markup_amount'] = $data['non_local_markup_amount'];
             $marketplaceData['logistics_markup_amount'] = $data['logistics_markup_amount'];
             $marketplaceData['raw_non_local_markup_percent'] = $weightedMarkup;
+            $marketplaceData['non_local_markup_source'] = $displayMarkupSource;
+            if ($hasFactualMarkup) {
+                $marketplaceData['factual_non_local_markup_percent'] = $displayMarkup;
+                $marketplaceData['factual_non_local_markup_amount'] = $displayMarkupAmount;
+            }
 
             $data['markup_rule_reason'] = null;
             if (! $isFboScheme) {

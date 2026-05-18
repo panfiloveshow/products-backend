@@ -10,7 +10,7 @@ use App\Models\UnitEconomicsCache;
 use App\Services\IntegrationAccessService;
 use App\Services\UnitEconomicsCacheService;
 use App\Services\UnitEconomicsService;
-use PHPUnit\Framework\TestCase;
+use Tests\TestCase;
 
 class UnitEconomicsCacheControllerTest extends TestCase
 {
@@ -64,6 +64,48 @@ class UnitEconomicsCacheControllerTest extends TestCase
         $this->assertSame('Самара', $salesProfile[1]['cluster_name']);
     }
 
+    public function test_ozon_display_non_local_markup_prefers_factual_order_summary(): void
+    {
+        $controller = new UnitEconomicsCacheController(
+            $this->createMock(UnitEconomicsCacheService::class),
+            $this->createMock(UnitEconomicsService::class),
+            $this->createMock(UnitEconomicsOrchestrator::class),
+            $this->createMock(IntegrationAccessService::class),
+        );
+
+        $method = new \ReflectionMethod($controller, 'resolveOzonDisplayNonLocalMarkup');
+        $method->setAccessible(true);
+
+        $result = $method->invoke($controller, [
+            'orders_count' => 14,
+            'avg_non_local_markup_percent' => 0.574,
+            'avg_non_local_markup_amount' => 3.216,
+        ], 8.0, 44.0);
+
+        $this->assertSame([0.57, 3.22, true], $result);
+    }
+
+    public function test_ozon_display_non_local_markup_falls_back_to_expected_without_orders(): void
+    {
+        $controller = new UnitEconomicsCacheController(
+            $this->createMock(UnitEconomicsCacheService::class),
+            $this->createMock(UnitEconomicsService::class),
+            $this->createMock(UnitEconomicsOrchestrator::class),
+            $this->createMock(IntegrationAccessService::class),
+        );
+
+        $method = new \ReflectionMethod($controller, 'resolveOzonDisplayNonLocalMarkup');
+        $method->setAccessible(true);
+
+        $result = $method->invoke($controller, [
+            'orders_count' => 0,
+            'avg_non_local_markup_percent' => 0.0,
+            'avg_non_local_markup_amount' => 0.0,
+        ], 8.0, 44.0);
+
+        $this->assertSame([8.0, 44.0, false], $result);
+    }
+
     public function test_enrich_cache_item_exposes_volume_weight_and_chargeable_volume(): void
     {
         $controller = new UnitEconomicsCacheController(
@@ -108,6 +150,8 @@ class UnitEconomicsCacheControllerTest extends TestCase
 
         $method = new \ReflectionMethod(UnitEconomicsCacheController::class, 'enrichCacheItem');
         $method->setAccessible(true);
+
+        \Illuminate\Support\Facades\Cache::shouldReceive('remember')->andReturn(null);
 
         $pageContext = [
             'wb_warehouses_by_product_key' => collect([
