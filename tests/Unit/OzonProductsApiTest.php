@@ -48,4 +48,28 @@ class OzonProductsApiTest extends TestCase
 
         $this->assertSame([], $api->getPricingStrategyProductInfo([7856197312], maxRequests: 10, sleepMicros: 0));
     }
+
+    public function test_get_pricing_strategy_product_info_marks_disabled_strategy_without_price(): void
+    {
+        Http::fake([
+            'https://api-seller.ozon.ru/v1/pricing-strategy/product/info' => Http::response([
+                'result' => [
+                    'strategy_id' => '',
+                    'is_enabled' => false,
+                    'strategy_product_price' => 0,
+                    'price_downloaded_at' => '',
+                    'strategy_competitor_id' => 0,
+                    'strategy_competitor_product_url' => '',
+                ],
+            ]),
+        ]);
+
+        $api = new ProductsApi(new OzonClient('client', 'key'));
+
+        $result = $api->getPricingStrategyProductInfo([7856197312], maxRequests: 10, sleepMicros: 0);
+
+        $this->assertSame(0.0, $result['7856197312']['competitor_price']);
+        $this->assertFalse($result['7856197312']['is_enabled']);
+        $this->assertSame('disabled', $result['7856197312']['status']);
+    }
 }

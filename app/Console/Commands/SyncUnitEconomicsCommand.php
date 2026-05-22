@@ -349,7 +349,7 @@ class SyncUnitEconomicsCommand extends Command
                         if (! empty($ozonPricingStrategyBySku)) {
                             $availableCount = count(array_filter(
                                 $ozonPricingStrategyBySku,
-                                fn ($info) => ($info['competitor_price'] ?? null) !== null
+                                fn ($info) => (float) ($info['competitor_price'] ?? 0) > 0
                             ));
                             $this->info("  Индекс цены Ozon: {$availableCount}/".count($ozonPricingStrategyBySku).' товаров с ценой конкурента');
                         }
@@ -1209,12 +1209,17 @@ class SyncUnitEconomicsCommand extends Command
 
         $competitorPrice = is_numeric($competitorPrice) ? round((float) $competitorPrice, 2) : null;
         if ($currentPrice <= 0 || $competitorPrice === null || $competitorPrice <= 0) {
+            $label = ($pricingStrategyData['is_enabled'] ?? null) === false
+                || ($pricingStrategyData['status'] ?? null) === 'disabled'
+                    ? 'Не в стратегии'
+                    : 'Нет цены конкурента';
+
             return array_merge($pricingStrategyData, [
                 'current_price' => round($currentPrice, 2),
                 'competitor_price' => $competitorPrice,
                 'current_price_index' => null,
                 'current_price_is_favorable' => null,
-                'current_price_index_label' => 'Нет данных',
+                'current_price_index_label' => $label,
                 'current_price_competitor_delta' => null,
                 'current_price_competitor_delta_percent' => null,
             ]);
