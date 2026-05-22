@@ -305,6 +305,7 @@ class ProductsApi implements ProductsApiInterface
                     : 0;
                 
                 $allPrices[$sku] = [
+                    'product_id' => $item['product_id'] ?? null,
                     'price' => $price,                           // Базовая цена без скидок
                     'old_price' => $oldPrice,                    // Зачёркнутая цена (маркетинговая)
                     'min_price' => (float) ($priceData['min_price'] ?? 0),
@@ -321,6 +322,96 @@ class ProductsApi implements ProductsApiInterface
         } while (!empty($items) && !empty($cursor));
 
         return $allPrices;
+    }
+
+    /**
+     * Получить цену товара у конкурента из стратегии ценообразования Ozon.
+     *
+     * Ozon отдаёт эти данные только по одному product_id, поэтому метод намеренно
+     * ограничивает количество запросов за запуск и не бросает исключения наружу:
+     * отсутствие этих данных не должно ломать основной расчёт юнит-экономики.
+     *
+     * @param array<int|string> $productIds
+     * @return array<string,array<string,mixed>> product_id => normalized pricing strategy info
+     */
+    public function getPricingStrategyProductInfo(array $productIds, int $maxRequests = 500, int $sleepMicros = 120000): array
+    {
+        $ids = collect($productIds)
+            ->map(fn ($id) => is_numeric($id) ? (int) $id : null)
+            ->filter(fn ($id) => $id !== null && $id > 0)
+            ->unique()
+            ->take($maxRequests)
+            ->values()
+            ->all();
+
+        if (empty($ids)) {
+            return [];
+        }
+
+        $result = [];
+
+        foreach ($ids as $index => $productId) {
+            try {
+                $response = $this->client->post('/v1/pricing-strategy/product/info', [
+                    'product_id' => $productId,
+                ]);
+
+                if (($response['_error'] ?? false) || ! is_array($response)) {
+                    \Log::warning('Ozon pricing strategy product info unavailable', [
+                        'product_id' => $productId,
+                        'status' => $response['_http_status'] ?? null,
+                    ]);
+                    continue;
+                }
+
+                $info = $response['result'] ?? null;
+                if (! is_array($info)) {
+                    continue;
+                }
+
+                $price = $this->normalizeMoney($info['strategy_product_price'] ?? null);
+                $isEnabled = array_key_exists('is_enabled', $info) ? (bool) $info['is_enabled'] : null;
+
+                $result[(string) $productId] = [
+                    'product_id' => $productId,
+                    'strategy_id' => $info['strategy_id'] ?? null,
+                    'is_enabled' => $isEnabled,
+                    'competitor_price' => $price,
+                    'strategy_product_price' => $price,
+                    'price_downloaded_at' => $info['price_downloaded_at'] ?? null,
+                    'strategy_competitor_id' => $info['strategy_competitor_id'] ?? null,
+                    'strategy_competitor_product_url' => $info['strategy_competitor_product_url'] ?? null,
+                    'source' => 'pricing_strategy_product_info',
+                    'status' => $price !== null && $price > 0
+                        ? 'available'
+                        : ($isEnabled === false ? 'disabled' : 'no_price'),
+                ];
+            } catch (\Throwable $e) {
+                \Log::warning('Ozon pricing strategy product info error', [
+                    'product_id' => $productId,
+                    'error' => $e->getMessage(),
+                ]);
+            }
+
+            if ($sleepMicros > 0 && $index < count($ids) - 1) {
+                usleep($sleepMicros);
+            }
+        }
+
+        return $result;
+    }
+
+    private function normalizeMoney(mixed $value): ?float
+    {
+        if ($value === null || $value === '') {
+            return null;
+        }
+
+        if (is_string($value)) {
+            $value = str_replace(',', '.', $value);
+        }
+
+        return is_numeric($value) ? round((float) $value, 2) : null;
     }
 
     /**

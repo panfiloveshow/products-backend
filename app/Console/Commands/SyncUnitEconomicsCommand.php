@@ -273,6 +273,7 @@ class SyncUnitEconomicsCommand extends Command
         $acquiringData = [];
         $redemptionData = [];
         $productPrices = []; // Актуальные цены из API (включая акционные)
+        $ozonPricingStrategyBySku = [];
         $deliveryProfiles = [];
         $ozonDirectSalesProfiles = [];
         $previewFixationMap = [];
@@ -340,6 +341,22 @@ class SyncUnitEconomicsCommand extends Command
                     $productPrices = $ozonService->getProductPrices();
                     $promotionCount = count(array_filter($productPrices, fn ($p) => $p['is_in_promotion'] ?? false));
                     $this->info('  Цены: '.count($productPrices).' товаров, '.$promotionCount.' в акциях');
+
+                    try {
+                        $productIdsBySku = $this->resolveOzonProductIdsBySku($integrationId, $productPrices);
+                        $pricingStrategyByProductId = $ozonService->getPricingStrategyProductInfo(array_values($productIdsBySku));
+                        $ozonPricingStrategyBySku = $this->mapOzonPricingStrategyBySku($productIdsBySku, $pricingStrategyByProductId);
+                        if (! empty($ozonPricingStrategyBySku)) {
+                            $availableCount = count(array_filter(
+                                $ozonPricingStrategyBySku,
+                                fn ($info) => ($info['competitor_price'] ?? null) !== null
+                            ));
+                            $this->info("  Индекс цены Ozon: {$availableCount}/".count($ozonPricingStrategyBySku).' товаров с ценой конкурента');
+                        }
+                    } catch (\Throwable $pricingStrategyException) {
+                        $this->warn('  Не удалось получить индекс цены Ozon: '.$pricingStrategyException->getMessage());
+                        $ozonPricingStrategyBySku = [];
+                    }
 
                     // Логируем примеры товаров в акциях для диагностики
                     $promotionExamples = array_filter($productPrices, fn ($p) => $p['is_in_promotion'] ?? false);
@@ -966,6 +983,7 @@ class SyncUnitEconomicsCommand extends Command
                         $productWbLocalization,
                         $wbCommissionsData,
                         $productPriceData, // Ozon: актуальные цены из API
+                        $ozonPricingStrategyBySku[$product->sku] ?? null,
                         $deliveryProfiles[$product->sku] ?? null,
                         $productYandexPrice,
                         $productYandexTariffs,
@@ -1130,6 +1148,94 @@ class SyncUnitEconomicsCommand extends Command
             : [$marketplace];
     }
 
+    private function resolveOzonProductIdsBySku(int $integrationId, array $productPrices): array
+    {
+        $productIdsBySku = [];
+
+        foreach ($productPrices as $sku => $priceData) {
+            $productId = $priceData['product_id'] ?? null;
+            if (is_numeric($productId) && (int) $productId > 0) {
+                $productIdsBySku[(string) $sku] = (int) $productId;
+            }
+        }
+
+        Product::where('integration_id', $integrationId)
+            ->where('marketplace', 'ozon')
+            ->select(['sku', 'marketplace_id', 'ozon_data'])
+            ->chunk(500, function ($products) use (&$productIdsBySku) {
+                foreach ($products as $product) {
+                    if (isset($productIdsBySku[$product->sku])) {
+                        continue;
+                    }
+
+                    $ozonData = is_array($product->ozon_data ?? null) ? $product->ozon_data : [];
+                    $productId = $product->marketplace_id
+                        ?? $ozonData['product_id']
+                        ?? $ozonData['id']
+                        ?? null;
+
+                    if (is_numeric($productId) && (int) $productId > 0) {
+                        $productIdsBySku[$product->sku] = (int) $productId;
+                    }
+                }
+            });
+
+        return $productIdsBySku;
+    }
+
+    private function mapOzonPricingStrategyBySku(array $productIdsBySku, array $pricingStrategyByProductId): array
+    {
+        $bySku = [];
+
+        foreach ($productIdsBySku as $sku => $productId) {
+            $info = $pricingStrategyByProductId[(string) $productId] ?? null;
+            if (is_array($info)) {
+                $bySku[(string) $sku] = $info;
+            }
+        }
+
+        return $bySku;
+    }
+
+    private function buildOzonPriceCompetitivenessData(float $currentPrice, ?array $pricingStrategyData): ?array
+    {
+        if (! is_array($pricingStrategyData) || empty($pricingStrategyData)) {
+            return null;
+        }
+
+        $competitorPrice = $pricingStrategyData['competitor_price']
+            ?? $pricingStrategyData['strategy_product_price']
+            ?? null;
+
+        $competitorPrice = is_numeric($competitorPrice) ? round((float) $competitorPrice, 2) : null;
+        if ($currentPrice <= 0 || $competitorPrice === null || $competitorPrice <= 0) {
+            return array_merge($pricingStrategyData, [
+                'current_price' => round($currentPrice, 2),
+                'competitor_price' => $competitorPrice,
+                'current_price_index' => null,
+                'current_price_is_favorable' => null,
+                'current_price_index_label' => 'Нет данных',
+                'current_price_competitor_delta' => null,
+                'current_price_competitor_delta_percent' => null,
+            ]);
+        }
+
+        $index = round($currentPrice / $competitorPrice, 4);
+        $delta = round($currentPrice - $competitorPrice, 2);
+        $deltaPercent = round(($index - 1) * 100, 2);
+        $isFavorable = $currentPrice <= $competitorPrice;
+
+        return array_merge($pricingStrategyData, [
+            'current_price' => round($currentPrice, 2),
+            'competitor_price' => $competitorPrice,
+            'current_price_index' => $index,
+            'current_price_is_favorable' => $isFavorable,
+            'current_price_index_label' => $isFavorable ? 'Выгодно' : 'Дороже конкурента',
+            'current_price_competitor_delta' => $delta,
+            'current_price_competitor_delta_percent' => $deltaPercent,
+        ]);
+    }
+
     private function buildCalculationData(
         Product $product,
         ?object $inventory,
@@ -1149,6 +1255,7 @@ class SyncUnitEconomicsCommand extends Command
         ?array $wbLocalizationData = null,
         ?array $wbCommissionsData = null,
         ?array $productPriceData = null,
+        ?array $ozonPricingStrategyData = null,
         ?array $ozonDeliveryProfile = null,
         ?array $productYandexPrice = null,
         ?array $productYandexTariffs = null,
@@ -1653,6 +1760,17 @@ class SyncUnitEconomicsCommand extends Command
                 $data['marketing_seller_price'] = $productPriceData['marketing_seller_price']
                     ?? $commissions['marketing_seller_price']
                     ?? null; // Цена с акцией (из API)
+
+                $pricingStrategy = $this->buildOzonPriceCompetitivenessData($price, $ozonPricingStrategyData);
+                if ($pricingStrategy !== null) {
+                    $data['pricing_strategy'] = $pricingStrategy;
+                    $data['competitor_price'] = $pricingStrategy['competitor_price'];
+                    $data['current_price_index'] = $pricingStrategy['current_price_index'];
+                    $data['current_price_is_favorable'] = $pricingStrategy['current_price_is_favorable'];
+                    $data['current_price_index_label'] = $pricingStrategy['current_price_index_label'];
+                    $data['current_price_competitor_delta'] = $pricingStrategy['current_price_competitor_delta'];
+                    $data['current_price_competitor_delta_percent'] = $pricingStrategy['current_price_competitor_delta_percent'];
+                }
                 break;
 
             case 'yandex':

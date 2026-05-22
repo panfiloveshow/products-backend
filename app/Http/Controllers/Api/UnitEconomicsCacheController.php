@@ -1748,6 +1748,28 @@ class UnitEconomicsCacheController extends Controller
             $data['tariff_version'] = $cache->tariff_version;
             $data['tariff_effective_from'] = optional($cache->tariff_effective_from)?->toDateString();
             $data['tariff_source'] = $cache->tariff_source;
+            $pricingStrategy = is_array($marketplaceData['pricing_strategy'] ?? null) ? $marketplaceData['pricing_strategy'] : [];
+            $data['pricing_strategy'] = $pricingStrategy ?: null;
+            $data['competitor_price'] = isset($marketplaceData['competitor_price'])
+                ? round((float) $marketplaceData['competitor_price'], 2)
+                : (isset($pricingStrategy['competitor_price']) ? round((float) $pricingStrategy['competitor_price'], 2) : null);
+            $data['current_price_index'] = isset($marketplaceData['current_price_index'])
+                ? round((float) $marketplaceData['current_price_index'], 4)
+                : (isset($pricingStrategy['current_price_index']) ? round((float) $pricingStrategy['current_price_index'], 4) : null);
+            $data['current_price_is_favorable'] = array_key_exists('current_price_is_favorable', $marketplaceData)
+                ? ($marketplaceData['current_price_is_favorable'] === null ? null : (bool) $marketplaceData['current_price_is_favorable'])
+                : (array_key_exists('current_price_is_favorable', $pricingStrategy)
+                    ? ($pricingStrategy['current_price_is_favorable'] === null ? null : (bool) $pricingStrategy['current_price_is_favorable'])
+                    : null);
+            $data['current_price_index_label'] = $marketplaceData['current_price_index_label']
+                ?? $pricingStrategy['current_price_index_label']
+                ?? null;
+            $data['current_price_competitor_delta'] = isset($marketplaceData['current_price_competitor_delta'])
+                ? round((float) $marketplaceData['current_price_competitor_delta'], 2)
+                : (isset($pricingStrategy['current_price_competitor_delta']) ? round((float) $pricingStrategy['current_price_competitor_delta'], 2) : null);
+            $data['current_price_competitor_delta_percent'] = isset($marketplaceData['current_price_competitor_delta_percent'])
+                ? round((float) $marketplaceData['current_price_competitor_delta_percent'], 2)
+                : (isset($pricingStrategy['current_price_competitor_delta_percent']) ? round((float) $pricingStrategy['current_price_competitor_delta_percent'], 2) : null);
             $activeFixation = is_array($ozonData['active_fixation'] ?? null) ? $ozonData['active_fixation'] : [];
             $orderEconomicsSummary = is_array($marketplaceData['order_economics_summary'] ?? null)
                 ? $marketplaceData['order_economics_summary']

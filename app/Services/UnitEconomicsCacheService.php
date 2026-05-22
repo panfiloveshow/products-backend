@@ -402,6 +402,13 @@ class UnitEconomicsCacheService
         $weightedNonLocalMarkupPercent = null;
         $clustersSummary = [];
         $shippingRoutes = [];
+        $pricingStrategy = [];
+        $competitorPrice = null;
+        $currentPriceIndex = null;
+        $currentPriceIsFavorable = null;
+        $currentPriceIndexLabel = null;
+        $currentPriceCompetitorDelta = null;
+        $currentPriceCompetitorDeltaPercent = null;
 
         if ($marketplace === 'ozon') {
             $activeFixation = is_array($marketplaceData['active_fixation'] ?? null)
@@ -450,6 +457,29 @@ class UnitEconomicsCacheService
                 ? $profileCluster['clusters_summary']
                 : [];
             $existingMarketplaceData = is_array($existingUE?->marketplace_data ?? null) ? $existingUE->marketplace_data : [];
+            $pricingStrategy = is_array($marketplaceData['pricing_strategy'] ?? null)
+                ? $marketplaceData['pricing_strategy']
+                : (is_array($existingMarketplaceData['pricing_strategy'] ?? null) ? $existingMarketplaceData['pricing_strategy'] : []);
+            $competitorPrice = $marketplaceData['competitor_price']
+                ?? $existingMarketplaceData['competitor_price']
+                ?? ($pricingStrategy['competitor_price'] ?? null);
+            $currentPriceIndex = $marketplaceData['current_price_index']
+                ?? $existingMarketplaceData['current_price_index']
+                ?? ($pricingStrategy['current_price_index'] ?? null);
+            $currentPriceIsFavorable = array_key_exists('current_price_is_favorable', $marketplaceData)
+                ? $marketplaceData['current_price_is_favorable']
+                : (array_key_exists('current_price_is_favorable', $existingMarketplaceData)
+                    ? $existingMarketplaceData['current_price_is_favorable']
+                    : ($pricingStrategy['current_price_is_favorable'] ?? null));
+            $currentPriceIndexLabel = $marketplaceData['current_price_index_label']
+                ?? $existingMarketplaceData['current_price_index_label']
+                ?? ($pricingStrategy['current_price_index_label'] ?? null);
+            $currentPriceCompetitorDelta = $marketplaceData['current_price_competitor_delta']
+                ?? $existingMarketplaceData['current_price_competitor_delta']
+                ?? ($pricingStrategy['current_price_competitor_delta'] ?? null);
+            $currentPriceCompetitorDeltaPercent = $marketplaceData['current_price_competitor_delta_percent']
+                ?? $existingMarketplaceData['current_price_competitor_delta_percent']
+                ?? ($pricingStrategy['current_price_competitor_delta_percent'] ?? null);
             $stockProfile = is_array($marketplaceData['stock_profile'] ?? null)
                 ? $marketplaceData['stock_profile']
                 : ($profileStock !== [] ? $profileStock : (is_array($existingMarketplaceData['stock_profile'] ?? null) ? $existingMarketplaceData['stock_profile'] : []));
@@ -829,6 +859,13 @@ class UnitEconomicsCacheService
                 'not_redeemed_count' => $redemption['not_redeemed_count'] ?? $existingMarketplaceData['not_redeemed_count'] ?? null,
                 'in_flight_count' => $redemption['in_flight_count'] ?? $existingMarketplaceData['in_flight_count'] ?? null,
                 'spp_percent' => $sppPercent,
+                'pricing_strategy' => $pricingStrategy,
+                'competitor_price' => $competitorPrice !== null ? round((float) $competitorPrice, 2) : null,
+                'current_price_index' => $currentPriceIndex !== null ? round((float) $currentPriceIndex, 4) : null,
+                'current_price_is_favorable' => $currentPriceIsFavorable !== null ? (bool) $currentPriceIsFavorable : null,
+                'current_price_index_label' => $currentPriceIndexLabel,
+                'current_price_competitor_delta' => $currentPriceCompetitorDelta !== null ? round((float) $currentPriceCompetitorDelta, 2) : null,
+                'current_price_competitor_delta_percent' => $currentPriceCompetitorDeltaPercent !== null ? round((float) $currentPriceCompetitorDeltaPercent, 2) : null,
             ],
         ];
     }

@@ -697,6 +697,11 @@ class OzonMarketplace implements MarketplaceInterface
         return $this->products->getPrices();
     }
 
+    public function getPricingStrategyProductInfo(array $productIds, int $maxRequests = 500, int $sleepMicros = 120000): array
+    {
+        return $this->products->getPricingStrategyProductInfo($productIds, $maxRequests, $sleepMicros);
+    }
+
     // === Export to Marketplace ===
 
     /**
