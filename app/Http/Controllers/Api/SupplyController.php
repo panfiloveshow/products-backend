@@ -9,6 +9,7 @@ use App\Models\Supply;
 use App\Models\SupplyAnalytics;
 use App\Models\SupplyRecommendation;
 use App\Models\SupplySettings;
+use App\Models\WarehouseSlot;
 use App\Services\Supply\LegacySupplyRecommendationService;
 use App\Services\Supply\SupplyService;
 use Illuminate\Http\JsonResponse;
@@ -1958,6 +1959,54 @@ class SupplyController extends Controller
         }, $apiClusters);
     }
 
+
+    /**
+     * Забронировать складской слот для legacy-страницы поставок.
+     *
+     * POST /api/warehouse-slots/{slotId}/book
+     */
+    public function bookWarehouseSlot(Request $request, string $slotId): JsonResponse
+    {
+        $validated = $request->validate([
+            'shipment_id' => 'required|string',
+        ]);
+
+        $slot = WarehouseSlot::query()
+            ->where('id', $slotId)
+            ->orWhere('external_slot_id', $slotId)
+            ->firstOrFail();
+
+        if (! $slot->book((string) $validated['shipment_id'])) {
+            return response()->json([
+                'message' => 'Слот недоступен для бронирования',
+            ], 422);
+        }
+
+        return response()->json([
+            'message' => 'Слот забронирован',
+            'data' => $slot->fresh(),
+        ]);
+    }
+
+    /**
+     * Освободить складской слот для legacy-страницы поставок.
+     *
+     * POST /api/warehouse-slots/{slotId}/release
+     */
+    public function releaseWarehouseSlot(string $slotId): JsonResponse
+    {
+        $slot = WarehouseSlot::query()
+            ->where('id', $slotId)
+            ->orWhere('external_slot_id', $slotId)
+            ->firstOrFail();
+
+        $slot->release();
+
+        return response()->json([
+            'message' => 'Слот освобождён',
+            'data' => $slot->fresh(),
+        ]);
+    }
 
     /**
      * Получить доступные слоты приёмки

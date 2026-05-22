@@ -14,6 +14,9 @@ use App\Services\ProductService;
 use App\Services\SellicoApiService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Storage;
+use Illuminate\Support\Str;
+use Symfony\Component\HttpFoundation\StreamedResponse;
 
 class ProductController extends Controller
 {
@@ -305,6 +308,148 @@ class ProductController extends Controller
         ]);
     }
 
+    public function export(Request $request, string $marketplace): JsonResponse
+    {
+        $validated = $request->validate([
+            'integration_id' => 'required|integer',
+            'warehouse_id' => 'nullable|string',
+            'include_images' => 'nullable|boolean',
+            'include_stocks' => 'nullable|boolean',
+            'include_description' => 'nullable|boolean',
+            'include_attributes' => 'nullable|boolean',
+        ]);
+
+        $marketplace = $this->normalizeMarketplace($marketplace);
+        $resolution = $this->integrationAccessService->ensureAccessibleIntegration(
+            $request,
+            (int) $validated['integration_id'],
+            $marketplace
+        );
+
+        if (! ($resolution['success'] ?? false)) {
+            return response()->json([
+                'success' => false,
+                'message' => $resolution['message'] ?? 'Интеграция недоступна',
+            ], $resolution['status'] ?? 403);
+        }
+
+        $query = Product::query()
+            ->where('integration_id', (int) $validated['integration_id']);
+
+        if ($marketplace === 'yandex_market') {
+            $query->whereIn('marketplace', ['yandex', 'yandex_market']);
+        } else {
+            $query->where('marketplace', $marketplace);
+        }
+
+        $exportId = 'products_'.$marketplace.'_'.(string) Str::uuid();
+        $path = $this->productExportPath($exportId);
+
+        $handle = fopen('php://temp', 'r+');
+        fputcsv($handle, [
+            'id',
+            'sku',
+            'name',
+            'marketplace',
+            'marketplace_id',
+            'barcode',
+            'price',
+            'category',
+            'stock',
+            'created_at',
+            'updated_at',
+        ]);
+
+        foreach ($query->orderBy('id')->cursor() as $product) {
+            fputcsv($handle, [
+                $product->id,
+                $product->sku,
+                $product->name,
+                $product->marketplace,
+                $product->marketplace_id,
+                $product->barcode,
+                $product->price,
+                $product->category,
+                $product->stock ?? $product->current_stock ?? null,
+                optional($product->created_at)->toIso8601String(),
+                optional($product->updated_at)->toIso8601String(),
+            ]);
+        }
+
+        rewind($handle);
+        Storage::disk('local')->put($path, stream_get_contents($handle));
+        fclose($handle);
+        Storage::disk('local')->put($this->productExportMetadataPath($exportId), json_encode([
+            'integration_id' => (int) $validated['integration_id'],
+            'marketplace' => $marketplace,
+            'created_at' => now()->toIso8601String(),
+        ], JSON_UNESCAPED_UNICODE));
+
+        return response()->json([
+            'success' => true,
+            'message' => 'Экспорт товаров готов',
+            'data' => [
+                'export_id' => $exportId,
+                'status' => 'completed',
+                'progress' => 100,
+                'download_url' => url("/api/products/export/{$exportId}/download"),
+            ],
+        ]);
+    }
+
+    public function exportStatus(Request $request, string $exportId): JsonResponse
+    {
+        if (! $this->isValidProductExportId($exportId)) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Некорректный export_id',
+            ], 422);
+        }
+
+        $accessError = $this->authorizeProductExportAccess($request, $exportId);
+        if ($accessError !== null) {
+            return $accessError;
+        }
+
+        $exists = Storage::disk('local')->exists($this->productExportPath($exportId));
+
+        return response()->json([
+            'success' => true,
+            'data' => [
+                'status' => $exists ? 'completed' : 'not_found',
+                'progress' => $exists ? 100 : 0,
+                'download_url' => $exists ? url("/api/products/export/{$exportId}/download") : null,
+            ],
+        ], $exists ? 200 : 404);
+    }
+
+    public function downloadExport(Request $request, string $exportId): StreamedResponse|JsonResponse
+    {
+        if (! $this->isValidProductExportId($exportId)) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Некорректный export_id',
+            ], 422);
+        }
+
+        $accessError = $this->authorizeProductExportAccess($request, $exportId);
+        if ($accessError !== null) {
+            return $accessError;
+        }
+
+        $path = $this->productExportPath($exportId);
+        if (! Storage::disk('local')->exists($path)) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Экспорт не найден',
+            ], 404);
+        }
+
+        return Storage::disk('local')->download($path, $exportId.'.csv', [
+            'Content-Type' => 'text/csv; charset=UTF-8',
+        ]);
+    }
+
     public function syncStatus(Request $request): JsonResponse
     {
         $integrationId = $request->input('integration_id');
@@ -580,4 +725,58 @@ class ProductController extends Controller
             ARRAY_FILTER_USE_BOTH
         );
     }
+
+    private function productExportPath(string $exportId): string
+    {
+        return "exports/products/{$exportId}.csv";
+    }
+
+    private function productExportMetadataPath(string $exportId): string
+    {
+        return "exports/products/{$exportId}.json";
+    }
+
+    private function authorizeProductExportAccess(Request $request, string $exportId): ?JsonResponse
+    {
+        $metaPath = $this->productExportMetadataPath($exportId);
+        if (! Storage::disk('local')->exists($metaPath)) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Экспорт не найден',
+            ], 404);
+        }
+
+        $metadata = json_decode((string) Storage::disk('local')->get($metaPath), true);
+        if (! is_array($metadata) || empty($metadata['integration_id'])) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Экспорт не найден',
+            ], 404);
+        }
+
+        $marketplace = isset($metadata['marketplace'])
+            ? $this->normalizeMarketplace((string) $metadata['marketplace'])
+            : null;
+
+        $resolution = $this->integrationAccessService->ensureAccessibleIntegration(
+            $request,
+            (int) $metadata['integration_id'],
+            $marketplace
+        );
+
+        if (! ($resolution['success'] ?? false)) {
+            return response()->json([
+                'success' => false,
+                'message' => $resolution['message'] ?? 'Интеграция недоступна',
+            ], $resolution['status'] ?? 403);
+        }
+
+        return null;
+    }
+
+    private function isValidProductExportId(string $exportId): bool
+    {
+        return (bool) preg_match('/^products_[a-z_]+_[0-9a-f-]{36}$/', $exportId);
+    }
+
 }

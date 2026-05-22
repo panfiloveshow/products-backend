@@ -2,6 +2,7 @@
 
 namespace App\Services\Marketplace;
 
+use App\Domains\Wildberries\Api\CardListWithPhotoFilter;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 
@@ -120,7 +121,7 @@ class WildberriesService implements MarketplaceInterface
                     'settings' => [
                         'cursor' => $cursor,
                         'filter' => [
-                            'withPhoto' => -1,
+                            'withPhoto' => CardListWithPhotoFilter::allCards(),
                         ],
                     ],
                 ]);
@@ -532,7 +533,7 @@ class WildberriesService implements MarketplaceInterface
                 'settings' => [
                     'cursor' => $cursor,
                     'filter' => [
-                        'withPhoto' => -1,
+                        'withPhoto' => CardListWithPhotoFilter::allCards(),
                     ],
                 ],
             ]);
@@ -807,7 +808,7 @@ class WildberriesService implements MarketplaceInterface
      * POST https://content-api.wildberries.ru/content/v2/get/cards/list
      *
      * Структура запроса согласно документации:
-     * { settings: { cursor: { limit, updatedAt?, nmID? }, filter: { withPhoto: -1 } } }
+     * { settings: { cursor: { limit, updatedAt?, nmID? }, filter: { withPhoto: all-cards value } } }
      * Курсор пагинации в ответе: cursor.updatedAt + cursor.nmID
      */
     private function getAllChrtIdsFromContent(): array
@@ -828,7 +829,7 @@ class WildberriesService implements MarketplaceInterface
             $body = [
                 'settings' => [
                     'cursor' => $cursorPayload,
-                    'filter' => ['withPhoto' => -1],
+                    'filter' => ['withPhoto' => CardListWithPhotoFilter::allCards()],
                 ],
             ];
 

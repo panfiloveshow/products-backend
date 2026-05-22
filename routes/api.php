@@ -8,6 +8,12 @@ use App\Http\Controllers\Api\CostPriceController;
 use App\Http\Controllers\Api\ProductController;
 use App\Http\Controllers\Api\InventoryController;
 use App\Http\Controllers\Api\ShipmentController;
+use App\Http\Controllers\Api\SupplyController;
+use App\Http\Controllers\Api\SupplyDocumentController;
+use App\Http\Controllers\Api\SupplyPackageController;
+use App\Http\Controllers\Api\SupplyPlanController;
+use App\Http\Controllers\Api\SupplyRecommendationController;
+use App\Http\Controllers\Api\PostingController;
 use App\Http\Controllers\Api\PlaceholderController;
 use App\Http\Controllers\Api\UnitEconomicsController;
 use App\Http\Controllers\Api\UnitEconomicsCacheController;
@@ -88,6 +94,13 @@ Route::prefix('products')->middleware('sellico.permission')->group(function () {
     Route::post('/sync/{marketplace}', [ProductController::class, 'sync'])
         ->whereIn('marketplace', ['wildberries', 'ozon', 'yandex', 'yandex_market'])
         ->name('products.sync');
+    Route::post('/export/{marketplace}', [ProductController::class, 'export'])
+        ->whereIn('marketplace', ['wildberries', 'ozon', 'yandex', 'yandex_market'])
+        ->name('products.export');
+    Route::get('/export/{exportId}/status', [ProductController::class, 'exportStatus'])
+        ->name('products.export.status');
+    Route::get('/export/{exportId}/download', [ProductController::class, 'downloadExport'])
+        ->name('products.export.download');
     Route::get('/cost-price', [CostPriceController::class, 'index'])->name('products.cost-price.index');
     Route::post('/cost-price/upload', [CostPriceController::class, 'upload'])->name('products.cost-price.upload');
     Route::post('/cost-price/bulk', [CostPriceController::class, 'bulk'])->name('products.cost-price.bulk');
@@ -164,10 +177,145 @@ Route::prefix('shipments')->middleware('sellico.permission')->group(function () 
 
 /*
 |--------------------------------------------------------------------------
+| Supply Recommendations Module
+|--------------------------------------------------------------------------
+*/
+Route::prefix('supply-recommendations')->middleware('sellico.permission')->group(function () {
+    Route::get('/', [SupplyRecommendationController::class, 'index'])->name('supply-recommendations.index');
+    Route::get('/by-warehouse', [SupplyRecommendationController::class, 'byWarehouse'])->name('supply-recommendations.byWarehouse');
+    Route::get('/stats', [SupplyRecommendationController::class, 'stats'])->name('supply-recommendations.stats');
+    Route::post('/generate', [SupplyRecommendationController::class, 'generate'])->name('supply-recommendations.generate');
+    Route::get('/{id}', [SupplyRecommendationController::class, 'show'])->name('supply-recommendations.show');
+    Route::post('/{id}/apply', [SupplyRecommendationController::class, 'apply'])->name('supply-recommendations.apply');
+    Route::post('/{id}/dismiss', [SupplyRecommendationController::class, 'dismiss'])->name('supply-recommendations.dismiss');
+});
+
+/*
+|--------------------------------------------------------------------------
+| Supply Plans Module
+|--------------------------------------------------------------------------
+*/
+Route::prefix('supply-plans')->middleware('sellico.permission')->group(function () {
+    Route::get('/', [SupplyPlanController::class, 'index'])->name('supply-plans.index');
+    Route::post('/', [SupplyPlanController::class, 'store'])->name('supply-plans.store');
+    Route::get('/{id}', [SupplyPlanController::class, 'show'])->name('supply-plans.show');
+    Route::put('/{id}', [SupplyPlanController::class, 'update'])->name('supply-plans.update');
+    Route::delete('/{id}', [SupplyPlanController::class, 'destroy'])->name('supply-plans.destroy');
+    Route::get('/{id}/calculate', [SupplyPlanController::class, 'calculate'])->name('supply-plans.calculate');
+    Route::post('/{id}/approve', [SupplyPlanController::class, 'approve'])->name('supply-plans.approve');
+    Route::post('/{id}/cancel', [SupplyPlanController::class, 'cancel'])->name('supply-plans.cancel');
+});
+
+/*
+|--------------------------------------------------------------------------
+| Warehouse Slots Module
+|--------------------------------------------------------------------------
+*/
+Route::prefix('warehouse-slots')->middleware('sellico.permission')->group(function () {
+    Route::get('/', [SupplyController::class, 'getSlots'])->name('warehouse-slots.index');
+    Route::get('/warehouses', [AutoSupplyPlanController::class, 'warehouses'])->name('warehouse-slots.warehouses');
+    Route::post('/sync', [SupplyController::class, 'syncSlots'])->name('warehouse-slots.sync');
+    Route::post('/{slotId}/book', [SupplyController::class, 'bookWarehouseSlot'])->name('warehouse-slots.book');
+    Route::post('/{slotId}/release', [SupplyController::class, 'releaseWarehouseSlot'])->name('warehouse-slots.release');
+});
+
+/*
+|--------------------------------------------------------------------------
+| Ozon FBO Supplies Module
+|--------------------------------------------------------------------------
+*/
+Route::prefix('supplies')->middleware('sellico.permission')->group(function () {
+    Route::get('/stats', [SupplyController::class, 'getStats'])->name('supplies.stats');
+    Route::get('/settings', [SupplyController::class, 'getSettings'])->name('supplies.settings.index');
+    Route::put('/settings', [SupplyController::class, 'updateSettings'])->name('supplies.settings.update');
+    Route::get('/analytics', [SupplyController::class, 'getAnalytics'])->name('supplies.analytics');
+    Route::get('/clusters', [SupplyController::class, 'getClusters'])->name('supplies.clusters');
+    Route::get('/clusters/{clusterId}/products', [SupplyController::class, 'getClusterProducts'])->name('supplies.cluster-products');
+    Route::post('/clusters/{clusterId}/add-products', [SupplyController::class, 'addClusterProducts'])->name('supplies.add-cluster-products');
+    Route::post('/clusters/{clusterId}/delivery', [SupplyController::class, 'setClusterDeliveryMethod'])->name('supplies.set-cluster-delivery-method');
+    Route::post('/clusters/{clusterId}/warehouse', [SupplyController::class, 'setClusterWarehouse'])->name('supplies.set-cluster-warehouse');
+    Route::get('/slots', [SupplyController::class, 'getSlots'])->name('supplies.slots');
+    Route::post('/sync-slots', [SupplyController::class, 'syncSlots'])->name('supplies.sync-slots');
+    Route::get('/products-for-supply', [SupplyController::class, 'getProductsForSupply'])->name('supplies.products-for-supply');
+    Route::post('/create-with-slot', [SupplyController::class, 'createWithSlot'])->name('supplies.create-with-slot');
+
+    Route::prefix('recommendations')->group(function () {
+        Route::get('/', [SupplyController::class, 'getRecommendations'])->name('supplies.recommendations.index');
+        Route::get('/map', [SupplyController::class, 'getRecommendationsMap'])->name('supplies.recommendations.map');
+        Route::get('/map-warehouses', [SupplyController::class, 'getRecommendationsMapWarehouses'])->name('supplies.recommendations.map-warehouses');
+        Route::post('/calculate', [SupplyController::class, 'calculateRecommendations'])->name('supplies.recommendations.calculate');
+        Route::get('/by-sku/{sku}', [SupplyController::class, 'getRecommendationsBySku'])->where('sku', '.*')->name('supplies.recommendations.by-sku');
+        Route::get('/summary', [SupplyController::class, 'getRecommendationsSummary'])->name('supplies.recommendations.summary');
+        Route::post('/{id}/accept', [SupplyController::class, 'acceptRecommendation'])->whereNumber('id')->name('supplies.recommendations.accept');
+        Route::post('/{id}/reject', [SupplyController::class, 'rejectRecommendation'])->whereNumber('id')->name('supplies.recommendations.reject');
+        Route::post('/{id}/postpone', [SupplyController::class, 'postponeRecommendation'])->whereNumber('id')->name('supplies.recommendations.postpone');
+    });
+
+    Route::get('/', [SupplyController::class, 'index'])->name('supplies.index');
+    Route::post('/', [SupplyController::class, 'store'])->name('supplies.store');
+    Route::post('/manual', [SupplyController::class, 'storeManual'])->name('supplies.store-manual');
+
+    Route::get('/{id}/packages/summary', [SupplyPackageController::class, 'summary'])->whereNumber('id')->name('supplies.packages.summary');
+    Route::post('/{id}/packages/auto-pack', [SupplyPackageController::class, 'autoPack'])->whereNumber('id')->name('supplies.packages.auto-pack');
+    Route::get('/{id}/packages', [SupplyPackageController::class, 'index'])->whereNumber('id')->name('supplies.packages.index');
+    Route::post('/{id}/packages', [SupplyPackageController::class, 'store'])->whereNumber('id')->name('supplies.packages.store');
+    Route::get('/{id}/packages/{packageId}', [SupplyPackageController::class, 'show'])->whereNumber('id')->whereNumber('packageId')->name('supplies.packages.show');
+    Route::put('/{id}/packages/{packageId}', [SupplyPackageController::class, 'update'])->whereNumber('id')->whereNumber('packageId')->name('supplies.packages.update');
+    Route::delete('/{id}/packages/{packageId}', [SupplyPackageController::class, 'destroy'])->whereNumber('id')->whereNumber('packageId')->name('supplies.packages.destroy');
+    Route::post('/{id}/packages/{packageId}/items', [SupplyPackageController::class, 'addItem'])->whereNumber('id')->whereNumber('packageId')->name('supplies.packages.add-item');
+    Route::delete('/{id}/packages/{packageId}/items/{itemId}', [SupplyPackageController::class, 'removeItem'])->whereNumber('id')->whereNumber('packageId')->whereNumber('itemId')->name('supplies.packages.remove-item');
+    Route::post('/{id}/packages/{packageId}/pack', [SupplyPackageController::class, 'pack'])->whereNumber('id')->whereNumber('packageId')->name('supplies.packages.pack');
+    Route::post('/{id}/packages/{packageId}/label', [SupplyDocumentController::class, 'generatePackageLabel'])->whereNumber('id')->whereNumber('packageId')->name('supplies.documents.package-label');
+
+    Route::get('/{id}/documents', [SupplyDocumentController::class, 'index'])->whereNumber('id')->name('supplies.documents.index');
+    Route::get('/{id}/documents/{documentId}', [SupplyDocumentController::class, 'show'])->whereNumber('id')->whereNumber('documentId')->name('supplies.documents.show');
+    Route::get('/{id}/documents/{documentId}/download', [SupplyDocumentController::class, 'download'])->whereNumber('id')->whereNumber('documentId')->name('supplies.documents.download');
+    Route::post('/{id}/labels/generate-all', [SupplyDocumentController::class, 'generateAllLabels'])->whereNumber('id')->name('supplies.documents.all-labels');
+    Route::post('/{id}/documents/packing-list', [SupplyDocumentController::class, 'generatePackingList'])->whereNumber('id')->name('supplies.documents.packing-list');
+
+    Route::post('/{id}/create-draft', [SupplyController::class, 'createDraft'])->whereNumber('id')->name('supplies.create-draft');
+    Route::get('/{id}/timeslots', [SupplyController::class, 'getTimeslots'])->whereNumber('id')->name('supplies.timeslots');
+    Route::post('/{id}/book-slot', [SupplyController::class, 'bookSlot'])->whereNumber('id')->name('supplies.book-slot');
+    Route::post('/{id}/start-preparing', [SupplyController::class, 'startPreparing'])->whereNumber('id')->name('supplies.start-preparing');
+    Route::post('/{id}/ready-to-ship', [SupplyController::class, 'markReadyToShip'])->whereNumber('id')->name('supplies.ready-to-ship');
+    Route::post('/{id}/ship', [SupplyController::class, 'markShipped'])->whereNumber('id')->name('supplies.ship');
+    Route::post('/{id}/cancel', [SupplyController::class, 'cancel'])->whereNumber('id')->name('supplies.cancel');
+    Route::post('/{id}/sync-status', [SupplyController::class, 'syncStatus'])->whereNumber('id')->name('supplies.sync-status');
+    Route::get('/{id}/events', [SupplyController::class, 'getEvents'])->whereNumber('id')->name('supplies.events');
+    Route::get('/{id}', [SupplyController::class, 'show'])->whereNumber('id')->name('supplies.show');
+});
+
+/*
+|--------------------------------------------------------------------------
+| Ozon FBS Postings Module
+|--------------------------------------------------------------------------
+*/
+Route::prefix('postings')->middleware('sellico.permission')->group(function () {
+    Route::get('/', [PostingController::class, 'index'])->name('postings.index');
+    Route::get('/statistics', [PostingController::class, 'statistics'])->name('postings.statistics');
+    Route::post('/sync', [PostingController::class, 'sync'])->name('postings.sync');
+    Route::post('/bulk-labels', [PostingController::class, 'bulkLabels'])->name('postings.bulk-labels');
+    Route::post('/bulk-ship', [PostingController::class, 'bulkShip'])->name('postings.bulk-ship');
+    Route::post('/act/create', [PostingController::class, 'createAct'])->name('postings.act.create');
+    Route::get('/act/{actId}/download', [PostingController::class, 'downloadAct'])->whereNumber('actId')->name('postings.act.download');
+    Route::get('/cancel-reasons', [PostingController::class, 'cancelReasons'])->name('postings.cancel-reasons');
+    Route::get('/returns', [PostingController::class, 'returns'])->name('postings.returns');
+    Route::get('/{id}', [PostingController::class, 'show'])->name('postings.show');
+    Route::post('/{id}/assemble', [PostingController::class, 'assemble'])->name('postings.assemble');
+    Route::post('/{id}/pack', [PostingController::class, 'pack'])->name('postings.pack');
+    Route::post('/{id}/ship', [PostingController::class, 'ship'])->name('postings.ship');
+    Route::post('/{id}/cancel', [PostingController::class, 'cancel'])->name('postings.cancel');
+    Route::get('/{id}/label', [PostingController::class, 'label'])->name('postings.label');
+});
+
+/*
+|--------------------------------------------------------------------------
 | Unit Economics Module
 |--------------------------------------------------------------------------
 */
 Route::prefix('unit-economics')->middleware('sellico.permission')->group(function () {
+    Route::get('/', [UnitEconomicsController::class, 'index'])
+        ->name('unit-economics.index');
     Route::get('/comparison', [UnitEconomicsCacheController::class, 'comparison'])
         ->name('unit-economics.comparison');
     Route::get('/stats', [UnitEconomicsCacheController::class, 'stats'])

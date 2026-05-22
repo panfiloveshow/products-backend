@@ -2,7 +2,12 @@
 
 namespace Tests\Unit;
 
+use App\Domains\UnitEconomics\DTO\CalculationInput;
+use App\Domains\UnitEconomics\DTO\CostBreakdown;
+use App\Domains\UnitEconomics\DTO\UnitEconomicsResult;
 use App\Domains\UnitEconomics\UnitEconomicsOrchestrator;
+use App\Domains\Wildberries\UnitEconomics\WildberriesUnitEconomicsCalculator;
+use App\Models\Product;
 use App\Services\UnitEconomicsCacheService;
 use PHPUnit\Framework\TestCase;
 
@@ -141,5 +146,80 @@ class UnitEconomicsCacheServiceTest extends TestCase
         $this->assertSame(8.0, $merged[0]['non_local_markup_percent']);
         $this->assertSame(8.0, $merged[0]['effective_markup_percent']);
         $this->assertSame('non_local_markup_applied', $merged[0]['markup_reason']);
+    }
+
+    public function test_cache_conversion_calculates_tax_from_price_when_metadata_has_no_tax_amount(): void
+    {
+        $service = new UnitEconomicsCacheService(
+            $this->createMock(UnitEconomicsOrchestrator::class)
+        );
+
+        $result = new UnitEconomicsResult(
+            sku: 'sku-tax',
+            marketplace: 'yandex_market',
+            fulfillmentType: 'FBS',
+            price: 1000.0,
+            costs: new CostBreakdown(
+                commission: 100.0,
+                acquiring: 10.0,
+                logistics: 50.0,
+                deliveryCost: 50.0,
+                costPrice: 300.0,
+            ),
+            revenue: 1000.0,
+            totalCosts: 460.0,
+            netProfit: 540.0,
+            marginPercent: 54.0,
+            marginAbsolute: 540.0,
+            commissionPercent: 10.0,
+            acquiringPercent: 1.0,
+            isProfitable: true,
+            hasCostPrice: true,
+            productName: 'Tax Product',
+        );
+
+        $method = new \ReflectionMethod(UnitEconomicsCacheService::class, 'convertResultToCacheData');
+        $method->setAccessible(true);
+
+        $cacheData = $method->invoke(
+            $service,
+            new Product(['id' => 'product-tax', 'name' => 'Tax Product']),
+            null,
+            $result,
+            [
+                '_extra' => [
+                    'tax_percent' => 6,
+                    'drr_percent' => 0,
+                    'our_share_percent' => 0,
+                    'vat_percent' => 0,
+                ],
+            ]
+        );
+
+        $this->assertSame(60.0, $cacheData['tax_amount']);
+    }
+
+    public function test_wildberries_calculator_calculates_tax_from_price_not_settlement_profit(): void
+    {
+        $calculator = new WildberriesUnitEconomicsCalculator();
+
+        $result = $calculator->calculate(CalculationInput::fromArray([
+            'sku' => 'wb-tax',
+            'integration_id' => 1,
+            'marketplace' => 'wildberries',
+            'fulfillment_type' => 'FBO',
+            'price' => 1000,
+            'cost_price' => 300,
+            'tax_percent' => 6,
+            'commission_rate' => 15,
+            'length' => 10,
+            'width' => 10,
+            'height' => 10,
+            'redemption_rate' => 100,
+            'storage_cost' => 0,
+            'acquiring_percent' => 0,
+        ]));
+
+        $this->assertSame(60.0, $result->metadata['tax_amount']);
     }
 }

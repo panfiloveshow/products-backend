@@ -43,7 +43,7 @@ class ProductsApi implements ProductsApiInterface
                     'limit' => $limit,
                 ],
                 'filter' => [
-                    'withPhoto' => -1,
+                    'withPhoto' => CardListWithPhotoFilter::allCards(),
                 ],
             ],
         ];
@@ -112,7 +112,7 @@ class ProductsApi implements ProductsApiInterface
                         'limit' => 100,
                     ],
                     'filter' => [
-                        'withPhoto' => -1,
+                        'withPhoto' => CardListWithPhotoFilter::allCards(),
                     ],
                 ],
             ];
@@ -162,7 +162,7 @@ class ProductsApi implements ProductsApiInterface
             'settings' => [
                 'cursor' => ['limit' => 1],
                 'filter' => [
-                    'withPhoto' => -1,
+                    'withPhoto' => CardListWithPhotoFilter::allCards(),
                     'textSearch' => $sku,
                 ],
             ],

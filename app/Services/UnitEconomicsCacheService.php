@@ -857,7 +857,7 @@ class UnitEconomicsCacheService
         $metaDrrAmount = array_key_exists('drr_amount', $result->metadata) ? (float) $result->metadata['drr_amount'] : null;
         $metaTaxAmount = array_key_exists('tax_amount', $result->metadata) ? (float) $result->metadata['tax_amount'] : null;
         $metaVatAmount = array_key_exists('vat_amount', $result->metadata) ? (float) $result->metadata['vat_amount'] : null;
-        $taxAmount = $metaTaxAmount ?? ($result->netProfit > 0 ? $result->netProfit * ($taxPercent / 100) : 0);
+        $taxAmount = $metaTaxAmount ?? ($price * ($taxPercent / 100));
         $effectiveDrrAmount = $metaDrrAmount ?? $drrAmount;
         $effectiveTaxAmount = $metaTaxAmount ?? $taxAmount;
         $effectiveVatAmount = $metaVatAmount ?? $vatAmount;

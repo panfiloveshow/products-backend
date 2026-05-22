@@ -127,10 +127,9 @@ class WildberriesUnitEconomicsCalculator implements UnitEconomicsCalculatorInter
         // ДРР, ₽ = цена × ДРР%
         $drrAmount = $price * ($drrPercent / 100);
         
-        // Налог, ₽ = (на р/с - себестоимость - ДРР) × налог%
-        // Налог считается от прибыли до налога
-        $profitBeforeTax = $toSettlementAccount - $costPrice - $drrAmount;
-        $taxAmount = max(0, $profitBeforeTax * ($taxPercent / 100));
+        // Налог, ₽ = действующая цена × налог%.
+        // База налога едина для WB/Ozon/Yandex и не зависит от суммы к перечислению на р/с.
+        $taxAmount = $price * ($taxPercent / 100);
         
         // Чистая прибыль = на р/с - себестоимость - ДРР - налог
         $netProfit = $toSettlementAccount - $costPrice - $drrAmount - $taxAmount;

@@ -580,7 +580,7 @@ class UnitEconomicsCacheController extends Controller
         $sheet = $spreadsheet->getActiveSheet();
         $sheet->setTitle('Юнит-экономика');
 
-        // ── Определения колонок (A-AG, 33 колонки) ──
+        // ── Определения колонок (A-AE, 31 колонка) ──
         $columns = [
             'A'  => ['header' => 'Артикул',             'width' => 15, 'field' => 'sku',                      'format' => '@'],
             'B'  => ['header' => 'Наименование',        'width' => 40, 'field' => 'product_name',             'format' => '@'],
@@ -609,15 +609,13 @@ class UnitEconomicsCacheController extends Controller
             'Y'  => ['header' => '% выкупа',            'width' => 10, 'field' => 'redemption_rate',          'format' => '0.00"%"'],
             'Z'  => ['header' => 'Точность',            'width' => 11, 'field' => 'calculation_confidence',   'format' => '@'],
             'AA' => ['header' => 'Итого затраты, ₽',    'width' => 14, 'field' => 'total_costs',              'format' => '#,##0.00 "₽"'],
-            'AB' => ['header' => 'Прибыль min, ₽',      'width' => 13, 'field' => 'profit_min',               'format' => '#,##0.00 "₽"'],
-            'AC' => ['header' => 'Прибыль, ₽',          'width' => 12, 'field' => 'net_profit',               'format' => '#,##0.00 "₽"'],
-            'AD' => ['header' => 'Прибыль max, ₽',      'width' => 13, 'field' => 'profit_max',               'format' => '#,##0.00 "₽"'],
-            'AE' => ['header' => 'Маржа, %',            'width' => 10, 'field' => 'margin_percent',           'format' => '0.00"%"'],
-            'AF' => ['header' => 'ROI, %',              'width' => 10, 'field' => 'roi_percent',              'format' => '0.00"%"'],
-            'AG' => ['header' => 'На р/с, ₽',           'width' => 12, 'field' => 'to_settlement_account',    'format' => '#,##0.00 "₽"'],
+            'AB' => ['header' => 'Прибыль',             'width' => 12, 'field' => 'net_profit',               'format' => '#,##0.00 "₽"'],
+            'AC' => ['header' => 'Маржа, %',            'width' => 10, 'field' => 'margin_percent',           'format' => '0.00"%"'],
+            'AD' => ['header' => 'ROI, %',              'width' => 10, 'field' => 'roi_percent',              'format' => '0.00"%"'],
+            'AE' => ['header' => 'На р/с, ₽',           'width' => 12, 'field' => 'to_settlement_account',    'format' => '#,##0.00 "₽"'],
         ];
 
-        $lastCol = 'AG';
+        $lastCol = 'AE';
 
         // ── Ширины колонок ──
         foreach ($columns as $col => $def) {
@@ -629,8 +627,6 @@ class UnitEconomicsCacheController extends Controller
             ['I', 'J'],   // Комиссия (% + ₽)
             ['P', 'T'],   // Проценты прочих сборов
             ['V', 'X'],   // Деталь локальности и наценки
-            ['AB', 'AB'], // Прибыль min
-            ['AD', 'AD'], // Прибыль max
         ];
         foreach ($collapsibleGroups as [$from, $to]) {
             $fromIndex = \PhpOffice\PhpSpreadsheet\Cell\Coordinate::columnIndexFromString($from);
@@ -757,26 +753,18 @@ class UnitEconomicsCacheController extends Controller
                         . "+(C{$currentRow}*T{$currentRow}/100)"
                     );
                 } elseif ($col === 'AB') {
-                    // AB: Прибыль min — сохраняем сценарный спред относительно базовой прибыли.
-                    $delta = round((float) ($item['profit_min'] ?? 0) - (float) ($item['net_profit'] ?? 0), 2);
-                    $sheet->setCellValue("AB{$currentRow}", "=AC{$currentRow}" . ($delta >= 0 ? '+' : '') . $delta);
+                    // AB: Прибыль — ключевая формула, меняется от цены/расходов/себестоимости.
+                    $sheet->setCellValue("AB{$currentRow}", "=AE{$currentRow}-D{$currentRow}");
                 } elseif ($col === 'AC') {
-                    // AC: Прибыль — ключевая формула, меняется от цены/расходов/себестоимости.
-                    $sheet->setCellValue("AC{$currentRow}", "=AG{$currentRow}-D{$currentRow}");
+                    // AC: Маржа — Excel-формула =IF(C>0, AB/C*100, 0)
+                    $sheet->setCellValue("AC{$currentRow}", "=IF(C{$currentRow}>0,AB{$currentRow}/C{$currentRow}*100,0)");
                 } elseif ($col === 'AD') {
-                    // AD: Прибыль max — сохраняем сценарный спред относительно базовой прибыли.
-                    $delta = round((float) ($item['profit_max'] ?? 0) - (float) ($item['net_profit'] ?? 0), 2);
-                    $sheet->setCellValue("AD{$currentRow}", "=AC{$currentRow}" . ($delta >= 0 ? '+' : '') . $delta);
+                    // AD: ROI — Excel-формула =IF(D>0, AB/D*100, 0)
+                    $sheet->setCellValue("AD{$currentRow}", "=IF(D{$currentRow}>0,AB{$currentRow}/D{$currentRow}*100,0)");
                 } elseif ($col === 'AE') {
-                    // AE: Маржа — Excel-формула =IF(C>0, AC/C*100, 0)
-                    $sheet->setCellValue("AE{$currentRow}", "=IF(C{$currentRow}>0,AC{$currentRow}/C{$currentRow}*100,0)");
-                } elseif ($col === 'AF') {
-                    // AF: ROI — Excel-формула =IF(D>0, AC/D*100, 0)
-                    $sheet->setCellValue("AF{$currentRow}", "=IF(D{$currentRow}>0,AC{$currentRow}/D{$currentRow}*100,0)");
-                } elseif ($col === 'AG') {
-                    // AG: На р/с — цена минус маркетплейс/процентные расходы без себестоимости.
+                    // AE: На р/с — цена минус маркетплейс/процентные расходы без себестоимости.
                     $sheet->setCellValue(
-                        "AG{$currentRow}",
+                        "AE{$currentRow}",
                         "=C{$currentRow}-J{$currentRow}-M{$currentRow}-N{$currentRow}-O{$currentRow}"
                         . "-(C{$currentRow}*P{$currentRow}/100)-(C{$currentRow}*Q{$currentRow}/100)"
                         . "-(C{$currentRow}*R{$currentRow}/100)-(C{$currentRow}*S{$currentRow}/100)"
@@ -862,18 +850,18 @@ class UnitEconomicsCacheController extends Controller
                 }
             }
 
-            // Красный цвет для отрицательной прибыли (AC)
+            // Красный цвет для отрицательной прибыли (AB)
             $netProfit = (float) ($item['net_profit'] ?? 0);
             if ($netProfit < 0) {
-                $sheet->getStyle("AC{$currentRow}")->applyFromArray([
+                $sheet->getStyle("AB{$currentRow}")->applyFromArray([
                     'font' => ['color' => ['rgb' => 'dc2626']],
                 ]);
             }
 
-            // Красный цвет для отрицательной маржи (AE)
+            // Красный цвет для отрицательной маржи (AC)
             $marginPercent = (float) ($item['margin_percent'] ?? 0);
             if ($marginPercent < 0) {
-                $sheet->getStyle("AE{$currentRow}")->applyFromArray([
+                $sheet->getStyle("AC{$currentRow}")->applyFromArray([
                     'font' => ['color' => ['rgb' => 'dc2626']],
                 ]);
             }
@@ -897,7 +885,7 @@ class UnitEconomicsCacheController extends Controller
         $sheet->setCellValue("A{$summaryRow}", 'ИТОГО');
 
         // SUM формулы для денежных колонок и количеств
-        $sumCols = ['C', 'F', 'G', 'J', 'K', 'L', 'M', 'N', 'O', 'AA', 'AB', 'AC', 'AD', 'AG'];
+        $sumCols = ['C', 'F', 'G', 'J', 'K', 'L', 'M', 'N', 'O', 'AA', 'AB', 'AE'];
         foreach ($sumCols as $col) {
             if ($dataEndRow >= $dataStartRow) {
                 $sheet->setCellValue("{$col}{$summaryRow}", "=SUM({$col}{$dataStartRow}:{$col}{$dataEndRow})");
@@ -907,7 +895,7 @@ class UnitEconomicsCacheController extends Controller
         }
 
         // AVERAGE формулы для процентных/относительных колонок
-        $avgCols = ['E', 'H', 'I', 'P', 'Q', 'R', 'S', 'T', 'V', 'W', 'Y', 'AE', 'AF'];
+        $avgCols = ['E', 'H', 'I', 'P', 'Q', 'R', 'S', 'T', 'V', 'W', 'Y', 'AC', 'AD'];
         foreach ($avgCols as $col) {
             if ($dataEndRow >= $dataStartRow) {
                 $sheet->setCellValue("{$col}{$summaryRow}", "=AVERAGE({$col}{$dataStartRow}:{$col}{$dataEndRow})");
