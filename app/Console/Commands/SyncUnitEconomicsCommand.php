@@ -343,15 +343,42 @@ class SyncUnitEconomicsCommand extends Command
                     $this->info('  Цены: '.count($productPrices).' товаров, '.$promotionCount.' в акциях');
 
                     try {
+                        $ozonPricingStrategyBySku = $this->mapOzonPriceIndexesBySku($productPrices);
                         $productIdsBySku = $this->resolveOzonProductIdsBySku($integrationId, $productPrices);
-                        $pricingStrategyByProductId = $ozonService->getPricingStrategyProductInfo(array_values($productIdsBySku));
-                        $ozonPricingStrategyBySku = $this->mapOzonPricingStrategyBySku($productIdsBySku, $pricingStrategyByProductId);
+                        $missingProductIdsBySku = array_filter(
+                            $productIdsBySku,
+                            fn ($productId, $sku) => ! isset($ozonPricingStrategyBySku[(string) $sku])
+                                || (
+                                    (float) ($ozonPricingStrategyBySku[(string) $sku]['competitor_price'] ?? 0) <= 0
+                                    && ($ozonPricingStrategyBySku[(string) $sku]['current_price_index'] ?? null) === null
+                                ),
+                            ARRAY_FILTER_USE_BOTH
+                        );
+
+                        if (! empty($missingProductIdsBySku)) {
+                            $pricingStrategyByProductId = $ozonService->getPricingStrategyProductInfo(array_values($missingProductIdsBySku));
+                            foreach ($this->mapOzonPricingStrategyBySku($missingProductIdsBySku, $pricingStrategyByProductId) as $sku => $fallbackInfo) {
+                                if (! isset($ozonPricingStrategyBySku[$sku])
+                                    || (
+                                        (float) ($ozonPricingStrategyBySku[$sku]['competitor_price'] ?? 0) <= 0
+                                        && ($ozonPricingStrategyBySku[$sku]['current_price_index'] ?? null) === null
+                                    )
+                                ) {
+                                    $ozonPricingStrategyBySku[$sku] = $fallbackInfo;
+                                }
+                            }
+                        }
+
                         if (! empty($ozonPricingStrategyBySku)) {
                             $availableCount = count(array_filter(
                                 $ozonPricingStrategyBySku,
                                 fn ($info) => (float) ($info['competitor_price'] ?? 0) > 0
                             ));
-                            $this->info("  Индекс цены Ozon: {$availableCount}/".count($ozonPricingStrategyBySku).' товаров с ценой конкурента');
+                            $fromPriceIndexes = count(array_filter(
+                                $ozonPricingStrategyBySku,
+                                fn ($info) => ($info['source'] ?? null) === 'product_info_prices'
+                            ));
+                            $this->info("  Индекс цены Ozon: {$availableCount}/".count($ozonPricingStrategyBySku)." товаров с ценой конкурента ({$fromPriceIndexes} из product/info/prices)");
                         }
                     } catch (\Throwable $pricingStrategyException) {
                         $this->warn('  Не удалось получить индекс цены Ozon: '.$pricingStrategyException->getMessage());
@@ -1197,6 +1224,47 @@ class SyncUnitEconomicsCommand extends Command
         return $bySku;
     }
 
+    private function mapOzonPriceIndexesBySku(array $productPrices): array
+    {
+        $bySku = [];
+
+        foreach ($productPrices as $sku => $priceData) {
+            if (! is_array($priceData)) {
+                continue;
+            }
+
+            $priceIndexes = is_array($priceData['price_indexes'] ?? null) ? $priceData['price_indexes'] : [];
+            if (empty($priceIndexes)) {
+                continue;
+            }
+
+            $competitorPrice = $this->normalizeOzonMoney($priceData['competitor_price'] ?? null);
+            $priceIndexValue = is_numeric($priceData['price_index_value'] ?? null)
+                ? round((float) $priceData['price_index_value'], 4)
+                : null;
+            $colorIndex = $this->normalizeOzonPriceIndexColor($priceData['price_index_color'] ?? ($priceIndexes['color_index'] ?? null));
+            $label = $this->ozonPriceIndexLabel($colorIndex);
+
+            $bySku[(string) $sku] = [
+                'product_id' => $priceData['product_id'] ?? null,
+                'source' => 'product_info_prices',
+                'status' => $colorIndex ?: 'WITHOUT_INDEX',
+                'competitor_price' => $competitorPrice,
+                'strategy_product_price' => $competitorPrice,
+                'price_index_value' => $priceIndexValue,
+                'price_index_color' => $colorIndex,
+                'price_index_label' => $label,
+                'current_price_index' => $priceIndexValue,
+                'current_price_is_favorable' => $this->isOzonPriceIndexFavorable($colorIndex),
+                'current_price_index_label' => $label,
+                'competitor_price_source' => $priceData['competitor_price_source'] ?? ($priceIndexes['selected_index_source'] ?? null),
+                'price_indexes' => $priceIndexes,
+            ];
+        }
+
+        return $bySku;
+    }
+
     private function buildOzonPriceCompetitivenessData(float $currentPrice, ?array $pricingStrategyData): ?array
     {
         if (! is_array($pricingStrategyData) || empty($pricingStrategyData)) {
@@ -1208,17 +1276,47 @@ class SyncUnitEconomicsCommand extends Command
             ?? null;
 
         $competitorPrice = is_numeric($competitorPrice) ? round((float) $competitorPrice, 2) : null;
-        if ($currentPrice <= 0 || $competitorPrice === null || $competitorPrice <= 0) {
-            $label = ($pricingStrategyData['is_enabled'] ?? null) === false
-                || ($pricingStrategyData['status'] ?? null) === 'disabled'
-                    ? 'Не в стратегии'
-                    : 'Нет цены конкурента';
+        $providedIndex = is_numeric($pricingStrategyData['current_price_index'] ?? $pricingStrategyData['price_index_value'] ?? null)
+            ? round((float) ($pricingStrategyData['current_price_index'] ?? $pricingStrategyData['price_index_value']), 4)
+            : null;
+        $colorIndex = $this->normalizeOzonPriceIndexColor($pricingStrategyData['price_index_color'] ?? $pricingStrategyData['status'] ?? null);
+        $providedLabel = $pricingStrategyData['current_price_index_label']
+            ?? $pricingStrategyData['price_index_label']
+            ?? $this->ozonPriceIndexLabel($colorIndex);
+        $providedFavorable = array_key_exists('current_price_is_favorable', $pricingStrategyData)
+            ? $pricingStrategyData['current_price_is_favorable']
+            : $this->isOzonPriceIndexFavorable($colorIndex);
+
+        if ($providedIndex !== null && ($pricingStrategyData['source'] ?? null) === 'product_info_prices') {
+            $delta = $competitorPrice !== null && $competitorPrice > 0
+                ? round($currentPrice - $competitorPrice, 2)
+                : null;
+            $deltaPercent = $competitorPrice !== null && $competitorPrice > 0
+                ? round((($currentPrice / $competitorPrice) - 1) * 100, 2)
+                : null;
 
             return array_merge($pricingStrategyData, [
                 'current_price' => round($currentPrice, 2),
                 'competitor_price' => $competitorPrice,
-                'current_price_index' => null,
-                'current_price_is_favorable' => null,
+                'current_price_index' => $providedIndex,
+                'current_price_is_favorable' => $providedFavorable,
+                'current_price_index_label' => $providedLabel,
+                'current_price_competitor_delta' => $delta,
+                'current_price_competitor_delta_percent' => $deltaPercent,
+            ]);
+        }
+
+        if ($currentPrice <= 0 || $competitorPrice === null || $competitorPrice <= 0) {
+            $label = ($pricingStrategyData['is_enabled'] ?? null) === false
+                || ($pricingStrategyData['status'] ?? null) === 'disabled'
+                    ? 'Не в стратегии'
+                    : ($providedLabel ?? 'Нет цены конкурента');
+
+            return array_merge($pricingStrategyData, [
+                'current_price' => round($currentPrice, 2),
+                'competitor_price' => $competitorPrice,
+                'current_price_index' => $providedIndex,
+                'current_price_is_favorable' => $providedFavorable,
                 'current_price_index_label' => $label,
                 'current_price_competitor_delta' => null,
                 'current_price_competitor_delta_percent' => null,
@@ -1239,6 +1337,56 @@ class SyncUnitEconomicsCommand extends Command
             'current_price_competitor_delta' => $delta,
             'current_price_competitor_delta_percent' => $deltaPercent,
         ]);
+    }
+
+    private function normalizeOzonMoney(mixed $value): ?float
+    {
+        if ($value === null || $value === '') {
+            return null;
+        }
+
+        if (is_string($value)) {
+            $value = str_replace(',', '.', $value);
+        }
+
+        return is_numeric($value) ? round((float) $value, 2) : null;
+    }
+
+    private function normalizeOzonPriceIndexColor(mixed $color): ?string
+    {
+        if (! is_string($color) || trim($color) === '') {
+            return null;
+        }
+
+        $color = strtoupper(trim($color));
+        return match ($color) {
+            'COLOR_INDEX_GREEN' => 'GREEN',
+            'COLOR_INDEX_YELLOW' => 'YELLOW',
+            'COLOR_INDEX_RED' => 'RED',
+            'COLOR_INDEX_WITHOUT_INDEX' => 'WITHOUT_INDEX',
+            default => $color,
+        };
+    }
+
+    private function ozonPriceIndexLabel(?string $color): ?string
+    {
+        return match ($this->normalizeOzonPriceIndexColor($color)) {
+            'GREEN' => 'Выгодный',
+            'YELLOW' => 'Средний индекс',
+            'RED' => 'Невыгодный',
+            'SUPER' => 'Супервыгодный',
+            'WITHOUT_INDEX' => 'Нет индекса',
+            default => null,
+        };
+    }
+
+    private function isOzonPriceIndexFavorable(?string $color): ?bool
+    {
+        return match ($this->normalizeOzonPriceIndexColor($color)) {
+            'GREEN', 'SUPER' => true,
+            'YELLOW', 'RED' => false,
+            default => null,
+        };
     }
 
     private function buildCalculationData(

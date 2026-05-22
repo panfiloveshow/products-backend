@@ -291,6 +291,7 @@ class ProductsApi implements ProductsApiInterface
                 $price = (float) ($priceData['price'] ?? 0);
                 $oldPrice = (float) ($priceData['old_price'] ?? 0);
                 $marketingSellerPrice = (float) ($priceData['marketing_seller_price'] ?? 0);
+                $priceIndexes = $this->normalizePriceIndexes($item['price_indexes'] ?? []);
                 
                 // Актуальная цена = marketing_seller_price если есть акция, иначе price
                 // marketing_seller_price — это цена с учётом всех скидок и акций
@@ -313,6 +314,12 @@ class ProductsApi implements ProductsApiInterface
                     'actual_price' => $actualPrice,              // Действующая цена (с учётом акций)
                     'is_in_promotion' => $isInPromotion,         // Участвует в акции
                     'promotion_discount' => $promotionDiscount,  // Процент скидки
+                    'price_indexes' => $priceIndexes,
+                    'price_index_color' => $priceIndexes['color_index'] ?? null,
+                    'price_index_label' => $this->priceIndexLabel($priceIndexes['color_index'] ?? null),
+                    'price_index_value' => $priceIndexes['selected_index_data']['price_index_value'] ?? null,
+                    'competitor_price' => $priceIndexes['selected_index_data']['min_price'] ?? null,
+                    'competitor_price_source' => $priceIndexes['selected_index_source'] ?? null,
                     // Дополнительные данные из v5 API
                     'commissions' => $item['commissions'] ?? [],
                     'volume_weight' => (float) ($item['volume_weight'] ?? 0),
@@ -322,6 +329,73 @@ class ProductsApi implements ProductsApiInterface
         } while (!empty($items) && !empty($cursor));
 
         return $allPrices;
+    }
+
+    private function normalizePriceIndexes(mixed $priceIndexes): array
+    {
+        if (! is_array($priceIndexes) || empty($priceIndexes)) {
+            return [];
+        }
+
+        $normalized = [
+            'color_index' => $this->normalizePriceIndexColor($priceIndexes['color_index'] ?? $priceIndexes['price_index'] ?? null),
+            'ozon_index_data' => $this->normalizePriceIndexData($priceIndexes['ozon_index_data'] ?? $priceIndexes['ozon'] ?? []),
+            'external_index_data' => $this->normalizePriceIndexData($priceIndexes['external_index_data'] ?? $priceIndexes['external'] ?? []),
+            'self_marketplaces_index_data' => $this->normalizePriceIndexData($priceIndexes['self_marketplaces_index_data'] ?? $priceIndexes['self_marketplaces'] ?? []),
+        ];
+
+        foreach (['ozon_index_data', 'external_index_data', 'self_marketplaces_index_data'] as $source) {
+            if (($normalized[$source]['min_price'] ?? 0) > 0 || ($normalized[$source]['price_index_value'] ?? 0) > 0) {
+                $normalized['selected_index_source'] = $source;
+                $normalized['selected_index_data'] = $normalized[$source];
+                break;
+            }
+        }
+
+        return $normalized;
+    }
+
+    private function normalizePriceIndexData(mixed $data): array
+    {
+        if (! is_array($data)) {
+            $data = [];
+        }
+
+        return [
+            'min_price' => $this->normalizeMoney($data['min_price'] ?? $data['minimal_price'] ?? null) ?? 0.0,
+            'min_price_currency' => $data['min_price_currency'] ?? $data['minimal_price_currency'] ?? null,
+            'price_index_value' => is_numeric($data['price_index_value'] ?? null)
+                ? round((float) $data['price_index_value'], 4)
+                : 0.0,
+        ];
+    }
+
+    private function normalizePriceIndexColor(mixed $color): ?string
+    {
+        if (! is_string($color) || trim($color) === '') {
+            return null;
+        }
+
+        $color = strtoupper(trim($color));
+        return match ($color) {
+            'COLOR_INDEX_GREEN' => 'GREEN',
+            'COLOR_INDEX_YELLOW' => 'YELLOW',
+            'COLOR_INDEX_RED' => 'RED',
+            'COLOR_INDEX_WITHOUT_INDEX' => 'WITHOUT_INDEX',
+            default => $color,
+        };
+    }
+
+    private function priceIndexLabel(?string $color): ?string
+    {
+        return match ($this->normalizePriceIndexColor($color)) {
+            'GREEN' => 'Выгодный',
+            'YELLOW' => 'Средний индекс',
+            'RED' => 'Невыгодный',
+            'SUPER' => 'Супервыгодный',
+            'WITHOUT_INDEX' => 'Нет индекса',
+            default => null,
+        };
     }
 
     /**

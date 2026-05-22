@@ -37,6 +37,26 @@ class OzonPriceCompetitivenessDataTest extends TestCase
         $this->assertSame('Выгодно', $result['current_price_index_label']);
     }
 
+    public function test_product_info_price_indexes_use_ozon_index_value_and_color_label(): void
+    {
+        $result = $this->buildOzonPriceCompetitivenessData(1600, [
+            'product_id' => 2990459081,
+            'source' => 'product_info_prices',
+            'competitor_price' => 689,
+            'price_index_value' => 1.35,
+            'price_index_color' => 'RED',
+            'price_index_label' => 'Невыгодный',
+            'current_price_index' => 1.35,
+            'current_price_is_favorable' => false,
+            'current_price_index_label' => 'Невыгодный',
+        ]);
+
+        $this->assertSame(1.35, $result['current_price_index']);
+        $this->assertFalse($result['current_price_is_favorable']);
+        $this->assertSame('Невыгодный', $result['current_price_index_label']);
+        $this->assertSame(911.0, $result['current_price_competitor_delta']);
+    }
+
     private function buildOzonPriceCompetitivenessData(float $currentPrice, array $pricingStrategyData): array
     {
         $command = new SyncUnitEconomicsCommand;

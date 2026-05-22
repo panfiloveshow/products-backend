@@ -553,6 +553,13 @@ class OzonMarketplace implements MarketplaceInterface
                 'actual_price' => $actualPrice,                  // Действующая цена (с учётом акций)
                 'marketing_seller_price' => $marketingSellerPrice, // Цена с акцией из API
                 'old_price' => $oldPrice,                        // Зачёркнутая цена
+                'min_price' => $priceData['min_price'] ?? null,
+                'price_indexes' => $priceData['price_indexes'] ?? [],
+                'price_index_color' => $priceData['price_index_color'] ?? null,
+                'price_index_label' => $priceData['price_index_label'] ?? null,
+                'price_index_value' => $priceData['price_index_value'] ?? null,
+                'competitor_price' => $priceData['competitor_price'] ?? null,
+                'competitor_price_source' => $priceData['competitor_price_source'] ?? null,
                 'is_in_promotion' => $isInPromotion,             // Участвует в акции
                 'promotion_discount' => $promotionDiscount,      // Процент скидки
                 'visibility' => $item['is_discounted'] ?? false,

@@ -9,6 +9,58 @@ use Tests\TestCase;
 
 class OzonProductsApiTest extends TestCase
 {
+    public function test_get_prices_normalizes_price_indexes_from_product_info_prices(): void
+    {
+        Http::fake([
+            'https://api-seller.ozon.ru/v5/product/info/prices' => Http::response([
+                'items' => [
+                    [
+                        'offer_id' => '3-02/4011',
+                        'product_id' => 2990459081,
+                        'volume_weight' => 0.4,
+                        'price' => [
+                            'price' => 3000,
+                            'old_price' => 6000,
+                            'min_price' => 3000,
+                            'marketing_seller_price' => 1600,
+                        ],
+                        'price_indexes' => [
+                            'external_index_data' => [
+                                'min_price' => 652,
+                                'min_price_currency' => 'RUB',
+                                'price_index_value' => 1.39,
+                            ],
+                            'ozon_index_data' => [
+                                'min_price' => 689,
+                                'min_price_currency' => 'RUB',
+                                'price_index_value' => 1.35,
+                            ],
+                            'color_index' => 'RED',
+                            'self_marketplaces_index_data' => [
+                                'min_price' => 697,
+                                'min_price_currency' => 'RUB',
+                                'price_index_value' => 1.34,
+                            ],
+                        ],
+                    ],
+                ],
+                'cursor' => '',
+            ]),
+        ]);
+
+        $api = new ProductsApi(new OzonClient('client', 'key'));
+
+        $result = $api->getPrices();
+
+        $this->assertSame(1600.0, $result['3-02/4011']['actual_price']);
+        $this->assertSame('RED', $result['3-02/4011']['price_index_color']);
+        $this->assertSame('Невыгодный', $result['3-02/4011']['price_index_label']);
+        $this->assertSame(1.35, $result['3-02/4011']['price_index_value']);
+        $this->assertSame(689.0, $result['3-02/4011']['competitor_price']);
+        $this->assertSame('ozon_index_data', $result['3-02/4011']['competitor_price_source']);
+        $this->assertSame(652.0, $result['3-02/4011']['price_indexes']['external_index_data']['min_price']);
+    }
+
     public function test_get_pricing_strategy_product_info_normalizes_competitor_price(): void
     {
         Http::fake([
