@@ -1049,7 +1049,8 @@ class UnitEconomicsCacheController extends Controller
         );
 
         $date = now()->format('Y-m-d');
-        $filename = "unit-economics-{$marketplace}-{$fulfillmentType}-{$date}.xlsx";
+        $time = now()->format('His');
+        $filename = "unit-economics-{$marketplace}-{$fulfillmentType}-{$date}-{$time}.xlsx";
 
         return new StreamedResponse(function () use ($spreadsheet) {
             $writer = new Xlsx($spreadsheet);
@@ -1110,13 +1111,13 @@ class UnitEconomicsCacheController extends Controller
             'W'  => ['header' => 'Нелок. наценка экран, %', 'width' => 18, 'field' => 'non_local_markup_percent', 'format' => '0.00"%"'],
             'X'  => ['header' => 'Причина наценки',     'width' => 28, 'field' => 'markup_rule_reason_label', 'format' => '@'],
             'Y'  => ['header' => '% выкупа',            'width' => 10, 'field' => 'redemption_rate',          'format' => '0.00"%"'],
-            'Z'  => ['header' => 'Точность',            'width' => 11, 'field' => 'calculation_confidence',   'format' => '@'],
+            'Z'  => ['header' => 'Статус данных',       'width' => 13, 'field' => 'calculation_confidence',   'format' => '@'],
             'AA' => ['header' => 'Итого затраты, ₽',    'width' => 14, 'field' => 'total_costs',              'format' => '#,##0.00 "₽"'],
             'AB' => ['header' => 'Прибыль',             'width' => 12, 'field' => 'net_profit',               'format' => '#,##0.00 "₽"'],
             'AC' => ['header' => 'Маржа, %',            'width' => 10, 'field' => 'margin_percent',           'format' => '0.00"%"'],
             'AD' => ['header' => 'ROI, %',              'width' => 10, 'field' => 'roi_percent',              'format' => '0.00"%"'],
             'AE' => ['header' => 'На р/с, ₽',           'width' => 12, 'field' => 'to_settlement_account',    'format' => '#,##0.00 "₽"'],
-            'AF' => ['header' => 'Индекс цен',           'width' => 11, 'field' => 'current_price_index',      'format' => '0.00'],
+            'AF' => ['header' => 'Индекс цены',          'width' => 12, 'field' => 'current_price_index',      'format' => '0.00'],
             'AG' => ['header' => 'КС, %',                'width' => 10, 'field' => 'warehouse_coef_percent',   'format' => '0.00"%"'],
             'AH' => ['header' => 'КС, ₽',                'width' => 10, 'field' => 'warehouse_coef_amount',    'format' => '#,##0.00 "₽"'],
             'AI' => ['header' => 'ИЛ',                   'width' => 9,  'field' => 'localization_index',       'format' => '0.00'],
@@ -1297,7 +1298,7 @@ class UnitEconomicsCacheController extends Controller
                     // U: Локальность (лейбл)
                     $sheet->setCellValue("U{$currentRow}", $this->resolveLocalityLabel($item));
                 } elseif ($col === 'Z') {
-                    // Z: Точность расчёта (лейбл)
+                    // Z: пользовательский статус данных без пугающих low/medium формулировок.
                     $sheet->setCellValue("Z{$currentRow}", $this->resolveConfidenceLabel($item['calculation_confidence'] ?? null));
                 } elseif (in_array($col, $nullableNumericColumns, true)) {
                     // Числовые nullable — пустая ячейка при null
@@ -1874,14 +1875,13 @@ class UnitEconomicsCacheController extends Controller
     }
 
     /**
-     * Человекочитаемый лейбл точности расчёта (calculation_confidence)
+     * Человекочитаемый статус данных для Excel.
      */
     private function resolveConfidenceLabel(?string $confidence): string
     {
         return match (strtolower((string) $confidence)) {
-            'high'   => 'Высокая',
-            'medium' => 'Средняя',
-            'low'    => 'Низкая',
+            'high', 'medium' => 'Проверено',
+            'low'            => 'Проверить',
             default  => '',
         };
     }
