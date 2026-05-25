@@ -60,6 +60,7 @@ class SyncStorageFeesJob implements ShouldQueue
                 Log::info('SyncStorageFeesJob: no storage fees data', [
                     'integration_id' => $this->integrationId,
                 ]);
+                $this->dispatchUnitEconomicsSync();
                 return;
             }
             
@@ -148,6 +149,8 @@ class SyncStorageFeesJob implements ShouldQueue
                     'last_sync_status' => 'completed',
                 ]);
             }
+
+            $this->dispatchUnitEconomicsSync();
             
         } catch (\Exception $e) {
             Log::error('SyncStorageFeesJob: failed', [
@@ -171,5 +174,15 @@ class SyncStorageFeesJob implements ShouldQueue
     private function formatMemory(int $bytes): string
     {
         return round($bytes / 1024 / 1024, 2) . ' MB';
+    }
+
+    private function dispatchUnitEconomicsSync(): void
+    {
+        SyncUnitEconomicsJob::dispatch($this->integrationId)
+            ->onQueue('unit-economics');
+
+        Log::info('UnitEconomics sync dispatched after WB storage fees sync', [
+            'integration_id' => $this->integrationId,
+        ]);
     }
 }

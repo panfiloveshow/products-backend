@@ -493,11 +493,12 @@ class InventoryService
     {
         \Illuminate\Support\Facades\Cache::forget("inventory_stats_{$integrationId}_{$marketplace}");
         \Illuminate\Support\Facades\Cache::forget('inventory_stats_all');
+        \Illuminate\Support\Facades\Cache::forget('inventory_overall_stats');
     }
 
     public function getOverallStats(): array
     {
-        return [
+        return Cache::remember('inventory_overall_stats', 60, fn () => [
             'total_products' => Product::count(),
             'total_warehouses' => InventoryWarehouse::distinct('warehouse_id')->count(),
             'total_stock' => InventoryWarehouse::sum('quantity'),
@@ -510,6 +511,6 @@ class InventoryService
                 ->get()
                 ->keyBy('marketplace')
                 ->toArray(),
-        ];
+        ]);
     }
 }

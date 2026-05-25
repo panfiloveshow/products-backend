@@ -134,6 +134,7 @@ class UnitEconomicsOrchestrator
                 deliveryCoefficient: $input->deliveryCoefficient,
                 warehouseCoefficient: $input->warehouseCoefficient,
                 localizationIndex: $input->localizationIndex,
+                salesDistributionIndex: $input->salesDistributionIndex,
                 sppPercent: $input->sppPercent,
                 drrPercent: $input->drrPercent,
                 ourSharePercent: $input->ourSharePercent,

@@ -16,18 +16,35 @@ use Illuminate\Support\Facades\Schema;
 
 class ProductService
 {
-    public function applyComputedStock(Builder $query, string $alias = 'computed_stock'): Builder
+    public function applyComputedStock(
+        Builder $query,
+        string $alias = 'computed_stock',
+        ?int $integrationId = null,
+        ?string $marketplace = null
+    ): Builder
     {
-        $this->joinInventoryTotals($query);
+        $this->joinInventoryTotals($query, $integrationId, $marketplace);
 
         return $query
             ->select('products.*')
             ->selectRaw($this->computedStockExpression().' as '.$alias);
     }
 
-    public function joinInventoryTotals(Builder $query): Builder
+    public function joinInventoryTotals(
+        Builder $query,
+        ?int $integrationId = null,
+        ?string $marketplace = null
+    ): Builder
     {
         $inventoryTotals = DB::table('inventory_warehouses')
+            ->when($integrationId !== null, fn ($q) => $q->where('integration_id', $integrationId))
+            ->when($marketplace !== null && $marketplace !== '' && $marketplace !== 'all', function ($q) use ($marketplace) {
+                if (in_array($marketplace, ['yandex', 'yandex_market'], true)) {
+                    $q->whereIn('marketplace', ['yandex', 'yandex_market']);
+                } else {
+                    $q->where('marketplace', $marketplace);
+                }
+            })
             ->selectRaw('COALESCE(integration_id, 0) as stock_integration_id, sku, SUM(quantity) as total_stock')
             ->groupByRaw('COALESCE(integration_id, 0), sku');
 
@@ -50,75 +67,84 @@ class ProductService
 
     public function getProductsStats(array $filters = []): array
     {
-        $query = Product::query();
-        $this->joinInventoryTotals($query);
+        $statsVersion = Cache::get('products_stats_version', 1);
+        $cacheKey = 'products_stats_'.$statsVersion.'_'.md5(json_encode($filters));
 
-        if (! empty($filters['marketplace'])) {
-            $mp = $filters['marketplace'];
-            if (in_array($mp, ['yandex', 'yandex_market'], true)) {
-                $query->whereIn('marketplace', ['yandex', 'yandex_market']);
-            } else {
-                $query->marketplace($mp);
+        return Cache::remember($cacheKey, 60, function () use ($filters) {
+            $query = Product::query();
+            $this->joinInventoryTotals(
+                $query,
+                ! empty($filters['integration_id']) ? (int) $filters['integration_id'] : null,
+                $filters['marketplace'] ?? null
+            );
+
+            if (! empty($filters['marketplace'])) {
+                $mp = $filters['marketplace'];
+                if (in_array($mp, ['yandex', 'yandex_market'], true)) {
+                    $query->whereIn('marketplace', ['yandex', 'yandex_market']);
+                } else {
+                    $query->marketplace($mp);
+                }
             }
-        }
 
-        if (! empty($filters['integration_id'])) {
-            $query->where('integration_id', (int) $filters['integration_id']);
-        }
+            if (! empty($filters['integration_id'])) {
+                $query->where('integration_id', (int) $filters['integration_id']);
+            }
 
-        if (! empty($filters['search'])) {
-            $query->search($filters['search']);
-        }
+            if (! empty($filters['search'])) {
+                $query->search($filters['search']);
+            }
 
-        if (! empty($filters['category'])) {
-            $query->where('category', $filters['category']);
-        }
+            if (! empty($filters['category'])) {
+                $query->where('category', $filters['category']);
+            }
 
-        if (! empty($filters['brand'])) {
-            $query->where('brand', $filters['brand']);
-        }
+            if (! empty($filters['brand'])) {
+                $query->where('brand', $filters['brand']);
+            }
 
-        if (isset($filters['price_from'])) {
-            $query->where('price', '>=', $filters['price_from']);
-        }
+            if (isset($filters['price_from'])) {
+                $query->where('price', '>=', $filters['price_from']);
+            }
 
-        if (isset($filters['price_to'])) {
-            $query->where('price', '<=', $filters['price_to']);
-        }
+            if (isset($filters['price_to'])) {
+                $query->where('price', '<=', $filters['price_to']);
+            }
 
-        if (! empty($filters['in_stock'])) {
-            $query->whereRaw($this->computedStockExpression().' > 0');
-        }
+            if (! empty($filters['in_stock'])) {
+                $query->whereRaw($this->computedStockExpression().' > 0');
+            }
 
-        $total = $query->count();
-        $inStock = (clone $query)->whereRaw($this->computedStockExpression().' > 0')->count();
-        $outOfStock = (clone $query)->whereRaw($this->computedStockExpression().' <= 0')->count();
-        $averagePrice = (clone $query)->avg('products.price') ?? 0;
-        $totalValue = (clone $query)
-            ->selectRaw('SUM(COALESCE(products.price, 0) * '.$this->computedStockExpression().') as total')
-            ->value('total') ?? 0;
+            $total = $query->count();
+            $inStock = (clone $query)->whereRaw($this->computedStockExpression().' > 0')->count();
+            $outOfStock = (clone $query)->whereRaw($this->computedStockExpression().' <= 0')->count();
+            $averagePrice = (clone $query)->avg('products.price') ?? 0;
+            $totalValue = (clone $query)
+                ->selectRaw('SUM(COALESCE(products.price, 0) * '.$this->computedStockExpression().') as total')
+                ->value('total') ?? 0;
 
-        $byMarketplace = (clone $query)
-            ->select('products.marketplace')
-            ->selectRaw('COUNT(*) as count')
-            ->selectRaw('AVG(products.price) as average_price')
-            ->groupBy('products.marketplace')
-            ->get()
-            ->keyBy('marketplace')
-            ->map(fn ($item) => [
-                'count' => $item->count,
-                'average_price' => round($item->average_price, 2),
-            ])
-            ->toArray();
+            $byMarketplace = (clone $query)
+                ->select('products.marketplace')
+                ->selectRaw('COUNT(*) as count')
+                ->selectRaw('AVG(products.price) as average_price')
+                ->groupBy('products.marketplace')
+                ->get()
+                ->keyBy('marketplace')
+                ->map(fn ($item) => [
+                    'count' => $item->count,
+                    'average_price' => round($item->average_price, 2),
+                ])
+                ->toArray();
 
-        return [
-            'total' => $total,
-            'in_stock' => $inStock,
-            'out_of_stock' => $outOfStock,
-            'average_price' => round($averagePrice, 2),
-            'total_value' => round($totalValue, 2),
-            'by_marketplace' => $byMarketplace,
-        ];
+            return [
+                'total' => $total,
+                'in_stock' => $inStock,
+                'out_of_stock' => $outOfStock,
+                'average_price' => round($averagePrice, 2),
+                'total_value' => round($totalValue, 2),
+                'by_marketplace' => $byMarketplace,
+            ];
+        });
     }
 
     /**
@@ -248,6 +274,10 @@ class ProductService
     {
         \Illuminate\Support\Facades\Cache::forget("products_stats_{$integrationId}_{$marketplace}");
         \Illuminate\Support\Facades\Cache::forget('products_stats_all');
+        if (! \Illuminate\Support\Facades\Cache::has('products_stats_version')) {
+            \Illuminate\Support\Facades\Cache::forever('products_stats_version', 1);
+        }
+        \Illuminate\Support\Facades\Cache::increment('products_stats_version');
     }
 
     public function getSyncStatuses(?int $integrationId = null): array
@@ -307,6 +337,7 @@ class ProductService
                         [
                             'marketplace' => $syncLog->marketplace,
                             'marketplace_id' => $productData['marketplace_id'],
+                            'integration_id' => $syncLog->integration_id,
                         ],
                         $productData
                     );

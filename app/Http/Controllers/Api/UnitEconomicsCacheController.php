@@ -7,6 +7,7 @@ use App\Domains\UnitEconomics\DTO\CalculationInput;
 use App\Domains\UnitEconomics\UnitEconomicsOrchestrator;
 use App\Http\Controllers\Controller;
 use App\Http\Requests\UnitEconomics\CalculateRequest;
+use App\Jobs\RecalculateUnitEconomicsCacheJob;
 use App\Jobs\SyncUnitEconomicsJob;
 use App\Models\Integration;
 use App\Models\InventoryWarehouse;
@@ -14,6 +15,7 @@ use App\Models\Product;
 use App\Models\UnitEconomics;
 use App\Models\UnitEconomicsCache;
 use App\Models\UnitEconomicsSettings;
+use App\Models\WildberriesTariffSnapshot;
 use App\Services\IntegrationAccessService;
 use App\Services\UnitEconomicsCacheService;
 use App\Services\UnitEconomicsService;
@@ -21,8 +23,11 @@ use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Facades\Validator;
 use PhpOffice\PhpSpreadsheet\Spreadsheet;
+use PhpOffice\PhpSpreadsheet\IOFactory;
 use PhpOffice\PhpSpreadsheet\Style\Alignment;
 use PhpOffice\PhpSpreadsheet\Style\Border;
 use PhpOffice\PhpSpreadsheet\Style\Color;
@@ -85,7 +90,10 @@ class UnitEconomicsCacheController extends Controller
             'page' => 'nullable|integer|min:1',
         ])->validate();
 
-        $resolution = $this->integrationAccessService->ensureAccessibleIntegration(
+        // Listing должен быть быстрым cache-read endpoint. Не делаем remote refresh
+        // интеграции через Sellico API до чтения кэша: если локальной интеграции
+        // нет, лучше быстро вернуть ошибку и не блокировать таблицу.
+        $resolution = $this->ensureLocalReadableIntegration(
             $request,
             (int) $validated['integration_id'],
             $marketplace
@@ -107,18 +115,34 @@ class UnitEconomicsCacheController extends Controller
             ->profitable($validated['profitable'] ?? null)
             ->marginRange($validated['margin_min'] ?? null, $validated['margin_max'] ?? null)
             ->priceRange($validated['price_min'] ?? null, $validated['price_max'] ?? null);
+        $statsQuery = clone $query;
 
         // Сортировка
         $sortField = $validated['sort'] ?? 'sku';
         $sortOrder = $validated['sort_order'] ?? 'asc';
-        $this->applyUnitEconomicsSorting($query, $sortField, $sortOrder);
+        if ($marketplace === 'wildberries' && in_array($sortField, ['stock', 'total_stock', 'current_stock', 'days_of_stock'], true)) {
+            $sortField = 'sku';
+        }
+        $this->applyUnitEconomicsSorting(
+            $query,
+            $sortField,
+            $sortOrder,
+            (int) $validated['integration_id'],
+            $marketplace
+        );
 
-        // Пагинация
-        $limit = $validated['limit'] ?? 50;
-        $page = $validated['page'] ?? 1;
-        $paginator = $query->with('product')->paginate($limit, ['*'], 'page', $page);
+        // Пагинация без paginate(): стандартный paginate() делает COUNT(*) до
+        // выборки страницы. Для listing отдаём страницу кэша через limit/offset,
+        // а total берём из stats ниже.
+        $limit = (int) ($validated['limit'] ?? 50);
+        $page = (int) ($validated['page'] ?? 1);
+        $pageRows = $query
+            ->with('product')
+            ->offset(($page - 1) * $limit)
+            ->limit($limit)
+            ->get();
 
-        $itemsCollection = collect($paginator->items());
+        $itemsCollection = collect($pageRows);
         $settingsMap = collect();
         if ($itemsCollection->isNotEmpty()) {
             $settingsMap = UnitEconomicsSettings::where('integration_id', $validated['integration_id'])
@@ -127,7 +151,7 @@ class UnitEconomicsCacheController extends Controller
                 ->keyBy('sku');
         }
 
-        $pageContext = $this->buildWildberriesUnitEconomicsPageContext($marketplace, $itemsCollection);
+        $pageContext = $this->buildUnitEconomicsPageContext($marketplace, $itemsCollection);
 
         // Обогащаем данные полями из Product для совместимости с v1
         $items = $itemsCollection->map(function ($cache) use ($validated, $settingsMap, $pageContext) {
@@ -139,8 +163,11 @@ class UnitEconomicsCacheController extends Controller
         // Статистика по схемам
         $schemeCounts = $this->getSchemeCounts($validated['integration_id'], $marketplace);
 
-        // Реальная схема работы магазина (для подсветки)
-        $actualScheme = $this->getActualScheme($validated['integration_id'], $marketplace);
+        // Реальная схема работы магазина (для подсветки). На listing не считаем
+        // actual_scheme через inventory на cache miss: это отдельная диагностическая
+        // задача, а таблице достаточно cached значения или выбранной схемы.
+        $actualScheme = Cache::get("ue_actual_scheme_{$validated['integration_id']}_{$marketplace}")
+            ?? strtoupper((string) $validated['fulfillment_type']);
 
         // default_scheme = actual_scheme (схема по умолчанию для выбора таба)
         $defaultScheme = $actualScheme ?? match ($marketplace) {
@@ -148,18 +175,24 @@ class UnitEconomicsCacheController extends Controller
             default => 'FBO',
         };
 
-        // Общая статистика
-        $stats = $this->getStats($validated['integration_id'], $marketplace, $validated['fulfillment_type']);
+        // Общая статистика. Без фильтров берём лёгкий cached aggregate по интеграции/схеме,
+        // чтобы GET страницы не сканировал выборку на каждом открытии.
+        $stats = $this->canUseFastStats($validated)
+            ? $this->getStats((int) $validated['integration_id'], $marketplace, (string) $validated['fulfillment_type'])
+            : $this->getStatsFromQuery($statsQuery);
+        $total = (int) ($stats['total_count'] ?? $itemsCollection->count());
+        $lastPage = max(1, (int) ceil($total / max(1, $limit)));
 
         return response()->json([
             'data' => [
                 'items' => $items,
                 'pagination' => [
-                    'total' => $paginator->total(),
-                    'per_page' => $paginator->perPage(),
-                    'current_page' => $paginator->currentPage(),
-                    'last_page' => $paginator->lastPage(),
+                    'total' => $total,
+                    'per_page' => $limit,
+                    'current_page' => $page,
+                    'last_page' => $lastPage,
                 ],
+                'total' => $total,
                 'scheme_counts' => $schemeCounts,
                 'actual_scheme' => $actualScheme,
                 'default_scheme' => $defaultScheme,
@@ -172,23 +205,71 @@ class UnitEconomicsCacheController extends Controller
     private function applyUnitEconomicsSorting(
         \Illuminate\Database\Eloquent\Builder $query,
         string $sortField,
-        string $sortOrder
+        string $sortOrder,
+        ?int $integrationId = null,
+        ?string $marketplace = null
     ): void {
         $sortOrder = strtolower($sortOrder) === 'desc' ? 'desc' : 'asc';
 
         if (in_array($sortField, ['stock', 'total_stock', 'current_stock', 'days_of_stock'], true)) {
-            $inventoryTotals = InventoryWarehouse::query()
-                ->from('inventory_warehouses as inventory_rows')
+            $applyInventoryScope = function ($q) use ($integrationId, $marketplace) {
+                $q->when($integrationId !== null, fn ($query) => $query->where('inventory_rows.integration_id', $integrationId))
+                ->when($marketplace !== null, function ($query) use ($marketplace) {
+                    if (in_array($marketplace, ['yandex', 'yandex_market'], true)) {
+                        $query->whereIn('inventory_rows.marketplace', ['yandex', 'yandex_market']);
+                    } else {
+                        $query->where('inventory_rows.marketplace', $marketplace);
+                    }
+                })
+                ->when($marketplace !== null, function ($query) use ($marketplace) {
+                    if (in_array($marketplace, ['yandex', 'yandex_market'], true)) {
+                        $query->whereIn('inventory_products.marketplace', ['yandex', 'yandex_market']);
+                    } else {
+                        $query->where('inventory_products.marketplace', $marketplace);
+                    }
+                });
+            };
+
+            $inventoryBySku = DB::table('inventory_warehouses as inventory_rows')
                 ->join('products as inventory_products', function ($join) {
                     $join->on('inventory_products.integration_id', '=', 'inventory_rows.integration_id')
-                        ->where(function ($condition) {
-                            $condition->whereColumn('inventory_rows.sku', 'inventory_products.sku')
-                                ->orWhereColumn('inventory_rows.sku', 'inventory_products.barcode')
-                                ->orWhereColumn('inventory_rows.sku', 'inventory_products.vendor_code');
-                        });
+                        ->on('inventory_products.sku', '=', 'inventory_rows.sku');
                 })
-                ->selectRaw('inventory_products.id as product_id, COALESCE(SUM(inventory_rows.quantity), 0) as total_stock, COALESCE(SUM(inventory_rows.average_daily_sales), 0) as total_ads')
-                ->groupBy('inventory_products.id');
+                ->tap($applyInventoryScope)
+                ->selectRaw('inventory_products.id as product_id, inventory_rows.quantity, inventory_rows.average_daily_sales');
+
+            $inventoryByBarcode = DB::table('inventory_warehouses as inventory_rows')
+                ->join('products as inventory_products', function ($join) {
+                    $join->on('inventory_products.integration_id', '=', 'inventory_rows.integration_id')
+                        ->on('inventory_products.barcode', '=', 'inventory_rows.sku');
+                })
+                ->whereNotNull('inventory_products.barcode')
+                ->whereColumn('inventory_products.barcode', '!=', 'inventory_products.sku')
+                ->tap($applyInventoryScope)
+                ->selectRaw('inventory_products.id as product_id, inventory_rows.quantity, inventory_rows.average_daily_sales');
+
+            $inventoryByVendorCode = DB::table('inventory_warehouses as inventory_rows')
+                ->join('products as inventory_products', function ($join) {
+                    $join->on('inventory_products.integration_id', '=', 'inventory_rows.integration_id')
+                        ->on('inventory_products.vendor_code', '=', 'inventory_rows.sku');
+                })
+                ->whereNotNull('inventory_products.vendor_code')
+                ->whereColumn('inventory_products.vendor_code', '!=', 'inventory_products.sku')
+                ->where(function ($query) {
+                    $query->whereNull('inventory_products.barcode')
+                        ->orWhereColumn('inventory_products.vendor_code', '!=', 'inventory_products.barcode');
+                })
+                ->tap($applyInventoryScope)
+                ->selectRaw('inventory_products.id as product_id, inventory_rows.quantity, inventory_rows.average_daily_sales');
+
+            $inventoryUnion = $inventoryBySku
+                ->unionAll($inventoryByBarcode)
+                ->unionAll($inventoryByVendorCode);
+
+            $inventoryTotals = DB::query()
+                ->fromSub($inventoryUnion, 'inventory_matches')
+                ->selectRaw('product_id, COALESCE(SUM(quantity), 0) as total_stock, COALESCE(SUM(average_daily_sales), 0) as total_ads')
+                ->groupBy('product_id');
 
             $query->leftJoinSub($inventoryTotals, 'inventory_totals', function ($join) {
                 $join->on('inventory_totals.product_id', '=', 'unit_economics_cache.product_id');
@@ -209,6 +290,48 @@ class UnitEconomicsCacheController extends Controller
         }
 
         $query->orderBy($sortField, $sortOrder);
+    }
+
+    /**
+     * Быстрая read-only проверка для listing endpoint без внешних HTTP-запросов.
+     *
+     * @return array{success: bool, status?: int, message?: string, integration?: Integration}
+     */
+    private function ensureLocalReadableIntegration(Request $request, int $integrationId, string $marketplace): array
+    {
+        $integration = Integration::find($integrationId);
+        if (! $integration) {
+            return [
+                'success' => false,
+                'status' => 404,
+                'message' => 'Интеграция не найдена в products-backend cache. Запустите sync интеграции.',
+            ];
+        }
+
+        $workspaceId = $request->header('X-Sellico-Workspace')
+            ?? $request->header('X-Workspace-Id')
+            ?? $request->input('workspace');
+        if ($workspaceId && (int) $integration->work_space_id !== (int) $workspaceId) {
+            return [
+                'success' => false,
+                'status' => 403,
+                'message' => 'Интеграция не принадлежит текущему workspace',
+            ];
+        }
+
+        $actualMarketplace = $this->normalizeMarketplace((string) $integration->marketplace);
+        if ($actualMarketplace !== $marketplace) {
+            return [
+                'success' => false,
+                'status' => 404,
+                'message' => 'Интеграция не принадлежит выбранному маркетплейсу',
+            ];
+        }
+
+        return [
+            'success' => true,
+            'integration' => $integration,
+        ];
     }
 
     /**
@@ -243,7 +366,8 @@ class UnitEconomicsCacheController extends Controller
             default => 'FBO',
         };
 
-        $cache = UnitEconomicsCache::where('integration_id', $validated['integration_id'])
+        $cache = UnitEconomicsCache::with('product')
+            ->where('integration_id', $validated['integration_id'])
             ->where('marketplace', $marketplace)
             ->where('sku', $sku)
             ->where('fulfillment_type', $fulfillmentType)
@@ -261,21 +385,25 @@ class UnitEconomicsCacheController extends Controller
             ->where('sku', $sku)
             ->first();
 
-        $data = $cache->toArray();
-        if ($marketplace === 'ozon') {
-            unset($data['avg_delivery_time_hours'], $data['logistics_coefficient'], $data['additional_commission_percent']);
-        }
-
-        $allSchemes = UnitEconomicsCache::where('integration_id', $validated['integration_id'])
+        $pageItems = UnitEconomicsCache::with('product')
+            ->where('integration_id', $validated['integration_id'])
             ->when(
                 in_array($marketplace, ['yandex', 'yandex_market'], true),
                 fn ($query) => $query->whereIn('marketplace', ['yandex', 'yandex_market']),
                 fn ($query) => $query->where('marketplace', $marketplace)
             )
             ->where('sku', $sku)
-            ->get()
-            ->map(function (UnitEconomicsCache $item) use ($marketplace) {
-                $row = $item->toArray();
+            ->get();
+        $pageContext = $this->buildUnitEconomicsPageContext($marketplace, $pageItems);
+
+        $data = $this->enrichCacheItem($cache, $fulfillmentType, $settings, $pageContext);
+        if ($marketplace === 'ozon') {
+            unset($data['avg_delivery_time_hours'], $data['logistics_coefficient'], $data['additional_commission_percent']);
+        }
+
+        $allSchemes = $pageItems
+            ->map(function (UnitEconomicsCache $item) use ($marketplace, $settings, $pageContext) {
+                $row = $this->enrichCacheItem($item, (string) $item->fulfillment_type, $settings, $pageContext);
                 if ($marketplace === 'ozon') {
                     unset($row['avg_delivery_time_hours'], $row['logistics_coefficient'], $row['additional_commission_percent']);
                 }
@@ -310,6 +438,8 @@ class UnitEconomicsCacheController extends Controller
             'spp_percent' => 'nullable|numeric|min:0|max:100',
             // ИЛ (индекс локализации) — хранится на уровне интеграции, но принимаем здесь для удобства
             'localization_index' => 'nullable|numeric|min:0.50|max:2.50',
+            // ИРП (индекс распределения продаж) — хранится на уровне WB-интеграции, значение из ЛК WB в процентах
+            'sales_distribution_index' => 'nullable|numeric|min:0|max:2.50',
             // Габариты НЕ редактируемые — берутся из API маркетплейса
         ])->validate();
 
@@ -328,13 +458,30 @@ class UnitEconomicsCacheController extends Controller
 
         $integrationId = $validated['integration_id'];
         $localizationIndex = $validated['localization_index'] ?? null;
-        unset($validated['integration_id'], $validated['localization_index']);
+        $salesDistributionIndex = $validated['sales_distribution_index'] ?? null;
+        unset($validated['integration_id'], $validated['localization_index'], $validated['sales_distribution_index']);
 
-        // Если передан localization_index — обновляем интеграцию (это настройка магазина, не товара)
-        if ($localizationIndex !== null) {
-            Integration::where('id', $integrationId)->update([
-                'localization_index' => $localizationIndex,
-            ]);
+        // ИЛ и ИРП — настройки WB-интеграции, а не отдельного SKU.
+        if ($localizationIndex !== null || $salesDistributionIndex !== null) {
+            $integration = Integration::find($integrationId);
+            if ($integration) {
+                $settings = is_array($integration->settings) ? $integration->settings : [];
+                $update = [
+                    'settings' => $settings,
+                ];
+
+                if ($localizationIndex !== null) {
+                    $settings['wb_localization_index'] = (float) $localizationIndex;
+                    $update['localization_index'] = $localizationIndex;
+                }
+
+                if ($salesDistributionIndex !== null) {
+                    $settings['wb_sales_distribution_index'] = (float) $salesDistributionIndex;
+                }
+
+                $update['settings'] = $settings;
+                $integration->update($update);
+            }
         }
 
         // Обновляем или создаём настройки товара
@@ -343,8 +490,13 @@ class UnitEconomicsCacheController extends Controller
             array_filter($validated, fn ($v) => $v !== null)
         );
 
-        // Триггерим пересчёт кэша
-        $this->cacheService->onSettingsChanged($integrationId, $sku);
+        // ИЛ/ИРП — настройки всей WB-интеграции, поэтому пересчитываем всю интеграцию.
+        // Обычные SKU-настройки пересчитывают только выбранный SKU по всем схемам.
+        if ($localizationIndex !== null || $salesDistributionIndex !== null) {
+            $this->cacheService->onIntegrationSettingsChanged($integrationId);
+        } else {
+            $this->cacheService->onSettingsChanged($integrationId, $sku);
+        }
 
         // Возвращаем обновлённые данные
         $cache = UnitEconomicsCache::where('integration_id', $integrationId)
@@ -356,9 +508,10 @@ class UnitEconomicsCacheController extends Controller
         $integration = Integration::find($integrationId);
 
         return response()->json([
-            'message' => 'Settings updated and cache recalculated',
+            'message' => 'Settings updated; cache recalculation queued',
             'settings' => $settings,
             'localization_index' => (float) ($integration->localization_index ?? 1.0),
+            'sales_distribution_index' => (float) (($integration->settings['wb_sales_distribution_index'] ?? null) ?? 0.0),
             'cache' => $cache,
         ]);
     }
@@ -417,13 +570,358 @@ class UnitEconomicsCacheController extends Controller
             $skus[] = $sku;
         }
 
-        // Триггерим пересчёт кэша для всех изменённых товаров
+        // Триггерим асинхронный пересчёт кэша для всех изменённых товаров
         $this->cacheService->onBulkSettingsChanged($integrationId, $skus);
 
         return response()->json([
-            'message' => 'Bulk settings updated',
+            'message' => 'Bulk settings updated; cache recalculation queued',
             'updated_count' => count($skus),
         ]);
+    }
+
+    /**
+     * Импорт ИЛ/ИРП Wildberries из Excel/CSV выгрузки ЛК WB.
+     *
+     * Поддерживает два формата:
+     * - файл, где есть строки "Индекс локализации" / "Индекс распределения продаж";
+     * - детализацию по артикулам с колонками "Количество заказов", "КТР" и/или "КРП".
+     */
+    public function importWildberriesIndexes(Request $request): JsonResponse
+    {
+        $validated = Validator::make($request->all(), [
+            'integration_id' => 'required|integer',
+            'file' => 'required|file|mimes:xlsx,xls,csv,txt|max:20480',
+        ])->validate();
+
+        $resolution = $this->integrationAccessService->ensureAccessibleIntegration(
+            $request,
+            (int) $validated['integration_id']
+        );
+        if (! ($resolution['success'] ?? false)) {
+            return response()->json([
+                'message' => $resolution['message'] ?? 'Интеграция не найдена',
+                'errors' => [
+                    'integration_id' => [$resolution['message'] ?? 'Интеграция не найдена'],
+                ],
+            ], $resolution['status'] ?? 404);
+        }
+
+        $integration = Integration::find((int) $validated['integration_id']);
+        if (! $integration || $integration->marketplace !== 'wildberries') {
+            return response()->json([
+                'message' => 'Импорт ИЛ/ИРП доступен только для Wildberries интеграций',
+            ], 422);
+        }
+
+        try {
+            $parsed = $this->parseWildberriesIndexesSpreadsheet($request->file('file'));
+        } catch (\Throwable $e) {
+            return response()->json([
+                'message' => 'Не удалось прочитать Excel/CSV файл',
+                'details' => $e->getMessage(),
+            ], 422);
+        }
+
+        $localizationIndex = $parsed['localization_index'];
+        $salesDistributionIndex = $parsed['sales_distribution_index'];
+        if ($localizationIndex === null && $salesDistributionIndex === null) {
+            return response()->json([
+                'message' => 'В файле не найдены ИЛ или ИРП',
+                'details' => 'Загрузите Excel из ЛК WB с виджетами ИЛ/ИРП или детализацию с колонками "Количество заказов", "КТР", "КРП".',
+                'warnings' => $parsed['warnings'],
+            ], 422);
+        }
+
+        $settings = is_array($integration->settings) ? $integration->settings : [];
+        if ($localizationIndex !== null) {
+            $settings['wb_localization_index'] = $localizationIndex;
+        }
+        if ($salesDistributionIndex !== null) {
+            $settings['wb_sales_distribution_index'] = $salesDistributionIndex;
+        }
+        $settings['wb_indexes_source'] = 'excel_import';
+        $settings['wb_indexes_imported_at'] = now()->toIso8601String();
+
+        $update = ['settings' => $settings];
+        if ($localizationIndex !== null) {
+            $update['localization_index'] = $localizationIndex;
+        }
+        $integration->update($update);
+
+        $this->cacheService->onIntegrationSettingsChanged((int) $integration->id);
+
+        return response()->json([
+            'message' => 'Индексы WB импортированы; пересчёт кэша поставлен в очередь',
+            'localization_index' => $localizationIndex,
+            'sales_distribution_index' => $salesDistributionIndex,
+            'source' => $parsed['source'],
+            'rows_processed' => $parsed['rows_processed'],
+            'warnings' => $parsed['warnings'],
+        ]);
+    }
+
+    private function parseWildberriesIndexesSpreadsheet(\Illuminate\Http\UploadedFile $file): array
+    {
+        $spreadsheet = IOFactory::load($file->getPathname());
+        $rows = [];
+
+        foreach ($spreadsheet->getWorksheetIterator() as $sheet) {
+            foreach ($sheet->toArray(null, true, true, true) as $row) {
+                $values = array_values($row);
+                if ($this->spreadsheetRowIsEmpty($values)) {
+                    continue;
+                }
+                $rows[] = $values;
+            }
+        }
+
+        $result = [
+            'localization_index' => null,
+            'sales_distribution_index' => null,
+            'source' => 'unknown',
+            'rows_processed' => count($rows),
+            'warnings' => [],
+        ];
+
+        $this->extractWildberriesIndexesFromLabels($rows, $result);
+        $this->extractWildberriesIndexesFromDetailTable($rows, $result);
+
+        if ($result['localization_index'] !== null) {
+            $result['localization_index'] = round((float) $result['localization_index'], 2);
+        }
+        if ($result['sales_distribution_index'] !== null) {
+            $result['sales_distribution_index'] = round((float) $result['sales_distribution_index'], 4);
+        }
+
+        return $result;
+    }
+
+    private function extractWildberriesIndexesFromLabels(array $rows, array &$result): void
+    {
+        foreach ($rows as $rowIndex => $row) {
+            foreach ($row as $cellIndex => $cell) {
+                $label = $this->normalizeWildberriesIndexText($cell);
+                if ($label === '') {
+                    continue;
+                }
+
+                if ($result['localization_index'] === null && $this->isWildberriesLocalizationLabel($label)) {
+                    $value = $this->findSpreadsheetNumericNear($rows, $rowIndex, $cellIndex, 'localization');
+                    if ($value !== null) {
+                        $result['localization_index'] = $value;
+                        $result['source'] = 'excel_label';
+                    }
+                }
+
+                if ($result['sales_distribution_index'] === null && $this->isWildberriesSalesDistributionLabel($label)) {
+                    $value = $this->findSpreadsheetNumericNear($rows, $rowIndex, $cellIndex, 'percent');
+                    if ($value !== null) {
+                        $result['sales_distribution_index'] = $value;
+                        $result['source'] = 'excel_label';
+                    }
+                }
+            }
+        }
+    }
+
+    private function extractWildberriesIndexesFromDetailTable(array $rows, array &$result): void
+    {
+        if ($result['localization_index'] !== null && $result['sales_distribution_index'] !== null) {
+            return;
+        }
+
+        foreach ($rows as $headerIndex => $row) {
+            $headers = array_map(fn ($value) => $this->normalizeWildberriesIndexText($value), $row);
+            $ordersColumn = $this->findWildberriesIndexColumn($headers, [
+                'количествозаказ',
+                'колвозак',
+                'заказовшт',
+                'заказышт',
+                'всегозаказ',
+                'общееколичествозаказ',
+                'заказы',
+            ]);
+            $ktrColumn = $this->findWildberriesIndexColumn($headers, [
+                'ктр',
+                'коэффициенттерриториальногораспределения',
+                'коэффтерриториальногораспределения',
+                'коэфтерриториальногораспределения',
+                'коэффициенттерритраспределения',
+                'коэффтерритраспределения',
+                'коэфтерритраспределения',
+                'ктерриториальногораспределения',
+            ]);
+            $krpColumn = $this->findWildberriesIndexColumn($headers, [
+                'крп',
+                'коэффициентраспределенияпродаж',
+                'коэффраспределенияпродаж',
+                'коэфраспределенияпродаж',
+                'коэффициентраспрпродаж',
+                'коэффраспрпродаж',
+                'коэфраспрпродаж',
+                'краспределенияпродаж',
+            ]);
+
+            if ($ordersColumn === null || ($ktrColumn === null && $krpColumn === null)) {
+                continue;
+            }
+
+            $totalOrdersForKtr = 0.0;
+            $weightedKtr = 0.0;
+            $totalOrdersForKrp = 0.0;
+            $weightedKrp = 0.0;
+
+            for ($i = $headerIndex + 1; $i < count($rows); $i++) {
+                $orders = $this->parseSpreadsheetNumber($rows[$i][$ordersColumn] ?? null, 'plain');
+                if ($orders === null || $orders <= 0) {
+                    continue;
+                }
+
+                if ($ktrColumn !== null) {
+                    $ktr = $this->parseSpreadsheetNumber($rows[$i][$ktrColumn] ?? null, 'localization');
+                    if ($ktr !== null && $ktr >= 0.5 && $ktr <= 2.5) {
+                        $weightedKtr += $orders * $ktr;
+                        $totalOrdersForKtr += $orders;
+                    }
+                }
+
+                if ($krpColumn !== null) {
+                    $krp = $this->parseSpreadsheetNumber($rows[$i][$krpColumn] ?? null, 'percent');
+                    if ($krp !== null && $krp >= 0 && $krp <= 2.5) {
+                        $weightedKrp += $orders * $krp;
+                        $totalOrdersForKrp += $orders;
+                    }
+                }
+            }
+
+            if ($result['localization_index'] === null && $totalOrdersForKtr > 0) {
+                $result['localization_index'] = $weightedKtr / $totalOrdersForKtr;
+                $result['source'] = 'excel_detail_weighted';
+            }
+
+            if ($result['sales_distribution_index'] === null && $totalOrdersForKrp > 0) {
+                $result['sales_distribution_index'] = $weightedKrp / $totalOrdersForKrp;
+                $result['source'] = 'excel_detail_weighted';
+            }
+
+            return;
+        }
+
+        $result['warnings'][] = 'Не нашёл таблицу детализации с колонками "Количество заказов", "КТР" или "КРП".';
+    }
+
+    private function spreadsheetRowIsEmpty(array $row): bool
+    {
+        foreach ($row as $value) {
+            if (trim((string) $value) !== '') {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private function normalizeWildberriesIndexText(mixed $value): string
+    {
+        $text = mb_strtolower(trim((string) $value));
+        $text = str_replace('ё', 'е', $text);
+
+        return preg_replace('/[^a-zа-я0-9%]+/u', '', $text) ?: '';
+    }
+
+    private function isWildberriesLocalizationLabel(string $label): bool
+    {
+        return str_contains($label, 'индекслокализации')
+            || $label === 'ил'
+            || str_starts_with($label, 'ил%')
+            || str_starts_with($label, 'илкоэффициент')
+            || str_contains($label, 'текущийил')
+            || str_contains($label, 'значениеил')
+            || str_contains($label, 'илпродавца');
+    }
+
+    private function isWildberriesSalesDistributionLabel(string $label): bool
+    {
+        return str_contains($label, 'индексраспределенияпродаж')
+            || $label === 'ирп'
+            || str_starts_with($label, 'ирп%')
+            || str_contains($label, 'текущийирп')
+            || str_contains($label, 'значениеирп')
+            || str_contains($label, 'ирппродавца');
+    }
+
+    private function findSpreadsheetNumericNear(array $rows, int $rowIndex, int $cellIndex, string $mode): ?float
+    {
+        $sameRow = $rows[$rowIndex] ?? [];
+        for ($i = $cellIndex + 1; $i < min(count($sameRow), $cellIndex + 6); $i++) {
+            $value = $this->parseSpreadsheetNumber($sameRow[$i] ?? null, $mode);
+            if ($value !== null) {
+                return $value;
+            }
+        }
+
+        $nextRow = $rows[$rowIndex + 1] ?? [];
+        for ($i = max(0, $cellIndex - 1); $i < min(count($nextRow), $cellIndex + 4); $i++) {
+            $value = $this->parseSpreadsheetNumber($nextRow[$i] ?? null, $mode);
+            if ($value !== null) {
+                return $value;
+            }
+        }
+
+        return null;
+    }
+
+    private function findWildberriesIndexColumn(array $headers, array $needles): ?int
+    {
+        foreach ($headers as $index => $header) {
+            foreach ($needles as $needle) {
+                if ($header !== '' && str_contains($header, $needle)) {
+                    return (int) $index;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    private function parseSpreadsheetNumber(mixed $value, string $mode): ?float
+    {
+        if ($value === null || $value === '') {
+            return null;
+        }
+
+        if (is_numeric($value)) {
+            $number = (float) $value;
+            $hasPercentSign = false;
+        } else {
+            $text = trim((string) $value);
+            $hasPercentSign = str_contains($text, '%');
+            $text = str_replace(["\xc2\xa0", ' ', '%'], '', $text);
+            $text = str_replace(',', '.', $text);
+            $text = preg_replace('/[^0-9.\-]/', '', $text) ?: '';
+            if ($text === '' || ! is_numeric($text)) {
+                return null;
+            }
+            $number = (float) $text;
+        }
+
+        if ($mode === 'localization') {
+            if ($hasPercentSign || $number > 2.5) {
+                $number = $number / 100;
+            }
+
+            return $number >= 0.5 && $number <= 2.5 ? $number : null;
+        }
+
+        if ($mode === 'percent') {
+            if (! $hasPercentSign && $number > 0 && $number <= 0.05) {
+                $number *= 100;
+            }
+
+            return $number >= 0 && $number <= 2.5 ? $number : null;
+        }
+
+        return $number;
     }
 
     /**
@@ -433,23 +931,22 @@ class UnitEconomicsCacheController extends Controller
      */
     public function recalculate(int $integrationId): JsonResponse
     {
-        $stats = $this->cacheService->recalculateIntegration($integrationId);
-
-        // Проверяем на ошибку
-        if (isset($stats['error'])) {
+        if (! Integration::whereKey($integrationId)->exists()) {
             return response()->json([
-                'message' => $stats['error'],
+                'message' => 'Integration not found',
             ], 404);
         }
 
+        RecalculateUnitEconomicsCacheJob::dispatch($integrationId)
+            ->onQueue('unit-economics');
+
         return response()->json([
-            'message' => 'Пересчёт завершён',
-            'stats' => [
-                'total' => $stats['total'],
-                'success' => $stats['success'],
-                'errors' => $stats['errors'],
+            'message' => 'Пересчёт поставлен в очередь',
+            'data' => [
+                'integration_id' => $integrationId,
+                'status' => 'queued',
             ],
-        ]);
+        ], 202);
     }
 
     /**
@@ -501,7 +998,9 @@ class UnitEconomicsCacheController extends Controller
 
         // Те же фильтры, что в index — выгружаем «то что видит менеджер»
         // (без пагинации: Excel должен содержать ВСЕ отфильтрованные строки).
-        $items = UnitEconomicsCache::query()
+        // Важно: не грузим весь Eloquent-набор сразу. На больших интеграциях это
+        // легко превращалось в 30s+ и высокий memory pressure.
+        $exportQuery = UnitEconomicsCache::query()
             ->forIntegration($integrationId)
             ->forMarketplace($marketplace)
             ->forScheme($fulfillmentType)
@@ -511,27 +1010,31 @@ class UnitEconomicsCacheController extends Controller
             ->priceRange($validated['price_min'] ?? null, $validated['price_max'] ?? null)
             ->with('product')
             ->orderBy('sku')
-            ->get();
+            ->orderBy('id');
 
-        // Загружаем настройки пользователя
-        $settingsMap = collect();
-        if ($items->isNotEmpty()) {
+        $enrichedItems = [];
+        $exportQuery->chunk(500, function (Collection $items) use (
+            &$enrichedItems,
+            $integrationId,
+            $marketplace,
+            $fulfillmentType
+        ) {
             $settingsMap = UnitEconomicsSettings::where('integration_id', $integrationId)
-                ->whereIn('sku', $items->pluck('sku')->unique())
+                ->whereIn('sku', $items->pluck('sku')->unique()->values()->all())
                 ->get()
                 ->keyBy('sku');
-        }
 
-        $pageContext = $this->buildWildberriesUnitEconomicsPageContext($marketplace, $items);
+            $pageContext = $this->buildUnitEconomicsPageContext($marketplace, $items);
 
-        // Обогащаем данные. Финансовый пересчёт под фронт-формулу делается
-        // позже в buildUnitEconomicsSpreadsheet, чтобы Excel показывал ровно
-        // те же net_profit/margin/to_settlement, что менеджер видит в UI.
-        $enrichedItems = $items->map(function ($cache) use ($fulfillmentType, $settingsMap, $pageContext) {
-            $settings = $settingsMap->get($cache->sku);
+            // Обогащаем данные. Финансовый пересчёт под фронт-формулу делается
+            // позже в buildUnitEconomicsSpreadsheet, чтобы Excel показывал ровно
+            // те же net_profit/margin/to_settlement, что менеджер видит в UI.
+            foreach ($items as $cache) {
+                $settings = $settingsMap->get($cache->sku);
 
-            return $this->enrichCacheItem($cache, $fulfillmentType, $settings, $pageContext);
-        })->toArray();
+                $enrichedItems[] = $this->enrichCacheItem($cache, $fulfillmentType, $settings, $pageContext);
+            }
+        });
 
         // Получаем имя интеграции
         $integration = Integration::find($integrationId);
@@ -574,13 +1077,13 @@ class UnitEconomicsCacheController extends Controller
         // Иначе Excel показывает cache.net_profit (со своими корректировками типа
         // marketplace_compensation), а UI — локально пересчитанное значение,
         // и менеджеры видят разные цифры по одному и тому же SKU.
-        $items = $this->recalculateFinanceFieldsForExport($items);
+        $items = $this->recalculateFinanceFieldsForExport($items, $marketplace);
 
         $spreadsheet = new Spreadsheet();
         $sheet = $spreadsheet->getActiveSheet();
         $sheet->setTitle('Юнит-экономика');
 
-        // ── Определения колонок (A-AE, 31 колонка) ──
+        // ── Определения колонок ──
         $columns = [
             'A'  => ['header' => 'Артикул',             'width' => 15, 'field' => 'sku',                      'format' => '@'],
             'B'  => ['header' => 'Наименование',        'width' => 40, 'field' => 'product_name',             'format' => '@'],
@@ -594,7 +1097,7 @@ class UnitEconomicsCacheController extends Controller
             'J'  => ['header' => 'Комиссия, ₽',         'width' => 12, 'field' => 'commission_amount',        'format' => '#,##0.00 "₽"'],
             'K'  => ['header' => 'Логистика, ₽',        'width' => 12, 'field' => 'logistics_cost',           'format' => '#,##0.00 "₽"'],
             'L'  => ['header' => 'Посл. миля, ₽',       'width' => 12, 'field' => 'last_mile_cost',           'format' => '#,##0.00 "₽"'],
-            'M'  => ['header' => 'Доставка, ₽',         'width' => 12, 'field' => 'formula_delivery',         'format' => '#,##0.00 "₽"'],
+            'M'  => ['header' => 'Эфф. логистика, ₽',   'width' => 15, 'field' => 'effective_logistics',      'format' => '#,##0.00 "₽"'],
             'N'  => ['header' => 'Возвраты, ₽',         'width' => 12, 'field' => 'expected_return_cost',     'format' => '#,##0.00 "₽"'],
             'O'  => ['header' => 'Хранение, ₽',         'width' => 12, 'field' => 'storage_cost',             'format' => '#,##0.00 "₽"'],
             'P'  => ['header' => 'Эквайринг, %',        'width' => 12, 'field' => 'acquiring_percent',        'format' => '0.00"%"'],
@@ -604,7 +1107,7 @@ class UnitEconomicsCacheController extends Controller
             'T'  => ['header' => 'НДС, %',              'width' => 8,  'field' => 'vat_percent',              'format' => '0.00"%"'],
             'U'  => ['header' => 'Локальность',         'width' => 14, 'field' => 'locality',                 'format' => '@'],
             'V'  => ['header' => 'Локальность, %',      'width' => 13, 'field' => 'expected_locality_rate',   'format' => '0.00"%"'],
-            'W'  => ['header' => 'Нелок. наценка, %',   'width' => 15, 'field' => 'non_local_markup_percent', 'format' => '0.00"%"'],
+            'W'  => ['header' => 'Нелок. наценка экран, %', 'width' => 18, 'field' => 'non_local_markup_percent', 'format' => '0.00"%"'],
             'X'  => ['header' => 'Причина наценки',     'width' => 28, 'field' => 'markup_rule_reason_label', 'format' => '@'],
             'Y'  => ['header' => '% выкупа',            'width' => 10, 'field' => 'redemption_rate',          'format' => '0.00"%"'],
             'Z'  => ['header' => 'Точность',            'width' => 11, 'field' => 'calculation_confidence',   'format' => '@'],
@@ -613,9 +1116,22 @@ class UnitEconomicsCacheController extends Controller
             'AC' => ['header' => 'Маржа, %',            'width' => 10, 'field' => 'margin_percent',           'format' => '0.00"%"'],
             'AD' => ['header' => 'ROI, %',              'width' => 10, 'field' => 'roi_percent',              'format' => '0.00"%"'],
             'AE' => ['header' => 'На р/с, ₽',           'width' => 12, 'field' => 'to_settlement_account',    'format' => '#,##0.00 "₽"'],
+            'AF' => ['header' => 'Индекс цен',           'width' => 11, 'field' => 'current_price_index',      'format' => '0.00'],
+            'AG' => ['header' => 'КС, %',                'width' => 10, 'field' => 'warehouse_coef_percent',   'format' => '0.00"%"'],
+            'AH' => ['header' => 'КС, ₽',                'width' => 10, 'field' => 'warehouse_coef_amount',    'format' => '#,##0.00 "₽"'],
+            'AI' => ['header' => 'ИЛ',                   'width' => 9,  'field' => 'localization_index',       'format' => '0.00'],
+            'AJ' => ['header' => 'ИЛ, ₽',                'width' => 10, 'field' => 'localization_amount',      'format' => '#,##0.00 "₽"'],
+            'AK' => ['header' => 'ИРП, %',               'width' => 10, 'field' => 'sales_distribution_index', 'format' => '0.00"%"'],
+            'AL' => ['header' => 'ИРП, ₽',               'width' => 10, 'field' => 'sales_distribution_amount','format' => '#,##0.00 "₽"'],
+            'AM' => ['header' => 'СПП, %',                'width' => 10, 'field' => 'spp_percent',              'format' => '0.00"%"'],
+            'AN' => ['header' => 'СПП, ₽',                'width' => 10, 'field' => 'spp_amount',               'format' => '#,##0.00 "₽"'],
+            'AO' => ['header' => 'Нелок. наценка, ₽',     'width' => 15, 'field' => 'non_local_markup_amount',  'format' => '#,##0.00 "₽"'],
+            'AP' => ['header' => 'Нелок. ожид., %',       'width' => 15, 'field' => 'weighted_non_local_markup_percent', 'format' => '0.00"%"'],
+            'AQ' => ['header' => 'Источник наценки',      'width' => 20, 'field' => 'non_local_markup_source',  'format' => '@'],
         ];
 
-        $lastCol = 'AE';
+        $lastCol = 'AQ';
+        $isWildberriesExport = $marketplace === 'wildberries';
 
         // ── Ширины колонок ──
         foreach ($columns as $col => $def) {
@@ -719,9 +1235,9 @@ class UnitEconomicsCacheController extends Controller
         $currentRow = $dataStartRow;
 
         // Текстовые колонки (формат '@')
-        $textColumns = ['A', 'B', 'U', 'X', 'Z'];
+        $textColumns = ['A', 'B', 'U', 'X', 'Z', 'AQ'];
         // Колонки, которые должны отображаться пустыми при null (а не как 0)
-        $nullableNumericColumns = ['V'];
+        $nullableNumericColumns = ['V', 'AF'];
 
         foreach ($items as $item) {
             $isEvenRow = ($currentRow - $dataStartRow) % 2 === 1;
@@ -741,16 +1257,21 @@ class UnitEconomicsCacheController extends Controller
                     // J: Комиссия ₽ — зависит от цены и комиссии %
                     $sheet->setCellValue("J{$currentRow}", "=C{$currentRow}*I{$currentRow}/100");
                 } elseif ($col === 'M') {
-                    // M: Доставка — Excel-формула =K+L (логистика + посл. миля)
-                    $sheet->setCellValue("M{$currentRow}", "=K{$currentRow}+L{$currentRow}");
+                    // M: Эффективная логистика из API/UI. В Ozon она уже включает возвраты
+                    // и нелокальную наценку, поэтому N/W остаются детализацией, а не плюсуются повторно.
+                    $sheet->setCellValue("M{$currentRow}", (float) ($item['effective_logistics'] ?? 0));
                 } elseif ($col === 'AA') {
-                    // AA: Итого затраты — себестоимость + все видимые расходы.
-                    $sheet->setCellValue(
-                        "AA{$currentRow}",
-                        "=D{$currentRow}+J{$currentRow}+M{$currentRow}+N{$currentRow}+O{$currentRow}"
-                        . "+(C{$currentRow}*P{$currentRow}/100)+(C{$currentRow}*Q{$currentRow}/100)"
-                        . "+(C{$currentRow}*R{$currentRow}/100)+(C{$currentRow}*S{$currentRow}/100)"
-                        . "+(C{$currentRow}*T{$currentRow}/100)"
+                    // AA: Итого затраты — та же модель, что на экране. Для WB отдельно
+                    // учитываем СПП и хранение; для Ozon хранение/возвраты не дублируем,
+                    // потому что экранная формула использует effective_logistics.
+                    $sheet->setCellValue("AA{$currentRow}", $isWildberriesExport
+                        ? "=D{$currentRow}+J{$currentRow}+M{$currentRow}+O{$currentRow}+AN{$currentRow}"
+                            . "+(C{$currentRow}*P{$currentRow}/100)+(C{$currentRow}*Q{$currentRow}/100)"
+                            . "+(C{$currentRow}*S{$currentRow}/100)"
+                        : "=D{$currentRow}+J{$currentRow}+M{$currentRow}"
+                            . "+(C{$currentRow}*P{$currentRow}/100)+(C{$currentRow}*Q{$currentRow}/100)"
+                            . "+(C{$currentRow}*R{$currentRow}/100)+(C{$currentRow}*S{$currentRow}/100)"
+                            . "+(C{$currentRow}*T{$currentRow}/100)"
                     );
                 } elseif ($col === 'AB') {
                     // AB: Прибыль — ключевая формула, меняется от цены/расходов/себестоимости.
@@ -763,12 +1284,14 @@ class UnitEconomicsCacheController extends Controller
                     $sheet->setCellValue("AD{$currentRow}", "=IF(D{$currentRow}>0,AB{$currentRow}/D{$currentRow}*100,0)");
                 } elseif ($col === 'AE') {
                     // AE: На р/с — цена минус маркетплейс/процентные расходы без себестоимости.
-                    $sheet->setCellValue(
-                        "AE{$currentRow}",
-                        "=C{$currentRow}-J{$currentRow}-M{$currentRow}-N{$currentRow}-O{$currentRow}"
-                        . "-(C{$currentRow}*P{$currentRow}/100)-(C{$currentRow}*Q{$currentRow}/100)"
-                        . "-(C{$currentRow}*R{$currentRow}/100)-(C{$currentRow}*S{$currentRow}/100)"
-                        . "-(C{$currentRow}*T{$currentRow}/100)"
+                    $sheet->setCellValue("AE{$currentRow}", $isWildberriesExport
+                        ? "=C{$currentRow}-J{$currentRow}-M{$currentRow}-O{$currentRow}-AN{$currentRow}"
+                            . "-(C{$currentRow}*P{$currentRow}/100)-(C{$currentRow}*Q{$currentRow}/100)"
+                            . "-(C{$currentRow}*S{$currentRow}/100)"
+                        : "=C{$currentRow}-J{$currentRow}-M{$currentRow}"
+                            . "-(C{$currentRow}*P{$currentRow}/100)-(C{$currentRow}*Q{$currentRow}/100)"
+                            . "-(C{$currentRow}*R{$currentRow}/100)-(C{$currentRow}*S{$currentRow}/100)"
+                            . "-(C{$currentRow}*T{$currentRow}/100)"
                     );
                 } elseif ($col === 'U') {
                     // U: Локальность (лейбл)
@@ -885,7 +1408,7 @@ class UnitEconomicsCacheController extends Controller
         $sheet->setCellValue("A{$summaryRow}", 'ИТОГО');
 
         // SUM формулы для денежных колонок и количеств
-        $sumCols = ['C', 'F', 'G', 'J', 'K', 'L', 'M', 'N', 'O', 'AA', 'AB', 'AE'];
+        $sumCols = ['C', 'F', 'G', 'J', 'K', 'L', 'M', 'N', 'O', 'AA', 'AB', 'AE', 'AH', 'AJ', 'AN', 'AO'];
         foreach ($sumCols as $col) {
             if ($dataEndRow >= $dataStartRow) {
                 $sheet->setCellValue("{$col}{$summaryRow}", "=SUM({$col}{$dataStartRow}:{$col}{$dataEndRow})");
@@ -895,7 +1418,7 @@ class UnitEconomicsCacheController extends Controller
         }
 
         // AVERAGE формулы для процентных/относительных колонок
-        $avgCols = ['E', 'H', 'I', 'P', 'Q', 'R', 'S', 'T', 'V', 'W', 'Y', 'AC', 'AD'];
+        $avgCols = ['E', 'H', 'I', 'P', 'Q', 'R', 'S', 'T', 'V', 'W', 'Y', 'AC', 'AD', 'AF', 'AG', 'AI', 'AK', 'AM', 'AP'];
         foreach ($avgCols as $col) {
             if ($dataEndRow >= $dataStartRow) {
                 $sheet->setCellValue("{$col}{$summaryRow}", "=AVERAGE({$col}{$dataStartRow}:{$col}{$dataEndRow})");
@@ -945,19 +1468,18 @@ class UnitEconomicsCacheController extends Controller
     }
 
     /**
-     * Пересчёт финансовых полей под фронт-формулу (UnitEconomicsPage.tsx mapOzonItemsToRows).
+     * Пересчёт финансовых полей под фронт-формулы.
      *
-     * Фронт считает амуны процентов как % × price (а не использует cache.commission_amount),
-     * затем toSettlement = price - sum(амунов) - effectiveLogistics,
-     * net_profit = toSettlement - cost_price. Без этого пересчёта Excel и UI расходятся
-     * по одному и тому же SKU: Excel пишет cache (со своими корректировками типа
-     * marketplace_compensation), UI — собственный пересчёт.
+     * Ozon считает проценты как % × price и вычитает effective_logistics один раз.
+     * WB дополнительно вычитает СПП и хранение, как WBProductsTable при ручной правке.
      *
      * @param  array<int, array<string, mixed>>  $items
      * @return array<int, array<string, mixed>>
      */
-    private function recalculateFinanceFieldsForExport(array $items): array
+    private function recalculateFinanceFieldsForExport(array $items, string $marketplace): array
     {
+        $isWildberriesExport = $marketplace === 'wildberries';
+
         foreach ($items as &$item) {
             $price = (float) ($item['price'] ?? 0);
             $costPrice = (float) ($item['cost_price'] ?? 0);
@@ -968,18 +1490,24 @@ class UnitEconomicsCacheController extends Controller
             $drrPercent = (float) ($item['drr_percent'] ?? 0);
             $ourSharePercent = (float) ($item['our_share_percent'] ?? 0);
             $effectiveLogistics = (float) ($item['effective_logistics'] ?? 0);
+            $storageCost = $isWildberriesExport ? (float) ($item['storage_cost'] ?? 0) : 0.0;
+            $sppPercent = (float) ($item['spp_percent'] ?? 0);
 
             $commissionAmount = $price * $commissionPercent / 100;
             $acquiringAmount = $price * $acquiringPercent / 100;
             $taxAmount = $price * $taxPercent / 100;
-            $vatAmount = $price * $vatPercent / 100;
+            $vatAmount = $isWildberriesExport ? 0.0 : $price * $vatPercent / 100;
             $drrAmount = $price * $drrPercent / 100;
-            $ourShareAmount = $price * $ourSharePercent / 100;
+            $ourShareAmount = $isWildberriesExport ? 0.0 : $price * $ourSharePercent / 100;
+            $sppAmount = $isWildberriesExport ? $price * $sppPercent / 100 : 0.0;
 
             $toSettlement = $price - $commissionAmount - $effectiveLogistics
                 - $acquiringAmount - $taxAmount - $vatAmount
-                - $ourShareAmount - $drrAmount;
+                - $ourShareAmount - $drrAmount - $storageCost - $sppAmount;
             $netProfit = $toSettlement - $costPrice;
+            $totalCosts = $costPrice + $commissionAmount + $effectiveLogistics
+                + $acquiringAmount + $taxAmount + $vatAmount
+                + $ourShareAmount + $drrAmount + $storageCost + $sppAmount;
 
             $item['commission_amount'] = round($commissionAmount, 2);
             $item['acquiring_amount'] = round($acquiringAmount, 2);
@@ -987,11 +1515,12 @@ class UnitEconomicsCacheController extends Controller
             $item['vat_amount'] = round($vatAmount, 2);
             $item['drr_amount'] = round($drrAmount, 2);
             $item['our_share_amount'] = round($ourShareAmount, 2);
+            $item['spp_amount'] = round($sppAmount, 2);
+            $item['total_costs'] = round($totalCosts, 2);
             $item['to_settlement_account'] = round($toSettlement, 2);
             $item['net_profit'] = round($netProfit, 2);
-
-            // margin_percent / roi_percent в Excel считаются формулами AC/C*100 и AC/D*100,
-            // так что их перезаписывать не нужно — Excel сам пересчитает по новому AC.
+            $item['margin_percent'] = $price > 0 ? round(($netProfit / $price) * 100, 2) : 0.0;
+            $item['roi_percent'] = $costPrice > 0 ? round(($netProfit / $costPrice) * 100, 2) : 0.0;
         }
         unset($item);
 
@@ -1430,6 +1959,10 @@ class UnitEconomicsCacheController extends Controller
 
     private function resolveActualSchemeFromInventory(int $integrationId, string $marketplace, ?string $sku = null): ?string
     {
+        if (! Schema::hasTable('inventory_warehouses')) {
+            return null;
+        }
+
         $cacheKey = 'ue_inventory_actual_scheme_'
             .$integrationId.'_'
             .$marketplace.'_'
@@ -1510,6 +2043,7 @@ class UnitEconomicsCacheController extends Controller
                     SUM(CASE WHEN net_profit <= 0 THEN 1 ELSE 0 END) as unprofitable_count,
                     AVG(margin_percent) as avg_margin,
                     SUM(revenue) as total_revenue,
+                    SUM(total_costs) as total_costs,
                     SUM(net_profit) as total_profit
                 ')
                 ->first();
@@ -1519,24 +2053,70 @@ class UnitEconomicsCacheController extends Controller
                 'profitable_count' => (int) ($stats->profitable_count ?? 0),
                 'unprofitable_count' => (int) ($stats->unprofitable_count ?? 0),
                 'avg_margin' => round((float) ($stats->avg_margin ?? 0), 2),
+                'average_margin' => round((float) ($stats->avg_margin ?? 0), 2),
                 'total_revenue' => round((float) ($stats->total_revenue ?? 0), 2),
+                'total_costs' => round((float) ($stats->total_costs ?? 0), 2),
                 'total_profit' => round((float) ($stats->total_profit ?? 0), 2),
             ];
         });
     }
 
+    private function canUseFastStats(array $validated): bool
+    {
+        foreach (['search', 'profitable', 'margin_min', 'margin_max', 'price_min', 'price_max'] as $field) {
+            if (array_key_exists($field, $validated) && $validated[$field] !== null && $validated[$field] !== '') {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
     /**
-     * Одна выборка складов и интеграций на страницу (WB), чтобы не бить N+1 в enrichCacheItem.
+     * Агрегаты для текущей отфильтрованной выборки, но без пагинации.
+     * Карточки на фронте не должны считаться только по первым 50 строкам.
+     */
+    private function getStatsFromQuery($query): array
+    {
+        $stats = $query
+            ->selectRaw('
+                COUNT(*) as total_count,
+                SUM(CASE WHEN net_profit > 0 THEN 1 ELSE 0 END) as profitable_count,
+                SUM(CASE WHEN net_profit <= 0 THEN 1 ELSE 0 END) as unprofitable_count,
+                AVG(margin_percent) as avg_margin,
+                SUM(revenue) as total_revenue,
+                SUM(total_costs) as total_costs,
+                SUM(net_profit) as total_profit
+            ')
+            ->first();
+
+        return [
+            'total_count' => (int) ($stats->total_count ?? 0),
+            'profitable_count' => (int) ($stats->profitable_count ?? 0),
+            'unprofitable_count' => (int) ($stats->unprofitable_count ?? 0),
+            'avg_margin' => round((float) ($stats->avg_margin ?? 0), 2),
+            'average_margin' => round((float) ($stats->avg_margin ?? 0), 2),
+            'total_revenue' => round((float) ($stats->total_revenue ?? 0), 2),
+            'total_costs' => round((float) ($stats->total_costs ?? 0), 2),
+            'total_profit' => round((float) ($stats->total_profit ?? 0), 2),
+        ];
+    }
+
+    /**
+     * Одна выборка остатков/интеграций на страницу, чтобы не бить N+1 в enrichCacheItem.
      *
      * @return array{
+     *   warehouses_by_key: Collection,
+     *   inventory_by_product_key: Collection,
+     *   actual_schemes_by_product_key: Collection,
      *   wb_warehouses_by_key: Collection,
      *   wb_warehouses_by_product_key: Collection,
      *   integrations_by_id: Collection
      * }|null
      */
-    private function buildWildberriesUnitEconomicsPageContext(string $marketplace, Collection $itemsCollection): ?array
+    private function buildUnitEconomicsPageContext(string $marketplace, Collection $itemsCollection): ?array
     {
-        if ($marketplace !== 'wildberries' || $itemsCollection->isEmpty()) {
+        if ($itemsCollection->isEmpty() || ! Schema::hasTable('inventory_warehouses')) {
             return null;
         }
 
@@ -1560,9 +2140,15 @@ class UnitEconomicsCacheController extends Controller
         $warehouseRows = InventoryWarehouse::query()
             ->whereIn('sku', $skus)
             ->whereIn('integration_id', $integrationIds)
-            ->where('marketplace', 'wildberries')
+            ->when(
+                in_array($marketplace, ['yandex', 'yandex_market'], true),
+                fn ($query) => $query->whereIn('marketplace', ['yandex', 'yandex_market']),
+                fn ($query) => $query->where('marketplace', $marketplace)
+            )
             ->get([
                 'id',
+                'marketplace',
+                'fulfillment_type',
                 'warehouse_id',
                 'warehouse_name',
                 'warehouse_coefficient',
@@ -1573,27 +2159,75 @@ class UnitEconomicsCacheController extends Controller
                 'integration_id',
             ]);
 
-        $wbWarehousesByKey = $warehouseRows->groupBy(fn ($w) => $w->sku.'|'.$w->integration_id);
-        $wbWarehousesByProductKey = $itemsCollection->mapWithKeys(function (UnitEconomicsCache $cache) use ($wbWarehousesByKey) {
+        $warehousesByKey = $warehouseRows->groupBy(fn ($w) => $w->sku.'|'.$w->integration_id);
+        $warehousesByProductKey = $itemsCollection->mapWithKeys(function (UnitEconomicsCache $cache) use ($warehousesByKey) {
             $lookupKeys = $this->resolveInventoryLookupKeys($cache, $cache->product);
             $warehouseItems = collect($lookupKeys)
-                ->flatMap(fn (string $lookupKey) => $wbWarehousesByKey->get($lookupKey.'|'.$cache->integration_id, collect()))
+                ->flatMap(fn (string $lookupKey) => $warehousesByKey->get($lookupKey.'|'.$cache->integration_id, collect()))
                 ->unique('id')
                 ->values();
 
-            return [($cache->product_id ?? $cache->sku).'|'.$cache->integration_id => $warehouseItems];
+            return [$this->unitEconomicsProductContextKey($cache) => $warehouseItems];
         });
 
-        $integrationsById = Integration::query()
-            ->whereIn('id', $integrationIds)
-            ->get()
-            ->keyBy('id');
+        $actualSchemesByProductKey = $warehousesByProductKey->map(
+            fn (Collection $warehouses): ?string => $this->resolveActualSchemeFromWarehouseRows($warehouses)
+        );
+
+        $integrationsById = collect();
+        if ($marketplace === 'wildberries') {
+            $integrationsById = Integration::query()
+                ->whereIn('id', $integrationIds)
+                ->get()
+                ->keyBy('id');
+        }
 
         return [
-            'wb_warehouses_by_key' => $wbWarehousesByKey,
-            'wb_warehouses_by_product_key' => $wbWarehousesByProductKey,
+            'warehouses_by_key' => $warehousesByKey,
+            'inventory_by_product_key' => $warehousesByProductKey,
+            'actual_schemes_by_product_key' => $actualSchemesByProductKey,
+            'wb_warehouses_by_key' => $warehousesByKey,
+            'wb_warehouses_by_product_key' => $warehousesByProductKey,
             'integrations_by_id' => $integrationsById,
         ];
+    }
+
+    private function unitEconomicsProductContextKey(UnitEconomicsCache $cache): string
+    {
+        return ($cache->product_id ?? $cache->sku).'|'.$cache->integration_id;
+    }
+
+    private function resolveActualSchemeFromWarehouseRows(Collection $warehouses): ?string
+    {
+        $rows = $warehouses
+            ->filter(fn ($row): bool => filled($row->fulfillment_type))
+            ->groupBy(fn ($row): string => strtoupper((string) $row->fulfillment_type))
+            ->map(function (Collection $items, string $scheme): ?array {
+                $normalizedScheme = $this->normalizeFulfillmentScheme($scheme);
+                if ($normalizedScheme === null) {
+                    return null;
+                }
+
+                return [
+                    'scheme' => $normalizedScheme,
+                    'total_quantity' => (float) $items->sum('quantity'),
+                    'rows_count' => $items->count(),
+                ];
+            })
+            ->filter()
+            ->values();
+
+        if ($rows->isEmpty()) {
+            return null;
+        }
+
+        $withStock = $rows->filter(fn (array $row): bool => $row['total_quantity'] > 0);
+        $winner = ($withStock->isNotEmpty() ? $withStock : $rows)
+            ->sortByDesc('rows_count')
+            ->sortByDesc('total_quantity')
+            ->first();
+
+        return $winner['scheme'] ?? null;
     }
 
     /**
@@ -1612,16 +2246,20 @@ class UnitEconomicsCacheController extends Controller
         $redemption = $ozonData['redemption'] ?? [];
         $salesCount = max(1, (int) $cache->sales_count);
 
-        // Получаем реальную схему товара из остатков: Ozon product API не гарантирует
-        // fulfillment_type, а inventory показывает где товар реально продаётся сейчас.
-        $realScheme = $this->resolveActualSchemeFromInventory(
-            (int) $cache->integration_id,
-            (string) $cache->marketplace,
-            (string) $cache->sku
-        ) ?? $product?->fulfillment_type ?? match ($cache->marketplace) {
-            'yandex', 'yandex_market' => 'FBY',
-            default => 'FBO',
-        };
+        // Получаем реальную схему товара из preload-остатков страницы. Fallback оставлен
+        // для show()/экспорта без контекста, но index не делает запрос на каждую строку.
+        $preloadedActualScheme = ($pageContext['actual_schemes_by_product_key'] ?? null)?->get($this->unitEconomicsProductContextKey($cache));
+        $realScheme = $preloadedActualScheme
+            ?? ($pageContext === null ? $this->resolveActualSchemeFromInventory(
+                (int) $cache->integration_id,
+                (string) $cache->marketplace,
+                (string) $cache->sku
+            ) : null)
+            ?? $product?->fulfillment_type
+            ?? match ($cache->marketplace) {
+                'yandex', 'yandex_market' => 'FBY',
+                default => 'FBO',
+            };
 
         // Базовые данные из кэша
         $data = $cache->toArray();
@@ -2076,7 +2714,7 @@ class UnitEconomicsCacheController extends Controller
 
             // КС (коэффициент склада) — средний по всем складам товара
             // Получаем ВСЕ склады товара для детализации (включая с нулевыми остатками)
-            $wbProductKey = ($cache->product_id ?? $cache->sku).'|'.$cache->integration_id;
+            $wbProductKey = $this->unitEconomicsProductContextKey($cache);
             if ($pageContext !== null && isset($pageContext['wb_warehouses_by_product_key'])) {
                 $warehouses = $pageContext['wb_warehouses_by_product_key']->get($wbProductKey, collect());
             } else {
@@ -2116,25 +2754,22 @@ class UnitEconomicsCacheController extends Controller
                 ];
             }
 
-            // Средний КС (взвешенный по количеству) — только по складам с остатками
-            // Если остатков нет — берём простое среднее по всем складам
+            // Средний КС (взвешенный по количеству) — только по складам с остатками.
+            // При нулевых остатках используем детерминированный fallback 1.0.
             if ($totalQuantity > 0) {
                 $avgWarehouseCoef = $weightedCoefSum / $totalQuantity;
-            } elseif ($warehouses->count() > 0) {
-                // Нет остатков — простое среднее по всем складам
-                $avgWarehouseCoef = $warehouses->avg(fn ($w) => (float) ($w->warehouse_coefficient ?? 1.0));
             } else {
                 $avgWarehouseCoef = 1.0;
             }
             // Проценты 100-значные: 1.0 = 100%, 1.4 = 140%
             $warehouseCoefPercent = $avgWarehouseCoef * 100;
 
-            $data['warehouse_coef_percent'] = round($warehouseCoefPercent, 0);
-            $data['warehouse_coefficient'] = round($avgWarehouseCoef, 3);
+            $data['warehouse_coef_percent'] = round((float) ($marketplaceData['warehouse_coef_percent'] ?? $warehouseCoefPercent), 0);
+            $data['warehouse_coefficient'] = round((float) ($marketplaceData['warehouse_coefficient'] ?? $avgWarehouseCoef), 3);
             $data['warehouse_details'] = $warehouseDetails; // Детализация по складам для tooltip
             $baseLogistics = (float) $cache->base_logistics_cost;
             // Сумма надбавки КС = базовая логистика × (коэффициент - 1)
-            $data['warehouse_coef_amount'] = round($baseLogistics * ($avgWarehouseCoef - 1), 2);
+            $data['warehouse_coef_amount'] = round((float) ($marketplaceData['warehouse_coef_amount'] ?? ($baseLogistics * ($avgWarehouseCoef - 1))), 2);
 
             // ИЛ (индекс локализации) — из интеграции (настройка магазина)
             if ($pageContext !== null && isset($pageContext['integrations_by_id'])) {
@@ -2142,10 +2777,31 @@ class UnitEconomicsCacheController extends Controller
             } else {
                 $integration = Integration::find($cache->integration_id);
             }
-            $localizationIndex = (float) ($cache->logistics_coefficient ?? $integration?->localization_index ?? 1.0);
+            $integrationSettings = is_array($integration?->settings ?? null) ? $integration->settings : [];
+            $localizationIndex = (float) (
+                $marketplaceData['localization_index']
+                ?? $integrationSettings['wb_localization_index']
+                ?? $integration?->localization_index
+                ?? $cache->logistics_coefficient
+                ?? 1.0
+            );
             $data['localization_index'] = $localizationIndex;
             // Сумма надбавки/скидки ИЛ = базовая логистика × КС × (ИЛ - 1)
-            $data['localization_amount'] = round($baseLogistics * $avgWarehouseCoef * ($localizationIndex - 1), 2);
+            $data['localization_amount'] = round((float) ($marketplaceData['localization_amount'] ?? ($baseLogistics * $avgWarehouseCoef * ($localizationIndex - 1))), 2);
+
+            $salesDistributionIndex = (float) (
+                $marketplaceData['sales_distribution_index']
+                ?? $marketplaceData['sales_distribution_index_percent']
+                ?? $integrationSettings['wb_sales_distribution_index']
+                ?? $integrationSettings['sales_distribution_index']
+                ?? 0.0
+            );
+            $salesDistributionAmount = (float) (
+                $marketplaceData['sales_distribution_amount']
+                ?? (((float) ($cache->old_price ?: $cache->price)) * ($salesDistributionIndex / 100))
+            );
+            $data['sales_distribution_index'] = round($salesDistributionIndex, 4);
+            $data['sales_distribution_amount'] = round($salesDistributionAmount, 2);
 
             // Базовая логистика
             $data['base_logistics'] = round($baseLogistics, 2);
@@ -2306,13 +2962,18 @@ class UnitEconomicsCacheController extends Controller
         $warehouses = null;
         $inventoryLookupKeys = $this->resolveInventoryLookupKeys($cache, $product);
 
-        if (
+        if ($pageContext !== null && isset($pageContext['inventory_by_product_key'])) {
+            $warehouses = $pageContext['inventory_by_product_key']->get(
+                $this->unitEconomicsProductContextKey($cache),
+                collect()
+            );
+        } elseif (
             $cache->marketplace === 'wildberries'
             && $pageContext !== null
             && isset($pageContext['wb_warehouses_by_product_key'])
         ) {
             $warehouses = $pageContext['wb_warehouses_by_product_key']->get(
-                ($cache->product_id ?? $cache->sku).'|'.$cache->integration_id,
+                $this->unitEconomicsProductContextKey($cache),
                 collect()
             );
         }
@@ -2389,6 +3050,20 @@ class UnitEconomicsCacheController extends Controller
     public function calculate(CalculateRequest $request, string $marketplace): JsonResponse
     {
         $marketplace = $this->normalizeMarketplace($marketplace);
+        if ($marketplace === 'wildberries') {
+            return response()->json([
+                'message' => 'WB live calculation endpoint is deprecated. Use GET /unit-economics/wildberries for cached data or POST /unit-economics/recalculate/{integrationId}.',
+                'data' => [
+                    'marketplace' => $marketplace,
+                    'deprecated' => true,
+                    'replacement' => [
+                        'read' => '/api/unit-economics/wildberries',
+                        'recalculate' => '/api/unit-economics/recalculate/{integrationId}',
+                    ],
+                ],
+            ], 410);
+        }
+
         $validated = $request->validated();
         $validated['marketplace'] = $marketplace;
         $validated['fulfillment_type'] = $validated['fulfillment_type'] ?? match ($marketplace) {
@@ -2463,12 +3138,61 @@ class UnitEconomicsCacheController extends Controller
      */
     public function commissions(string $marketplace): JsonResponse
     {
+        $marketplace = $this->normalizeMarketplace($marketplace);
+
+        if ($marketplace === 'wildberries' && request()->integer('integration_id') > 0) {
+            $integrationId = request()->integer('integration_id');
+            $resolution = $this->integrationAccessService->ensureAccessibleIntegration(
+                request(),
+                $integrationId,
+                $marketplace
+            );
+            if (! ($resolution['success'] ?? false)) {
+                return response()->json([
+                    'message' => $resolution['message'] ?? 'Интеграция не найдена',
+                    'errors' => [
+                        'integration_id' => [$resolution['message'] ?? 'Интеграция не найдена'],
+                    ],
+                ], $resolution['status'] ?? 404);
+            }
+
+            $rows = WildberriesTariffSnapshot::query()
+                ->where('integration_id', $integrationId)
+                ->where('tariff_type', 'commission')
+                ->orderByDesc('effective_date')
+                ->get();
+
+            if ($rows->isNotEmpty()) {
+                return response()->json([
+                    'data' => [
+                        'marketplace' => $marketplace,
+                        'source' => 'wildberries_tariff_snapshots',
+                        'integration_id' => $integrationId,
+                        'categories' => $rows->map(fn ($row) => [
+                            'subject_id' => $row->subject_id,
+                            'subject_name' => $row->subject_name,
+                            'scheme' => $row->scheme,
+                            'commission' => (float) data_get($row->payload, 'percent', 0),
+                            'effective_date' => optional($row->effective_date)->toDateString(),
+                        ])->values(),
+                    ],
+                ]);
+            }
+        }
+
         $commissionCalculator = $this->getCommissionCalculator($marketplace);
 
         if ($commissionCalculator) {
+            $isWildberriesFallback = $marketplace === 'wildberries';
+
             return response()->json([
                 'data' => [
                     'marketplace' => $marketplace,
+                    'source' => $isWildberriesFallback ? 'wildberries_legacy_static_fallback' : 'domain_static_fallback',
+                    'deprecated' => $isWildberriesFallback,
+                    'message' => $isWildberriesFallback
+                        ? 'Передайте integration_id и выполните синхронизацию тарифов, чтобы получить комиссии из WB API snapshots.'
+                        : null,
                     'categories' => $commissionCalculator->getAllCommissions(),
                     'acquiring_rate' => $commissionCalculator->getAcquiringRate(),
                 ],
@@ -2489,10 +3213,47 @@ class UnitEconomicsCacheController extends Controller
      */
     public function tariffs(string $marketplace): JsonResponse
     {
+        $marketplace = $this->normalizeMarketplace($marketplace);
+
+        if ($marketplace === 'wildberries' && request()->integer('integration_id') > 0) {
+            $integrationId = request()->integer('integration_id');
+            $resolution = $this->integrationAccessService->ensureAccessibleIntegration(
+                request(),
+                $integrationId,
+                $marketplace
+            );
+            if (! ($resolution['success'] ?? false)) {
+                return response()->json([
+                    'message' => $resolution['message'] ?? 'Интеграция не найдена',
+                    'errors' => [
+                        'integration_id' => [$resolution['message'] ?? 'Интеграция не найдена'],
+                    ],
+                ], $resolution['status'] ?? 404);
+            }
+
+            $rows = WildberriesTariffSnapshot::query()
+                ->where('integration_id', $integrationId)
+                ->whereIn('tariff_type', ['box', 'pallet', 'return', 'acceptance'])
+                ->orderByDesc('effective_date')
+                ->get();
+
+            if ($rows->isNotEmpty()) {
+                return response()->json([
+                    'data' => [
+                        'marketplace' => $marketplace,
+                        'source' => 'wildberries_tariff_snapshots',
+                        'integration_id' => $integrationId,
+                        'tariffs' => $rows->groupBy('tariff_type')->map(fn ($items) => $items->values())->toArray(),
+                    ],
+                ]);
+            }
+        }
+
         $tariffsProvider = $this->getTariffsProvider($marketplace);
         $schemes = $this->orchestrator->getSupportedSchemes($marketplace);
 
         if ($tariffsProvider && ! empty($schemes)) {
+            $isWildberriesFallback = $marketplace === 'wildberries';
             $tariffs = [];
             foreach ($schemes as $scheme) {
                 $tariffs[$scheme] = $tariffsProvider->getLogisticsTariffs($scheme);
@@ -2501,6 +3262,11 @@ class UnitEconomicsCacheController extends Controller
             return response()->json([
                 'data' => [
                     'marketplace' => $marketplace,
+                    'source' => $isWildberriesFallback ? 'wildberries_legacy_static_fallback' : 'domain_static_fallback',
+                    'deprecated' => $isWildberriesFallback,
+                    'message' => $isWildberriesFallback
+                        ? 'Передайте integration_id и выполните синхронизацию тарифов, чтобы получить тарифы из WB API snapshots.'
+                        : null,
                     'schemes' => $schemes,
                     'tariffs' => $tariffs,
                 ],
@@ -2817,6 +3583,7 @@ class UnitEconomicsCacheController extends Controller
     private function normalizeMarketplace(string $marketplace): string
     {
         return match (strtolower($marketplace)) {
+            'wb' => 'wildberries',
             'yandex', 'yandex_market' => 'yandex_market',
             default => strtolower($marketplace),
         };

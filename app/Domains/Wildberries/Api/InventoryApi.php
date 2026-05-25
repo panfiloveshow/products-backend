@@ -168,9 +168,11 @@ class InventoryApi implements InventoryApiInterface
             return [];
         }
 
+        $sizeMeta = $this->getSizeMetadata($integration);
+
         // Если chrtIds не переданы, получаем их из карточек товаров
         if (empty($chrtIds)) {
-            $chrtIds = $this->getAllChrtIds($integration);
+            $chrtIds = array_keys($sizeMeta['chrt_to_nm'] ?? []);
 
             if (empty($chrtIds)) {
                 Log::warning('WB InventoryApi: No chrtIds found from products');
@@ -202,7 +204,12 @@ class InventoryApi implements InventoryApiInterface
 
             foreach ($stocks as $stock) {
                 $sku = $stock['sku'] ?? null;
-                $chrtId = $stock['chrtId'] ?? null;
+                $chrtId = (int) ($stock['chrtId'] ?? 0);
+                $nmId = $chrtId > 0 ? ($sizeMeta['chrt_to_nm'][$chrtId] ?? null) : null;
+                $meta = ($nmId && $chrtId > 0)
+                    ? ($sizeMeta['by_nm_chrt']["{$nmId}:{$chrtId}"] ?? [])
+                    : [];
+                $sku = $sku ?: ($meta['barcode'] ?? null) ?: ($meta['supplierArticle'] ?? null);
                 if (! $sku) {
                     continue;
                 }

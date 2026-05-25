@@ -2,6 +2,8 @@
 
 namespace App\Services;
 
+use App\Jobs\RecalculateUnitEconomicsCacheJob;
+use App\Jobs\RecalculateUnitEconomicsForSkuJob;
 use App\Models\Integration;
 use App\Models\InventoryWarehouse;
 use App\Models\OzonSupplyFixation;
@@ -10,9 +12,11 @@ use App\Models\Product;
 use App\Models\UnitEconomics;
 use App\Models\UnitEconomicsCache;
 use App\Models\UnitEconomicsSettings;
+use App\Models\WildberriesTariffSnapshot;
 use App\Domains\Ozon\Tariffs\OzonPricingMatrix;
 use App\Domains\UnitEconomics\UnitEconomicsOrchestrator;
 use App\Domains\UnitEconomics\DTO\CalculationInput;
+use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
@@ -39,6 +43,8 @@ class UnitEconomicsCacheService
     private array $warehouseCoefficientCache = [];
     /** @var array<string, ?UnitEconomicsSettings> */
     private array $settingsCache = [];
+    /** @var array<int, array{box_by_warehouse: array<string, WildberriesTariffSnapshot>, box_fallback: ?WildberriesTariffSnapshot, return: array}> */
+    private array $wildberriesTariffSnapshotCache = [];
     /** @var array<string, array>|null Per-SKU locality data from real orders (batch-loaded) */
     private ?array $localityCache = null;
     /** @var int|null Seller-level FBO orders in last 7 days (cached per integration) */
@@ -186,7 +192,9 @@ class UnitEconomicsCacheService
         }
 
         Product::where('integration_id', $integrationId)
-            ->chunkById(100, function ($products) use (&$stats, $schemes) {
+            ->chunkById(100, function ($products) use (&$stats, $schemes, $integration) {
+                $this->warmRecalculateChunkCaches($products, $schemes, $integration);
+
                 foreach ($products as $product) {
                     $stats['total']++;
 
@@ -237,14 +245,13 @@ class UnitEconomicsCacheService
     public function onSettingsChanged(int $integrationId, string $sku): void
     {
         $this->forgetSettingsCache($integrationId, $sku);
-        $product = Product::where('integration_id', $integrationId)
-            ->where('sku', $sku)
-            ->first();
-
-        if ($product) {
-            $this->recalculateProductAllSchemes($product);
-            $this->forgetStatsCache($integrationId, $product->marketplace, $this->getSchemesForMarketplace($product->marketplace));
+        $integration = $this->getIntegrationCached($integrationId);
+        if ($integration) {
+            $this->forgetStatsCache($integrationId, $integration->marketplace, $this->getSchemesForMarketplace($integration->marketplace));
         }
+
+        RecalculateUnitEconomicsForSkuJob::dispatch($integrationId, $sku)
+            ->onQueue('unit-economics');
     }
 
     /**
@@ -255,18 +262,49 @@ class UnitEconomicsCacheService
         foreach ($skus as $sku) {
             $this->forgetSettingsCache($integrationId, $sku);
         }
-        Product::where('integration_id', $integrationId)
-            ->whereIn('sku', $skus)
-            ->chunk(50, function ($products) {
-                foreach ($products as $product) {
-                    $this->recalculateProductAllSchemes($product);
-                }
-            });
 
         $integration = $this->getIntegrationCached($integrationId);
         if ($integration) {
             $this->forgetStatsCache($integrationId, $integration->marketplace, $this->getSchemesForMarketplace($integration->marketplace));
         }
+
+        foreach (array_unique(array_filter(array_map('strval', $skus))) as $sku) {
+            RecalculateUnitEconomicsForSkuJob::dispatch($integrationId, $sku)
+            ->onQueue('unit-economics');
+        }
+    }
+
+    public function onIntegrationSettingsChanged(int $integrationId): void
+    {
+        $integration = $this->getIntegrationCached($integrationId);
+        if ($integration) {
+            $this->forgetStatsCache($integrationId, $integration->marketplace, $this->getSchemesForMarketplace($integration->marketplace));
+        }
+
+        RecalculateUnitEconomicsCacheJob::dispatch($integrationId)
+            ->onQueue('unit-economics');
+    }
+
+    public function recalculateSkuAllSchemes(int $integrationId, string $sku): array
+    {
+        $this->forgetSettingsCache($integrationId, $sku);
+        $this->forgetUnitEconomicsCache($integrationId, $sku);
+
+        $product = Product::query()
+            ->where('integration_id', $integrationId)
+            ->where('sku', $sku)
+            ->first();
+
+        if (! $product) {
+            return [];
+        }
+
+        $integration = $this->getIntegrationCached($integrationId);
+        if ($integration) {
+            $this->forgetStatsCache($integrationId, $integration->marketplace, $this->getSchemesForMarketplace($integration->marketplace));
+        }
+
+        return $this->recalculateProductAllSchemes($product);
     }
 
     /**
@@ -296,14 +334,23 @@ class UnitEconomicsCacheService
             'yandex_market' => ($product->yandex_data ?? []),
             default => ($product->ozon_data ?? []),
         };
-        $commissions = $marketplaceData['commissions'] ?? [];
+        $commissions = $marketplaceData['commissions_by_scheme'] ?? $marketplaceData['commissions'] ?? [];
         $redemption = $marketplaceData['redemption'] ?? [];
         $tariffBreakdown = $marketplaceData['tariffs'] ?? [];
 
         $existingUE = $this->getUnitEconomicsCached($product->integration_id, $product->sku, strtoupper($fulfillmentType));
 
         $schemeKey = strtolower($fulfillmentType);
-        if ($schemeKey === 'realfbs' || $schemeKey === 'dbs') {
+        if ($marketplace === 'wildberries') {
+            $schemeKey = match ($schemeKey) {
+                'fbo', 'fbw' => 'fbo',
+                'fbs' => 'fbs',
+                'edbs', 'express' => 'edbs',
+                'dbs', 'pickup' => 'dbs',
+                'dbw', 'booking' => 'dbw',
+                default => $schemeKey,
+            };
+        } elseif ($schemeKey === 'realfbs' || $schemeKey === 'dbs') {
             $schemeKey = 'rfbs';
         }
 
@@ -661,14 +708,31 @@ class UnitEconomicsCacheService
         $sppPercent = 0.0;
         $warehouseCoefficient = 1.0;
         $localizationIndex = 1.0;
+        $salesDistributionIndex = 0.0;
         if ($marketplace === 'wildberries') {
+            $tariffBreakdown = $this->resolveWildberriesTariffBreakdown(
+                (int) $product->integration_id,
+                (string) $fulfillmentType,
+                $marketplaceData,
+                is_array($tariffBreakdown) ? $tariffBreakdown : []
+            );
+            $tariffSource = $tariffBreakdown['source'] ?? $tariffSource;
+            $tariffEffectiveFrom = $tariffBreakdown['effective_date'] ?? $tariffEffectiveFrom;
             $sppPercent = (float) ($settings?->spp_percent ?? $marketplaceData['spp_percent'] ?? $existingUE?->spp_percent ?? 0);
             $warehouseCoefficient = $this->getAverageWarehouseCoefficient($product->integration_id, $product->sku, $marketplace);
             $localizationIndex = (float) (
-                $existingUE?->localization_index
-                ?? $integrationSettings['wb_localization_index']
+                $integrationSettings['wb_localization_index']
                 ?? $integration?->localization_index
+                ?? $existingUE?->localization_index
                 ?? 1.0
+            );
+            $salesDistributionIndex = (float) (
+                $marketplaceData['sales_distribution_index']
+                ?? $marketplaceData['sales_distribution_index_percent']
+                ?? $integrationSettings['wb_sales_distribution_index']
+                ?? $integrationSettings['sales_distribution_index']
+                ?? $existingMarketplaceData['sales_distribution_index']
+                ?? 0.0
             );
         }
 
@@ -686,7 +750,17 @@ class UnitEconomicsCacheService
         $acquiringPercent = (float) (($existingAcquiringPercent !== null && (float) $existingAcquiringPercent > 0)
             ? $existingAcquiringPercent
             : $defaultAcquiring);
-        $storageCost = (float) ($marketplaceData['storage_cost'] ?? $product->storage_cost ?? $existingUE?->storage_cost ?? 0);
+        $storageCost = $marketplace === 'wildberries'
+            ? (float) ($marketplaceData['storage_cost_per_unit'] ?? $marketplaceData['storage_cost_normalized'] ?? 0)
+            : (float) ($marketplaceData['storage_cost_per_unit']
+                ?? $marketplaceData['storage_cost_normalized']
+                ?? $marketplaceData['storage_cost']
+                ?? $product->storage_cost
+                ?? $existingUE?->storage_cost
+                ?? 0);
+        if ($marketplace === 'wildberries' && ! in_array(strtoupper($fulfillmentType), ['FBO', 'FBW'], true)) {
+            $storageCost = 0.0;
+        }
         $ownDeliveryCost = (float) (
             $marketplaceData['own_delivery_cost']
             ?? $integrationSettings['own_delivery_cost']
@@ -748,6 +822,7 @@ class UnitEconomicsCacheService
             'delivery_coefficient' => null,
             'warehouse_coefficient' => (float) $warehouseCoefficient,
             'localization_index' => (float) $localizationIndex,
+            'sales_distribution_index' => (float) $salesDistributionIndex,
             'spp_percent' => $sppPercent,
             'drr_percent' => $drrPercent,
             'our_share_percent' => $ourSharePercent,
@@ -859,6 +934,16 @@ class UnitEconomicsCacheService
                 'not_redeemed_count' => $redemption['not_redeemed_count'] ?? $existingMarketplaceData['not_redeemed_count'] ?? null,
                 'in_flight_count' => $redemption['in_flight_count'] ?? $existingMarketplaceData['in_flight_count'] ?? null,
                 'spp_percent' => $sppPercent,
+                'price_source' => $marketplaceData['price_source'] ?? null,
+                'commission_source' => isset($marketplaceData['commissions_by_scheme']) ? 'wb_commission_api_scheme' : null,
+                'storage_source' => $marketplace === 'wildberries'
+                    ? (array_key_exists('storage_cost_per_unit', $marketplaceData) || array_key_exists('storage_cost_normalized', $marketplaceData)
+                        ? 'wb_normalized_per_unit'
+                        : 'not_applied_without_normalized_per_unit')
+                    : null,
+                'calculation_warnings' => $marketplace === 'wildberries' && ($marketplaceData['storage_cost'] ?? null) !== null && ($marketplaceData['storage_cost_per_unit'] ?? $marketplaceData['storage_cost_normalized'] ?? null) === null
+                    ? ['wb_period_storage_cost_not_used_as_per_unit']
+                    : [],
                 'pricing_strategy' => $pricingStrategy,
                 'competitor_price' => $competitorPrice !== null ? round((float) $competitorPrice, 2) : null,
                 'current_price_index' => $currentPriceIndex !== null ? round((float) $currentPriceIndex, 4) : null,
@@ -1018,7 +1103,9 @@ class UnitEconomicsCacheService
             'sales_fee_percent' => $result->metadata['sales_fee_percent'] ?? $result->commissionPercent,
             // Legacy Ozon localization fields are kept physically but no longer used
             'avg_delivery_time_hours' => 0,
-            'logistics_coefficient' => 1,
+            'logistics_coefficient' => $result->marketplace === 'wildberries'
+                ? (float) ($result->metadata['localization_index'] ?? $inputData['localization_index'] ?? 1)
+                : 1,
             'additional_commission_percent' => 0,
             'tariff_status' => null,
             // base_logistics_cost — базовая логистика БЕЗ КС и ИЛ (из metadata для WB)
@@ -1535,6 +1622,205 @@ class UnitEconomicsCacheService
 
         $this->warehouseCoefficientCache[$cacheKey] = 1.0;
         return 1.0;
+    }
+
+    private function warmRecalculateChunkCaches(Collection $products, array $schemes, Integration $integration): void
+    {
+        $skus = $products->pluck('sku')
+            ->filter(fn ($sku) => filled($sku))
+            ->map(fn ($sku) => (string) $sku)
+            ->unique()
+            ->values();
+
+        if ($skus->isEmpty()) {
+            return;
+        }
+
+        UnitEconomicsSettings::where('integration_id', $integration->id)
+            ->whereIn('sku', $skus)
+            ->get()
+            ->each(function (UnitEconomicsSettings $settings) use ($integration) {
+                $this->settingsCache[$integration->id.'|'.$settings->sku] = $settings;
+            });
+
+        foreach ($skus as $sku) {
+            $this->settingsCache[$integration->id.'|'.$sku] ??= null;
+        }
+
+        $normalizedSchemes = collect($schemes)->map(fn ($scheme) => strtoupper((string) $scheme))->all();
+        UnitEconomics::where('integration_id', $integration->id)
+            ->whereIn('sku', $skus)
+            ->whereIn('fulfillment_type', $normalizedSchemes)
+            ->get()
+            ->each(function (UnitEconomics $unitEconomics) use ($integration) {
+                $key = $integration->id.'|'.$unitEconomics->sku.'|'.strtoupper((string) $unitEconomics->fulfillment_type);
+                $this->unitEconomicsCache[$key] = $unitEconomics;
+            });
+
+        foreach ($skus as $sku) {
+            foreach ($normalizedSchemes as $scheme) {
+                $this->unitEconomicsCache[$integration->id.'|'.$sku.'|'.$scheme] ??= null;
+            }
+        }
+
+        if ($integration->marketplace !== 'wildberries') {
+            return;
+        }
+
+        $this->warmWildberriesTariffSnapshotCache((int) $integration->id);
+
+        $warehousesBySku = InventoryWarehouse::where('integration_id', $integration->id)
+            ->where('marketplace', 'wildberries')
+            ->whereIn('sku', $skus)
+            ->get(['sku', 'warehouse_coefficient', 'quantity'])
+            ->groupBy('sku');
+
+        foreach ($skus as $sku) {
+            $cacheKey = $integration->id.'|wildberries|'.$sku;
+            $warehouses = $warehousesBySku->get($sku, collect());
+            $withStock = $warehouses->filter(fn ($warehouse) => (int) $warehouse->quantity > 0);
+            $totalQuantity = (int) $withStock->sum('quantity');
+
+            if ($totalQuantity <= 0) {
+                $this->warehouseCoefficientCache[$cacheKey] = 1.0;
+                continue;
+            }
+
+            $weightedSum = $withStock->sum(
+                fn ($warehouse) => (float) ($warehouse->warehouse_coefficient ?? 1.0) * (int) $warehouse->quantity
+            );
+            $this->warehouseCoefficientCache[$cacheKey] = $weightedSum / $totalQuantity;
+        }
+    }
+
+    private function warmWildberriesTariffSnapshotCache(int $integrationId): void
+    {
+        if (isset($this->wildberriesTariffSnapshotCache[$integrationId])) {
+            return;
+        }
+
+        $snapshots = WildberriesTariffSnapshot::where('integration_id', $integrationId)
+            ->whereIn('tariff_type', ['box', 'return'])
+            ->orderByDesc('effective_date')
+            ->orderByDesc('fetched_at')
+            ->get();
+
+        $boxByWarehouse = [];
+        $boxFallback = null;
+        $returnPayload = [];
+
+        foreach ($snapshots as $snapshot) {
+            if ($snapshot->tariff_type === 'return' && $returnPayload === []) {
+                $returnPayload = is_array($snapshot->payload) ? $snapshot->payload : [];
+                continue;
+            }
+
+            if ($snapshot->tariff_type !== 'box') {
+                continue;
+            }
+
+            $boxFallback ??= $snapshot;
+
+            $warehouseName = $snapshot->warehouse_name ? $this->normalizeWildberriesWarehouseName((string) $snapshot->warehouse_name) : null;
+            if ($warehouseName && ! isset($boxByWarehouse[$warehouseName])) {
+                $boxByWarehouse[$warehouseName] = $snapshot;
+            }
+        }
+
+        $this->wildberriesTariffSnapshotCache[$integrationId] = [
+            'box_by_warehouse' => $boxByWarehouse,
+            'box_fallback' => $boxFallback,
+            'return' => $returnPayload,
+        ];
+    }
+
+    private function resolveWildberriesTariffBreakdown(int $integrationId, string $fulfillmentType, array $marketplaceData, array $existing): array
+    {
+        if (isset($existing['box']) || isset($existing['source'])) {
+            return $existing;
+        }
+
+        $this->warmWildberriesTariffSnapshotCache($integrationId);
+        $snapshotCache = $this->wildberriesTariffSnapshotCache[$integrationId] ?? [
+            'box_by_warehouse' => [],
+            'box_fallback' => null,
+            'return' => [],
+        ];
+
+        $warehouseName = $this->resolveWildberriesTariffWarehouseName($marketplaceData);
+        if ($warehouseName !== null) {
+            $matching = $snapshotCache['box_by_warehouse'][$this->normalizeWildberriesWarehouseName($warehouseName)] ?? null;
+            if ($matching) {
+                return [
+                    'source' => 'wildberries_tariff_snapshots',
+                    'effective_date' => optional($matching->effective_date)->toDateString(),
+                    'warehouse_name' => $matching->warehouse_name,
+                    'scheme' => strtoupper($fulfillmentType),
+                    'box' => $matching->payload ?? [],
+                    'return' => $snapshotCache['return'] ?? [],
+                ];
+            }
+        }
+
+        $fallback = $snapshotCache['box_fallback'] ?? null;
+
+        if (! $fallback) {
+            return $existing;
+        }
+
+        return [
+            'source' => 'wildberries_tariff_snapshots_fallback',
+            'effective_date' => optional($fallback->effective_date)->toDateString(),
+            'warehouse_name' => $fallback->warehouse_name,
+            'scheme' => strtoupper($fulfillmentType),
+            'box' => $fallback->payload ?? [],
+            'return' => $snapshotCache['return'] ?? [],
+        ];
+    }
+
+    private function latestWildberriesReturnTariffPayload(int $integrationId): array
+    {
+        $this->warmWildberriesTariffSnapshotCache($integrationId);
+        if (isset($this->wildberriesTariffSnapshotCache[$integrationId])) {
+            return $this->wildberriesTariffSnapshotCache[$integrationId]['return'] ?? [];
+        }
+
+        $snapshot = WildberriesTariffSnapshot::where('integration_id', $integrationId)
+            ->where('tariff_type', 'return')
+            ->orderByDesc('effective_date')
+            ->first();
+
+        return is_array($snapshot?->payload) ? $snapshot->payload : [];
+    }
+
+    private function resolveWildberriesTariffWarehouseName(array $marketplaceData): ?string
+    {
+        $warehouses = $marketplaceData['stock_warehouses'] ?? [];
+        if (! is_array($warehouses)) {
+            return null;
+        }
+
+        $withStock = collect($warehouses)
+            ->filter(fn ($warehouse) => (int) ($warehouse['quantity'] ?? 0) > 0 && filled($warehouse['warehouse_name'] ?? null))
+            ->sortByDesc(fn ($warehouse) => (int) ($warehouse['quantity'] ?? 0))
+            ->first();
+
+        if ($withStock && filled($withStock['warehouse_name'] ?? null)) {
+            return (string) $withStock['warehouse_name'];
+        }
+
+        $first = collect($warehouses)->first(fn ($warehouse) => filled($warehouse['warehouse_name'] ?? null));
+
+        return $first ? (string) $first['warehouse_name'] : null;
+    }
+
+    private function normalizeWildberriesWarehouseName(string $warehouseName): string
+    {
+        $warehouseName = mb_strtolower(trim($warehouseName));
+        $warehouseName = str_replace(['-', '–', '—'], ' ', $warehouseName);
+        $warehouseName = preg_replace('/\s+/', ' ', $warehouseName) ?: $warehouseName;
+
+        return trim($warehouseName);
     }
 
     private function getIntegrationCached(int $integrationId): ?Integration

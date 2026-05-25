@@ -58,8 +58,9 @@ class SyncProductsJob implements ShouldBeUnique, ShouldQueue
         ]);
     }
 
-    public function handle(InventoryService $inventoryService, LimitsSyncService $limitsSync): void
+    public function handle(InventoryService $inventoryService, ?LimitsSyncService $limitsSync = null): void
     {
+        $limitsSync ??= app(LimitsSyncService::class);
         $this->syncLog->start();
 
         // User-токен прокидывается в credentials при старте sync (IntegrationController::sync).
@@ -89,10 +90,13 @@ class SyncProductsJob implements ShouldBeUnique, ShouldQueue
         try {
             // Получаем credentials из SyncLog (зашифрованы в БД)
             $credentials = $this->syncLog->credentials ?? [];
+            $integration = $this->syncLog->integration_id
+                ? \App\Models\Integration::find($this->syncLog->integration_id)
+                : null;
 
             // Создаём сервис маркетплейса с credentials
-            $marketplace = in_array($this->syncLog->marketplace, ['yandex', 'yandex_market'], true)
-                ? DomainMarketplaceFactory::create($this->syncLog->marketplace, $credentials)
+            $marketplace = in_array($this->syncLog->marketplace, ['wildberries', 'yandex', 'yandex_market'], true)
+                ? DomainMarketplaceFactory::create($this->syncLog->marketplace, $credentials, $integration)
                 : MarketplaceFactory::create($this->syncLog->marketplace, $credentials);
             $products = $marketplace->getProducts();
 
@@ -265,16 +269,9 @@ class SyncProductsJob implements ShouldBeUnique, ShouldQueue
                 ]);
             }
 
-            // Запускаем пересчёт юнит-экономики + кэша после синхронизации товаров
+            // Unit economics запускается после inventory/storage sync, чтобы расчёт
+            // видел свежие остатки, КС и storage fees.
             if ($this->syncLog->integration_id) {
-                SyncUnitEconomicsJob::dispatch($this->syncLog->integration_id)
-                    ->onQueue('unit-economics')
-                    ->delay(now()->addSeconds(30));
-
-                Log::info('UnitEconomics sync dispatched after products sync', [
-                    'integration_id' => $this->syncLog->integration_id,
-                ]);
-
                 // Локальность продаж напрямую влияет на взвешенные тарифы
                 // в юнит-экономике, поэтому пересчитываем её после sync'а
                 // (раньше зависело только от cron'а в 05:00 — данные могли

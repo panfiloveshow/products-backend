@@ -76,6 +76,10 @@ class WildberriesTariffs implements TariffsProviderInterface
         
         // WB использует объём в литрах
         $volumeInLiters = $volume;
+        $officialCost = $this->calculateOfficialBoxLogisticsCost($scheme, $volumeInLiters, $options['tariff_breakdown']['box'] ?? null);
+        if ($officialCost !== null) {
+            return $officialCost;
+        }
         
         // DBW — курьер WB забирает у продавца (тарифы примерно на 20% выше FBS)
         $dbwMultiplier = ($scheme === 'DBW') ? 1.2 : 1.0;
@@ -122,8 +126,71 @@ class WildberriesTariffs implements TariffsProviderInterface
      * Рассчитать стоимость обратной логистики (возврат)
      * Обратная логистика = базовая логистика (без коэффициентов)
      */
-    public function calculateReturnLogisticsCost(float $volume, float $weight): float
+    public function calculateReturnLogisticsCost(float $volume, float $weight, array $options = []): float
     {
-        return $this->calculateLogisticsCost('FBO', $volume, $weight);
+        $return = $options['tariff_breakdown']['return'] ?? null;
+        if (is_array($return)) {
+            $base = $this->firstNumeric($return, ['base', 'return_base', 'returnDeliveryBase', 'boxDeliveryBase']);
+            $liter = $this->firstNumeric($return, ['liter', 'return_liter', 'returnDeliveryLiter', 'boxDeliveryLiter']);
+            if ($base !== null) {
+                return $this->calculateBasePlusLiter($volume, $base, $liter ?? 0.0);
+            }
+        }
+
+        return $this->calculateLogisticsCost('FBO', $volume, $weight, $options);
+    }
+
+    private function calculateOfficialBoxLogisticsCost(string $scheme, float $volumeInLiters, mixed $boxTariff): ?float
+    {
+        if (! is_array($boxTariff)) {
+            return null;
+        }
+
+        $isMarketplaceDelivery = in_array($scheme, ['FBS', 'DBW'], true);
+        $baseKeys = $isMarketplaceDelivery
+            ? ['delivery_marketplace_base', 'boxDeliveryMarketplaceBase', 'delivery_base', 'boxDeliveryBase']
+            : ['delivery_base', 'boxDeliveryBase'];
+        $literKeys = $isMarketplaceDelivery
+            ? ['delivery_marketplace_liter', 'boxDeliveryMarketplaceLiter', 'delivery_liter', 'boxDeliveryLiter']
+            : ['delivery_liter', 'boxDeliveryLiter'];
+
+        $base = $this->firstNumeric($boxTariff, $baseKeys);
+        if ($base === null) {
+            return null;
+        }
+
+        $liter = $this->firstNumeric($boxTariff, $literKeys) ?? 0.0;
+
+        return $this->calculateBasePlusLiter($volumeInLiters, $base, $liter);
+    }
+
+    private function calculateBasePlusLiter(float $volumeInLiters, float $base, float $liter): float
+    {
+        $chargeableVolume = max(1.0, ceil($volumeInLiters));
+        $extraLiters = max(0.0, $chargeableVolume - 1.0);
+
+        return round($base + ($extraLiters * $liter), 2);
+    }
+
+    private function firstNumeric(array $data, array $keys): ?float
+    {
+        foreach ($keys as $key) {
+            if (! array_key_exists($key, $data) || $data[$key] === null || $data[$key] === '') {
+                continue;
+            }
+
+            if (is_numeric($data[$key])) {
+                return (float) $data[$key];
+            }
+
+            if (is_string($data[$key])) {
+                $normalized = str_replace(',', '.', $data[$key]);
+                if (is_numeric($normalized)) {
+                    return (float) $normalized;
+                }
+            }
+        }
+
+        return null;
     }
 }

@@ -42,7 +42,7 @@ class RecalculateUnitEconomicsForSkuJob implements ShouldQueue, ShouldBeUnique
     public function handle(UnitEconomicsCacheService $cacheService): void
     {
         try {
-            $cacheService->onSettingsChanged($this->integrationId, $this->sku);
+            $cacheService->recalculateSkuAllSchemes($this->integrationId, $this->sku);
         } catch (\Throwable $e) {
             Log::error('RecalculateUnitEconomicsForSkuJob failed', [
                 'integration_id' => $this->integrationId,

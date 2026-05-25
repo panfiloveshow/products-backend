@@ -61,8 +61,10 @@ class ProductsApi implements ProductsApiInterface
 
         $cards = $response['cards'] ?? [];
         
-        // Дополняем карточки габаритами из /cards/filter (там есть dimensions)
-        if (!empty($cards)) {
+        // Не делаем дополнительный поиск по nmID по умолчанию: при полной пагинации
+        // это превращает sync в O(pages^2) Content API calls. Включать только для
+        // точечных сценариев, где старый ответ карточек реально пришёл без dimensions.
+        if (! empty($cards) && ($options['enrich_dimensions'] ?? false)) {
             $nmIds = array_column($cards, 'nmID');
             $cardsWithDimensions = $this->getCardsByNmIds($nmIds);
             
@@ -276,7 +278,6 @@ class ProductsApi implements ProductsApiInterface
 
                 if (!$nmId) continue;
 
-                // Берём первый размер для базовой цены
                 $sizes       = $item['sizes'] ?? [];
                 $firstSize   = $sizes[0] ?? [];
 
@@ -309,6 +310,24 @@ class ProductsApi implements ProductsApiInterface
                 $prices[(string) $nmId] = $priceData;
                 if ($vendorCode) {
                     $prices[$vendorCode] = $priceData;
+                }
+                foreach ($priceData['sizes'] as $sizePrice) {
+                    $sizeId = $sizePrice['sizeID'] ?? null;
+                    if (! $sizeId) {
+                        continue;
+                    }
+
+                    $sizeFinal = (float) ($sizePrice['discountedPrice'] ?: $sizePrice['price']);
+                    $sizeData = array_merge($priceData, [
+                        'price' => (float) $sizePrice['price'],
+                        'discounted_price' => (float) $sizePrice['discountedPrice'],
+                        'club_price' => (float) $sizePrice['clubDiscountedPrice'],
+                        'final_price' => $sizeFinal,
+                        'sizeID' => $sizeId,
+                        'techSizeName' => $sizePrice['techSizeName'] ?? '',
+                    ]);
+
+                    $prices[(string) $nmId.':'.(string) $sizeId] = $sizeData;
                 }
             }
 

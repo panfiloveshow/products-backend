@@ -19,6 +19,46 @@ class RealizationReportApi
     ) {}
 
     /**
+     * Получить детализацию отчётов реализации через новый Finance API.
+     *
+     * Это будущий источник фактической сверки unit economics: реальные удержания
+     * WB по комиссиям, логистике, хранению, возвратам и прочим услугам.
+     *
+     * Endpoint: POST /api/finance/v1/sales-reports/detailed
+     * URL: https://finance-api.wildberries.ru
+     *
+     * @param array<int, string> $fields Опциональный список полей для уменьшения ответа.
+     */
+    public function getDetailedSalesReportsByPeriod(
+        string $dateFrom,
+        string $dateTo,
+        array $fields = []
+    ): array {
+        $payload = [
+            'dateFrom' => $dateFrom,
+            'dateTo' => $dateTo,
+        ];
+
+        if ($fields !== []) {
+            $payload['fields'] = array_values($fields);
+        }
+
+        try {
+            $response = $this->client->financePost('/api/finance/v1/sales-reports/detailed', $payload);
+
+            return is_array($response) ? $response : [];
+        } catch (\Throwable $e) {
+            Log::error('WB Finance detailed sales reports error', [
+                'date_from' => $dateFrom,
+                'date_to' => $dateTo,
+                'error' => $e->getMessage(),
+            ]);
+
+            return [];
+        }
+    }
+
+    /**
      * Получить детализацию отчёта реализации за период
      * 
      * Endpoint: GET /api/v5/supplier/reportDetailByPeriod

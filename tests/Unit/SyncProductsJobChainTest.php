@@ -159,7 +159,7 @@ class SyncProductsJobChainTest extends TestCase
         ]);
     }
 
-    public function test_dispatches_unit_economics_job_after_successful_sync(): void
+    public function test_does_not_dispatch_unit_economics_job_directly_after_successful_products_sync(): void
     {
         Bus::fake([SyncUnitEconomicsJob::class]);
         $this->fakeOzonApi();
@@ -192,9 +192,7 @@ class SyncProductsJobChainTest extends TestCase
         $job = new SyncProductsJob($syncLog);
         $job->handle($inventoryService);
 
-        Bus::assertDispatched(SyncUnitEconomicsJob::class, function ($job) {
-            return $job->integrationId === 17;
-        });
+        Bus::assertNotDispatched(SyncUnitEconomicsJob::class);
     }
 
     public function test_updates_integration_status_to_completed_on_success(): void

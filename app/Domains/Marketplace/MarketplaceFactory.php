@@ -22,7 +22,7 @@ class MarketplaceFactory
     public static function create(string $marketplace, array $credentials = [], ?Integration $integration = null): MarketplaceInterface
     {
         return match ($marketplace) {
-            'wildberries' => new WildberriesMarketplace($credentials),
+            'wildberries' => new WildberriesMarketplace($credentials, $integration),
             'ozon' => new OzonMarketplace($credentials, $integration),
             'yandex', 'yandex_market' => new YandexMarketMarketplace($credentials),
             default => throw new InvalidArgumentException("Unknown marketplace: {$marketplace}"),

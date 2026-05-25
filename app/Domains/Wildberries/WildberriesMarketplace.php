@@ -3,6 +3,7 @@
 namespace App\Domains\Wildberries;
 
 use App\Domains\Marketplace\Contracts\MarketplaceInterface;
+use App\Services\Marketplace\MarketplaceInterface as LegacyMarketplaceInterface;
 use App\Domains\Wildberries\Api\FbsSuppliesApi;
 use App\Domains\Wildberries\Api\InventoryApi;
 use App\Domains\Wildberries\Api\ProductsApi;
@@ -22,7 +23,7 @@ use App\Models\Integration;
  * - SalesApi — продажи
  * - StorageApi — хранение, тарифы
  */
-class WildberriesMarketplace implements MarketplaceInterface
+class WildberriesMarketplace implements MarketplaceInterface, LegacyMarketplaceInterface
 {
     private WildberriesClient $client;
 
@@ -88,7 +89,7 @@ class WildberriesMarketplace implements MarketplaceInterface
     public function testConnection(Integration $integration): bool
     {
         try {
-            $products = $this->products->getProducts(1);
+            $this->products->getProducts($integration, ['limit' => 1]);
 
             return true;
         } catch (\Exception $e) {
@@ -98,15 +99,34 @@ class WildberriesMarketplace implements MarketplaceInterface
 
     public function getSupportedSchemes(): array
     {
-        return ['FBO', 'FBS'];
+        return ['FBO', 'FBS', 'DBS', 'EDBS', 'DBW'];
     }
 
     // === Products ===
 
     public function getProducts(): array
     {
-        $result = $this->products->getProducts($this->getIntegration());
-        $cards = $result['cards'] ?? $result;
+        $cards = [];
+        $cursor = null;
+        $pages = 0;
+
+        do {
+            $result = $this->products->getProducts($this->getIntegration(), [
+                'limit' => 100,
+                'cursor' => $cursor,
+            ]);
+            $pageCards = $result['cards'] ?? $result;
+            $cursor = $result['cursor'] ?? null;
+
+            if (empty($pageCards)) {
+                break;
+            }
+
+            $cards = array_merge($cards, $pageCards);
+            $pages++;
+
+            $hasMore = $cursor && isset($cursor['nmID']) && (int) $cursor['nmID'] > 0;
+        } while ($hasMore && $pages < 500);
 
         if (empty($cards)) {
             \Illuminate\Support\Facades\Log::warning('WB Marketplace: No cards returned from Products API');
@@ -191,15 +211,48 @@ class WildberriesMarketplace implements MarketplaceInterface
             'sample_keys' => array_slice(array_keys($stocks), 0, 5),
         ]);
 
-        // Маппинг WB cards к формату Product модели с обогащением ценами и остатками
-        return array_map(fn ($card) => $this->mapCardToProduct($card, $commissionsByCategory, $prices, $stocks, $cardRatings, $sppByNmId), $cards);
+        // Маппинг WB cards к формату Product модели с обогащением ценами и остатками.
+        // Для WB SKU в проекте — barcode, поэтому одна карточка может дать несколько Product.
+        return collect($cards)
+            ->flatMap(fn ($card) => $this->mapCardToProducts($card, $commissionsByCategory, $prices, $stocks, $cardRatings, $sppByNmId))
+            ->values()
+            ->all();
+    }
+
+    private function mapCardToProducts(array $card, array $commissionsByCategory = [], array $prices = [], array $stocks = [], array $ratings = [], array $sppByNmId = []): array
+    {
+        $sizes = $card['sizes'] ?? [];
+        $sizeEntries = [];
+
+        foreach ($sizes as $size) {
+            foreach ($size['skus'] ?? [] as $barcode) {
+                if ($barcode) {
+                    $sizeEntries[] = [
+                        'barcode' => $barcode,
+                        'size' => $size,
+                    ];
+                }
+            }
+        }
+
+        if ($sizeEntries === []) {
+            $sizeEntries[] = [
+                'barcode' => $card['vendorCode'] ?? (string) ($card['nmID'] ?? ''),
+                'size' => $sizes[0] ?? [],
+            ];
+        }
+
+        return array_map(
+            fn (array $sizeEntry) => $this->mapCardToProduct($card, $commissionsByCategory, $prices, $stocks, $ratings, $sppByNmId, $sizeEntry),
+            $sizeEntries
+        );
     }
 
     /**
      * Маппинг WB карточки к формату Product модели
      * Аналогично Ozon сохраняем все данные API в wb_data
      */
-    private function mapCardToProduct(array $card, array $commissionsByCategory = [], array $prices = [], array $stocks = [], array $ratings = [], array $sppByNmId = []): array
+    private function mapCardToProduct(array $card, array $commissionsByCategory = [], array $prices = [], array $stocks = [], array $ratings = [], array $sppByNmId = [], ?array $sizeEntry = null): array
     {
         // Извлекаем габариты из sizes[0].dimensions или characteristics
         $dimensions = $this->extractDimensions($card);
@@ -212,14 +265,17 @@ class WildberriesMarketplace implements MarketplaceInterface
         $commissionData = $commissionsByCategory[$subjectId] ?? $commissionsByCategory['default'] ?? null;
         $commissionPercent = $commissionData['fbo'] ?? 15.0;
 
-        // Первый размер (основной)
-        $firstSize = $card['sizes'][0] ?? [];
-        $barcode = $firstSize['skus'][0] ?? null;
+        $firstSize = $sizeEntry['size'] ?? ($card['sizes'][0] ?? []);
+        $barcode = $sizeEntry['barcode'] ?? ($firstSize['skus'][0] ?? null);
         $nmId = $card['nmID'] ?? null;
         $vendorCode = $card['vendorCode'] ?? null;
+        $sizeId = $firstSize['chrtID'] ?? $firstSize['sizeID'] ?? null;
+        $marketplaceId = $nmId
+            ? ((string) $nmId.':'.(string) ($barcode ?: $sizeId ?: 'default'))
+            : (string) ($barcode ?: $vendorCode ?: '');
 
         // Получаем цены из Prices API (приоритет)
-        $priceData = $prices[$vendorCode] ?? $prices[(string) $nmId] ?? $prices[$barcode] ?? null;
+        $priceData = $this->resolvePriceData($prices, $vendorCode, $nmId, $barcode, $firstSize);
 
         // Получаем остатки из Statistics API (ищем по barcode, nmId, vendorCode)
         $stockData = $stocks[$barcode] ?? $stocks[(string) $nmId] ?? $stocks[$vendorCode] ?? null;
@@ -304,7 +360,7 @@ class WildberriesMarketplace implements MarketplaceInterface
         }
 
         return [
-            'marketplace_id' => (string) $card['nmID'],
+            'marketplace_id' => $marketplaceId,
             // В проекте sku используется как штрихкод (EAN) для WB, чтобы совпадало с текущими данными/кэшем
             'sku' => $barcode ?? (string) $card['nmID'],
             'vendor_code' => $card['vendorCode'] ?? null,
@@ -339,19 +395,16 @@ class WildberriesMarketplace implements MarketplaceInterface
                 'dimensions' => $dimensions,
                 'characteristics' => $card['characteristics'] ?? [],
                 // Комиссии по схемам (аналогично ozon_data.commissions)
-                'commissions' => [
-                    'fbo' => [
-                        'percent' => $commissionPercent,
-                        'category' => $category,
-                    ],
-                    'fbs' => [
-                        'percent' => $commissionPercent, // WB: одинаковая комиссия для FBO/FBS
-                        'category' => $category,
-                    ],
-                ],
+                'commissions' => $this->normalizeCommissionSchemes($commissionData, $category),
+                'commissions_by_scheme' => $this->normalizeCommissionSchemes($commissionData, $category),
                 // Актуальная цена (аналогично ozon_data.actual_price)
                 'actual_price' => $price,
                 'old_price' => $oldPrice,
+                'chrtID' => $firstSize['chrtID'] ?? null,
+                'sizeID' => $sizeId,
+                'size' => trim(($firstSize['wbSize'] ?? '') ?: ($firstSize['techSize'] ?? '') ?: ($firstSize['techSizeName'] ?? '')),
+                'prices_by_size' => $priceData['sizes'] ?? [],
+                'price_source' => isset($priceData['sizeID']) ? 'prices_api_size' : ($priceData ? 'prices_api_nm' : 'content_card'),
                 // Данные об остатках
                 'stock_warehouses' => $stockData['warehouses'] ?? [],
                 'inWayToClient' => $stockData['inWayToClient'] ?? 0,
@@ -363,6 +416,34 @@ class WildberriesMarketplace implements MarketplaceInterface
                 'weight_g' => $weightG,
                 'volume_liters' => $volumeLiters,
             ],
+        ];
+    }
+
+    private function resolvePriceData(array $prices, ?string $vendorCode, mixed $nmId, ?string $barcode, array $size): ?array
+    {
+        $sizeId = $size['chrtID'] ?? $size['sizeID'] ?? null;
+        if ($nmId && $sizeId && isset($prices[(string) $nmId.':'.(string) $sizeId])) {
+            return $prices[(string) $nmId.':'.(string) $sizeId];
+        }
+
+        return ($barcode && isset($prices[$barcode]))
+            ? $prices[$barcode]
+            : ($prices[$vendorCode] ?? $prices[(string) $nmId] ?? null);
+    }
+
+    private function normalizeCommissionSchemes(?array $commissionData, string $category): array
+    {
+        $commissionData = $commissionData ?: [];
+        $fbo = (float) ($commissionData['fbo'] ?? 15.0);
+        $fbs = (float) ($commissionData['fbs'] ?? $fbo);
+
+        return [
+            'fbo' => ['percent' => $fbo, 'category' => $category],
+            'fbs' => ['percent' => $fbs, 'category' => $category],
+            'edbs' => ['percent' => (float) ($commissionData['fbs_express'] ?? $fbs), 'category' => $category],
+            'dbs' => ['percent' => (float) ($commissionData['pickup'] ?? $fbs), 'category' => $category],
+            'dbw' => ['percent' => (float) ($commissionData['booking'] ?? $fbs), 'category' => $category],
+            'paid_storage' => ['percent' => (float) ($commissionData['paid_storage'] ?? 0.0), 'category' => $category],
         ];
     }
 
@@ -498,7 +579,7 @@ class WildberriesMarketplace implements MarketplaceInterface
 
     public function getProductPrices(): array
     {
-        return $this->products->getPrices();
+        return $this->products->getPrices($this->getIntegration());
     }
 
     // === Inventory ===
@@ -580,6 +661,11 @@ class WildberriesMarketplace implements MarketplaceInterface
     public function getStorageTariffs(): array
     {
         return $this->storage->getStorageTariffs();
+    }
+
+    public function getTariffSnapshots(?string $date = null): array
+    {
+        return $this->storage->getTariffSnapshots($date);
     }
 
     public function getCommissions(): array

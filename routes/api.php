@@ -36,6 +36,12 @@ use Illuminate\Support\Facades\Route;
 | Integrations Module
 |--------------------------------------------------------------------------
 */
+Route::get('/health', fn () => response()->json([
+    'status' => 'ok',
+    'service' => 'products-backend',
+    'time' => now()->toIso8601String(),
+]))->name('health');
+
 Route::prefix('integrations')->middleware('sellico.permission')->group(function () {
     Route::get('/', [IntegrationController::class, 'index'])->name('integrations.index');
     Route::get('/{id}/premium-status', [IntegrationController::class, 'getPremiumStatus'])->name('integrations.premiumStatus');
@@ -337,6 +343,8 @@ Route::prefix('unit-economics')->middleware('sellico.permission')->group(functio
     Route::put('/settings/{sku}', [UnitEconomicsCacheController::class, 'updateSettings'])
         ->where('sku', '.*')
         ->name('unit-economics.settings.update');
+    Route::post('/wildberries/indexes/import', [UnitEconomicsCacheController::class, 'importWildberriesIndexes'])
+        ->name('unit-economics.wildberries.indexes.import');
 
     // Recalculate — закрываем IDOR: middleware проверяет доступ к integrationId
     // до вызова контроллера (раньше любой мог запустить пересчёт чужой интеграции).

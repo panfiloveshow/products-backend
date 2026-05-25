@@ -40,6 +40,7 @@ class CalculationInput
         public readonly ?float $deliveryCoefficient = null,  // Коэффициент времени доставки (Ozon FBO)
         public readonly ?float $warehouseCoefficient = null,  // КС (коэффициент склада) — множитель логистики WB (1.0 = 100%, 1.4 = 140%)
         public readonly ?float $localizationIndex = null,  // ИЛ (индекс локализации) — множитель логистики WB (1.0 = без изменений)
+        public readonly ?float $salesDistributionIndex = null,  // ИРП WB, проценты от цены до скидки WB (например 1.15 = 1.15%)
         public readonly ?float $sppPercent = null,
         public readonly ?float $drrPercent = null,
         public readonly ?float $ourSharePercent = null,
@@ -170,6 +171,9 @@ class CalculationInput
             deliveryCoefficient: isset($data['delivery_coefficient']) ? (float) $data['delivery_coefficient'] : null,
             warehouseCoefficient: isset($data['warehouse_coefficient']) ? (float) $data['warehouse_coefficient'] : null,
             localizationIndex: isset($data['localization_index']) ? (float) $data['localization_index'] : null,
+            salesDistributionIndex: isset($data['sales_distribution_index'])
+                ? (float) $data['sales_distribution_index']
+                : (isset($data['sales_distribution_index_percent']) ? (float) $data['sales_distribution_index_percent'] : null),
             sppPercent: isset($data['spp_percent']) ? (float) $data['spp_percent'] : null,
             drrPercent: isset($data['drr_percent']) ? (float) $data['drr_percent'] : null,
             ourSharePercent: isset($data['our_share_percent']) ? (float) $data['our_share_percent'] : null,

@@ -241,6 +241,100 @@ class StorageApi
             return $this->getFallbackCommissions();
         }
     }
+
+    public function getTariffSnapshots(?string $date = null): array
+    {
+        $date = $date ?? now()->format('Y-m-d');
+        $fetchedAt = now()->toISOString();
+        $snapshots = [];
+
+        foreach ($this->getCommissions() as $subjectId => $commission) {
+            if ($subjectId === 'default') {
+                continue;
+            }
+
+            foreach (['fbo', 'fbs', 'edbs', 'dbs', 'dbw'] as $scheme) {
+                $sourceKey = match ($scheme) {
+                    'fbo' => 'fbo',
+                    'fbs' => 'fbs',
+                    'edbs' => 'fbs_express',
+                    'dbs' => 'pickup',
+                    'dbw' => 'booking',
+                };
+
+                $snapshots[] = [
+                    'tariff_type' => 'commission',
+                    'effective_date' => $date,
+                    'subject_id' => (string) $subjectId,
+                    'subject_name' => $commission['subject_name'] ?? null,
+                    'scheme' => strtoupper($scheme),
+                    'payload' => [
+                        'percent' => (float) ($commission[$sourceKey] ?? $commission['fbs'] ?? $commission['fbo'] ?? 15.0),
+                        'source_key' => $sourceKey,
+                        'raw' => $commission,
+                    ],
+                    'fetched_at' => $fetchedAt,
+                ];
+            }
+        }
+
+        $boxTariffs = $this->getBoxTariffs($date);
+        foreach (($boxTariffs['warehouseList'] ?? []) as $warehouse) {
+            $warehouseName = (string) ($warehouse['warehouse_name'] ?? '');
+
+            $snapshots[] = [
+                'tariff_type' => 'box',
+                'effective_date' => $date,
+                'warehouse_id' => $warehouseName !== '' ? 'name:'.sha1($this->normalizeWarehouseName($warehouseName)) : null,
+                'warehouse_name' => $warehouseName !== '' ? $warehouseName : null,
+                'scheme' => null,
+                'payload' => $warehouse,
+                'fetched_at' => $fetchedAt,
+            ];
+        }
+
+        foreach ((array) $this->getReturnTariffs($date) as $key => $payload) {
+            $snapshots[] = [
+                'tariff_type' => 'return',
+                'effective_date' => $date,
+                'warehouse_id' => is_string($key) ? $key : 'row:'.(string) $key,
+                'payload' => is_array($payload) ? $payload : ['value' => $payload],
+                'fetched_at' => $fetchedAt,
+            ];
+        }
+
+        $palletTariffs = $this->getPalletTariffs($date);
+        foreach (($palletTariffs['warehouseList'] ?? []) as $warehouse) {
+            $warehouseName = (string) ($warehouse['warehouseName'] ?? $warehouse['warehouse_name'] ?? '');
+
+            $snapshots[] = [
+                'tariff_type' => 'pallet',
+                'effective_date' => $date,
+                'warehouse_id' => $warehouseName !== '' ? 'name:'.sha1($this->normalizeWarehouseName($warehouseName)) : null,
+                'warehouse_name' => $warehouseName !== '' ? $warehouseName : null,
+                'payload' => is_array($warehouse) ? $warehouse : ['value' => $warehouse],
+                'fetched_at' => $fetchedAt,
+            ];
+        }
+
+        $acceptance = $this->client->commonGet('/api/tariffs/v1/acceptance/coefficients', [
+            'date' => $date,
+        ]) ?? [];
+        foreach (($acceptance['coefficients'] ?? $acceptance['response']['data'] ?? $acceptance['data'] ?? []) as $key => $row) {
+            $snapshots[] = [
+                'tariff_type' => 'acceptance',
+                'effective_date' => $date,
+                'warehouse_id' => isset($row['warehouseID'])
+                    ? (string) $row['warehouseID']
+                    : (isset($row['warehouseId']) ? (string) $row['warehouseId'] : 'row:'.(string) $key),
+                'warehouse_name' => $row['warehouseName'] ?? null,
+                'payload' => is_array($row) ? $row : ['value' => $row],
+                'fetched_at' => $fetchedAt,
+            ];
+        }
+
+        return $snapshots;
+    }
     
     /**
      * Fallback комиссии если API недоступен
@@ -326,6 +420,21 @@ class StorageApi
             return $response['response']['data'] ?? $response ?? [];
         } catch (\Exception $e) {
             Log::error('WB getReturnTariffs error', ['error' => $e->getMessage()]);
+            return [];
+        }
+    }
+
+    public function getPalletTariffs(?string $date = null): array
+    {
+        try {
+            $date = $date ?? now()->format('Y-m-d');
+            $response = $this->client->commonGet('/api/v1/tariffs/pallet', [
+                'date' => $date,
+            ]);
+
+            return $response['response']['data'] ?? $response ?? [];
+        } catch (\Exception $e) {
+            Log::error('WB getPalletTariffs error', ['error' => $e->getMessage()]);
             return [];
         }
     }

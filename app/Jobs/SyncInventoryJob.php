@@ -425,6 +425,14 @@ class SyncInventoryJob implements ShouldBeUnique, ShouldQueue
                         'integration_id' => $this->syncLog->integration_id,
                     ]);
                 }
+            } elseif ($this->syncLog->integration_id) {
+                SyncUnitEconomicsJob::dispatch((int) $this->syncLog->integration_id)
+                    ->onQueue('unit-economics');
+
+                Log::info('UnitEconomics sync dispatched after inventory sync', [
+                    'integration_id' => $this->syncLog->integration_id,
+                    'marketplace' => $this->syncLog->marketplace,
+                ]);
             }
         } catch (\Exception $e) {
             $this->syncLog->fail($e->getMessage());

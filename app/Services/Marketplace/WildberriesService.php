@@ -262,7 +262,8 @@ class WildberriesService implements MarketplaceInterface
                     continue;
                 }
 
-                $firstSize = $item['sizes'][0] ?? [];
+                $sizes = $item['sizes'] ?? [];
+                $firstSize = $sizes[0] ?? [];
                 $discountedPrice = (float) ($firstSize['discountedPrice'] ?? 0);
                 $basePrice = (float) ($firstSize['price'] ?? 0);
 
@@ -271,11 +272,37 @@ class WildberriesService implements MarketplaceInterface
                     'base_price' => $basePrice,
                     'discounted_price' => $discountedPrice,
                     'discount' => (int) ($item['discount'] ?? 0),
+                    'sizes' => array_map(fn ($size) => [
+                        'sizeID' => $size['sizeID'] ?? null,
+                        'price' => (float) ($size['price'] ?? 0),
+                        'discountedPrice' => (float) ($size['discountedPrice'] ?? 0),
+                        'clubDiscountedPrice' => (float) ($size['clubDiscountedPrice'] ?? 0),
+                        'techSizeName' => $size['techSizeName'] ?? '',
+                    ], $sizes),
                 ];
 
                 $prices[(string) $nmId] = $priceData;
                 if ($vendorCode) {
                     $prices[$vendorCode] = $priceData;
+                }
+                foreach ($priceData['sizes'] as $sizePrice) {
+                    $sizeId = $sizePrice['sizeID'] ?? null;
+                    if (! $sizeId) {
+                        continue;
+                    }
+
+                    $sizeFinalPrice = (float) (($sizePrice['discountedPrice'] ?? 0) > 0
+                        ? $sizePrice['discountedPrice']
+                        : ($sizePrice['price'] ?? 0));
+
+                    $prices[(string) $nmId.':'.(string) $sizeId] = array_merge($priceData, [
+                        'final_price' => $sizeFinalPrice,
+                        'base_price' => (float) ($sizePrice['price'] ?? 0),
+                        'discounted_price' => (float) ($sizePrice['discountedPrice'] ?? 0),
+                        'club_price' => (float) ($sizePrice['clubDiscountedPrice'] ?? 0),
+                        'sizeID' => $sizeId,
+                        'techSizeName' => $sizePrice['techSizeName'] ?? '',
+                    ]);
                 }
             }
 
@@ -348,9 +375,17 @@ class WildberriesService implements MarketplaceInterface
             $sizeName = $sizeInfo['size_name'];
             $name = $sizeName ? "{$baseName} ({$sizeName})" : $baseName;
 
-            // Если цены из Prices API нет — пробуем из sizes карточки
-            $itemFinalPrice = $finalPrice;
-            $itemOldPrice = $oldPrice;
+            $sizeId = $sizeInfo['chrtID'] ?? null;
+            $marketplaceId = $nmId
+                ? ((string) $nmId.':'.(string) ($barcode ?: $sizeId ?: 'default'))
+                : (string) $barcode;
+            $sizePriceData = $sizeId ? ($prices[$nmId.':'.(string) $sizeId] ?? null) : null;
+            $itemFinalPrice = $sizePriceData
+                ? (float) ($sizePriceData['final_price'] ?? 0)
+                : $finalPrice;
+            $itemOldPrice = $sizePriceData
+                ? (((float) ($sizePriceData['base_price'] ?? 0) > $itemFinalPrice) ? (float) $sizePriceData['base_price'] : null)
+                : $oldPrice;
             if ($itemFinalPrice === null) {
                 foreach ($sizes as $size) {
                     if (in_array($barcode, $size['skus'] ?? [])) {
@@ -382,23 +417,20 @@ class WildberriesService implements MarketplaceInterface
                 'rating' => $card['rating'] ?? null,
                 'reviews_count' => $card['feedbackCount'] ?? 0,
                 'marketplace' => 'wildberries',
-                'marketplace_id' => $nmId,
+                'marketplace_id' => $marketplaceId,
                 'url' => "https://www.wildberries.ru/catalog/{$nmId}/detail.aspx",
                 'wb_data' => [
                     'nmID' => $card['nmID'],
                     'imtID' => $card['imtID'] ?? null,
                     'vendorCode' => $vendorCode,
                     'subjectID' => $card['subjectID'] ?? null,
-                    'commissions' => [
-                        'fbo' => [
-                            'percent' => (float) ($subjectCommissions['fbo'] ?? 15.0),
-                        ],
-                        'fbs' => [
-                            'percent' => (float) ($subjectCommissions['fbs'] ?? $subjectCommissions['fbo'] ?? 15.0),
-                        ],
-                    ],
+                    'commissions' => $this->normalizeCommissionSchemes($subjectCommissions),
+                    'commissions_by_scheme' => $this->normalizeCommissionSchemes($subjectCommissions),
                     'chrtID' => $sizeInfo['chrtID'],
+                    'sizeID' => $sizeInfo['chrtID'],
                     'size' => $sizeName,
+                    'prices_by_size' => $priceData['sizes'] ?? [],
+                    'price_source' => $sizePriceData ? 'prices_api_size' : ($priceData ? 'prices_api_nm' : 'content_card'),
                     'sizes' => $sizes,
                     'characteristics' => $card['characteristics'] ?? [],
                     'createdAt' => $card['createdAt'] ?? null,
@@ -408,6 +440,22 @@ class WildberriesService implements MarketplaceInterface
         }
 
         return $results;
+    }
+
+    private function normalizeCommissionSchemes(?array $commissionData): array
+    {
+        $commissionData = $commissionData ?: [];
+        $fbo = (float) ($commissionData['fbo'] ?? 15.0);
+        $fbs = (float) ($commissionData['fbs'] ?? $fbo);
+
+        return [
+            'fbo' => ['percent' => $fbo],
+            'fbs' => ['percent' => $fbs],
+            'edbs' => ['percent' => (float) ($commissionData['fbs_express'] ?? $fbs)],
+            'dbs' => ['percent' => (float) ($commissionData['pickup'] ?? $fbs)],
+            'dbw' => ['percent' => (float) ($commissionData['booking'] ?? $fbs)],
+            'paid_storage' => ['percent' => (float) ($commissionData['paid_storage'] ?? 0.0)],
+        ];
     }
 
     /**
@@ -969,6 +1017,10 @@ class WildberriesService implements MarketplaceInterface
                 $result[(string) $subjectId] = [
                     'fbo' => (float) ($item['kgvpMarketplace'] ?? 15.0),
                     'fbs' => (float) ($item['kgvpSupplier'] ?? 15.0),
+                    'fbs_express' => (float) ($item['kgvpSupplierExpress'] ?? $item['kgvpSupplier'] ?? 15.0),
+                    'pickup' => (float) ($item['kgvpPickup'] ?? $item['kgvpSupplier'] ?? 15.0),
+                    'booking' => (float) ($item['kgvpBooking'] ?? $item['kgvpSupplier'] ?? 15.0),
+                    'paid_storage' => (float) ($item['paidStorageKgvp'] ?? 0.0),
                 ];
             }
 

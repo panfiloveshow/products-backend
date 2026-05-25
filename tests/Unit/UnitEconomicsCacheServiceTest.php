@@ -222,4 +222,284 @@ class UnitEconomicsCacheServiceTest extends TestCase
 
         $this->assertSame(60.0, $result->metadata['tax_amount']);
     }
+
+    public function test_wildberries_non_fbo_does_not_apply_wb_storage_cost(): void
+    {
+        $calculator = new WildberriesUnitEconomicsCalculator();
+
+        $fbo = $calculator->calculate(CalculationInput::fromArray([
+            'sku' => 'wb-storage',
+            'integration_id' => 1,
+            'marketplace' => 'wildberries',
+            'fulfillment_type' => 'FBO',
+            'price' => 1000,
+            'cost_price' => 0,
+            'commission_rate' => 0,
+            'length' => 10,
+            'width' => 10,
+            'height' => 10,
+            'redemption_rate' => 100,
+            'storage_cost' => 100,
+            'acquiring_percent' => 0,
+            'tax_percent' => 0,
+        ]));
+
+        $fbs = $calculator->calculate(CalculationInput::fromArray([
+            'sku' => 'wb-storage',
+            'integration_id' => 1,
+            'marketplace' => 'wildberries',
+            'fulfillment_type' => 'FBS',
+            'price' => 1000,
+            'cost_price' => 0,
+            'commission_rate' => 0,
+            'length' => 10,
+            'width' => 10,
+            'height' => 10,
+            'redemption_rate' => 100,
+            'storage_cost' => 100,
+            'acquiring_percent' => 0,
+            'tax_percent' => 0,
+        ]));
+
+        $this->assertSame(100.0, $fbo->costs->storageCost);
+        $this->assertSame(0.0, $fbs->costs->storageCost);
+    }
+
+    public function test_wildberries_calculator_uses_official_box_tariff_breakdown_for_logistics(): void
+    {
+        $calculator = new WildberriesUnitEconomicsCalculator();
+
+        $result = $calculator->calculate(CalculationInput::fromArray([
+            'sku' => 'wb-tariff',
+            'integration_id' => 1,
+            'marketplace' => 'wildberries',
+            'fulfillment_type' => 'FBO',
+            'price' => 1000,
+            'cost_price' => 0,
+            'commission_rate' => 0,
+            'length' => 10,
+            'width' => 10,
+            'height' => 30,
+            'warehouse_coefficient' => 1.5,
+            'localization_index' => 1,
+            'redemption_rate' => 100,
+            'storage_cost' => 0,
+            'acquiring_percent' => 0,
+            'tax_percent' => 0,
+            'tariff_breakdown' => [
+                'source' => 'wildberries_tariff_snapshots',
+                'effective_date' => '2026-05-23',
+                'warehouse_name' => 'Коледино',
+                'box' => [
+                    'delivery_base' => 40,
+                    'delivery_liter' => 10,
+                    'delivery_coef_percent' => 150,
+                    'delivery_marketplace_base' => 30,
+                    'delivery_marketplace_liter' => 5,
+                ],
+            ],
+        ]));
+
+        $this->assertSame(40.0, $result->metadata['base_logistics']);
+        $this->assertSame(60.0, $result->costs->logistics);
+        $this->assertSame(150.0, $result->metadata['warehouse_coef_percent']);
+        $this->assertSame(20.0, $result->metadata['warehouse_coef_amount']);
+        $this->assertTrue($result->metadata['warehouse_coef_included_in_tariff']);
+        $this->assertSame('wildberries_tariff_snapshots', $result->metadata['tariff_source']);
+        $this->assertSame('Коледино', $result->metadata['tariff_warehouse_name']);
+    }
+
+    public function test_wildberries_official_box_tariff_applies_localization_without_double_warehouse_coef(): void
+    {
+        $calculator = new WildberriesUnitEconomicsCalculator();
+
+        $result = $calculator->calculate(CalculationInput::fromArray([
+            'sku' => 'wb-tariff-il',
+            'integration_id' => 1,
+            'marketplace' => 'wildberries',
+            'fulfillment_type' => 'FBO',
+            'price' => 1000,
+            'cost_price' => 0,
+            'commission_rate' => 0,
+            'length' => 10,
+            'width' => 10,
+            'height' => 30,
+            'warehouse_coefficient' => 1.5,
+            'localization_index' => 1.2,
+            'redemption_rate' => 100,
+            'storage_cost' => 0,
+            'acquiring_percent' => 0,
+            'tax_percent' => 0,
+            'tariff_breakdown' => [
+                'box' => [
+                    'delivery_base' => 40,
+                    'delivery_liter' => 10,
+                    'delivery_coef_percent' => 150,
+                ],
+            ],
+        ]));
+
+        $this->assertSame(40.0, $result->metadata['base_logistics']);
+        $this->assertSame(60.0, $result->metadata['base_logistics'] + $result->metadata['warehouse_coef_amount']);
+        $this->assertSame(12.0, $result->metadata['localization_amount']);
+        $this->assertSame(72.0, $result->costs->logistics);
+    }
+
+    public function test_wildberries_dbs_does_not_apply_warehouse_or_localization_amounts_to_own_delivery(): void
+    {
+        $calculator = new WildberriesUnitEconomicsCalculator();
+
+        $result = $calculator->calculate(CalculationInput::fromArray([
+            'sku' => 'wb-dbs',
+            'integration_id' => 1,
+            'marketplace' => 'wildberries',
+            'fulfillment_type' => 'DBS',
+            'price' => 1000,
+            'cost_price' => 0,
+            'commission_rate' => 0,
+            'length' => 10,
+            'width' => 10,
+            'height' => 10,
+            'warehouse_coefficient' => 1.8,
+            'localization_index' => 1.5,
+            'own_delivery_cost' => 100,
+            'redemption_rate' => 100,
+            'storage_cost' => 0,
+            'acquiring_percent' => 0,
+            'tax_percent' => 0,
+        ]));
+
+        $this->assertSame(100.0, $result->costs->logistics);
+        $this->assertSame(100.0, $result->metadata['warehouse_coef_percent']);
+        $this->assertSame(0.0, $result->metadata['warehouse_coef_amount']);
+        $this->assertSame(0.0, $result->metadata['localization_amount']);
+    }
+
+    public function test_wildberries_logistics_adds_sales_distribution_index_to_price_before_wb_discount(): void
+    {
+        $calculator = new WildberriesUnitEconomicsCalculator();
+
+        $result = $calculator->calculate(CalculationInput::fromArray([
+            'sku' => 'wb-irp',
+            'integration_id' => 1,
+            'marketplace' => 'wildberries',
+            'fulfillment_type' => 'FBO',
+            'price' => 1000,
+            'old_price' => 1200,
+            'cost_price' => 0,
+            'commission_rate' => 0,
+            'length' => 10,
+            'width' => 10,
+            'height' => 30,
+            'warehouse_coefficient' => 1.5,
+            'localization_index' => 1.2,
+            'sales_distribution_index' => 1.15,
+            'redemption_rate' => 100,
+            'storage_cost' => 0,
+            'acquiring_percent' => 0,
+            'tax_percent' => 0,
+            'tariff_breakdown' => [
+                'box' => [
+                    'delivery_base' => 40,
+                    'delivery_liter' => 10,
+                    'delivery_coef_percent' => 150,
+                ],
+            ],
+        ]));
+
+        $this->assertSame(40.0, $result->metadata['base_logistics']);
+        $this->assertSame(12.0, $result->metadata['localization_amount']);
+        $this->assertSame(1.15, $result->metadata['sales_distribution_index']);
+        $this->assertSame(13.8, $result->metadata['sales_distribution_amount']);
+        $this->assertSame(85.8, $result->costs->logistics);
+    }
+
+    public function test_wildberries_fbs_uses_marketplace_box_tariff_fields(): void
+    {
+        $calculator = new WildberriesUnitEconomicsCalculator();
+
+        $result = $calculator->calculate(CalculationInput::fromArray([
+            'sku' => 'wb-tariff-fbs',
+            'integration_id' => 1,
+            'marketplace' => 'wildberries',
+            'fulfillment_type' => 'FBS',
+            'price' => 1000,
+            'cost_price' => 0,
+            'commission_rate' => 0,
+            'length' => 10,
+            'width' => 10,
+            'height' => 30,
+            'redemption_rate' => 100,
+            'storage_cost' => 0,
+            'acquiring_percent' => 0,
+            'tax_percent' => 0,
+            'tariff_breakdown' => [
+                'box' => [
+                    'delivery_base' => 100,
+                    'delivery_liter' => 100,
+                    'delivery_marketplace_base' => 30,
+                    'delivery_marketplace_liter' => 5,
+                ],
+            ],
+        ]));
+
+        $this->assertSame(40.0, $result->metadata['base_logistics']);
+        $this->assertSame(40.0, $result->costs->logistics);
+    }
+
+    public function test_wildberries_cache_conversion_persists_localization_index_in_logistics_coefficient(): void
+    {
+        $service = new UnitEconomicsCacheService(
+            $this->createMock(UnitEconomicsOrchestrator::class)
+        );
+
+        $result = new UnitEconomicsResult(
+            sku: 'wb-il',
+            marketplace: 'wildberries',
+            fulfillmentType: 'FBO',
+            price: 1000.0,
+            costs: new CostBreakdown(
+                commission: 0.0,
+                acquiring: 0.0,
+                logistics: 72.0,
+                deliveryCost: 72.0,
+                costPrice: 0.0,
+            ),
+            revenue: 1000.0,
+            totalCosts: 72.0,
+            netProfit: 928.0,
+            marginPercent: 92.8,
+            marginAbsolute: 928.0,
+            commissionPercent: 0.0,
+            acquiringPercent: 0.0,
+            isProfitable: true,
+            hasCostPrice: false,
+            productName: 'WB IL',
+        );
+        $result->metadata = [
+            'base_logistics' => 40.0,
+            'localization_index' => 1.2,
+        ];
+
+        $method = new \ReflectionMethod(UnitEconomicsCacheService::class, 'convertResultToCacheData');
+        $method->setAccessible(true);
+
+        $cacheData = $method->invoke(
+            $service,
+            new Product(['id' => 'wb-il-product', 'name' => 'WB IL']),
+            null,
+            $result,
+            [
+                'localization_index' => 1.2,
+                '_extra' => [
+                    'tax_percent' => 0,
+                    'drr_percent' => 0,
+                    'our_share_percent' => 0,
+                    'vat_percent' => 0,
+                ],
+            ]
+        );
+
+        $this->assertSame(1.2, $cacheData['logistics_coefficient']);
+    }
 }

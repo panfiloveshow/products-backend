@@ -31,7 +31,12 @@ class ProductController extends Controller
         $validated = $request->validated();
 
         $query = Product::query();
-        $this->productService->applyComputedStock($query);
+        $this->productService->applyComputedStock(
+            $query,
+            'computed_stock',
+            ! empty($validated['integration_id']) ? (int) $validated['integration_id'] : null,
+            $validated['marketplace'] ?? null
+        );
 
         if (! empty($validated['search'])) {
             $query->search($validated['search']);

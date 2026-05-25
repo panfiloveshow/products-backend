@@ -20,6 +20,7 @@ class WildberriesClient
     private const COMMON_URL = 'https://common-api.wildberries.ru';
     private const ANALYTICS_URL = 'https://seller-analytics-api.wildberries.ru';
     private const PRICES_URL = 'https://discounts-prices-api.wildberries.ru';
+    private const FINANCE_URL = 'https://finance-api.wildberries.ru';
     
     private string $apiKey;
     private int $timeout = 30;
@@ -613,6 +614,14 @@ class WildberriesClient
     }
 
     /**
+     * POST запрос к Finance API (новые отчёты реализации WB).
+     */
+    public function financePost(string $endpoint, array $data = []): ?array
+    {
+        return $this->post($endpoint, $data, self::FINANCE_URL);
+    }
+
+    /**
      * Заголовки запроса
      * 
      * WB API использует два формата авторизации:
@@ -685,6 +694,7 @@ class WildberriesClient
             self::STATISTICS_URL => 'Statistics',
             self::ANALYTICS_URL => 'Analytics',
             self::PRICES_URL => 'Prices',
+            self::FINANCE_URL => 'Finance',
             self::COMMON_URL => 'Common',
             self::ADVERT_URL => 'Advert',
             self::SUPPLIERS_URL => 'Suppliers',

@@ -10,10 +10,180 @@ use App\Models\UnitEconomicsCache;
 use App\Services\IntegrationAccessService;
 use App\Services\UnitEconomicsCacheService;
 use App\Services\UnitEconomicsService;
+use Illuminate\Http\UploadedFile;
+use PhpOffice\PhpSpreadsheet\Spreadsheet;
+use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
 use Tests\TestCase;
 
 class UnitEconomicsCacheControllerTest extends TestCase
 {
+    public function test_wildberries_indexes_import_parser_handles_realistic_detail_headers(): void
+    {
+        $controller = new UnitEconomicsCacheController(
+            $this->createMock(UnitEconomicsCacheService::class),
+            $this->createMock(UnitEconomicsService::class),
+            $this->createMock(UnitEconomicsOrchestrator::class),
+            $this->createMock(IntegrationAccessService::class),
+        );
+
+        $spreadsheet = new Spreadsheet();
+        $sheet = $spreadsheet->getActiveSheet();
+        $sheet->fromArray([
+            ['Кол-во заказов, шт', 'Коэфф. территориального распределения', 'КРП, %'],
+            [100, '110%', '1,15%'],
+            [50, '0,80', '0,00%'],
+        ]);
+
+        $path = tempnam(sys_get_temp_dir(), 'wb-indexes-').'.xlsx';
+        (new Xlsx($spreadsheet))->save($path);
+
+        $method = new \ReflectionMethod(UnitEconomicsCacheController::class, 'parseWildberriesIndexesSpreadsheet');
+        $method->setAccessible(true);
+
+        try {
+            $result = $method->invoke($controller, new UploadedFile($path, 'wb-indexes.xlsx', null, null, true));
+        } finally {
+            @unlink($path);
+        }
+
+        $this->assertSame(1.0, $result['localization_index']);
+        $this->assertSame(0.7667, $result['sales_distribution_index']);
+        $this->assertSame('excel_detail_weighted', $result['source']);
+    }
+
+    public function test_wildberries_indexes_import_parser_handles_current_value_labels(): void
+    {
+        $controller = new UnitEconomicsCacheController(
+            $this->createMock(UnitEconomicsCacheService::class),
+            $this->createMock(UnitEconomicsService::class),
+            $this->createMock(UnitEconomicsOrchestrator::class),
+            $this->createMock(IntegrationAccessService::class),
+        );
+
+        $spreadsheet = new Spreadsheet();
+        $sheet = $spreadsheet->getActiveSheet();
+        $sheet->fromArray([
+            ['Текущий ИЛ', '0,92'],
+            ['Значение ИРП', '1,15%'],
+        ]);
+
+        $path = tempnam(sys_get_temp_dir(), 'wb-index-labels-').'.xlsx';
+        (new Xlsx($spreadsheet))->save($path);
+
+        $method = new \ReflectionMethod(UnitEconomicsCacheController::class, 'parseWildberriesIndexesSpreadsheet');
+        $method->setAccessible(true);
+
+        try {
+            $result = $method->invoke($controller, new UploadedFile($path, 'wb-index-labels.xlsx', null, null, true));
+        } finally {
+            @unlink($path);
+        }
+
+        $this->assertSame(0.92, $result['localization_index']);
+        $this->assertSame(1.15, $result['sales_distribution_index']);
+        $this->assertSame('excel_label', $result['source']);
+    }
+
+    public function test_wildberries_commissions_static_fallback_is_marked_deprecated(): void
+    {
+        $controller = new UnitEconomicsCacheController(
+            $this->createMock(UnitEconomicsCacheService::class),
+            $this->createMock(UnitEconomicsService::class),
+            $this->createMock(UnitEconomicsOrchestrator::class),
+            $this->createMock(IntegrationAccessService::class),
+        );
+
+        $response = $controller->commissions('wb');
+        $data = $response->getData(true)['data'];
+
+        $this->assertSame('wildberries', $data['marketplace']);
+        $this->assertSame('wildberries_legacy_static_fallback', $data['source']);
+        $this->assertTrue($data['deprecated']);
+        $this->assertNotEmpty($data['categories']);
+    }
+
+    public function test_wildberries_tariffs_static_fallback_is_marked_deprecated(): void
+    {
+        $orchestrator = $this->createMock(UnitEconomicsOrchestrator::class);
+        $orchestrator->method('getSupportedSchemes')
+            ->with('wildberries')
+            ->willReturn(['FBO', 'FBS', 'DBS', 'EDBS', 'DBW']);
+
+        $controller = new UnitEconomicsCacheController(
+            $this->createMock(UnitEconomicsCacheService::class),
+            $this->createMock(UnitEconomicsService::class),
+            $orchestrator,
+            $this->createMock(IntegrationAccessService::class),
+        );
+
+        $response = $controller->tariffs('wb');
+        $data = $response->getData(true)['data'];
+
+        $this->assertSame('wildberries', $data['marketplace']);
+        $this->assertSame('wildberries_legacy_static_fallback', $data['source']);
+        $this->assertTrue($data['deprecated']);
+        $this->assertSame(['FBO', 'FBS', 'DBS', 'EDBS', 'DBW'], $data['schemes']);
+    }
+
+    public function test_wildberries_commissions_snapshots_require_integration_access(): void
+    {
+        $access = $this->createMock(IntegrationAccessService::class);
+        $access->expects($this->once())
+            ->method('ensureAccessibleIntegration')
+            ->with($this->anything(), 13, 'wildberries')
+            ->willReturn([
+                'success' => false,
+                'status' => 403,
+                'message' => 'Интеграция не принадлежит текущему workspace',
+            ]);
+
+        $controller = new UnitEconomicsCacheController(
+            $this->createMock(UnitEconomicsCacheService::class),
+            $this->createMock(UnitEconomicsService::class),
+            $this->createMock(UnitEconomicsOrchestrator::class),
+            $access,
+        );
+
+        $originalRequest = app('request');
+        app()->instance('request', \Illuminate\Http\Request::create(
+            '/api/unit-economics/commissions/wildberries',
+            'GET',
+            ['integration_id' => 13]
+        ));
+
+        try {
+            $response = $controller->commissions('wildberries');
+        } finally {
+            app()->instance('request', $originalRequest);
+        }
+
+        $this->assertSame(403, $response->getStatusCode());
+        $this->assertSame('Интеграция не принадлежит текущему workspace', $response->getData(true)['message']);
+    }
+
+    public function test_wildberries_live_calculate_is_deprecated(): void
+    {
+        $controller = new UnitEconomicsCacheController(
+            $this->createMock(UnitEconomicsCacheService::class),
+            $this->createMock(UnitEconomicsService::class),
+            $this->createMock(UnitEconomicsOrchestrator::class),
+            $this->createMock(IntegrationAccessService::class),
+        );
+
+        $request = \App\Http\Requests\UnitEconomics\CalculateRequest::create(
+            '/api/unit-economics/calculate/wildberries',
+            'POST',
+            []
+        );
+
+        $response = $controller->calculate($request, 'wildberries');
+        $data = $response->getData(true);
+
+        $this->assertSame(410, $response->getStatusCode());
+        $this->assertTrue($data['data']['deprecated']);
+        $this->assertSame('wildberries', $data['data']['marketplace']);
+    }
+
     public function test_normalize_ozon_cluster_markup_data_enriches_summary_and_sales_profile(): void
     {
         $controller = new UnitEconomicsCacheController(
@@ -172,6 +342,56 @@ class UnitEconomicsCacheControllerTest extends TestCase
         $this->assertSame('2.0000', $result['dimensions']['chargeable_volume']);
     }
 
+    public function test_wildberries_enrich_prefers_current_integration_localization_over_legacy_default_cache_value(): void
+    {
+        $controller = new UnitEconomicsCacheController(
+            $this->createMock(UnitEconomicsCacheService::class),
+            $this->createMock(UnitEconomicsService::class),
+            $this->createMock(UnitEconomicsOrchestrator::class),
+            $this->createMock(IntegrationAccessService::class),
+        );
+
+        $product = new Product([
+            'marketplace' => 'wildberries',
+        ]);
+        $product->fulfillment_type = 'FBO';
+
+        $cache = new UnitEconomicsCache([
+            'integration_id' => 13,
+            'product_id' => 10,
+            'sku' => 'sku-il',
+            'marketplace' => 'wildberries',
+            'fulfillment_type' => 'FBO',
+            'sales_count' => 1,
+            'price' => 1000,
+            'cost_price' => 0,
+            'base_logistics_cost' => 100,
+            'logistics_coefficient' => 1,
+            'marketplace_data' => [],
+        ]);
+        $cache->setRelation('product', $product);
+
+        $method = new \ReflectionMethod(UnitEconomicsCacheController::class, 'enrichCacheItem');
+        $method->setAccessible(true);
+
+        \Illuminate\Support\Facades\Cache::shouldReceive('remember')->andReturn(null);
+
+        $result = $method->invoke($controller, $cache, 'FBO', null, [
+            'wb_warehouses_by_product_key' => collect([
+                '10|13' => collect(),
+            ]),
+            'integrations_by_id' => collect([
+                13 => new Integration([
+                    'settings' => ['wb_localization_index' => 1.4],
+                    'localization_index' => 1.2,
+                ]),
+            ]),
+        ]);
+
+        $this->assertSame(1.4, $result['localization_index']);
+        $this->assertSame(40.0, $result['localization_amount']);
+    }
+
     public function test_profit_range_is_aligned_with_current_net_profit(): void
     {
         $controller = new UnitEconomicsCacheController(
@@ -269,5 +489,88 @@ class UnitEconomicsCacheControllerTest extends TestCase
         $this->assertSame('Выгодно', $result['current_price_index_label']);
         $this->assertSame(-100.0, $result['current_price_competitor_delta']);
         $this->assertSame(-10.0, $result['current_price_competitor_delta_percent']);
+    }
+
+    public function test_excel_export_ozon_finance_formulas_match_screen_formula(): void
+    {
+        $controller = new UnitEconomicsCacheController(
+            $this->createMock(UnitEconomicsCacheService::class),
+            $this->createMock(UnitEconomicsService::class),
+            $this->createMock(UnitEconomicsOrchestrator::class),
+            $this->createMock(IntegrationAccessService::class),
+        );
+
+        $method = new \ReflectionMethod(UnitEconomicsCacheController::class, 'buildUnitEconomicsSpreadsheet');
+        $method->setAccessible(true);
+
+        $spreadsheet = $method->invoke($controller, [[
+            'sku' => '9137/black',
+            'product_name' => 'Test product',
+            'price' => 1000,
+            'cost_price' => 300,
+            'sales_count' => 1,
+            'revenue' => 1000,
+            'commission_percent' => 10,
+            'logistics_cost' => 40,
+            'last_mile_cost' => 20,
+            'effective_logistics' => 120,
+            'expected_return_cost' => 60,
+            'storage_cost' => 35,
+            'acquiring_percent' => 1.5,
+            'drr_percent' => 5,
+            'our_share_percent' => 2,
+            'tax_percent' => 6,
+            'vat_percent' => 0,
+            'non_local_markup_percent' => 0.57,
+            'non_local_markup_amount' => 5.7,
+            'weighted_non_local_markup_percent' => 8,
+            'non_local_markup_source' => 'order_economics_summary',
+        ]], 'Test', 'ozon', 'FBO');
+
+        $sheet = $spreadsheet->getActiveSheet();
+
+        $this->assertSame(120.0, $sheet->getCell('M5')->getValue());
+        $this->assertSame('=D5+J5+M5+(C5*P5/100)+(C5*Q5/100)+(C5*R5/100)+(C5*S5/100)+(C5*T5/100)', $sheet->getCell('AA5')->getValue());
+        $this->assertSame('=C5-J5-M5-(C5*P5/100)-(C5*Q5/100)-(C5*R5/100)-(C5*S5/100)-(C5*T5/100)', $sheet->getCell('AE5')->getValue());
+        $this->assertSame(5.7, $sheet->getCell('AO5')->getValue());
+        $this->assertSame(8.0, $sheet->getCell('AP5')->getValue());
+        $this->assertSame('order_economics_summary', $sheet->getCell('AQ5')->getValue());
+    }
+
+    public function test_excel_export_wildberries_finance_formulas_include_spp_and_storage_like_screen(): void
+    {
+        $controller = new UnitEconomicsCacheController(
+            $this->createMock(UnitEconomicsCacheService::class),
+            $this->createMock(UnitEconomicsService::class),
+            $this->createMock(UnitEconomicsOrchestrator::class),
+            $this->createMock(IntegrationAccessService::class),
+        );
+
+        $method = new \ReflectionMethod(UnitEconomicsCacheController::class, 'buildUnitEconomicsSpreadsheet');
+        $method->setAccessible(true);
+
+        $spreadsheet = $method->invoke($controller, [[
+            'sku' => 'wb-1',
+            'product_name' => 'WB product',
+            'price' => 1000,
+            'cost_price' => 300,
+            'sales_count' => 1,
+            'revenue' => 1000,
+            'commission_percent' => 25,
+            'effective_logistics' => 90,
+            'storage_cost' => 15,
+            'spp_percent' => 7,
+            'acquiring_percent' => 1.5,
+            'drr_percent' => 5,
+            'tax_percent' => 6,
+            'vat_percent' => 20,
+            'our_share_percent' => 4,
+        ]], 'Test', 'wildberries', 'FBO');
+
+        $sheet = $spreadsheet->getActiveSheet();
+
+        $this->assertSame(70.0, $sheet->getCell('AN5')->getValue());
+        $this->assertSame('=D5+J5+M5+O5+AN5+(C5*P5/100)+(C5*Q5/100)+(C5*S5/100)', $sheet->getCell('AA5')->getValue());
+        $this->assertSame('=C5-J5-M5-O5-AN5-(C5*P5/100)-(C5*Q5/100)-(C5*S5/100)', $sheet->getCell('AE5')->getValue());
     }
 }
