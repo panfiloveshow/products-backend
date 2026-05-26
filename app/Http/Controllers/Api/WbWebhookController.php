@@ -76,7 +76,10 @@ class WbWebhookController extends Controller
         }
 
         try {
-            $response = Http::withToken($wbToken)
+            $response = Http::withHeaders([
+                'User-Agent' => config('services.wildberries.user_agent', 'wbas_sellico.ru9757'),
+            ])
+                ->withToken($wbToken)
                 ->timeout(15)
                 ->post('https://push.wildberries.ru/api/v1/subscribe', [
                     'url' => $webhookUrl,

@@ -14,6 +14,7 @@ use Illuminate\Support\Facades\Log;
 class WildberriesService implements MarketplaceInterface
 {
     private string $apiKey;
+    private string $userAgent;
 
     // Актуальные базовые URL для разных API Wildberries
     private string $contentApiUrl = 'https://content-api.wildberries.ru';
@@ -37,6 +38,15 @@ class WildberriesService implements MarketplaceInterface
     public function __construct(?string $apiKey = null)
     {
         $this->apiKey = $apiKey ?? config('services.wildberries.api_key') ?? '';
+        $this->userAgent = (string) config('services.wildberries.user_agent', 'wbas_sellico.ru9757');
+    }
+
+    private function wbHeaders(array $headers = []): array
+    {
+        return array_merge([
+            'Authorization' => $this->apiKey,
+            'User-Agent' => $this->userAgent,
+        ], $headers);
     }
 
     /**
@@ -48,7 +58,7 @@ class WildberriesService implements MarketplaceInterface
         usleep($this->requestDelayMs * 1000);
         $attempt = 0;
         do {
-            $response = Http::withHeaders(['Authorization' => $this->apiKey])
+            $response = Http::withHeaders($this->wbHeaders())
                 ->timeout($timeout)
                 ->get($url, $params);
             if ($response->status() !== 429) {
@@ -76,10 +86,9 @@ class WildberriesService implements MarketplaceInterface
         usleep($this->requestDelayMs * 1000);
         $attempt = 0;
         do {
-            $response = Http::withHeaders([
-                'Authorization' => $this->apiKey,
+            $response = Http::withHeaders($this->wbHeaders([
                 'Content-Type' => 'application/json',
-            ])->timeout($timeout)->post($url, $data);
+            ]))->timeout($timeout)->post($url, $data);
             if ($response->status() !== 429) {
                 return $response;
             }
@@ -881,10 +890,9 @@ class WildberriesService implements MarketplaceInterface
                 ],
             ];
 
-            $response = Http::withHeaders([
-                'Authorization' => $this->apiKey,
+            $response = Http::withHeaders($this->wbHeaders([
                 'Content-Type' => 'application/json',
-            ])->timeout(30)->post(
+            ]))->timeout(30)->post(
                 'https://content-api.wildberries.ru/content/v2/get/cards/list',
                 $body
             );

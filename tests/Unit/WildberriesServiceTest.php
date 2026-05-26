@@ -105,6 +105,37 @@ class WildberriesServiceTest extends TestCase
         Carbon::setTestNow();
     }
 
+    public function test_get_products_sends_required_user_agent_to_wildberries_requests(): void
+    {
+        Http::fake([
+            'content-api.wildberries.ru/content/v2/get/cards/list' => Http::response([
+                'cards' => [],
+                'cursor' => ['total' => 0],
+            ]),
+            'discounts-prices-api.wildberries.ru/api/v2/list/goods/filter*' => Http::response([
+                'data' => ['listGoods' => []],
+            ]),
+            'common-api.wildberries.ru/api/v1/tariffs/commission*' => Http::response([
+                'report' => [],
+            ]),
+        ]);
+
+        (new WildberriesService('test-token'))->getProducts();
+
+        Http::assertSent(function ($request) {
+            return str_contains($request->url(), 'content-api.wildberries.ru/content/v2/get/cards/list')
+                && $request->hasHeader('User-Agent', 'wbas_sellico.ru9757');
+        });
+        Http::assertSent(function ($request) {
+            return str_contains($request->url(), 'discounts-prices-api.wildberries.ru/api/v2/list/goods/filter')
+                && $request->hasHeader('User-Agent', 'wbas_sellico.ru9757');
+        });
+        Http::assertSent(function ($request) {
+            return str_contains($request->url(), 'common-api.wildberries.ru/api/v1/tariffs/commission')
+                && $request->hasHeader('User-Agent', 'wbas_sellico.ru9757');
+        });
+    }
+
     public function test_get_products_maps_prices_by_size_not_first_size_for_all_barcodes(): void
     {
         Http::fake([

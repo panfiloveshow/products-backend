@@ -43,6 +43,7 @@ return [
 
     'wildberries' => [
         'api_key' => env('WILDBERRIES_API_KEY'),
+        'user_agent' => env('WILDBERRIES_USER_AGENT', 'wbas_sellico.ru9757'),
         'base_url' => env('WILDBERRIES_BASE_URL', 'https://suppliers-api.wildberries.ru'),
         'stats_url' => env('WILDBERRIES_STATS_URL', 'https://statistics-api.wildberries.ru'),
     ],

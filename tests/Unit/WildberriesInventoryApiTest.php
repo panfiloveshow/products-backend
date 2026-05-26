@@ -39,5 +39,18 @@ class WildberriesInventoryApiTest extends TestCase
         $this->assertSame('BAR-S', $stocks[0]['sku']);
         $this->assertSame(7, $stocks[0]['total']);
         $this->assertSame('FBS', $stocks[0]['warehouses'][0]['fulfillment_type']);
+
+        Http::assertSent(function ($request) {
+            return str_contains($request->url(), 'marketplace-api.wildberries.ru/api/v3/warehouses')
+                && $request->hasHeader('User-Agent', 'wbas_sellico.ru9757');
+        });
+        Http::assertSent(function ($request) {
+            return str_contains($request->url(), 'content-api.wildberries.ru/content/v2/get/cards/list')
+                && $request->hasHeader('User-Agent', 'wbas_sellico.ru9757');
+        });
+        Http::assertSent(function ($request) {
+            return str_contains($request->url(), 'marketplace-api.wildberries.ru/api/v3/stocks/55')
+                && $request->hasHeader('User-Agent', 'wbas_sellico.ru9757');
+        });
     }
 }

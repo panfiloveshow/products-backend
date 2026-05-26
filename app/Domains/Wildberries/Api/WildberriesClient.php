@@ -24,10 +24,12 @@ class WildberriesClient
     
     private string $apiKey;
     private int $timeout = 30;
+    private string $userAgent;
 
     public function __construct(?string $apiKey = null)
     {
         $this->apiKey = $apiKey ?? config('services.wildberries.api_key') ?? '';
+        $this->userAgent = (string) config('services.wildberries.user_agent', 'wbas_sellico.ru9757');
     }
 
     /**
@@ -653,6 +655,7 @@ class WildberriesClient
     {
         return [
             'Authorization' => $this->apiKey,
+            'User-Agent' => $this->userAgent,
             'Content-Type' => 'application/json',
             'Accept' => 'application/json',
         ];
@@ -669,6 +672,7 @@ class WildberriesClient
     {
         return [
             'Authorization' => 'Bearer ' . $this->apiKey,
+            'User-Agent' => $this->userAgent,
             'Content-Type' => 'application/json',
             'Accept' => 'application/json',
         ];
