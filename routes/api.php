@@ -400,6 +400,8 @@ Route::prefix('auto-supply-plans')->middleware('sellico.permission')->group(func
         ->name('auto-supply-plans.calculate');
     Route::get('/{id}/lines', [AutoSupplyPlanController::class, 'lines'])
         ->name('auto-supply-plans.lines');
+    Route::get('/{id}/clusters', [AutoSupplyPlanController::class, 'clusters'])
+        ->name('auto-supply-plans.clusters');
     Route::put('/{id}/lines/{lineId}', [AutoSupplyPlanController::class, 'updateLine'])->name('auto-supply-plans.lines.update');
     Route::get('/{id}/simulate', [AutoSupplyPlanController::class, 'simulate'])
         ->name('auto-supply-plans.simulate');

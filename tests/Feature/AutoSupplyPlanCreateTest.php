@@ -79,6 +79,32 @@ class AutoSupplyPlanCreateTest extends TestCase
             ->assertJsonPath('data.params.cluster_ids', [149, 154]);
     }
 
+    public function test_ozon_plan_converts_legacy_cluster_warehouse_ids_to_cluster_ids(): void
+    {
+        Queue::fake();
+        Config::set('services.sellico.skip_permission_check', true);
+        $this->fakeSellicoLimits(30);
+
+        $integration = Integration::factory()->ozon()->create([
+            'id' => 9104,
+            'work_space_id' => 3,
+        ]);
+
+        $response = $this
+            ->withHeader('X-Workspace-Id', '3')
+            ->postJson('/api/auto-supply-plans', [
+                'integration_id' => $integration->id,
+                'mode' => 'balanced',
+                'horizon_days' => 28,
+                'warehouse_ids' => ['cluster:154'],
+            ]);
+
+        $response
+            ->assertCreated()
+            ->assertJsonPath('data.params.cluster_ids', [154])
+            ->assertJsonPath('data.params.warehouse_ids', null);
+    }
+
     public function test_autoplanning_limit_exceeded_still_blocks_creation(): void
     {
         Queue::fake();

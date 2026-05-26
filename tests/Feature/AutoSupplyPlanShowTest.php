@@ -170,6 +170,72 @@ class AutoSupplyPlanShowTest extends TestCase
         $this->assertSame([1, 2], $clusters);
     }
 
+    public function test_selected_ozon_cluster_scopes_show_lines_and_cluster_endpoints(): void
+    {
+        Config::set('services.sellico.skip_permission_check', true);
+
+        $integration = Integration::factory()->ozon()->create(['id' => 9014]);
+
+        $plan = AutoSupplyPlan::create([
+            'integration_id' => $integration->id,
+            'mp_account_id' => $integration->id,
+            'marketplace' => 'ozon',
+            'status' => AutoSupplyPlan::STATUS_READY,
+            'mode' => AutoSupplyPlan::MODE_BALANCED,
+            'params' => ['cluster_ids' => [154]],
+            'total_lines' => 2,
+            'total_qty' => 15,
+        ]);
+
+        $base = [
+            'auto_supply_plan_id' => $plan->id,
+            'sku' => 'SKU-SCOPED',
+            'offer_id' => 'OFF-SCOPED',
+            'product_name' => 'Scoped product',
+            'destination_type' => 'cluster',
+            'qty_recommended' => 1,
+            'current_stock' => 0,
+            'in_transit' => 0,
+            'risk_level' => 'high',
+            'priority' => 'high',
+            'expected_profit' => 10,
+        ];
+
+        foreach ([154 => 10, 155 => 5] as $clusterId => $qty) {
+            AutoSupplyPlanLine::create(array_merge($base, [
+                'warehouse_id' => 'cluster:' . $clusterId,
+                'warehouse_name' => 'Cluster ' . $clusterId,
+                'cluster_id' => $clusterId,
+                'cluster_name' => 'Cluster ' . $clusterId,
+                'destination' => 'Cluster ' . $clusterId,
+                'destination_id' => 'cluster:' . $clusterId,
+                'qty_rounded' => $qty,
+            ]));
+        }
+
+        $this->getJson("/api/auto-supply-plans/{$plan->id}?per_page=50")
+            ->assertOk()
+            ->assertJsonPath('data.summary.total_lines', 1)
+            ->assertJsonPath('data.summary.total_qty', 10)
+            ->assertJsonPath('data.lines.total', 1)
+            ->assertJsonPath('data.lines.data.0.cluster_id', 154);
+
+        $this->getJson("/api/auto-supply-plans/{$plan->id}/lines?per_page=50")
+            ->assertOk()
+            ->assertJsonPath('data.total', 1)
+            ->assertJsonPath('data.data.0.cluster_id', 154);
+
+        $this->getJson("/api/auto-supply-plans/{$plan->id}/clusters")
+            ->assertOk()
+            ->assertJsonPath('data.total_clusters', 1)
+            ->assertJsonPath('data.clusters.0.cluster_id', 154);
+
+        $this->getJson("/api/auto-supply-plans/{$plan->id}/cluster-split")
+            ->assertOk()
+            ->assertJsonCount(1, 'data')
+            ->assertJsonPath('data.0.cluster_id', '154');
+    }
+
     public function test_ozon_show_normalizes_old_cluster_rows_without_destination_type(): void
     {
         Config::set('services.sellico.skip_permission_check', true);

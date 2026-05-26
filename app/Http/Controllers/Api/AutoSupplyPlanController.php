@@ -96,6 +96,37 @@ class AutoSupplyPlanController extends Controller
             return $limitResponse;
         }
 
+        $normalizedClusterIds = $this->normalizeOzonClusterIdsFromRequest($request, $integration);
+        $warehouseIds = $request->input('warehouse_ids');
+        if ($integration->marketplace === 'ozon' && is_array($warehouseIds)) {
+            $warehouseIds = array_values(array_filter(
+                $warehouseIds,
+                static fn ($warehouseId) => ! preg_match('/^cluster:\d+$/', (string) $warehouseId)
+            ));
+        }
+
+        $params = array_filter([
+            'target_days' => $request->input('target_cover_days', 21),
+            'safety_days' => $request->input('safety_stock_days', 5),
+            'lead_time_days' => $request->input('lead_time_days', 7),
+            'ewma_alpha' => 0.35,
+            'warehouse_ids' => $warehouseIds,
+            'cluster_ids' => $normalizedClusterIds,
+
+            // Advanced (используются алгоритмом расчёта — см. CalculateAutoSupplyPlanJob)
+            'ozon_qty_anchor' => $request->input('ozon_qty_anchor'),
+            'demand_seasonality_multiplier' => $request->input('demand_seasonality_multiplier'),
+            'skip_negative_profit' => $request->input('skip_negative_profit'),
+            'include_wb_supplies_api_in_transit' => $request->input('include_wb_supplies_api_in_transit'),
+
+            // Locality integration (читаются в CalculateAutoSupplyPlanJob и LocalityEnrichmentService)
+            'split_by_cluster' => $request->input('split_by_cluster'),
+            'minimum_locality_confidence' => $request->input('minimum_locality_confidence'),
+            'include_locality_recommendations' => $request->input('include_locality_recommendations'),
+            'locality_distribution_strategy' => $request->input('locality_distribution_strategy'),
+            'locality_recommendation_ids' => $request->input('locality_recommendation_ids'),
+        ], static fn ($v) => $v !== null && $v !== []);
+
         $plan = AutoSupplyPlan::create([
             'integration_id' => $integration->id,
             'mp_account_id' => $integration->id,
@@ -111,27 +142,7 @@ class AutoSupplyPlanController extends Controller
             'budget_limit' => $request->input('budget_limit'),
             'forecast_model' => 'EWMA_0.35',
             'algorithm_version' => 'asp-1.0.0',
-            'params' => array_filter([
-                'target_days' => $request->input('target_cover_days', 21),
-                'safety_days' => $request->input('safety_stock_days', 5),
-                'lead_time_days' => $request->input('lead_time_days', 7),
-                'ewma_alpha' => 0.35,
-                'warehouse_ids' => $request->input('warehouse_ids'),
-                'cluster_ids' => $request->input('cluster_ids'),
-
-                // Advanced (используются алгоритмом расчёта — см. CalculateAutoSupplyPlanJob)
-                'ozon_qty_anchor' => $request->input('ozon_qty_anchor'),
-                'demand_seasonality_multiplier' => $request->input('demand_seasonality_multiplier'),
-                'skip_negative_profit' => $request->input('skip_negative_profit'),
-                'include_wb_supplies_api_in_transit' => $request->input('include_wb_supplies_api_in_transit'),
-
-                // Locality integration (читаются в CalculateAutoSupplyPlanJob и LocalityEnrichmentService)
-                'split_by_cluster' => $request->input('split_by_cluster'),
-                'minimum_locality_confidence' => $request->input('minimum_locality_confidence'),
-                'include_locality_recommendations' => $request->input('include_locality_recommendations'),
-                'locality_distribution_strategy' => $request->input('locality_distribution_strategy'),
-                'locality_recommendation_ids' => $request->input('locality_recommendation_ids'),
-            ], static fn ($v) => $v !== null),
+            'params' => $params,
         ]);
 
         if ((int) ($integration->work_space_id ?? 0) > 0) {
@@ -144,6 +155,39 @@ class AutoSupplyPlanController extends Controller
             'message' => 'План создан, расчёт запущен',
             'data' => $plan->load('integration'),
         ], 201);
+    }
+
+    /**
+     * @return list<int>|null
+     */
+    private function normalizeOzonClusterIdsFromRequest(Request $request, Integration $integration): ?array
+    {
+        if ($integration->marketplace !== 'ozon') {
+            return $request->input('cluster_ids');
+        }
+
+        $clusterIds = collect((array) $request->input('cluster_ids', []))
+            ->map(fn ($clusterId) => (int) $clusterId);
+
+        $legacyClusterIds = collect((array) $request->input('warehouse_ids', []))
+            ->map(function ($warehouseId) {
+                $warehouseId = (string) $warehouseId;
+                if (preg_match('/^cluster:(\d+)$/', $warehouseId, $matches)) {
+                    return (int) $matches[1];
+                }
+
+                return null;
+            })
+            ->filter();
+
+        $normalized = $clusterIds
+            ->merge($legacyClusterIds)
+            ->filter(fn (int $clusterId) => $clusterId > 0)
+            ->unique()
+            ->values()
+            ->all();
+
+        return $normalized === [] ? null : $normalized;
     }
 
     private function ensureAutoplanningLimitAvailable(Integration $integration): ?JsonResponse
@@ -198,7 +242,7 @@ class AutoSupplyPlanController extends Controller
     {
         $plan = AutoSupplyPlan::findOrFail($id);
 
-        $query = $plan->lines();
+        $query = $this->planLinesQueryForSelectedClusters($plan);
 
         if ($request->filled('risk_level')) {
             $query->where('risk_level', $request->input('risk_level'));
@@ -229,7 +273,7 @@ class AutoSupplyPlanController extends Controller
             'destination_id' => 'nullable|string',
         ]);
 
-        $query = $plan->lines()->where('offer_id', $request->input('offer_id'));
+        $query = $this->planLinesQueryForSelectedClusters($plan)->where('offer_id', $request->input('offer_id'));
 
         if ($request->filled('destination_id')) {
             $query->where('destination_id', $request->input('destination_id'));
@@ -268,30 +312,33 @@ class AutoSupplyPlanController extends Controller
         }
 
         $perPage = $request->input('per_page', 50);
-        $lines = $this->paginateAggregatedPlanLines($plan, $plan->lines(), (int) $perPage);
+        $linesQuery = $this->planLinesQueryForSelectedClusters($plan);
+        $lines = $this->paginateAggregatedPlanLines($plan, $linesQuery, (int) $perPage);
 
         // Финансовые агрегаты
-        $allLines = $plan->lines();
+        $allLines = $this->planLinesQueryForSelectedClusters($plan);
         $totalSupplyCost = (float) $allLines->sum('supply_cost_estimate');
-        $totalExpectedRevenue = (float) $plan->lines()->sum('expected_revenue');
-        $totalExpectedProfit = (float) $plan->lines()->sum('expected_profit');
-        $totalLostRevenueDaily = (float) $plan->lines()->sum('lost_revenue_daily');
-        $avgRoi = (float) $plan->lines()->whereNotNull('roi_percent')->avg('roi_percent');
-        $avgTurnover = (float) $plan->lines()->whereNotNull('turnover_days')->avg('turnover_days');
+        $totalExpectedRevenue = (float) $this->planLinesQueryForSelectedClusters($plan)->sum('expected_revenue');
+        $totalExpectedProfit = (float) $this->planLinesQueryForSelectedClusters($plan)->sum('expected_profit');
+        $totalLostRevenueDaily = (float) $this->planLinesQueryForSelectedClusters($plan)->sum('lost_revenue_daily');
+        $avgRoi = (float) $this->planLinesQueryForSelectedClusters($plan)->whereNotNull('roi_percent')->avg('roi_percent');
+        $avgTurnover = (float) $this->planLinesQueryForSelectedClusters($plan)->whereNotNull('turnover_days')->avg('turnover_days');
+        $scopedTotalLines = (int) $this->planLinesQueryForSelectedClusters($plan)->count();
+        $scopedTotalQty = (int) $this->planLinesQueryForSelectedClusters($plan)->sum('qty_rounded');
 
         // Приоритет breakdown
         $priorityBreakdown = [
-            'critical' => $plan->lines()->where('priority', 'critical')->count(),
-            'high' => $plan->lines()->where('priority', 'high')->count(),
-            'medium' => $plan->lines()->where('priority', 'medium')->count(),
-            'low' => $plan->lines()->where('priority', 'low')->count(),
+            'critical' => $this->planLinesQueryForSelectedClusters($plan)->where('priority', 'critical')->count(),
+            'high' => $this->planLinesQueryForSelectedClusters($plan)->where('priority', 'high')->count(),
+            'medium' => $this->planLinesQueryForSelectedClusters($plan)->where('priority', 'medium')->count(),
+            'low' => $this->planLinesQueryForSelectedClusters($plan)->where('priority', 'low')->count(),
         ];
 
         // Тренд breakdown
         $trendBreakdown = [
-            'growing' => $plan->lines()->where('sales_trend', 'growing')->count(),
-            'stable' => $plan->lines()->where('sales_trend', 'stable')->count(),
-            'declining' => $plan->lines()->where('sales_trend', 'declining')->count(),
+            'growing' => $this->planLinesQueryForSelectedClusters($plan)->where('sales_trend', 'growing')->count(),
+            'stable' => $this->planLinesQueryForSelectedClusters($plan)->where('sales_trend', 'stable')->count(),
+            'declining' => $this->planLinesQueryForSelectedClusters($plan)->where('sales_trend', 'declining')->count(),
         ];
 
         return response()->json([
@@ -300,14 +347,14 @@ class AutoSupplyPlanController extends Controller
                 'plan' => $plan,
                 'lines' => $lines,
                 'summary' => [
-                    'total_lines' => $plan->total_lines,
-                    'total_qty' => $plan->total_qty,
+                    'total_lines' => $scopedTotalLines,
+                    'total_qty' => $scopedTotalQty,
                     'data_quality_score' => $plan->data_quality_score,
                     'data_quality_json' => $plan->data_quality_json,
                     'risk_breakdown' => [
-                        'high' => $plan->lines()->where('risk_level', 'high')->count(),
-                        'med' => $plan->lines()->where('risk_level', 'med')->count(),
-                        'low' => $plan->lines()->where('risk_level', 'low')->count(),
+                        'high' => $this->planLinesQueryForSelectedClusters($plan)->where('risk_level', 'high')->count(),
+                        'med' => $this->planLinesQueryForSelectedClusters($plan)->where('risk_level', 'med')->count(),
+                        'low' => $this->planLinesQueryForSelectedClusters($plan)->where('risk_level', 'low')->count(),
                     ],
                     'priority_breakdown' => $priorityBreakdown,
                     'trend_breakdown' => $trendBreakdown,
@@ -334,6 +381,17 @@ class AutoSupplyPlanController extends Controller
         });
 
         return $paginator;
+    }
+
+    private function planLinesQueryForSelectedClusters(AutoSupplyPlan $plan)
+    {
+        $selectedClusterIds = $this->selectedPlanClusterIds($plan);
+
+        return $plan->lines()
+            ->when(
+                $plan->marketplace === 'ozon' && $selectedClusterIds !== [],
+                fn ($query) => $query->whereIn('cluster_id', $selectedClusterIds)
+            );
     }
 
     private function aggregatedPlanLinesQuery(AutoSupplyPlan $plan, $query)
@@ -440,7 +498,7 @@ class AutoSupplyPlanController extends Controller
             return [];
         }
 
-        $planKeys = $plan->lines()
+        $planKeys = $this->planLinesQueryForSelectedClusters($plan)
             ->whereNotNull('cluster_id')
             ->get(['sku', 'cluster_id']);
 
@@ -544,7 +602,7 @@ class AutoSupplyPlanController extends Controller
     {
         $plan = AutoSupplyPlan::findOrFail($id);
 
-        $lines = $plan->lines()->get();
+        $lines = $this->planLinesQueryForSelectedClusters($plan)->get();
 
         $clusters = [];
         $unclustered = ['cluster_id' => null, 'cluster_name' => 'Без кластера', 'region' => null, 'warehouses' => [], 'total_qty' => 0, 'total_skus' => 0, 'total_supply_cost' => 0, 'skus' => []];
@@ -859,7 +917,7 @@ class AutoSupplyPlanController extends Controller
             return response()->json(['message' => $access['message'] ?? 'Доступ запрещён'], $access['status'] ?? 403);
         }
 
-        $rows = $plan->lines()
+        $rows = $this->planLinesQueryForSelectedClusters($plan)
             ->whereNotNull('cluster_id')
             ->selectRaw("
                 cluster_id,
@@ -903,8 +961,9 @@ class AutoSupplyPlanController extends Controller
             return response()->json(['message' => $access['message'] ?? 'Доступ запрещён'], $access['status'] ?? 403);
         }
 
-        $skusInPlan = $plan->lines()->pluck('sku')->unique()->values();
-        $linkedRecIds = collect($plan->lines()
+        $selectedClusterIds = $this->selectedPlanClusterIds($plan);
+        $skusInPlan = $this->planLinesQueryForSelectedClusters($plan)->pluck('sku')->unique()->values();
+        $linkedRecIds = collect($this->planLinesQueryForSelectedClusters($plan)
             ->whereNotNull('linked_locality_recommendation_ids')
             ->pluck('linked_locality_recommendation_ids')
             ->all())
@@ -920,6 +979,7 @@ class AutoSupplyPlanController extends Controller
             ->where('integration_id', $plan->integration_id)
             ->whereIn('sku', $skusInPlan)
             ->where('state', \App\Models\LocalityRecommendation::STATE_NEW)
+            ->when($selectedClusterIds !== [], fn ($query) => $query->whereIn('target_cluster_id', array_map('strval', $selectedClusterIds)))
             ->orderByDesc('rank_score')
             ->get();
 
@@ -1293,7 +1353,7 @@ class AutoSupplyPlanController extends Controller
             'qty_rounded' => 'required|integer|min:0',
         ]);
 
-        $line = $plan->lines()->findOrFail($lineId);
+        $line = $this->planLinesQueryForSelectedClusters($plan)->findOrFail($lineId);
         $oldQty = $line->qty_rounded;
         $newQty = $request->input('qty_rounded');
 
@@ -1331,7 +1391,7 @@ class AutoSupplyPlanController extends Controller
             abort(422, 'План ещё не рассчитан');
         }
 
-        $lines = $plan->lines()->get();
+        $lines = $this->planLinesQueryForSelectedClusters($plan)->get();
 
         // Группируем по offer_id
         $grouped = [];
@@ -1501,7 +1561,7 @@ class AutoSupplyPlanController extends Controller
             abort(422, 'План ещё не рассчитан');
         }
 
-        $lines = $plan->lines()
+        $lines = $this->planLinesQueryForSelectedClusters($plan)
             ->where('qty_rounded', '>', 0)
             ->get();
 
@@ -1607,7 +1667,7 @@ class AutoSupplyPlanController extends Controller
             abort(422, 'План ещё не рассчитан');
         }
 
-        $lines = $plan->lines()
+        $lines = $this->planLinesQueryForSelectedClusters($plan)
             ->where('qty_rounded', '>', 0)
             ->get();
 

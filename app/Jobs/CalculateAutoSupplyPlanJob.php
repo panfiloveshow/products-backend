@@ -70,6 +70,10 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
 
         $integrationId = $plan->integration_id;
         $marketplace = $plan->marketplace;
+        $params = is_array($plan->params) ? $plan->params : [];
+        $seasonalityMultiplier = max(0.1, min(5.0, (float) ($params['demand_seasonality_multiplier'] ?? 1.0)));
+        $ozonQtyAnchor = (string) ($params['ozon_qty_anchor'] ?? 'internal');
+        $skipNegativeProfit = (bool) ($params['skip_negative_profit'] ?? false);
 
         // v2: Загружаем SupplySettings для интеграции (ABC target days, lead time, safety stock mode)
         $settings = SupplySettings::where('integration_id', $integrationId)->first();
@@ -331,6 +335,14 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
         $qBarcode = 0;
         $qualitySeenSkus = [];
         $totalSkus = $warehouses->pluck('sku')->unique()->count();
+        $demandSourceCounts = [];
+        $missingSourceCounts = [];
+        $fallbackLongLines = 0;
+        $negativeProfitLines = 0;
+        $skippedNegativeProfitLines = 0;
+        $ozonRecommendedLines = 0;
+        $manualReviewLines = 0;
+        $lowConfidenceTrialLines = 0;
 
         foreach ($warehouses as $wh) {
             $product = $products->get($wh->sku);
@@ -528,6 +540,10 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
             $demandSource = $demandResult['source'];
             $needsManualReview = $demandResult['needs_manual_review'];
 
+            if ($seasonalityMultiplier !== 1.0 && $dailyDemand > 0) {
+                $dailyDemand *= $seasonalityMultiplier;
+            }
+
             // v3: Для нового склада — сниженный спрос (пробная партия)
             // Берём 30% от общего avg_daily_sales как тестовый объём
             if ($supplyType === 'new_warehouse' && $dailyDemand > 0) {
@@ -540,6 +556,18 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
             $revenue30d = $revenueBySkuMap[$wh->sku] ?? 0;
             $abcPriority = $service->calculateAbcPriority($revenue30d);
             $targetCoverDays = $service->getTargetDaysByAbc($abcPriority, $settings, $planDefaultTargetDays);
+
+            $isLowDemandTrial = $marketplace === 'ozon'
+                && $sales30 > 0
+                && $sales30 < 3
+                && $realAvgDailySales <= 0
+                && $effectiveDailySales <= 0;
+            if ($isLowDemandTrial) {
+                $targetCoverDays = min($targetCoverDays, 14);
+                $needsManualReview = true;
+                $demandSource = $demandSource . '_low_confidence_trial';
+                $lowConfidenceTrialLines++;
+            }
 
             // v3: Для нового склада — короткий горизонт покрытия (макс 14 дней)
             if ($supplyType === 'new_warehouse') {
@@ -595,12 +623,44 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
                 }
             }
 
+            // --- v2: Ozon рекомендации для этого SKU/кластера ---
+            $ozonSkuData = $ozonAnalytics[$wh->sku] ?? null;
+            $ozonClusterRecommendation = null;
+            if ($clusterId && isset($ozonSkuData['clusters'][$clusterId]['recommended_supply'])) {
+                $ozonClusterRecommendation = (int) $ozonSkuData['clusters'][$clusterId]['recommended_supply'];
+            }
+            $ozonRecommendedSupply = $ozonClusterRecommendation ?? ($ozonSkuData['total_recommended_supply'] ?? null);
+            $ozonLostProfit = $clusterId && isset($ozonSkuData['clusters'][$clusterId]['lost_profit'])
+                ? (float) $ozonSkuData['clusters'][$clusterId]['lost_profit']
+                : (float) ($ozonSkuData['total_lost_profit'] ?? 0);
+            $ozonAvgDeliveryTime = $clusterId && isset($ozonSkuData['clusters'][$clusterId]['average_delivery_time'])
+                ? $ozonSkuData['clusters'][$clusterId]['average_delivery_time']
+                : ($ozonSkuData['max_delivery_time'] ?? null);
+            $ozonAttentionLevel = $clusterId && isset($ozonSkuData['clusters'][$clusterId]['attention_level'])
+                ? $ozonSkuData['clusters'][$clusterId]['attention_level']
+                : ($ozonSkuData['max_attention_level'] ?? null);
+            if ($marketplace === 'ozon' && $ozonRecommendedSupply !== null && $ozonRecommendedSupply > 0) {
+                $ozonRecommendedLines++;
+            }
+
             // --- Округление qty ---
             $packMultiple = $settings->default_pack_multiple ?? 1;
             if ($product && isset($product->ozon_data['pack_multiple'])) {
                 $packMultiple = max(1, (int) $product->ozon_data['pack_multiple']);
             }
             $qtyRounded = $service->roundToPackMultiple($needed, $packMultiple);
+            $internalQtyRounded = $qtyRounded;
+
+            if ($marketplace === 'ozon' && $ozonRecommendedSupply !== null && $ozonRecommendedSupply >= 0 && $ozonQtyAnchor !== 'internal') {
+                $ozonQtyRounded = $service->roundToPackMultiple((float) $ozonRecommendedSupply, $packMultiple);
+                $qtyRounded = match ($ozonQtyAnchor) {
+                    'ozon' => $ozonQtyRounded,
+                    'min' => min($internalQtyRounded, $ozonQtyRounded),
+                    'max' => max($internalQtyRounded, $ozonQtyRounded),
+                    'average' => $service->roundToPackMultiple(($internalQtyRounded + $ozonQtyRounded) / 2, $packMultiple),
+                    default => $internalQtyRounded,
+                };
+            }
 
             // --- Own stock accounting (optional) ---
             $ownStock = null;
@@ -699,13 +759,6 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
             $roiPercent = $supplyCostEstimate > 0 ? round(($expectedProfit / $supplyCostEstimate) * 100, 2) : 0;
             $turnoverDays = $dailyDemand > 0 ? round(($currentStock + $inTransit + $qtyRounded) / $dailyDemand, 1) : null;
 
-            // --- v2: Ozon рекомендации для этого SKU ---
-            $ozonSkuData = $ozonAnalytics[$wh->sku] ?? null;
-            $ozonRecommendedSupply = $ozonSkuData['total_recommended_supply'] ?? null;
-            $ozonLostProfit = $ozonSkuData['total_lost_profit'] ?? 0;
-            $ozonAvgDeliveryTime = $ozonSkuData['max_delivery_time'] ?? null;
-            $ozonAttentionLevel = $ozonSkuData['max_attention_level'] ?? null;
-
             // --- v2: Улучшенный приоритет (ABC + маржа + Ozon lost profit) ---
             $priorityResult = $service->calculatePriorityScoreV2(
                 $abcPriority, $oosDate, $coverBefore, $minCoverDays,
@@ -713,6 +766,20 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
             );
             $priorityScore = $priorityResult['score'];
             $priority = $priorityResult['priority'];
+            $missingSources = $service->detectMissingSources($wh, $product, $marketplace, $ue, $hasOzonReport);
+            $demandSourceCounts[$demandSource] = ($demandSourceCounts[$demandSource] ?? 0) + 1;
+            if (str_contains($demandSource, 'fallback_long')) {
+                $fallbackLongLines++;
+            }
+            if ($needsManualReview) {
+                $manualReviewLines++;
+            }
+            foreach ($missingSources as $missingSource) {
+                $missingSourceCounts[$missingSource] = ($missingSourceCounts[$missingSource] ?? 0) + 1;
+            }
+            if ($expectedProfit < 0) {
+                $negativeProfitLines++;
+            }
 
             // --- Explain JSON (v2: расширенный) ---
             $shortAvg = $sales7 > 0 ? $sales7 / 7 : 0;
@@ -734,6 +801,7 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
                     'in_transit_total' => $inTransit,
                     'daily_demand' => round($dailyDemand, 4),
                     'demand_source' => $demandSource,
+                    'demand_seasonality_multiplier' => $seasonalityMultiplier,
                     'ewma_alpha' => $ewmaAlpha,
                     'sales_7d' => $sales7,
                     'sales_14d' => $sales14,
@@ -762,14 +830,18 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
                     'cap_needed' => round($capNeeded, 2),
                     'caps_applied' => $capsApplied,
                     'needed_after_caps' => round($needed, 2),
+                    'internal_qty_rounded' => $internalQtyRounded,
+                    'qty_anchor' => $marketplace === 'ozon' ? $ozonQtyAnchor : 'internal',
+                    'ozon_recommended_supply_used' => $ozonRecommendedSupply,
                     'qty_rounded' => $qtyRounded,
                     'cover_before' => round($coverBefore, 2),
                     'cover_after' => round($coverAfter, 2),
                 ],
                 'confidence' => [
                     'needs_manual_review' => $needsManualReview,
-                    'missing_sources' => $service->detectMissingSources($wh, $product, $marketplace, $ue, $hasOzonReport),
+                    'missing_sources' => $missingSources,
                     'fallbacks' => $dailyDemand === 0.0 ? ['no_sales_data'] : [],
+                    'low_confidence_trial' => $isLowDemandTrial,
                 ],
                 'trend' => [
                     'sales_7d' => $sales7,
@@ -833,6 +905,11 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
 
             // Пропускаем строки с нулевым количеством
             if ($qtyRounded <= 0) {
+                continue;
+            }
+
+            if ($skipNegativeProfit && $expectedProfit < 0) {
+                $skippedNegativeProfitLines++;
                 continue;
             }
 
@@ -911,14 +988,12 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
 
                 $skuList = array_values(array_unique(array_column($lines, 'sku')));
                 $metrics = $enricher->loadMetricsForSkus((int) $integrationId, $skuList);
-                // Загружаем ВСЕ активные рекомендации по SKU плана, не фильтруя по выбранным кластерам.
-                // Иначе план в МСК+СПб теряет связь с рекомендациями про Краснодар/Самару — даже если
-                // там есть переплата. Cluster split всё равно применит только подходящие.
+                // Для выбранного Ozon-кластера рекомендации не должны расширять план на другие кластеры.
                 $recsPerSku = $enricher->loadRecommendationsForSkus(
                     (int) $integrationId,
                     $skuList,
                     (string) $minConfidence,
-                    null
+                    $selectedOzonClusterIds !== [] ? $selectedOzonClusterIds : null
                 );
 
                 $enriched = [];
@@ -1080,6 +1155,59 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
             $totalSkus, $qStocksCoverage, $qSalesHistory,
             $qInTransit, $qDestination, $qBarcode, $marketplace
         );
+        $fallbackLongShare = $totalLines > 0 ? round(($fallbackLongLines / $totalLines) * 100, 2) : 0.0;
+        $negativeProfitShare = ($totalLines + $skippedNegativeProfitLines) > 0
+            ? round(($negativeProfitLines / max($totalLines + $skippedNegativeProfitLines, 1)) * 100, 2)
+            : 0.0;
+        $qualityGateStatus = 'good';
+        $qualityGateReasons = [];
+
+        if ($marketplace === 'ozon') {
+            if (! $hasOzonReport) {
+                $qualityGateReasons[] = 'нет Ozon order report';
+            }
+            if (count($ozonStockAnalytics) === 0 && count($ozonStockAnalyticsCluster) === 0) {
+                $qualityGateReasons[] = 'нет Ozon stock analytics';
+            }
+            if (count($ozonAnalytics) === 0 || $ozonRecommendedLines === 0) {
+                $qualityGateReasons[] = 'нет рекомендаций Ozon';
+            }
+            if ($fallbackLongLines > 0) {
+                $qualityGateReasons[] = "{$fallbackLongLines} строк рассчитаны по fallback_long";
+            }
+            if ($negativeProfitLines > 0) {
+                $qualityGateReasons[] = "{$negativeProfitLines} строк с отрицательной прибылью";
+            }
+            if ($manualReviewLines > 0) {
+                $qualityGateReasons[] = "{$manualReviewLines} строк требуют проверки спроса";
+            }
+
+            if (! $hasOzonReport || $fallbackLongShare >= 50 || $negativeProfitShare >= 40) {
+                $qualityGateStatus = 'bad';
+            } elseif ($qualityGateReasons !== []) {
+                $qualityGateStatus = 'warning';
+            }
+        }
+
+        $qualityJson['meta'] = array_merge($qualityJson['meta'] ?? [], [
+            'quality_gate_status' => $qualityGateStatus,
+            'quality_gate_reasons' => $qualityGateReasons,
+            'demand_source_counts' => $demandSourceCounts,
+            'missing_source_counts' => $missingSourceCounts,
+            'fallback_long_lines' => $fallbackLongLines,
+            'fallback_long_share_percent' => $fallbackLongShare,
+            'negative_profit_lines' => $negativeProfitLines,
+            'negative_profit_share_percent' => $negativeProfitShare,
+            'skipped_negative_profit_lines' => $skippedNegativeProfitLines,
+            'ozon_recommended_lines' => $ozonRecommendedLines,
+            'manual_review_lines' => $manualReviewLines,
+            'low_confidence_trial_lines' => $lowConfidenceTrialLines,
+            'advanced_params_applied' => [
+                'demand_seasonality_multiplier' => $seasonalityMultiplier,
+                'ozon_qty_anchor' => $ozonQtyAnchor,
+                'skip_negative_profit' => $skipNegativeProfit,
+            ],
+        ]);
         $qualityScore = $qualityJson['total'];
 
         $plan->markReady($qualityScore, $totalLines, $totalQty, $qualityJson);
