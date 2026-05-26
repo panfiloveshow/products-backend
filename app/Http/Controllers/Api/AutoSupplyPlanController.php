@@ -9,12 +9,14 @@ use App\Models\AutoSupplyPlan;
 use App\Models\AutoSupplyPlanLine;
 use App\Models\InventoryWarehouse;
 use App\Models\Integration;
+use App\Models\LocalityRecommendation;
 use App\Models\OzonWarehouseCluster;
 use App\Models\Product;
 use App\Services\IntegrationAccessService;
 use App\Services\LimitsSyncService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Validator;
 use PhpOffice\PhpSpreadsheet\Spreadsheet;
 use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
 use Symfony\Component\HttpFoundation\StreamedResponse;
@@ -97,6 +99,11 @@ class AutoSupplyPlanController extends Controller
             }
         }
 
+        return $this->createPlanFromRequest($request, $integration);
+    }
+
+    private function createPlanFromRequest(Request $request, Integration $integration): JsonResponse
+    {
         $limitResponse = $this->ensureAutoplanningLimitAvailable($integration);
         if ($limitResponse !== null) {
             return $limitResponse;
@@ -136,6 +143,7 @@ class AutoSupplyPlanController extends Controller
                 'minimum_locality_confidence' => $request->input('minimum_locality_confidence'),
                 'include_locality_recommendations' => $request->input('include_locality_recommendations'),
                 'locality_distribution_strategy' => $request->input('locality_distribution_strategy'),
+                'locality_recommendation_ids' => $request->input('locality_recommendation_ids'),
             ], static fn ($v) => $v !== null),
         ]);
 
@@ -1093,6 +1101,137 @@ class AutoSupplyPlanController extends Controller
                 $groups->count()
             ),
             'data' => $results,
+        ]);
+    }
+
+    /**
+     * POST /api/auto-supply-plans/from-locality-recommendations
+     * Создаёт автоплан с включённым locality split по активным рекомендациям.
+     */
+    public function createFromLocalityRecommendations(Request $request): JsonResponse
+    {
+        $validated = Validator::make($request->all(), [
+            'integration_id' => 'required|integer',
+            'recommendation_ids' => 'nullable|array',
+            'recommendation_ids.*' => 'integer',
+            'mode' => 'nullable|string|in:anti_oos,balanced,cash_safe',
+            'horizon_days' => 'nullable|integer|in:7,14,28,30,56,60,90',
+            'min_cover_days' => 'nullable|integer|min:1|max:90',
+            'target_cover_days' => 'nullable|integer|min:1|max:120',
+            'max_cover_days' => 'nullable|integer|min:1|max:180',
+            'safety_stock_days' => 'nullable|integer|min:0|max:30',
+            'turnover_limit_days' => 'nullable|integer|min:1|max:365',
+            'budget_limit' => 'nullable|numeric|min:0',
+            'lead_time_days' => 'nullable|integer|min:0|max:30',
+            'cluster_ids' => 'nullable|array',
+            'cluster_ids.*' => 'integer',
+        ])->validate();
+
+        $integrationAccess = $this->integrationAccessService
+            ->ensureAccessibleIntegration($request, (int) $validated['integration_id']);
+
+        if (! ($integrationAccess['success'] ?? false)) {
+            return response()->json([
+                'message' => $integrationAccess['message'] ?? 'Интеграция не найдена',
+            ], $integrationAccess['status'] ?? 404);
+        }
+
+        /** @var Integration $integration */
+        $integration = $integrationAccess['integration'];
+
+        $recommendations = LocalityRecommendation::query()
+            ->where('integration_id', $integration->id)
+            ->where('state', LocalityRecommendation::STATE_NEW)
+            ->when(! empty($validated['recommendation_ids'] ?? []), function ($query) use ($validated) {
+                $query->whereIn('id', array_map('intval', $validated['recommendation_ids']));
+            })
+            ->whereNotNull('target_cluster_id')
+            ->get();
+
+        $clusterIds = collect($validated['cluster_ids'] ?? [])
+            ->merge($recommendations->pluck('target_cluster_id'))
+            ->map(fn ($clusterId) => (int) $clusterId)
+            ->filter(fn (int $clusterId) => $clusterId > 0)
+            ->unique()
+            ->values()
+            ->all();
+
+        if ($clusterIds === []) {
+            return response()->json([
+                'message' => 'Нет активных locality-рекомендаций с целевыми кластерами',
+                'error' => 'no_locality_recommendations',
+            ], 422);
+        }
+
+        $request->merge([
+            'cluster_ids' => $clusterIds,
+            'split_by_cluster' => true,
+            'include_locality_recommendations' => true,
+            'locality_distribution_strategy' => 'recommendations',
+            'locality_recommendation_ids' => $recommendations->pluck('id')->map(fn ($id) => (int) $id)->values()->all(),
+        ]);
+
+        return $this->createPlanFromRequest($request, $integration);
+    }
+
+    /**
+     * POST /api/auto-supply-plans/preview-split-by-cluster
+     * Лёгкий preview для UI перед созданием плана из locality recommendations.
+     */
+    public function previewSplitByCluster(Request $request): JsonResponse
+    {
+        $validated = Validator::make($request->all(), [
+            'integration_id' => 'required|integer',
+            'recommendation_ids' => 'nullable|array',
+            'recommendation_ids.*' => 'integer',
+        ])->validate();
+
+        $integrationAccess = $this->integrationAccessService
+            ->ensureAccessibleIntegration($request, (int) $validated['integration_id']);
+
+        if (! ($integrationAccess['success'] ?? false)) {
+            return response()->json([
+                'message' => $integrationAccess['message'] ?? 'Интеграция не найдена',
+            ], $integrationAccess['status'] ?? 404);
+        }
+
+        /** @var Integration $integration */
+        $integration = $integrationAccess['integration'];
+
+        $recommendations = LocalityRecommendation::query()
+            ->where('integration_id', $integration->id)
+            ->where('state', LocalityRecommendation::STATE_NEW)
+            ->when(! empty($validated['recommendation_ids'] ?? []), function ($query) use ($validated) {
+                $query->whereIn('id', array_map('intval', $validated['recommendation_ids']));
+            })
+            ->whereNotNull('target_cluster_id')
+            ->orderByDesc('rank_score')
+            ->get();
+
+        $clusters = $recommendations
+            ->groupBy('target_cluster_id')
+            ->map(function ($items, $clusterId) {
+                $first = $items->first();
+
+                return [
+                    'cluster_id' => (string) $clusterId,
+                    'cluster_name' => (string) $first->target_cluster_name,
+                    'recommendations_count' => $items->count(),
+                    'total_qty' => (int) $items->sum('recommended_qty_units'),
+                    'expected_savings_rub' => round((float) $items->sum('expected_savings_rub'), 2),
+                ];
+            })
+            ->values()
+            ->all();
+
+        return response()->json([
+            'message' => 'Success',
+            'data' => [
+                'clusters' => $clusters,
+                'total_clusters' => count($clusters),
+                'total_recommendations' => $recommendations->count(),
+                'total_qty' => array_sum(array_column($clusters, 'total_qty')),
+            ],
         ]);
     }
 
