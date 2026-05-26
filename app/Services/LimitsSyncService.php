@@ -122,10 +122,12 @@ class LimitsSyncService
      */
     public function limitResponsePayload(array $check): array
     {
+        $isExceeded = array_key_exists('limit', $check) && $check['limit'] !== null;
+
         return [
             'success' => false,
             'message' => $check['message'] ?? 'Лимит тарифа исчерпан',
-            'error' => 'limit_exceeded',
+            'error' => $isExceeded ? 'limit_exceeded' : 'limit_check_failed',
             'type' => $check['type'] ?? null,
             'current_value' => $check['current_value'] ?? null,
             'requested_value' => $check['requested_value'] ?? null,
@@ -142,6 +144,15 @@ class LimitsSyncService
         $result = $this->sellicoApi->getWorkspaceLimitsExternal($workspaceId, $type);
 
         if (! ($result['success'] ?? false)) {
+            if ($this->isMissingExternalLimit($result)) {
+                return [
+                    'success' => true,
+                    'status' => 200,
+                    'limit' => null,
+                    'missing_limit' => true,
+                ];
+            }
+
             return $result;
         }
 
@@ -185,7 +196,7 @@ class LimitsSyncService
 
         return array_merge($result, [
             'workspace_id' => $workspaceId,
-            'type' => 'products',
+            'type' => $type,
             'current_value' => $currentValue,
         ]);
     }
@@ -228,16 +239,24 @@ class LimitsSyncService
         }
 
         if (isset($limits['type'])) {
-            return ($limits['type'] === $type) ? $limits : null;
+            return $this->normalizeType((string) $limits['type']) === $type ? $limits : null;
         }
 
         foreach ($limits as $limit) {
-            if (is_array($limit) && ($limit['type'] ?? null) === $type) {
+            if (is_array($limit) && $this->normalizeType((string) ($limit['type'] ?? '')) === $type) {
                 return $limit;
             }
         }
 
         return null;
+    }
+
+    private function isMissingExternalLimit(array $result): bool
+    {
+        $error = mb_strtolower((string) ($result['error'] ?? ''));
+
+        return str_contains($error, 'limit not found')
+            || str_contains($error, 'лимит не найден');
     }
 
     /**
