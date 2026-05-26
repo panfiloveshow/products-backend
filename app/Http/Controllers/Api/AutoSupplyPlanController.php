@@ -86,19 +86,6 @@ class AutoSupplyPlanController extends Controller
         /** @var Integration $integration */
         $integration = $integrationAccess['integration'];
 
-        if ($integration->marketplace === 'ozon') {
-            $clusterIds = array_values(array_filter(
-                array_map('intval', (array) $request->input('cluster_ids', []))
-            ));
-
-            if ($clusterIds === []) {
-                return response()->json([
-                    'message' => 'Для Ozon-плана нужно выбрать хотя бы один кластер поставки',
-                    'error' => 'ozon_cluster_required',
-                ], 422);
-            }
-        }
-
         return $this->createPlanFromRequest($request, $integration);
     }
 
