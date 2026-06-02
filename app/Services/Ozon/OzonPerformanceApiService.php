@@ -101,6 +101,8 @@ class OzonPerformanceApiService
                     'derived' => $stats['derived'],
                     'top_by_spend' => $stats['top_by_spend'],
                     'field_keys' => $stats['field_keys'],
+                    'source' => $stats['source'],
+                    'source_error' => $stats['source_error'],
                 ],
                 'bid_limits' => [
                     'http_status' => $limits['http_status'],
@@ -400,7 +402,8 @@ class OzonPerformanceApiService
                     $token['access_token'],
                     $dateFrom,
                     $dateTo,
-                    $campaignIds
+                    $campaignIds,
+                    true
                 );
                 $campaignReportRows = $this->campaignStatsRowsToProductReportRows(
                     $campaignStats['rows'],
@@ -438,7 +441,14 @@ class OzonPerformanceApiService
                     'campaign_product_rows' => count($campaignReportRows),
                     'mapped_campaign_product_rows' => $mappedCampaignProductRows,
                     'unmapped_campaign_product_rows' => max(0, count($campaignReportRows) - $mappedCampaignProductRows),
+                    'campaign_stats_source' => $campaignStats['source'] ?? null,
+                    'campaign_stats_source_error' => $campaignStats['source_error'] ?? null,
+                    'campaign_stat_field_keys' => $campaignStats['field_keys'] ?? [],
+                    'campaign_sample_rows' => $campaignStats['sample_rows'] ?? [],
+                    'unmapped_campaign_keys' => $this->unmappedCampaignKeys($campaignReportRows),
                     'local_product_aliases' => count($productReportSkuMap['by_sku'] ?? []),
+                    'local_product_aliases_count' => count($productReportSkuMap['by_sku'] ?? []),
+                    'local_product_alias_examples' => array_slice(array_keys($productReportSkuMap['by_sku'] ?? []), 0, 5),
                     'campaign_totals' => $campaignStats['totals'] ?? null,
                     'note' => $campaignStats !== null
                         ? 'Сводка объединяет товарный UUID-отчёт и статистику товарных PPC-кампаний Ozon за тот же период. CPC-строки сопоставляются с товарами по Ozon SKU и артикулу продавца.'
@@ -605,42 +615,59 @@ class OzonPerformanceApiService
         string $accessToken,
         string $dateFrom,
         string $dateTo,
-        array $campaignIds
+        array $campaignIds,
+        bool $productDetailOnly = false
     ): array {
         $rows = [];
+        $source = 'fallback';
+        $sourceErrors = [];
         $chunks = count($campaignIds) > 0 ? array_chunk($campaignIds, 20) : [[]];
 
         foreach ($chunks as $chunk) {
-            $query = [
-                'dateFrom' => $dateFrom,
-                'dateTo' => $dateTo,
-            ];
-            if (count($chunk) > 0) {
-                $query['campaignIds'] = $chunk;
-            }
+            $queryString = $this->campaignProductStatsQueryString($dateFrom, $dateTo, $chunk);
 
             $csvResponse = Http::timeout(30)
                 ->withToken($accessToken)
                 ->accept('*/*')
-                ->get(self::BASE_URL . '/api/client/statistics/campaign/product', $query);
+                ->get(self::BASE_URL . '/api/client/statistics/campaign/product?' . $queryString);
 
             if ($csvResponse->successful()) {
                 $csvRows = $this->parseCampaignProductCsvRows((string) $csvResponse->body());
                 if ($csvRows !== []) {
                     $rows = array_merge($rows, $csvRows);
+                    $source = 'csv';
                     continue;
                 }
+
+                $sourceErrors[] = 'CSV ответ не содержит товарных строк или заголовок не распознан';
+            } else {
+                $sourceErrors[] = 'CSV HTTP ' . $csvResponse->status();
             }
 
             $response = $this->authorized($accessToken)
-                ->get(self::BASE_URL . '/api/client/statistics/campaign/product/json', $query);
+                ->get(self::BASE_URL . '/api/client/statistics/campaign/product/json?' . $queryString);
 
             $payload = $response->json();
             if (! $response->successful() || ! is_array($payload)) {
+                $sourceErrors[] = 'JSON HTTP ' . $response->status();
                 continue;
             }
 
-            $rows = array_merge($rows, $this->extractRows($payload));
+            $jsonRows = $this->extractRows($payload);
+            $productRows = $productDetailOnly
+                ? array_values(array_filter($jsonRows, fn (array $row): bool => $this->hasCampaignProductIdentifier($row)))
+                : $jsonRows;
+
+            if ($productDetailOnly && $jsonRows !== [] && $productRows === []) {
+                $sourceErrors[] = 'JSON вернул агрегаты кампаний без товарного SKU';
+            }
+
+            if ($productRows !== []) {
+                $rows = array_merge($rows, $productRows);
+                if ($source !== 'csv') {
+                    $source = 'json';
+                }
+            }
         }
 
         $totals = $this->sumStatisticRows($rows);
@@ -661,7 +688,137 @@ class OzonPerformanceApiService
             ],
             'top_by_spend' => $this->topBySpend($rows),
             'field_keys' => isset($rows[0]) && is_array($rows[0]) ? array_keys($rows[0]) : [],
+            'source' => $source,
+            'source_error' => $sourceErrors !== [] ? implode('; ', array_unique($sourceErrors)) : null,
+            'sample_rows' => $this->sampleCampaignRows($rows),
         ];
+    }
+
+    /**
+     * Ozon Performance ожидает повторяющиеся campaignIds в query string:
+     * campaignIds=1&campaignIds=2. Нельзя отдавать массивом campaignIds[0].
+     */
+    private function campaignProductStatsQueryString(string $dateFrom, string $dateTo, array $campaignIds): string
+    {
+        $parts = [
+            'dateFrom=' . rawurlencode($dateFrom),
+            'dateTo=' . rawurlencode($dateTo),
+        ];
+
+        foreach ($campaignIds as $campaignId) {
+            $campaignId = trim((string) $campaignId);
+            if ($campaignId === '') {
+                continue;
+            }
+
+            $parts[] = 'campaignIds=' . rawurlencode($campaignId);
+        }
+
+        return implode('&', $parts);
+    }
+
+    /**
+     * @param array<string, mixed> $row
+     */
+    private function hasCampaignProductIdentifier(array $row): bool
+    {
+        return $this->firstString($row, [
+            'SKU',
+            'sku',
+            'Артикул',
+            'offerId',
+            'offer_id',
+            'vendorCode',
+            'vendor_code',
+            'productSku',
+            'product_sku',
+            'product.sku',
+            'productId',
+            'product_id',
+            'product.id',
+            'objectId',
+            'object_id',
+            'advObjectId',
+            'adv_object_id',
+        ]) !== '';
+    }
+
+    /**
+     * @param array<int, array<string, mixed>> $rows
+     * @return array<int, array<string, mixed>>
+     */
+    private function sampleCampaignRows(array $rows): array
+    {
+        return array_map(function (array $row): array {
+            $sample = [];
+            foreach ([
+                'SKU',
+                'sku',
+                'Артикул',
+                'offerId',
+                'productSku',
+                'productId',
+                'product.id',
+                'objectId',
+                'advObjectId',
+                'id',
+                'Название товара',
+                'title',
+                'name',
+                'productName',
+                'moneySpent',
+                'Расход',
+                'views',
+                'Показы',
+                'clicks',
+                'Клики',
+                'orders',
+                'Заказы',
+                'ordersMoney',
+                'Выручка',
+            ] as $key) {
+                if (array_key_exists($key, $row)) {
+                    $sample[$key] = is_scalar($row[$key]) || $row[$key] === null
+                        ? $row[$key]
+                        : '[object]';
+                }
+            }
+
+            return $sample;
+        }, array_slice($rows, 0, 3));
+    }
+
+    /**
+     * @param array<int, array<string, mixed>> $rows
+     * @return array<int, string>
+     */
+    private function unmappedCampaignKeys(array $rows): array
+    {
+        $keys = [];
+        foreach ($rows as $row) {
+            if ((string) ($row['_mapping_status'] ?? '') !== 'unmapped_ozon_sku') {
+                continue;
+            }
+
+            $key = $this->firstString($row, [
+                '_mapping_key',
+                '_raw_campaign_sku',
+                '_raw_campaign_product_id',
+                'SKU',
+                'Артикул',
+                'Название товара',
+            ]);
+
+            if ($key !== '') {
+                $keys[$key] = true;
+            }
+
+            if (count($keys) >= 10) {
+                break;
+            }
+        }
+
+        return array_keys($keys);
     }
 
     /**
@@ -734,7 +891,12 @@ class OzonPerformanceApiService
                 }
             }
 
-            $row = array_merge($context, $scalar);
+            $flatNested = [];
+            foreach ($nested as $key => $value) {
+                $flatNested = array_merge($flatNested, $this->flattenScalarPayload($value, (string) $key));
+            }
+
+            $row = array_merge($context, $scalar, $flatNested);
             if ($this->looksLikeStatisticRow($row)) {
                 $rows[] = $row;
             }
@@ -755,12 +917,37 @@ class OzonPerformanceApiService
     }
 
     /**
+     * @param mixed $payload
+     * @return array<string, mixed>
+     */
+    private function flattenScalarPayload(mixed $payload, string $prefix): array
+    {
+        if (! is_array($payload)) {
+            return [$prefix => $payload];
+        }
+
+        $flat = [];
+        foreach ($payload as $key => $value) {
+            $path = $prefix . '.' . (string) $key;
+            if (is_array($value)) {
+                $flat = array_merge($flat, $this->flattenScalarPayload($value, $path));
+            } else {
+                $flat[$path] = $value;
+            }
+        }
+
+        return $flat;
+    }
+
+    /**
      * @param array<string, mixed> $row
      */
     private function looksLikeStatisticRow(array $row): bool
     {
         foreach ([
             'SKU', 'sku', 'offerId', 'offer_id', 'productId', 'product_id',
+            'productSku', 'product_sku', 'objectId', 'object_id', 'advObjectId', 'adv_object_id',
+            'product.id', 'product.sku',
             'moneySpent', 'Расход', 'views', 'Показы', 'clicks', 'Клики',
             'orders', 'Заказы', 'ordersMoney', 'Выручка',
         ] as $key) {
@@ -1003,7 +1190,17 @@ class OzonPerformanceApiService
                 $row[$name] = (string) ($cells[$index] ?? '');
             }
 
-            $sku = $this->firstString($row, ['SKU', 'sku']);
+            $sku = $this->firstString($row, [
+                'SKU',
+                'sku',
+                'Артикул',
+                'productSku',
+                'product_sku',
+                'productId',
+                'product_id',
+                'objectId',
+                'advObjectId',
+            ]);
             if ($sku === '' || in_array(mb_strtolower($sku), ['всего', 'итого', 'bcero'], true)) {
                 continue;
             }
@@ -1116,12 +1313,35 @@ class OzonPerformanceApiService
                     'signals_ru' => [],
                     'source' => 'ozon_performance_product_report',
                     'sources' => [],
+                    'mapping_status' => $row['_mapping_status'] ?? null,
+                    'mapping_key' => $row['_mapping_key'] ?? null,
+                    'mapping_source' => $row['_mapping_source'] ?? null,
+                    'raw_campaign_sku' => $row['_raw_campaign_sku'] ?? null,
+                    'raw_campaign_product_id' => $row['_raw_campaign_product_id'] ?? null,
                 ];
             }
 
-            foreach (array_filter([$offerId, $ozonSku]) as $alias) {
+            foreach (array_filter([
+                $offerId,
+                $ozonSku,
+                $row['_mapping_key'] ?? null,
+                $row['_raw_campaign_sku'] ?? null,
+                $row['_raw_campaign_product_id'] ?? null,
+            ]) as $alias) {
                 if (! in_array($alias, $products[$key]['aliases'], true)) {
                     $products[$key]['aliases'][] = $alias;
+                }
+            }
+
+            foreach ([
+                'mapping_status' => '_mapping_status',
+                'mapping_key' => '_mapping_key',
+                'mapping_source' => '_mapping_source',
+                'raw_campaign_sku' => '_raw_campaign_sku',
+                'raw_campaign_product_id' => '_raw_campaign_product_id',
+            ] as $target => $sourceKey) {
+                if (! empty($row[$sourceKey])) {
+                    $products[$key][$target] = $row[$sourceKey];
                 }
             }
 
@@ -1252,16 +1472,18 @@ class OzonPerformanceApiService
 
     /**
      * @param array<int, array<string, string>> $rows
-     * @return array{by_sku: array<string, string>, meta_by_sku: array<string, array<string, string>>}
+     * @return array<string, mixed>
      */
     private function buildProductReportSkuMap(array $rows): array
     {
         $bySku = [];
         $metaBySku = [];
+        $nameToOfferIds = [];
 
         foreach ($rows as $row) {
             $ozonSku = trim((string) ($row['SKU'] ?? ''));
             $offerId = trim((string) ($row['Артикул'] ?? ''));
+            $productName = trim((string) ($row['Название товара'] ?? ''));
             if ($ozonSku === '') {
                 continue;
             }
@@ -1272,30 +1494,38 @@ class OzonPerformanceApiService
 
             $metaBySku[$ozonSku] = [
                 'offer_id' => $offerId,
-                'product_name' => trim((string) ($row['Название товара'] ?? '')),
+                'product_name' => $productName,
                 'category' => trim((string) ($row['Категория товара'] ?? '')),
             ];
+
+            $nameKey = $this->normalizeProductName($productName);
+            if ($nameKey !== '' && $offerId !== '') {
+                $nameToOfferIds[$nameKey][$offerId] = true;
+            }
         }
 
         return [
             'by_sku' => $bySku,
             'meta_by_sku' => $metaBySku,
+            'by_name' => $this->uniqueNameMap($nameToOfferIds),
+            'name_counts' => $this->nameCounts($nameToOfferIds),
         ];
     }
 
     /**
-     * @return array{by_sku: array<string, string>, meta_by_sku: array<string, array<string, string>>}
+     * @return array<string, mixed>
      */
     private function buildLocalProductSkuMap(int $integrationId): array
     {
         $bySku = [];
         $metaBySku = [];
+        $nameToOfferIds = [];
 
         Product::query()
             ->where('integration_id', $integrationId)
             ->where('marketplace', 'ozon')
             ->select(['sku', 'vendor_code', 'name', 'category', 'marketplace_id', 'ozon_data'])
-            ->chunk(500, function ($products) use (&$bySku, &$metaBySku): void {
+            ->chunk(500, function ($products) use (&$bySku, &$metaBySku, &$nameToOfferIds): void {
                 foreach ($products as $product) {
                     $offerId = trim((string) ($product->sku ?? ''));
                     if ($offerId === '') {
@@ -1303,6 +1533,8 @@ class OzonPerformanceApiService
                     }
 
                     $ozonData = is_array($product->ozon_data) ? $product->ozon_data : [];
+                    $productName = trim((string) ($product->name ?? ''));
+                    $category = trim((string) ($product->category ?? ''));
                     $aliases = [
                         $offerId,
                         $product->vendor_code ?? null,
@@ -1323,9 +1555,14 @@ class OzonPerformanceApiService
                         $bySku[$alias] = $offerId;
                         $metaBySku[$alias] = [
                             'offer_id' => $offerId,
-                            'product_name' => trim((string) ($product->name ?? '')),
-                            'category' => trim((string) ($product->category ?? '')),
+                            'product_name' => $productName,
+                            'category' => $category,
                         ];
+                    }
+
+                    $nameKey = $this->normalizeProductName($productName);
+                    if ($nameKey !== '') {
+                        $nameToOfferIds[$nameKey][$offerId] = true;
                     }
                 }
             }, 'sku');
@@ -1333,25 +1570,166 @@ class OzonPerformanceApiService
         return [
             'by_sku' => $bySku,
             'meta_by_sku' => $metaBySku,
+            'by_name' => $this->uniqueNameMap($nameToOfferIds),
+            'name_counts' => $this->nameCounts($nameToOfferIds),
         ];
     }
 
     /**
-     * @param array{by_sku?: array<string, string>, meta_by_sku?: array<string, array<string, string>>} $base
-     * @param array{by_sku?: array<string, string>, meta_by_sku?: array<string, array<string, string>>} $override
-     * @return array{by_sku: array<string, string>, meta_by_sku: array<string, array<string, string>>}
+     * @param array<string, mixed> $base
+     * @param array<string, mixed> $override
+     * @return array<string, mixed>
      */
     private function mergeProductSkuMaps(array $base, array $override): array
     {
+        $bySku = is_array($base['by_sku'] ?? null) ? $base['by_sku'] : [];
+        foreach (is_array($override['by_sku'] ?? null) ? $override['by_sku'] : [] as $key => $value) {
+            $bySku[$key] = $value;
+        }
+
+        $metaBySku = is_array($base['meta_by_sku'] ?? null) ? $base['meta_by_sku'] : [];
+        foreach (is_array($override['meta_by_sku'] ?? null) ? $override['meta_by_sku'] : [] as $key => $value) {
+            $metaBySku[$key] = $value;
+        }
+
+        $nameCounts = [];
+        foreach ([$base['name_counts'] ?? [], $override['name_counts'] ?? []] as $counts) {
+            if (! is_array($counts)) {
+                continue;
+            }
+            foreach ($counts as $name => $count) {
+                $nameCounts[(string) $name] = (int) ($nameCounts[(string) $name] ?? 0) + (int) $count;
+            }
+        }
+
+        $byName = array_merge(
+            is_array($base['by_name'] ?? null) ? $base['by_name'] : [],
+            is_array($override['by_name'] ?? null) ? $override['by_name'] : []
+        );
+        foreach ($byName as $name => $offerId) {
+            if ((int) ($nameCounts[$name] ?? 0) !== 1) {
+                unset($byName[$name]);
+            }
+        }
+
         return [
-            'by_sku' => array_merge($base['by_sku'] ?? [], $override['by_sku'] ?? []),
-            'meta_by_sku' => array_merge($base['meta_by_sku'] ?? [], $override['meta_by_sku'] ?? []),
+            'by_sku' => $bySku,
+            'meta_by_sku' => $metaBySku,
+            'by_name' => $byName,
+            'name_counts' => $nameCounts,
+        ];
+    }
+
+    /**
+     * @param array<string, array<string, bool>> $nameToOfferIds
+     * @return array<string, string>
+     */
+    private function uniqueNameMap(array $nameToOfferIds): array
+    {
+        $map = [];
+        foreach ($nameToOfferIds as $name => $offerIds) {
+            $ids = array_keys($offerIds);
+            if (count($ids) === 1) {
+                $map[(string) $name] = (string) $ids[0];
+            }
+        }
+
+        return $map;
+    }
+
+    /**
+     * @param array<string, array<string, bool>> $nameToOfferIds
+     * @return array<string, int>
+     */
+    private function nameCounts(array $nameToOfferIds): array
+    {
+        $counts = [];
+        foreach ($nameToOfferIds as $name => $offerIds) {
+            $counts[(string) $name] = count($offerIds);
+        }
+
+        return $counts;
+    }
+
+    private function normalizeProductName(string $name): string
+    {
+        $normalized = mb_strtolower(trim($name));
+        $normalized = preg_replace('/\s+/u', ' ', $normalized) ?? $normalized;
+
+        return $normalized;
+    }
+
+    /**
+     * @param array<string, mixed> $productReportSkuMap
+     * @return array{offer_id: string, status: string, mapping_key: string, lookup_key: string, source: string}
+     */
+    private function resolveCampaignProductMapping(
+        string $ozonSku,
+        string $offerId,
+        string $productName,
+        array $productReportSkuMap
+    ): array {
+        $bySku = is_array($productReportSkuMap['by_sku'] ?? null) ? $productReportSkuMap['by_sku'] : [];
+        $byName = is_array($productReportSkuMap['by_name'] ?? null) ? $productReportSkuMap['by_name'] : [];
+
+        if ($offerId !== '') {
+            $mapped = trim((string) ($bySku[$offerId] ?? ''));
+            $nameKey = $this->normalizeProductName($productName);
+            if ($mapped === '' && $nameKey !== '' && isset($byName[$nameKey])) {
+                return [
+                    'offer_id' => (string) $byName[$nameKey],
+                    'status' => 'mapped_by_unique_product_name',
+                    'mapping_key' => $productName,
+                    'lookup_key' => $offerId,
+                    'source' => 'unique_product_name',
+                ];
+            }
+
+            return [
+                'offer_id' => $mapped !== '' ? $mapped : $offerId,
+                'status' => $mapped !== '' ? 'mapped_by_local_offer_alias' : 'direct_offer_id',
+                'mapping_key' => $offerId,
+                'lookup_key' => $offerId,
+                'source' => $mapped !== '' ? 'local_alias' : 'campaign_offer_id',
+            ];
+        }
+
+        if ($ozonSku !== '') {
+            $mapped = trim((string) ($bySku[$ozonSku] ?? ''));
+            if ($mapped !== '') {
+                return [
+                    'offer_id' => $mapped,
+                    'status' => 'mapped_by_product_sku_alias',
+                    'mapping_key' => $ozonSku,
+                    'lookup_key' => $ozonSku,
+                    'source' => 'sku_alias',
+                ];
+            }
+        }
+
+        $nameKey = $this->normalizeProductName($productName);
+        if ($nameKey !== '' && isset($byName[$nameKey])) {
+            return [
+                'offer_id' => (string) $byName[$nameKey],
+                'status' => 'mapped_by_unique_product_name',
+                'mapping_key' => $productName,
+                'lookup_key' => '',
+                'source' => 'unique_product_name',
+            ];
+        }
+
+        return [
+            'offer_id' => '',
+            'status' => 'unmapped_ozon_sku',
+            'mapping_key' => $ozonSku !== '' ? $ozonSku : $productName,
+            'lookup_key' => $ozonSku,
+            'source' => 'unmapped',
         ];
     }
 
     /**
      * @param array<int, array<string, mixed>> $rows
-     * @param array{by_sku?: array<string, string>, meta_by_sku?: array<string, array<string, string>>} $productReportSkuMap
+     * @param array<string, mixed> $productReportSkuMap
      * @return array<int, array<string, mixed>>
      */
     private function campaignStatsRowsToProductReportRows(array $rows, array $productReportSkuMap = []): array
@@ -1364,9 +1742,25 @@ class OzonPerformanceApiService
                 'sku',
                 'productSku',
                 'product_sku',
+                'product.sku',
                 'productId',
                 'product_id',
+                'product.id',
                 'ozon_sku',
+                'objectId',
+                'object_id',
+                'advObjectId',
+                'adv_object_id',
+                'id',
+            ]);
+            $rawCampaignProductId = $this->firstString($row, [
+                'productId',
+                'product_id',
+                'product.id',
+                'objectId',
+                'object_id',
+                'advObjectId',
+                'adv_object_id',
                 'id',
             ]);
             $offerId = $this->firstString($row, [
@@ -1377,12 +1771,16 @@ class OzonPerformanceApiService
                 'external_id',
                 'article',
                 'vendorCode',
+                'vendor_code',
+                'product.offerId',
+                'product.offer_id',
             ]);
-            $mappedOfferId = $offerId !== ''
-                ? $offerId
-                : trim((string) (($productReportSkuMap['by_sku'] ?? [])[$ozonSku] ?? ''));
-            $meta = is_array(($productReportSkuMap['meta_by_sku'] ?? [])[$ozonSku] ?? null)
-                ? ($productReportSkuMap['meta_by_sku'][$ozonSku] ?? [])
+            $productName = $this->firstString($row, ['Название товара', 'title', 'name', 'productName', 'product_name', 'product.title', 'product.name']);
+            $mapping = $this->resolveCampaignProductMapping($ozonSku, $offerId, $productName, $productReportSkuMap);
+            $mappedOfferId = $mapping['offer_id'];
+            $metaKey = $mapping['lookup_key'] !== '' ? $mapping['lookup_key'] : $ozonSku;
+            $meta = is_array(($productReportSkuMap['meta_by_sku'] ?? [])[$metaKey] ?? null)
+                ? ($productReportSkuMap['meta_by_sku'][$metaKey] ?? [])
                 : [];
             $key = $mappedOfferId !== '' ? $mappedOfferId : $ozonSku;
             if ($key === '') {
@@ -1397,6 +1795,7 @@ class OzonPerformanceApiService
                 'Расход, ₽',
                 'Расход, Р',
                 'Расход, Р, с НДС',
+                'Расход (Оплата за клик)',
             ]);
             $revenue = $this->firstNumber($row, [
                 'ordersMoney',
@@ -1409,24 +1808,27 @@ class OzonPerformanceApiService
                 'Продажи',
                 'Продажи, ₽',
                 'Продажи, Р',
+                'Продажи (Оплата за клик)',
+                'Выручка (Оплата за клик)',
             ]);
-            $orders = $this->firstNumber($row, ['orders', 'ordersCount', 'Заказы', 'Заказы, шт']);
-            $impressions = $this->firstNumber($row, ['views', 'impressions', 'Показы', 'Показы, шт']);
-            $clicks = $this->firstNumber($row, ['clicks', 'Клики', 'Клики, шт']);
-            $toCart = $this->firstNumber($row, ['toCart', 'to_cart', 'cart', 'В корзину', 'В корзину, шт']);
-            $ctr = $this->firstNumber($row, ['ctr', 'CTR', 'CTR (%)', 'CTR, %']);
+            $orders = $this->firstNumber($row, ['orders', 'ordersCount', 'Заказы', 'Заказы, шт', 'Заказы (Оплата за клик)']);
+            $impressions = $this->firstNumber($row, ['views', 'impressions', 'Показы', 'Показы, шт', 'Показы (Оплата за клик)']);
+            $clicks = $this->firstNumber($row, ['clicks', 'Клики', 'Клики, шт', 'Клики (Оплата за клик)']);
+            $toCart = $this->firstNumber($row, ['toCart', 'to_cart', 'cart', 'В корзину', 'В корзину, шт', 'В корзину (Оплата за клик)']);
+            $ctr = $this->firstNumber($row, ['ctr', 'CTR', 'CTR (%)', 'CTR, %', 'CTR (Оплата за клик)']);
             $averageCpc = $this->firstNumber($row, [
                 'avgCpc',
                 'averageCpc',
                 'average_cpc',
                 'Ср. цена клика',
                 'Средняя стоимость клика',
+                'Ср. цена клика (Оплата за клик)',
             ]);
 
             $converted[] = [
                 'SKU' => $ozonSku,
                 'Артикул' => $mappedOfferId,
-                'Название товара' => $this->firstString($row, ['Название товара', 'title', 'name', 'productName', 'product_name'])
+                'Название товара' => $productName
                     ?: (string) ($meta['product_name'] ?? ''),
                 'Категория товара' => $this->firstString($row, ['Категория товара', 'category', 'categoryName', 'category_name'])
                     ?: (string) ($meta['category'] ?? ''),
@@ -1440,9 +1842,11 @@ class OzonPerformanceApiService
                 'CTR (Оплата за клик)' => $ctr,
                 'Ср. цена клика (Оплата за клик)' => $averageCpc,
                 '_source' => 'campaign_product_stats_cpc',
-                '_mapping_status' => $mappedOfferId !== ''
-                    ? ($offerId !== '' ? 'direct_offer_id' : 'mapped_by_product_report_sku')
-                    : 'unmapped_ozon_sku',
+                '_mapping_status' => $mapping['status'],
+                '_mapping_key' => $mapping['mapping_key'],
+                '_mapping_source' => $mapping['source'],
+                '_raw_campaign_sku' => $ozonSku,
+                '_raw_campaign_product_id' => $rawCampaignProductId,
             ];
         }
 

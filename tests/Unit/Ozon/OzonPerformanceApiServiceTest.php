@@ -2,12 +2,16 @@
 
 namespace Tests\Unit\Ozon;
 
+use App\Models\Product;
 use App\Services\Ozon\OzonPerformanceApiService;
+use Illuminate\Foundation\Testing\LazilyRefreshDatabase;
 use Illuminate\Support\Facades\Http;
 use Tests\TestCase;
 
 class OzonPerformanceApiServiceTest extends TestCase
 {
+    use LazilyRefreshDatabase;
+
     public function test_check_credentials_requests_performance_token(): void
     {
         Http::fake([
@@ -82,6 +86,7 @@ class OzonPerformanceApiServiceTest extends TestCase
                     ],
                 ],
             ]),
+            'https://api-performance.ozon.ru/api/client/statistics/campaign/product?*' => Http::response('', 404),
             'https://api-performance.ozon.ru/api/client/statistics/campaign/product/json*' => Http::response([
                 'rows' => [
                     [
@@ -137,6 +142,234 @@ class OzonPerformanceApiServiceTest extends TestCase
         $this->assertSame(2.51, $result['statistics']['derived']['average_cpc']);
         $this->assertSame(12.54, $result['statistics']['derived']['drr_percent']);
         $this->assertSame(1, $result['bid_limits']['groups_count']);
+    }
+
+    public function test_product_advertising_impact_maps_cpc_csv_by_ozon_sku_and_repeated_campaign_ids(): void
+    {
+        Http::fake([
+            'https://api-performance.ozon.ru/api/client/token' => Http::response([
+                'access_token' => 'token-value',
+                'token_type' => 'Bearer',
+                'expires_in' => 1800,
+            ]),
+            'https://api-performance.ozon.ru/api/client/statistics/report-uuid' => Http::response([
+                'UUID' => 'report-uuid',
+                'state' => 'OK',
+                'kind' => 'SEARCH_PROMO_ORGANISATION_PRODUCTS',
+                'link' => '/api/client/statistics/report?UUID=report-uuid',
+            ]),
+            'https://api-performance.ozon.ru/api/client/statistics/report?UUID=report-uuid' => Http::response(
+                "SKU;Артикул;Название товара;Категория товара;Продвижение;Цена товара, ₽\n"
+                . "2127759756;3-02/3846;Чековая лента 80 мм;Кассовые ленты;Включено;259,00\n",
+                200,
+                ['content-type' => 'text/csv; charset=utf-8']
+            ),
+            'https://api-performance.ozon.ru/api/client/campaign' => Http::response([
+                'total' => 2,
+                'list' => [
+                    ['id' => '101', 'title' => 'Чеки 57'],
+                    ['id' => '102', 'title' => 'Чеки 80'],
+                ],
+            ]),
+            'https://api-performance.ozon.ru/api/client/statistics/campaign/product?*' => Http::response(
+                "sku;Название товара;Показы;Клики;CTR (%);Расход;Заказы;Выручка;ДРР\n"
+                . "2127759756;Чековая лента 80 мм;1000;50;5,0;100,50;5;1000,00;10,05\n",
+                200,
+                ['content-type' => 'text/csv; charset=utf-8']
+            ),
+        ]);
+
+        $result = (new OzonPerformanceApiService())->productAdvertisingImpact([
+            'performance_api_key' => 'performance-client-id',
+            'performance_client_secret' => 'performance-secret',
+        ], 'report-uuid', 5000, '2026-05-04', '2026-06-02');
+
+        $this->assertTrue($result['success']);
+        $this->assertSame('csv', $result['coverage']['campaign_stats_source']);
+        $this->assertSame(1, $result['coverage']['campaign_product_rows']);
+        $this->assertSame(1, $result['coverage']['mapped_campaign_product_rows']);
+        $this->assertSame([], $result['coverage']['unmapped_campaign_keys']);
+
+        $product = $result['by_offer_id']['3-02/3846'];
+        $this->assertSame('mapped_by_product_sku_alias', $product['mapping_status']);
+        $this->assertSame('2127759756', $product['mapping_key']);
+        $this->assertSame(50, $product['clicks']);
+        $this->assertSame(5.0, $product['ctr_percent']);
+        $this->assertSame(100.5, $product['ad_spend']);
+        $this->assertSame(10.05, $product['ad_drr_percent']);
+
+        Http::assertSent(function ($request): bool {
+            $url = $request->url();
+
+            return str_starts_with($url, 'https://api-performance.ozon.ru/api/client/statistics/campaign/product?')
+                && str_contains($url, 'campaignIds=101')
+                && str_contains($url, 'campaignIds=102')
+                && ! str_contains($url, 'campaignIds%5B0%5D')
+                && ! str_contains($url, 'campaignIds[0]');
+        });
+    }
+
+    public function test_product_advertising_impact_maps_cpc_by_local_ozon_data_sku(): void
+    {
+        Product::factory()->ozon()->create([
+            'integration_id' => 77,
+            'sku' => '3-02/3846',
+            'vendor_code' => '3-02/3846',
+            'marketplace_id' => '1756951343',
+            'name' => 'Чековая лента 80 мм, 45 метров',
+            'ozon_data' => [
+                'sku' => '2127759756',
+                'product_id' => '1756951343',
+                'offer_id' => '3-02/3846',
+            ],
+        ]);
+
+        Http::fake([
+            'https://api-performance.ozon.ru/api/client/token' => Http::response([
+                'access_token' => 'token-value',
+                'token_type' => 'Bearer',
+                'expires_in' => 1800,
+            ]),
+            'https://api-performance.ozon.ru/api/client/statistics/report-uuid' => Http::response([
+                'UUID' => 'report-uuid',
+                'state' => 'OK',
+                'kind' => 'SEARCH_PROMO_ORGANISATION_PRODUCTS',
+                'link' => '/api/client/statistics/report?UUID=report-uuid',
+            ]),
+            'https://api-performance.ozon.ru/api/client/statistics/report?UUID=report-uuid' => Http::response(
+                "SKU;Артикул;Название товара;Категория товара;Продвижение;Цена товара, ₽\n",
+                200,
+                ['content-type' => 'text/csv; charset=utf-8']
+            ),
+            'https://api-performance.ozon.ru/api/client/campaign' => Http::response([
+                'total' => 1,
+                'list' => [
+                    ['id' => '101', 'title' => 'Чеки 80'],
+                ],
+            ]),
+            'https://api-performance.ozon.ru/api/client/statistics/campaign/product?*' => Http::response(
+                "sku;Название товара;Показы;Клики;CTR (%);Расход;Заказы;Выручка;ДРР\n"
+                . "2127759756;Чековая лента 80 мм, 45 метров;1000;50;5,0;222,20;6;2222,00;10,00\n",
+                200,
+                ['content-type' => 'text/csv; charset=utf-8']
+            ),
+        ]);
+
+        $result = (new OzonPerformanceApiService())->productAdvertisingImpact([
+            'performance_api_key' => 'performance-client-id',
+            'performance_client_secret' => 'performance-secret',
+        ], 'report-uuid', 5000, '2026-05-04', '2026-06-02', 77);
+
+        $this->assertTrue($result['success']);
+        $this->assertSame(1, $result['coverage']['mapped_campaign_product_rows']);
+        $this->assertGreaterThanOrEqual(3, $result['coverage']['local_product_aliases_count']);
+        $this->assertArrayHasKey('3-02/3846', $result['by_offer_id']);
+        $this->assertSame('2127759756', $result['by_offer_id']['3-02/3846']['mapping_key']);
+        $this->assertSame(50, $result['by_offer_id']['3-02/3846']['clicks']);
+    }
+
+    public function test_product_advertising_impact_maps_by_unique_product_name_when_id_is_unknown(): void
+    {
+        Product::factory()->ozon()->create([
+            'integration_id' => 78,
+            'sku' => '3-02/3846',
+            'name' => 'Уникальная чековая лента 80 мм',
+            'ozon_data' => [
+                'sku' => '2127759756',
+            ],
+        ]);
+
+        Http::fake([
+            'https://api-performance.ozon.ru/api/client/token' => Http::response([
+                'access_token' => 'token-value',
+                'token_type' => 'Bearer',
+                'expires_in' => 1800,
+            ]),
+            'https://api-performance.ozon.ru/api/client/statistics/report-uuid' => Http::response([
+                'UUID' => 'report-uuid',
+                'state' => 'OK',
+                'kind' => 'SEARCH_PROMO_ORGANISATION_PRODUCTS',
+                'link' => '/api/client/statistics/report?UUID=report-uuid',
+            ]),
+            'https://api-performance.ozon.ru/api/client/statistics/report?UUID=report-uuid' => Http::response(
+                "SKU;Артикул;Название товара;Категория товара;Продвижение;Цена товара, ₽\n",
+                200,
+                ['content-type' => 'text/csv; charset=utf-8']
+            ),
+            'https://api-performance.ozon.ru/api/client/campaign' => Http::response([
+                'total' => 1,
+                'list' => [
+                    ['id' => '101', 'title' => 'Чеки 80'],
+                ],
+            ]),
+            'https://api-performance.ozon.ru/api/client/statistics/campaign/product?*' => Http::response(
+                "sku;Название товара;Показы;Клики;CTR (%);Расход;Заказы;Выручка;ДРР\n"
+                . "9999999999;Уникальная чековая лента 80 мм;100;7;7,0;70,00;2;700,00;10,00\n",
+                200,
+                ['content-type' => 'text/csv; charset=utf-8']
+            ),
+        ]);
+
+        $result = (new OzonPerformanceApiService())->productAdvertisingImpact([
+            'performance_api_key' => 'performance-client-id',
+            'performance_client_secret' => 'performance-secret',
+        ], 'report-uuid', 5000, '2026-05-04', '2026-06-02', 78);
+
+        $this->assertTrue($result['success']);
+        $this->assertSame(1, $result['coverage']['mapped_campaign_product_rows']);
+        $this->assertSame('mapped_by_unique_product_name', $result['by_offer_id']['3-02/3846']['mapping_status']);
+        $this->assertSame(7, $result['by_offer_id']['3-02/3846']['clicks']);
+    }
+
+    public function test_product_advertising_impact_reports_unmapped_json_aggregates_without_counting_them_as_product_rows(): void
+    {
+        Http::fake([
+            'https://api-performance.ozon.ru/api/client/token' => Http::response([
+                'access_token' => 'token-value',
+                'token_type' => 'Bearer',
+                'expires_in' => 1800,
+            ]),
+            'https://api-performance.ozon.ru/api/client/statistics/report-uuid' => Http::response([
+                'UUID' => 'report-uuid',
+                'state' => 'OK',
+                'kind' => 'SEARCH_PROMO_ORGANISATION_PRODUCTS',
+                'link' => '/api/client/statistics/report?UUID=report-uuid',
+            ]),
+            'https://api-performance.ozon.ru/api/client/statistics/report?UUID=report-uuid' => Http::response(
+                "SKU;Артикул;Название товара;Категория товара;Продвижение;Цена товара, ₽\n",
+                200,
+                ['content-type' => 'text/csv; charset=utf-8']
+            ),
+            'https://api-performance.ozon.ru/api/client/campaign' => Http::response([
+                'total' => 1,
+                'list' => [
+                    ['id' => '101', 'title' => 'Кампания без товарной детализации'],
+                ],
+            ]),
+            'https://api-performance.ozon.ru/api/client/statistics/campaign/product?*' => Http::response('', 200),
+            'https://api-performance.ozon.ru/api/client/statistics/campaign/product/json?*' => Http::response([
+                'rows' => [
+                    [
+                        'id' => '101',
+                        'title' => 'Кампания без товарной детализации',
+                        'moneySpent' => '100',
+                        'views' => '1000',
+                        'clicks' => '10',
+                    ],
+                ],
+            ]),
+        ]);
+
+        $result = (new OzonPerformanceApiService())->productAdvertisingImpact([
+            'performance_api_key' => 'performance-client-id',
+            'performance_client_secret' => 'performance-secret',
+        ], 'report-uuid', 5000, '2026-05-04', '2026-06-02');
+
+        $this->assertTrue($result['success']);
+        $this->assertSame('fallback', $result['coverage']['campaign_stats_source']);
+        $this->assertStringContainsString('JSON вернул агрегаты', $result['coverage']['campaign_stats_source_error']);
+        $this->assertSame(0, $result['coverage']['campaign_product_rows']);
+        $this->assertSame(0, $result['coverage']['mapped_campaign_product_rows']);
     }
 
     public function test_product_statistics_report_generation_uses_rfc3339_dates(): void
