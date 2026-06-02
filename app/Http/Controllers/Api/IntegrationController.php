@@ -676,7 +676,8 @@ class IntegrationController extends Controller
             $uuid,
             (int) ($validated['limit'] ?? 5000),
             $validated['date_from'] ?? null,
-            $validated['date_to'] ?? null
+            $validated['date_to'] ?? null,
+            (int) $resolved['integration']->id
         );
 
         return response()->json([

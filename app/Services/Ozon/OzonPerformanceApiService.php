@@ -2,6 +2,7 @@
 
 namespace App\Services\Ozon;
 
+use App\Models\Product;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Str;
 
@@ -352,7 +353,8 @@ class OzonPerformanceApiService
         string $uuid,
         int $limit = 5000,
         ?string $dateFrom = null,
-        ?string $dateTo = null
+        ?string $dateTo = null,
+        ?int $integrationId = null
     ): array
     {
         $missing = $this->missingCredentialsResponse($credentials);
@@ -378,6 +380,12 @@ class OzonPerformanceApiService
 
             $parsed = $this->parseProductReportCsvPreview((string) $download['body'], $limit);
             $productReportSkuMap = $this->buildProductReportSkuMap($parsed['rows']);
+            if ($integrationId !== null && $integrationId > 0) {
+                $productReportSkuMap = $this->mergeProductSkuMaps(
+                    $productReportSkuMap,
+                    $this->buildLocalProductSkuMap($integrationId)
+                );
+            }
             $campaignStats = null;
             $campaignReportRows = [];
 
@@ -414,6 +422,7 @@ class OzonPerformanceApiService
                     'date_from' => $dateFrom,
                     'date_to' => $dateTo,
                 ],
+                'integration_id' => $integrationId,
                 'content_type' => $download['content_type'] ?? null,
                 'rows_count' => count($parsed['rows']),
                 'campaign_rows_count' => $campaignStats !== null ? count($campaignStats['rows']) : 0,
@@ -429,6 +438,7 @@ class OzonPerformanceApiService
                     'campaign_product_rows' => count($campaignReportRows),
                     'mapped_campaign_product_rows' => $mappedCampaignProductRows,
                     'unmapped_campaign_product_rows' => max(0, count($campaignReportRows) - $mappedCampaignProductRows),
+                    'local_product_aliases' => count($productReportSkuMap['by_sku'] ?? []),
                     'campaign_totals' => $campaignStats['totals'] ?? null,
                     'note' => $campaignStats !== null
                         ? 'Сводка объединяет товарный UUID-отчёт и статистику товарных PPC-кампаний Ozon за тот же период. CPC-строки сопоставляются с товарами по Ozon SKU и артикулу продавца.'
@@ -1155,6 +1165,72 @@ class OzonPerformanceApiService
         return [
             'by_sku' => $bySku,
             'meta_by_sku' => $metaBySku,
+        ];
+    }
+
+    /**
+     * @return array{by_sku: array<string, string>, meta_by_sku: array<string, array<string, string>>}
+     */
+    private function buildLocalProductSkuMap(int $integrationId): array
+    {
+        $bySku = [];
+        $metaBySku = [];
+
+        Product::query()
+            ->where('integration_id', $integrationId)
+            ->where('marketplace', 'ozon')
+            ->select(['sku', 'vendor_code', 'name', 'category', 'marketplace_id', 'ozon_data'])
+            ->chunk(500, function ($products) use (&$bySku, &$metaBySku): void {
+                foreach ($products as $product) {
+                    $offerId = trim((string) ($product->sku ?? ''));
+                    if ($offerId === '') {
+                        continue;
+                    }
+
+                    $ozonData = is_array($product->ozon_data) ? $product->ozon_data : [];
+                    $aliases = [
+                        $offerId,
+                        $product->vendor_code ?? null,
+                        $product->marketplace_id ?? null,
+                        $ozonData['offer_id'] ?? null,
+                        $ozonData['product_id'] ?? null,
+                        $ozonData['sku'] ?? null,
+                        $ozonData['fbo_sku'] ?? null,
+                        $ozonData['fbs_sku'] ?? null,
+                    ];
+
+                    foreach ($aliases as $alias) {
+                        $alias = trim((string) $alias);
+                        if ($alias === '') {
+                            continue;
+                        }
+
+                        $bySku[$alias] = $offerId;
+                        $metaBySku[$alias] = [
+                            'offer_id' => $offerId,
+                            'product_name' => trim((string) ($product->name ?? '')),
+                            'category' => trim((string) ($product->category ?? '')),
+                        ];
+                    }
+                }
+            }, 'sku');
+
+        return [
+            'by_sku' => $bySku,
+            'meta_by_sku' => $metaBySku,
+        ];
+    }
+
+    /**
+     * @param array{by_sku?: array<string, string>, meta_by_sku?: array<string, array<string, string>>} $base
+     * @param array{by_sku?: array<string, string>, meta_by_sku?: array<string, array<string, string>>} $override
+     * @return array{by_sku: array<string, string>, meta_by_sku: array<string, array<string, string>>}
+     */
+    private function mergeProductSkuMaps(array $base, array $override): array
+    {
+        return [
+            'by_sku' => array_merge($base['by_sku'] ?? [], $override['by_sku'] ?? []),
+            'meta_by_sku' => array_merge($base['meta_by_sku'] ?? [], $override['meta_by_sku'] ?? []),
         ];
     }
 

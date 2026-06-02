@@ -1876,7 +1876,8 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
                 $uuid,
                 5000,
                 is_array($params['performance_period'] ?? null) ? ($params['performance_period']['date_from'] ?? null) : null,
-                is_array($params['performance_period'] ?? null) ? ($params['performance_period']['date_to'] ?? null) : null
+                is_array($params['performance_period'] ?? null) ? ($params['performance_period']['date_to'] ?? null) : null,
+                (int) $plan->integration_id
             );
             $impact['uuid'] = $uuid;
 
