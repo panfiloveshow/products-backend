@@ -204,13 +204,65 @@ class UnitEconomicsCache extends Model
      */
     public function scopeSearch(Builder $query, ?string $search): Builder
     {
-        if (empty($search)) {
+        $normalizedSearch = trim((string) $search);
+        if ($normalizedSearch === '') {
             return $query;
         }
 
-        return $query->where(function ($q) use ($search) {
-            $q->where($this->getTable().'.sku', 'like', "%{$search}%")
-                ->orWhere($this->getTable().'.product_name', 'like', "%{$search}%");
+        $tokens = preg_split('/\s+/u', $normalizedSearch) ?: [];
+        $tokens = array_values(array_unique(array_filter(array_map(
+            static fn ($token) => trim((string) $token),
+            array_slice($tokens, 0, 6)
+        ))));
+
+        $table = $this->getTable();
+        $driver = $query->getConnection()->getDriverName();
+        $likeOperator = $driver === 'pgsql' ? 'ilike' : 'like';
+
+        return $query->where(function (Builder $root) use ($tokens, $normalizedSearch, $table, $likeOperator) {
+            // Точный SKU/артикул должен находиться мгновенно.
+            $root->where("{$table}.sku", '=', $normalizedSearch)
+                ->orWhereHas('product', function (Builder $productQuery) use ($normalizedSearch) {
+                    $productQuery->where('products.sku', '=', $normalizedSearch)
+                        ->orWhere('products.vendor_code', '=', $normalizedSearch)
+                        ->orWhere('products.barcode', '=', $normalizedSearch);
+                });
+
+            // Prefix-поиск для быстрых "sku starts with ...".
+            $root->orWhere("{$table}.sku", $likeOperator, "{$normalizedSearch}%")
+                ->orWhereHas('product', function (Builder $productQuery) use ($normalizedSearch, $likeOperator) {
+                    $productQuery->where('products.sku', $likeOperator, "{$normalizedSearch}%")
+                        ->orWhere('products.vendor_code', $likeOperator, "{$normalizedSearch}%")
+                        ->orWhere('products.barcode', $likeOperator, "{$normalizedSearch}%");
+                });
+
+            // Полное совпадение/подстрока по основным полям.
+            $root->orWhere("{$table}.sku", $likeOperator, "%{$normalizedSearch}%")
+                ->orWhere("{$table}.product_name", $likeOperator, "%{$normalizedSearch}%")
+                ->orWhereHas('product', function (Builder $productQuery) use ($normalizedSearch, $likeOperator) {
+                    $productQuery->where('products.sku', $likeOperator, "%{$normalizedSearch}%")
+                        ->orWhere('products.vendor_code', $likeOperator, "%{$normalizedSearch}%")
+                        ->orWhere('products.barcode', $likeOperator, "%{$normalizedSearch}%")
+                        ->orWhere('products.name', $likeOperator, "%{$normalizedSearch}%");
+                });
+
+            // По каждому токену требуем попадание хотя бы в одно поле (AND между токенами).
+            foreach ($tokens as $token) {
+                if (mb_strlen($token) < 2) {
+                    continue;
+                }
+
+                $root->where(function (Builder $tokenQuery) use ($token, $table, $likeOperator) {
+                    $tokenQuery->where("{$table}.sku", $likeOperator, "%{$token}%")
+                        ->orWhere("{$table}.product_name", $likeOperator, "%{$token}%")
+                        ->orWhereHas('product', function (Builder $productQuery) use ($token, $likeOperator) {
+                            $productQuery->where('products.sku', $likeOperator, "%{$token}%")
+                                ->orWhere('products.vendor_code', $likeOperator, "%{$token}%")
+                                ->orWhere('products.barcode', $likeOperator, "%{$token}%")
+                                ->orWhere('products.name', $likeOperator, "%{$token}%");
+                        });
+                });
+            }
         });
     }
 
@@ -244,6 +296,162 @@ class UnitEconomicsCache extends Model
     }
 
     /**
+     * Фильтр по диапазону прибыли.
+     */
+    public function scopeProfitRange(Builder $query, ?float $min, ?float $max): Builder
+    {
+        if ($min !== null) {
+            $query->where($this->getTable().'.net_profit', '>=', $min);
+        }
+        if ($max !== null) {
+            $query->where($this->getTable().'.net_profit', '<=', $max);
+        }
+
+        return $query;
+    }
+
+    /**
+     * Фильтр по диапазону ROI.
+     */
+    public function scopeRoiRange(Builder $query, ?float $min, ?float $max): Builder
+    {
+        if ($min !== null) {
+            $query->where($this->getTable().'.roi_percent', '>=', $min);
+        }
+        if ($max !== null) {
+            $query->where($this->getTable().'.roi_percent', '<=', $max);
+        }
+
+        return $query;
+    }
+
+    /**
+     * Фильтр по диапазону эффективной логистики.
+     */
+    public function scopeEffectiveLogisticsRange(Builder $query, ?float $min, ?float $max): Builder
+    {
+        if ($min !== null) {
+            $query->where($this->getTable().'.effective_logistics', '>=', $min);
+        }
+        if ($max !== null) {
+            $query->where($this->getTable().'.effective_logistics', '<=', $max);
+        }
+
+        return $query;
+    }
+
+    /**
+     * Фильтр по диапазону продаж.
+     */
+    public function scopeSalesRange(Builder $query, ?int $min, ?int $max): Builder
+    {
+        if ($min !== null) {
+            $query->where($this->getTable().'.sales_count', '>=', $min);
+        }
+        if ($max !== null) {
+            $query->where($this->getTable().'.sales_count', '<=', $max);
+        }
+
+        return $query;
+    }
+
+    /**
+     * Фильтр по диапазону нелокальной наценки.
+     */
+    public function scopeNonLocalMarkupRange(Builder $query, ?float $min, ?float $max): Builder
+    {
+        if ($min !== null) {
+            $query->where($this->getTable().'.non_local_markup_percent', '>=', $min);
+        }
+        if ($max !== null) {
+            $query->where($this->getTable().'.non_local_markup_percent', '<=', $max);
+        }
+
+        return $query;
+    }
+
+    /**
+     * Фильтр по качеству расчёта (low/medium/high) из marketplace_data.
+     */
+    public function scopeConfidence(Builder $query, ?string $confidence): Builder
+    {
+        $confidence = strtolower(trim((string) $confidence));
+        if (! in_array($confidence, ['low', 'medium', 'high'], true)) {
+            return $query;
+        }
+
+        $expr = $this->jsonTextExpr($query, 'marketplace_data', 'calculation_confidence');
+
+        return $query->whereRaw("LOWER({$expr}) = ?", [$confidence]);
+    }
+
+    /**
+     * Фильтр по локальности.
+     * - local: только локальные
+     * - non_local: только нелокальные
+     * - mixed: смешанная локальность (0<rate<100)
+     * - no_sales: нет продаж за период
+     */
+    public function scopeLocalityState(Builder $query, ?string $state): Builder
+    {
+        $state = strtolower(trim((string) $state));
+        if ($state === '') {
+            return $query;
+        }
+
+        $table = $this->getTable();
+        $localityRateExpr = $this->jsonNumberExpr($query, 'marketplace_data', 'expected_locality_rate');
+
+        return match ($state) {
+            'local' => $query->where(function (Builder $q) use ($table, $localityRateExpr) {
+                $q->where("{$table}.is_local_sale", true)
+                    ->orWhereRaw("{$localityRateExpr} >= 99.99");
+            }),
+            'non_local' => $query->where(function (Builder $q) use ($table, $localityRateExpr) {
+                $q->where("{$table}.is_local_sale", false)
+                    ->orWhereRaw("{$localityRateExpr} <= 0.01");
+            }),
+            'mixed' => $query->where("{$table}.is_local_sale", null)
+                ->whereRaw("{$localityRateExpr} > 0.01")
+                ->whereRaw("{$localityRateExpr} < 99.99"),
+            'no_sales' => $query->where("{$table}.sales_count", '<=', 0),
+            default => $query,
+        };
+    }
+
+    /**
+     * Быстрые пресеты фильтрации для UE-таблицы.
+     */
+    public function scopeQuickFilter(Builder $query, ?string $quickFilter): Builder
+    {
+        $quickFilter = strtolower(trim((string) $quickFilter));
+        if ($quickFilter === '') {
+            return $query;
+        }
+
+        $table = $this->getTable();
+        $confidenceExpr = $this->jsonTextExpr($query, 'marketplace_data', 'calculation_confidence');
+        $localityRateExpr = $this->jsonNumberExpr($query, 'marketplace_data', 'expected_locality_rate');
+
+        return match ($quickFilter) {
+            'unprofitable', 'negative_margin' => $query->where("{$table}.net_profit", '<=', 0),
+            'no_sales_28d' => $query->where("{$table}.sales_count", '<=', 0),
+            'low_confidence' => $query->whereRaw("LOWER({$confidenceExpr}) = 'low'"),
+            'high_non_locality', 'locality_risk' => $query->where(function (Builder $q) use ($table, $localityRateExpr) {
+                $q->whereRaw("{$localityRateExpr} <= 50")
+                    ->orWhere("{$table}.is_local_sale", false);
+            }),
+            'high_non_local_markup' => $query->where("{$table}.non_local_markup_percent", '>=', 4),
+            'data_gap' => $query->where(function (Builder $q) use ($table) {
+                $q->where("{$table}.price", '<=', 0)
+                    ->orWhere("{$table}.cost_price", '<=', 0)
+                    ->orWhere("{$table}.commission_percent", '<=', 0);
+            }),
+            default => $query,
+        };
+    }
+
+    /**
      * Фильтр по цене
      */
     public function scopePriceRange(Builder $query, ?float $min, ?float $max): Builder
@@ -256,6 +464,34 @@ class UnitEconomicsCache extends Model
         }
 
         return $query;
+    }
+
+    private function jsonTextExpr(Builder $query, string $column, string $key): string
+    {
+        $table = $this->getTable();
+        $qualified = "{$table}.{$column}";
+        $driver = $query->getConnection()->getDriverName();
+
+        return match ($driver) {
+            'pgsql' => "COALESCE({$qualified}->>'{$key}', '')",
+            'mysql', 'mariadb' => "COALESCE(JSON_UNQUOTE(JSON_EXTRACT({$qualified}, '$.{$key}')), '')",
+            'sqlite' => "COALESCE(json_extract({$qualified}, '$.{$key}'), '')",
+            default => "''",
+        };
+    }
+
+    private function jsonNumberExpr(Builder $query, string $column, string $key): string
+    {
+        $table = $this->getTable();
+        $qualified = "{$table}.{$column}";
+        $driver = $query->getConnection()->getDriverName();
+
+        return match ($driver) {
+            'pgsql' => "COALESCE(NULLIF({$qualified}->>'{$key}', ''), '0')::numeric",
+            'mysql', 'mariadb' => "COALESCE(CAST(JSON_UNQUOTE(JSON_EXTRACT({$qualified}, '$.{$key}')) AS DECIMAL(14,4)), 0)",
+            'sqlite' => "COALESCE(CAST(json_extract({$qualified}, '$.{$key}') AS REAL), 0)",
+            default => '0',
+        };
     }
 
     // ==================== HELPERS ====================

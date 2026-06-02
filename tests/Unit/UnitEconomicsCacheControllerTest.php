@@ -5,6 +5,7 @@ namespace Tests\Unit;
 use App\Domains\UnitEconomics\UnitEconomicsOrchestrator;
 use App\Http\Controllers\Api\UnitEconomicsCacheController;
 use App\Models\Integration;
+use App\Models\LocalityMetricDaily;
 use App\Models\Product;
 use App\Models\UnitEconomicsCache;
 use App\Services\IntegrationAccessService;
@@ -532,9 +533,8 @@ class UnitEconomicsCacheControllerTest extends TestCase
         $this->assertSame(120.0, $sheet->getCell('M5')->getValue());
         $this->assertSame('=D5+J5+M5+(C5*P5/100)+(C5*Q5/100)+(C5*R5/100)+(C5*S5/100)+(C5*T5/100)', $sheet->getCell('AA5')->getValue());
         $this->assertSame('=C5-J5-M5-(C5*P5/100)-(C5*Q5/100)-(C5*R5/100)-(C5*S5/100)-(C5*T5/100)', $sheet->getCell('AE5')->getValue());
-        $this->assertSame(5.7, $sheet->getCell('AO5')->getValue());
-        $this->assertSame(8.0, $sheet->getCell('AP5')->getValue());
-        $this->assertSame('order_economics_summary', $sheet->getCell('AQ5')->getValue());
+        $this->assertSame('Индекс цены', $sheet->getCell('AF4')->getValue());
+        $this->assertSame('', (string) $sheet->getCell('AG4')->getValue());
     }
 
     public function test_excel_export_wildberries_finance_formulas_include_spp_and_storage_like_screen(): void
@@ -572,5 +572,142 @@ class UnitEconomicsCacheControllerTest extends TestCase
         $this->assertSame(70.0, $sheet->getCell('AN5')->getValue());
         $this->assertSame('=D5+J5+M5+O5+AN5+(C5*P5/100)+(C5*Q5/100)+(C5*S5/100)', $sheet->getCell('AA5')->getValue());
         $this->assertSame('=C5-J5-M5-O5-AN5-(C5*P5/100)-(C5*Q5/100)-(C5*S5/100)', $sheet->getCell('AE5')->getValue());
+    }
+
+    public function test_excel_export_headers_include_version_format_and_source_contract(): void
+    {
+        $controller = new UnitEconomicsCacheController(
+            $this->createMock(UnitEconomicsCacheService::class),
+            $this->createMock(UnitEconomicsService::class),
+            $this->createMock(UnitEconomicsOrchestrator::class),
+            $this->createMock(IntegrationAccessService::class),
+        );
+
+        $method = new \ReflectionMethod(UnitEconomicsCacheController::class, 'buildExportHeaders');
+        $method->setAccessible(true);
+
+        /** @var array<string,string> $headers */
+        $headers = $method->invoke($controller, 'unit-economics-test.xlsx');
+
+        $this->assertSame('v2', $headers['X-Unit-Economics-Export-Format']);
+        $this->assertSame('UnitEconomicsCacheController::exportExcel', $headers['X-Unit-Economics-Export-Source']);
+        $this->assertSame('2026-05-25-04', $headers['X-Unit-Economics-Export-Version']);
+        $this->assertStringContainsString('X-Unit-Economics-Export-Version', $headers['Access-Control-Expose-Headers']);
+    }
+
+    public function test_excel_export_spreadsheet_contains_version_markers_and_expected_columns(): void
+    {
+        $controller = new UnitEconomicsCacheController(
+            $this->createMock(UnitEconomicsCacheService::class),
+            $this->createMock(UnitEconomicsService::class),
+            $this->createMock(UnitEconomicsOrchestrator::class),
+            $this->createMock(IntegrationAccessService::class),
+        );
+
+        $method = new \ReflectionMethod(UnitEconomicsCacheController::class, 'buildUnitEconomicsSpreadsheet');
+        $method->setAccessible(true);
+
+        $spreadsheet = $method->invoke($controller, [[
+            'sku' => '9137/black',
+            'product_name' => 'Test product',
+            'price' => 1000,
+            'cost_price' => 300,
+            'sales_count' => 1,
+            'revenue' => 1000,
+            'commission_percent' => 10,
+            'effective_logistics' => 120,
+            'acquiring_percent' => 1.5,
+            'drr_percent' => 5,
+            'our_share_percent' => 2,
+            'tax_percent' => 6,
+            'vat_percent' => 0,
+            'calculation_confidence' => 'medium',
+            'current_price_index' => 0.9,
+        ]], 'Test', 'ozon', 'FBO');
+
+        $mainSheet = $spreadsheet->getSheetByName('Юнит-экономика');
+        $this->assertNotNull($mainSheet);
+        $this->assertSame('Статус данных', $mainSheet->getCell('Z4')->getValue());
+        $this->assertSame('Индекс цены', $mainSheet->getCell('AF4')->getValue());
+        $this->assertSame('2026-05-25-04', $mainSheet->getCell('AZ1')->getValue());
+        $this->assertFalse($mainSheet->getColumnDimension('AZ')->getVisible());
+
+        $metadata = $spreadsheet->getSheetByName('Метаданные');
+        $this->assertNotNull($metadata);
+
+        $rows = $metadata->toArray(null, true, true, true);
+        $templateVersion = null;
+        foreach ($rows as $row) {
+            if (($row['A'] ?? null) === 'Export template version') {
+                $templateVersion = $row['B'] ?? null;
+                break;
+            }
+        }
+
+        $this->assertSame('2026-05-25-04', $templateVersion);
+    }
+
+    public function test_resolve_locality_label_prefers_actual_locality_over_estimated_rate(): void
+    {
+        $controller = new UnitEconomicsCacheController(
+            $this->createMock(UnitEconomicsCacheService::class),
+            $this->createMock(UnitEconomicsService::class),
+            $this->createMock(UnitEconomicsOrchestrator::class),
+            $this->createMock(IntegrationAccessService::class),
+        );
+
+        $method = new \ReflectionMethod(UnitEconomicsCacheController::class, 'resolveLocalityLabel');
+        $method->setAccessible(true);
+
+        $this->assertSame('Нелокальная', $method->invoke($controller, [
+            'is_local_sale' => false,
+            'expected_locality_rate' => 75.0,
+        ]));
+
+        $this->assertSame('Локальная', $method->invoke($controller, [
+            'is_local_sale' => true,
+            'expected_locality_rate' => 20.0,
+        ]));
+
+        $this->assertSame('Оценка 75%', $method->invoke($controller, [
+            'is_local_sale' => null,
+            'expected_locality_rate' => 75.0,
+        ]));
+    }
+
+    public function test_apply_ozon_locality_metrics_to_export_item_matches_ui_values(): void
+    {
+        $controller = new UnitEconomicsCacheController(
+            $this->createMock(UnitEconomicsCacheService::class),
+            $this->createMock(UnitEconomicsService::class),
+            $this->createMock(UnitEconomicsOrchestrator::class),
+            $this->createMock(IntegrationAccessService::class),
+        );
+
+        $method = new \ReflectionMethod(UnitEconomicsCacheController::class, 'applyOzonLocalityMetricsToExportItem');
+        $method->setAccessible(true);
+
+        $row = new LocalityMetricDaily([
+            'sku' => '9137/black',
+            'orders_count' => 12,
+            'local_share_percent' => 50.0,
+            'avg_markup_percent' => 4.0,
+            'calculation_confidence' => 'high',
+        ]);
+
+        $result = $method->invoke($controller, [
+            'sku' => '9137/black',
+            'is_local_sale' => false,
+            'expected_locality_rate' => 75.0,
+            'non_local_markup_percent' => 0.55,
+            'calculation_confidence' => 'medium',
+        ], $row);
+
+        $this->assertSame(50.0, $result['expected_locality_rate']);
+        $this->assertSame(4.0, $result['non_local_markup_percent']);
+        $this->assertSame(4.0, $result['raw_non_local_markup_percent']);
+        $this->assertNull($result['is_local_sale']);
+        $this->assertSame('high', $result['calculation_confidence']);
+        $this->assertSame('locality_metrics_daily', $result['non_local_markup_source']);
     }
 }

@@ -13,6 +13,14 @@ use App\Models\SupplySettings;
 use App\Models\WbBarcodeCost;
 use App\Models\UnitEconomics;
 use App\Services\AutoSupplyPlanService;
+use App\Services\AutoSupplyPlanning\MarketplaceConstraintService;
+use App\Services\AutoSupplyPlanning\MarketplacePlanningCapabilityService;
+use App\Services\AutoSupplyPlanning\PlanningFactSnapshotService;
+use App\Services\AutoSupplyPlanning\TerritorialPlanningService;
+use App\Services\AutoSupplyPlanning\DeficitSurplusPlanningService;
+use App\Services\AutoSupplyPlanning\PlanQualityAuditService;
+use App\Services\Ozon\OzonPerformanceApiService;
+use App\Services\SellicoApiService;
 use Carbon\Carbon;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
@@ -20,6 +28,7 @@ use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
 use App\Models\OzonOrderReport;
+use App\Services\AutoSupplyPlanning\PlanLineOptimizer;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Collection;
 
@@ -53,6 +62,7 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
                 'error' => $e->getMessage(),
                 'trace' => $e->getTraceAsString(),
             ]);
+            app(PlanningFactSnapshotService::class)->fail($plan, $e->getMessage());
             $plan->markError($e->getMessage());
         }
     }
@@ -71,9 +81,42 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
         $integrationId = $plan->integration_id;
         $marketplace = $plan->marketplace;
         $params = is_array($plan->params) ? $plan->params : [];
+        $analysisPeriodDays = $this->analysisPeriodDays($params, $horizonDays);
         $seasonalityMultiplier = max(0.1, min(5.0, (float) ($params['demand_seasonality_multiplier'] ?? 1.0)));
-        $ozonQtyAnchor = (string) ($params['ozon_qty_anchor'] ?? 'internal');
+        $trendMultiplier = max(0.1, min(5.0, (float) ($params['trend_multiplier'] ?? 1.0)));
+        $promoMode = (string) ($params['promo_mode'] ?? 'none');
+        $includeInTransit = array_key_exists('include_in_transit', $params) ? (bool) $params['include_in_transit'] : true;
+        $requestedOzonQtyAnchor = (string) ($params['ozon_qty_anchor'] ?? 'internal');
+        $ozonQtyAnchor = $this->effectiveOzonQtyAnchor($requestedOzonQtyAnchor, $marketplace);
+        $ozonQtyAnchorWasDeprecated = $marketplace === 'ozon' && $requestedOzonQtyAnchor !== $ozonQtyAnchor;
         $skipNegativeProfit = (bool) ($params['skip_negative_profit'] ?? false);
+        $ozonAdvertisingImpact = $this->loadOzonAdvertisingImpact($plan, $params);
+        $ozonAdvertisingByOffer = is_array($ozonAdvertisingImpact['by_offer_id'] ?? null)
+            ? $ozonAdvertisingImpact['by_offer_id']
+            : [];
+        $constraintService = app(MarketplaceConstraintService::class);
+        $marketplaceNeedFacts = $constraintService->marketplaceNeedFacts($plan, $marketplace);
+        $constraintNeedSkus = array_values(array_unique(array_filter(array_map(
+            static fn (array $need): ?string => isset($need['sku']) && trim((string) $need['sku']) !== ''
+                ? trim((string) $need['sku'])
+                : null,
+            $marketplaceNeedFacts
+        ))));
+
+        app(PlanningFactSnapshotService::class)->start($plan, [
+            'constraints' => [
+                'selected_cluster_ids' => $params['cluster_ids'] ?? null,
+                'selected_warehouse_ids' => $params['warehouse_ids'] ?? null,
+                'analysis_period_days' => $analysisPeriodDays,
+                'include_in_transit' => $includeInTransit,
+                'budget_limit' => $plan->budget_limit,
+                'promo_mode' => $promoMode,
+                'trend_multiplier' => $trendMultiplier,
+                'seasonality_multiplier' => $seasonalityMultiplier,
+                'constraint_metadata' => $params['constraint_metadata'] ?? null,
+                'performance_report_uuid' => $ozonAdvertisingImpact['uuid'] ?? null,
+            ],
+        ]);
 
         // v2: Загружаем SupplySettings для интеграции (ABC target days, lead time, safety stock mode)
         $settings = SupplySettings::where('integration_id', $integrationId)->first();
@@ -84,17 +127,22 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
         // Получаем только актуальные записи остатков для интеграции:
         // SKU включается если есть остаток > 0 ИЛИ продажи за 30 дней > 0
         // Это исключает "мёртвые" товары которых давно нет и которые засоряют план
-        $activeSKUs = InventoryWarehouse::where('integration_id', $integrationId)
+        $activeSkuQuery = InventoryWarehouse::where('integration_id', $integrationId)
             ->when(
                 in_array($marketplace, ['yandex', 'yandex_market'], true),
                 // BUG FIX: исторически записи могут хранить и 'yandex', и 'yandex_market' — ищем оба варианта
                 fn ($q) => $q->whereIn('marketplace', ['yandex', 'yandex_market']),
                 fn ($q) => $q->where('marketplace', $marketplace)
-            )
-            ->where(function ($q) {
+            );
+
+        if ($marketplace !== 'ozon') {
+            $activeSkuQuery->where(function ($q) {
                 $q->where('quantity', '>', 0)
                   ->orWhere('sales_30_days', '>', 0);
-            })
+            });
+        }
+
+        $activeSKUs = $activeSkuQuery
             ->pluck('sku')
             ->unique()
             ->toArray();
@@ -114,13 +162,13 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
 
         $warehouses = $warehouseQuery->get();
 
-        if ($warehouses->isEmpty()) {
+        if ($warehouses->isEmpty() && $constraintNeedSkus === []) {
             $plan->markReady(0, 0, 0, $service->emptyQualityJson());
             return;
         }
 
         // Загружаем продукты для метаданных (barcode, name, pack_multiple, price)
-        $skus = $warehouses->pluck('sku')->unique()->toArray();
+        $skus = array_values(array_unique(array_merge($warehouses->pluck('sku')->unique()->toArray(), $constraintNeedSkus)));
         // BUG FIX: для Yandex ищем товары и 'yandex', и 'yandex_market' — аналогично inventory
         $productsRaw = Product::where('integration_id', $integrationId)
             ->when(
@@ -288,6 +336,8 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
 
         // v2: Загружаем рекомендации Ozon по поставкам (delivery analytics)
         $ozonAnalytics = [];
+        $ozonPostingDemand = ['by_warehouse' => [], 'by_cluster' => [], 'by_offer' => [], 'source' => 'posting_fbo_v3', 'days' => $analysisPeriodDays];
+        $ozonProductStocks = [];
         // v3: Аналитика остатков и оборачиваемости по SKU×склад (ads_cluster, idc_cluster, turnover_grade_cluster)
         $ozonStockAnalytics = [];
         $ozonStockAnalyticsCluster = [];
@@ -296,6 +346,8 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
             $integration = Integration::find($integrationId);
             if ($integration) {
                 $ozonAnalytics = $service->loadOzonDeliveryAnalytics($integration);
+                $ozonPostingDemand = $service->loadOzonPostingDemand($integration, $products, $clusterMapping, $analysisPeriodDays);
+                $ozonProductStocks = $service->loadOzonProductStocks($integration, $products);
 
                 // v3: Загружаем аналитику остатков из /v1/analytics/stocks и /v1/analytics/turnover/stocks
                 $stockAnalyticsData = $service->loadOzonStockAnalytics($integration, $products);
@@ -340,9 +392,14 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
         $fallbackLongLines = 0;
         $negativeProfitLines = 0;
         $skippedNegativeProfitLines = 0;
-        $ozonRecommendedLines = 0;
+        $budgetSkippedLines = 0;
+        $budgetUsed = 0.0;
+        $deprecatedOzonRecommendedLines = 0;
         $manualReviewLines = 0;
         $lowConfidenceTrialLines = 0;
+        $advertisingDrivenLines = 0;
+        $advertisingHighDrrLines = 0;
+        $advertisingProfitAdjustedLines = 0;
 
         foreach ($warehouses as $wh) {
             $product = $products->get($wh->sku);
@@ -359,6 +416,29 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
             $sales30 = $wh->sales_30_days ?? 0;
             $currentStock = $wh->quantity ?? 0;
             $avgDailySales = $wh->average_daily_sales ?? 0;
+            $localAvgDailyBeforePosting = (float) $avgDailySales;
+            $clusterIdForAnalytics = $wh->getAttribute('cluster_id');
+            $postingDemandData = null;
+            $postingDemandApplied = false;
+            $postingDemandShape = null;
+            $postingDemandWeakOfferOnly = false;
+            $aggregateDemandShape = null;
+
+            if ($marketplace === 'ozon') {
+                if (!$clusterIdForAnalytics && !empty($ozonProductStocks[$wh->sku])) {
+                    $currentStock = max((int) $currentStock, (int) ($ozonProductStocks[$wh->sku]['total'] ?? 0));
+                }
+
+                if ($clusterIdForAnalytics && !empty($ozonPostingDemand['by_cluster'][$wh->sku][(string) $clusterIdForAnalytics])) {
+                    $postingDemandData = $ozonPostingDemand['by_cluster'][$wh->sku][(string) $clusterIdForAnalytics];
+                } elseif (! $wh->getAttribute('is_cluster_aggregate') && !empty($ozonPostingDemand['by_offer'][$wh->sku])) {
+                    $postingDemandData = $ozonPostingDemand['by_offer'][$wh->sku];
+                } elseif ($wh->getAttribute('is_cluster_aggregate') && !empty($ozonPostingDemand['by_offer'][$wh->sku])) {
+                    // Общий спрос SKU нельзя размазывать на выбранный кластер:
+                    // это главный источник завышения после промо-всплесков.
+                    $postingDemandWeakOfferOnly = true;
+                }
+            }
 
             // v3: Получаем аналитику Ozon для этого SKU × склад
             $ozonStockData = null;
@@ -367,7 +447,6 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
             $ozonIdcCluster = null;
             $ozonTurnoverGradeCluster = null;
             $ozonDaysWithoutSalesCluster = null;
-            $clusterIdForAnalytics = $wh->getAttribute('cluster_id');
             if ($marketplace === 'ozon' && $clusterIdForAnalytics && !empty($ozonStockAnalyticsCluster[$wh->sku][(string) $clusterIdForAnalytics])) {
                 $ozonStockData = $ozonStockAnalyticsCluster[$wh->sku][(string) $clusterIdForAnalytics];
                 $ozonAdsCluster = $ozonStockData['ads_cluster'] ?? null;
@@ -396,6 +475,22 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
                 $avgDailySales = max($avgDailySales, $ozonAdsCluster);
             }
 
+            if ($marketplace === 'ozon' && $postingDemandData && (float) ($postingDemandData['avg_daily_sales'] ?? 0) > 0) {
+                $postingDemandShape = $service->shapeOzonPostingDemand(
+                    $postingDemandData,
+                    $localAvgDailyBeforePosting,
+                    $ozonAdsCluster !== null ? (float) $ozonAdsCluster : null
+                );
+
+                // Trust the actual postings windows instead of max-picking the
+                // highest source. max() made promotion spikes sticky and inflated.
+                $sales7 = (int) ($postingDemandData['sales_7_days'] ?? 0);
+                $sales14 = (int) ($postingDemandData['sales_14_days'] ?? 0);
+                $sales30 = (int) ($postingDemandData['sales_30_days'] ?? 0);
+                $avgDailySales = (float) ($postingDemandShape['daily_demand'] ?? $postingDemandData['avg_daily_sales']);
+                $postingDemandApplied = true;
+            }
+
             // v2: In-transit = API + заявки на поставку
             $inTransitApi = $wh->in_transit ?? 0;
             if ($marketplace === 'ozon' && $wh->getAttribute('is_cluster_aggregate') && $ozonStockData) {
@@ -415,6 +510,11 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
                 ? ($supplyInTransitByCluster[$wh->sku . '|' . $clusterIdForTransit] ?? 0)
                 : ($supplyInTransit[$wh->sku] ?? 0);
             $inTransit = $inTransitApi + $inTransitSupplies;
+            if (! $includeInTransit) {
+                $inTransitApi = 0;
+                $inTransitSupplies = 0;
+                $inTransit = 0;
+            }
 
             // WB v4: Товары на возврате с клиентов — уже едут обратно на склад
             // in_way_from_client снижает реальную потребность в новой поставке
@@ -449,6 +549,14 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
             // v2: Данные для улучшенного прогноза
             $realAvgDailySales = $wh->real_avg_daily_sales ?? 0;
             $effectiveDailySales = $wh->effective_daily_sales ?? 0;
+            $realAvgDemandSource = 'ozon_order_report';
+            if ($postingDemandApplied && $realAvgDailySales <= 0) {
+                $realAvgDailySales = (float) ($postingDemandShape['daily_demand'] ?? $postingDemandData['avg_daily_sales'] ?? 0);
+                $realAvgDemandSource = 'posting_fbo_v3';
+            }
+            if ($postingDemandApplied && $effectiveDailySales <= 0) {
+                $effectiveDailySales = (float) ($postingDemandShape['daily_demand'] ?? $postingDemandData['avg_daily_sales'] ?? 0);
+            }
             $daysInStock30 = $wh->days_in_stock_30 ?? 30;
 
             // WB v4: % выкупа — вычисляем из реальных данных unit_economics если есть
@@ -534,14 +642,31 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
                 $ewmaAlpha, $sales7, $sales14, $sales30,
                 $realAvgDailySales, $effectiveDailySales, $daysInStock30,
                 $redemptionRate, $salesTrend, $salesTrendPercent,
-                $avgDailySales
+                $avgDailySales, $realAvgDemandSource
             );
             $dailyDemand = $demandResult['daily_demand'];
             $demandSource = $demandResult['source'];
             $needsManualReview = $demandResult['needs_manual_review'];
 
+            if ($marketplace === 'ozon' && ! $postingDemandApplied && $dailyDemand > 0) {
+                $aggregateDemandShape = $service->shapeOzonAggregateDemand(
+                    $dailyDemand,
+                    (float) $sales7,
+                    (float) $sales14,
+                    (float) $sales30,
+                    (float) $avgDailySales
+                );
+
+                $dailyDemand = min($dailyDemand, (float) ($aggregateDemandShape['daily_demand'] ?? $dailyDemand));
+                $demandSource = 'ozon_aggregate_robust';
+                $needsManualReview = true;
+            }
+
             if ($seasonalityMultiplier !== 1.0 && $dailyDemand > 0) {
                 $dailyDemand *= $seasonalityMultiplier;
+            }
+            if ($trendMultiplier !== 1.0 && $dailyDemand > 0) {
+                $dailyDemand *= $trendMultiplier;
             }
 
             // v3: Для нового склада — сниженный спрос (пробная партия)
@@ -557,16 +682,31 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
             $abcPriority = $service->calculateAbcPriority($revenue30d);
             $targetCoverDays = $service->getTargetDaysByAbc($abcPriority, $settings, $planDefaultTargetDays);
 
-            $isLowDemandTrial = $marketplace === 'ozon'
-                && $sales30 > 0
-                && $sales30 < 3
-                && $realAvgDailySales <= 0
-                && $effectiveDailySales <= 0;
+            $postingOrderedUnits = (int) ($postingDemandData['ordered_units_total'] ?? 0);
+            $isPostingLowVolume = $postingDemandApplied && $postingOrderedUnits > 0 && $postingOrderedUnits < 5;
+            $isPostingSpikeSuspected = (bool) ($postingDemandShape['suspected_spike'] ?? false);
+            $isAggregateDemandSpikeSuspected = (bool) ($aggregateDemandShape['suspected_spike'] ?? false);
+            $isAggregateDemandWeak = $aggregateDemandShape !== null
+                && in_array(($aggregateDemandShape['confidence_level'] ?? 'warning'), ['warning', 'low', 'bad'], true);
+            $isLowDemandTrial = $marketplace === 'ozon' && (
+                ($sales30 > 0 && $sales30 < 3 && ! $postingDemandApplied)
+                || $isPostingLowVolume
+                || $isPostingSpikeSuspected
+                || $isAggregateDemandSpikeSuspected
+                || $isAggregateDemandWeak
+                || $postingDemandWeakOfferOnly
+            );
             if ($isLowDemandTrial) {
+                $targetCoverDays = min($targetCoverDays, ($isPostingSpikeSuspected || $isAggregateDemandSpikeSuspected) ? 7 : 14);
+                $needsManualReview = true;
+                if (! str_contains($demandSource, '_low_confidence_trial')) {
+                    $demandSource = $demandSource . '_low_confidence_trial';
+                }
+                $lowConfidenceTrialLines++;
+            }
+            if (in_array($promoMode, ['cautious', 'post_promo'], true) && $marketplace === 'ozon') {
                 $targetCoverDays = min($targetCoverDays, 14);
                 $needsManualReview = true;
-                $demandSource = $demandSource . '_low_confidence_trial';
-                $lowConfidenceTrialLines++;
             }
 
             // v3: Для нового склада — короткий горизонт покрытия (макс 14 дней)
@@ -580,6 +720,12 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
 
             // v3: Для нового склада — минимальный safety stock
             if ($supplyType === 'new_warehouse') {
+                $safetyStock = min($safetyStock, $dailyDemand * 3);
+            }
+            if ($isLowDemandTrial) {
+                $safetyStock = min($safetyStock, $dailyDemand * 3);
+            }
+            if (in_array($promoMode, ['cautious', 'post_promo'], true) && $marketplace === 'ozon') {
                 $safetyStock = min($safetyStock, $dailyDemand * 3);
             }
 
@@ -623,13 +769,16 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
                 }
             }
 
-            // --- v2: Ozon рекомендации для этого SKU/кластера ---
+            // Старый Ozon per-SKU/per-cluster recommended_supply больше не
+            // является источником количества: публичный метод с ним obsolete,
+            // а новый planning engine считает qty из фактов спроса/остатков.
             $ozonSkuData = $ozonAnalytics[$wh->sku] ?? null;
-            $ozonClusterRecommendation = null;
+            $deprecatedOzonRecommendedSupply = null;
             if ($clusterId && isset($ozonSkuData['clusters'][$clusterId]['recommended_supply'])) {
-                $ozonClusterRecommendation = (int) $ozonSkuData['clusters'][$clusterId]['recommended_supply'];
+                $deprecatedOzonRecommendedSupply = (int) $ozonSkuData['clusters'][$clusterId]['recommended_supply'];
             }
-            $ozonRecommendedSupply = $ozonClusterRecommendation ?? ($ozonSkuData['total_recommended_supply'] ?? null);
+            $deprecatedOzonRecommendedSupply = $deprecatedOzonRecommendedSupply ?? ($ozonSkuData['total_recommended_supply'] ?? null);
+            $ozonRecommendedSupply = null;
             $ozonLostProfit = $clusterId && isset($ozonSkuData['clusters'][$clusterId]['lost_profit'])
                 ? (float) $ozonSkuData['clusters'][$clusterId]['lost_profit']
                 : (float) ($ozonSkuData['total_lost_profit'] ?? 0);
@@ -639,9 +788,18 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
             $ozonAttentionLevel = $clusterId && isset($ozonSkuData['clusters'][$clusterId]['attention_level'])
                 ? $ozonSkuData['clusters'][$clusterId]['attention_level']
                 : ($ozonSkuData['max_attention_level'] ?? null);
-            if ($marketplace === 'ozon' && $ozonRecommendedSupply !== null && $ozonRecommendedSupply > 0) {
-                $ozonRecommendedLines++;
+            if ($marketplace === 'ozon' && $deprecatedOzonRecommendedSupply !== null && $deprecatedOzonRecommendedSupply > 0) {
+                $deprecatedOzonRecommendedLines++;
             }
+
+            $quantityGuardResult = [
+                'qty' => null,
+                'applied' => false,
+                'cap_qty' => null,
+                'trial_cover_days' => null,
+                'reason' => null,
+                'reasons' => [],
+            ];
 
             // --- Округление qty ---
             $packMultiple = $settings->default_pack_multiple ?? 1;
@@ -660,6 +818,41 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
                     'average' => $service->roundToPackMultiple(($internalQtyRounded + $ozonQtyRounded) / 2, $packMultiple),
                     default => $internalQtyRounded,
                 };
+            }
+
+            if ($marketplace === 'ozon') {
+                $quantityGuardReasons = [];
+                if ($postingDemandWeakOfferOnly) {
+                    $quantityGuardReasons[] = 'cluster_posting_demand_missing';
+                }
+                if ($postingDemandShape && !empty($postingDemandShape['confidence_reasons'])) {
+                    $quantityGuardReasons = array_merge($quantityGuardReasons, (array) $postingDemandShape['confidence_reasons']);
+                }
+                if ($aggregateDemandShape && !empty($aggregateDemandShape['confidence_reasons'])) {
+                    $quantityGuardReasons = array_merge($quantityGuardReasons, (array) $aggregateDemandShape['confidence_reasons']);
+                }
+
+                $quantityGuardResult = $service->applyProtectiveQuantityGuard(
+                    qty: $qtyRounded,
+                    dailyDemand: (float) $dailyDemand,
+                    currentStock: (int) $currentStock,
+                    inTransit: (int) $inTransit,
+                    packMultiple: (int) $packMultiple,
+                    confidenceReasons: $quantityGuardReasons,
+                    lowConfidenceTrial: (bool) $isLowDemandTrial,
+                    promoMode: $promoMode,
+                    marketplace: $marketplace,
+                );
+
+                if (!empty($quantityGuardResult['applied'])) {
+                    $qtyRounded = (int) $quantityGuardResult['qty'];
+                    $needed = min((float) $needed, (float) $qtyRounded);
+                    $capsApplied[] = 'protective_trial_quantity';
+                    $needsManualReview = true;
+                    if (! str_contains($demandSource, '_protected_trial')) {
+                        $demandSource .= '_protected_trial';
+                    }
+                }
             }
 
             // --- Own stock accounting (optional) ---
@@ -728,6 +921,9 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
 
             // --- Финансовые метрики ---
             $offerId = $wh->sku;
+            $advertisingImpact = $marketplace === 'ozon' && isset($ozonAdvertisingByOffer[$offerId]) && is_array($ozonAdvertisingByOffer[$offerId])
+                ? $ozonAdvertisingByOffer[$offerId]
+                : null;
             $barcode = $product?->barcode;
             $price = $product?->price ?? $ue?->price ?? 0;
 
@@ -756,6 +952,21 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
             $commissionCost = $expectedRevenue * ($commissionPercent / 100);
             $totalLogisticsCost = $logisticsCost * $qtyRounded;
             $expectedProfit = $expectedRevenue - $supplyCostEstimate - $commissionCost - $totalLogisticsCost - ($storageCostDaily * $targetCoverDays);
+            $expectedProfitBeforeAds = $expectedProfit;
+            $advertisingSpendPerOrder = $advertisingImpact ? (float) ($advertisingImpact['ad_spend_per_order'] ?? 0) : 0.0;
+            $expectedAdvertisingCost = $advertisingSpendPerOrder > 0
+                ? $advertisingSpendPerOrder * $dailyDemand * $targetCoverDays
+                : 0.0;
+            if ($expectedAdvertisingCost > 0) {
+                $expectedProfit -= $expectedAdvertisingCost;
+                $advertisingProfitAdjustedLines++;
+            }
+            if ($advertisingImpact && in_array('ads_driven_demand', (array) ($advertisingImpact['signals'] ?? []), true)) {
+                $advertisingDrivenLines++;
+            }
+            if ($advertisingImpact && in_array('high_ad_cost', (array) ($advertisingImpact['signals'] ?? []), true)) {
+                $advertisingHighDrrLines++;
+            }
             $roiPercent = $supplyCostEstimate > 0 ? round(($expectedProfit / $supplyCostEstimate) * 100, 2) : 0;
             $turnoverDays = $dailyDemand > 0 ? round(($currentStock + $inTransit + $qtyRounded) / $dailyDemand, 1) : null;
 
@@ -766,7 +977,7 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
             );
             $priorityScore = $priorityResult['score'];
             $priority = $priorityResult['priority'];
-            $missingSources = $service->detectMissingSources($wh, $product, $marketplace, $ue, $hasOzonReport);
+            $missingSources = $service->detectMissingSources($wh, $product, $marketplace, $ue, $hasOzonReport, $postingDemandApplied);
             $demandSourceCounts[$demandSource] = ($demandSourceCounts[$demandSource] ?? 0) + 1;
             if (str_contains($demandSource, 'fallback_long')) {
                 $fallbackLongLines++;
@@ -779,6 +990,33 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
             }
             if ($expectedProfit < 0) {
                 $negativeProfitLines++;
+            }
+
+            $confidenceReasons = [];
+            if ($postingDemandWeakOfferOnly) {
+                $confidenceReasons[] = 'cluster_posting_demand_missing';
+            }
+            if ($postingDemandShape && !empty($postingDemandShape['confidence_reasons'])) {
+                $confidenceReasons = array_merge($confidenceReasons, (array) $postingDemandShape['confidence_reasons']);
+            }
+            if ($aggregateDemandShape && !empty($aggregateDemandShape['confidence_reasons'])) {
+                $confidenceReasons = array_merge($confidenceReasons, (array) $aggregateDemandShape['confidence_reasons']);
+            }
+            if (!empty($quantityGuardResult['applied']) && !empty($quantityGuardResult['reasons'])) {
+                $confidenceReasons = array_merge($confidenceReasons, (array) $quantityGuardResult['reasons']);
+            }
+            if ($expectedProfit < 0) {
+                $confidenceReasons[] = 'negative_expected_profit';
+            }
+            foreach ((array) ($advertisingImpact['signals'] ?? []) as $advertisingSignal) {
+                $confidenceReasons[] = 'performance_' . (string) $advertisingSignal;
+            }
+            $confidenceReasons = array_values(array_unique($confidenceReasons));
+            $confidenceLevel = 'good';
+            if ($isLowDemandTrial || ($postingDemandShape['confidence_level'] ?? null) === 'low' || ($aggregateDemandShape['confidence_level'] ?? null) === 'low') {
+                $confidenceLevel = 'low';
+            } elseif ($needsManualReview || $confidenceReasons !== [] || ($postingDemandShape['confidence_level'] ?? null) === 'warning' || ($aggregateDemandShape['confidence_level'] ?? null) === 'warning') {
+                $confidenceLevel = 'warning';
             }
 
             // --- Explain JSON (v2: расширенный) ---
@@ -801,7 +1039,10 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
                     'in_transit_total' => $inTransit,
                     'daily_demand' => round($dailyDemand, 4),
                     'demand_source' => $demandSource,
+                    'analysis_period_days' => $analysisPeriodDays,
                     'demand_seasonality_multiplier' => $seasonalityMultiplier,
+                    'demand_trend_multiplier' => $trendMultiplier,
+                    'promo_mode' => $promoMode,
                     'ewma_alpha' => $ewmaAlpha,
                     'sales_7d' => $sales7,
                     'sales_14d' => $sales14,
@@ -810,6 +1051,14 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
                     'long_avg' => round($longAvg, 4),
                     'real_avg_daily_sales' => round($realAvgDailySales, 4),
                     'effective_daily_sales' => round($effectiveDailySales, 4),
+                    'posting_fbo_v3_avg_daily_sales' => $postingDemandApplied ? round((float) ($postingDemandData['avg_daily_sales'] ?? 0), 4) : null,
+                    'posting_fbo_v3_robust_daily_sales' => $postingDemandApplied ? round((float) ($postingDemandShape['daily_demand'] ?? 0), 4) : null,
+                    'posting_fbo_v3_ordered_units' => $postingDemandApplied ? (int) ($postingDemandData['ordered_units_total'] ?? 0) : null,
+                    'posting_fbo_v3_analysis_days' => $postingDemandApplied ? (int) ($ozonPostingDemand['days'] ?? $analysisPeriodDays) : null,
+                    'posting_fbo_v3_shape' => $postingDemandShape,
+                    'ozon_aggregate_input_daily_sales' => $aggregateDemandShape ? round((float) ($aggregateDemandShape['input_daily_demand'] ?? 0), 4) : null,
+                    'ozon_aggregate_robust_daily_sales' => $aggregateDemandShape ? round((float) ($aggregateDemandShape['daily_demand'] ?? 0), 4) : null,
+                    'ozon_aggregate_demand_shape' => $aggregateDemandShape,
                     'redemption_rate' => $redemptionRate,
                     'horizon_days' => $horizonDays,
                     'target_cover_days' => $targetCoverDays,
@@ -832,7 +1081,13 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
                     'needed_after_caps' => round($needed, 2),
                     'internal_qty_rounded' => $internalQtyRounded,
                     'qty_anchor' => $marketplace === 'ozon' ? $ozonQtyAnchor : 'internal',
+                    'requested_qty_anchor' => $marketplace === 'ozon' ? $requestedOzonQtyAnchor : 'internal',
+                    'qty_anchor_policy' => $ozonQtyAnchorWasDeprecated
+                        ? 'Старый сигнал Ozon по рекомендуемому количеству отключён: количество считает внутренний модуль планирования.'
+                        : null,
                     'ozon_recommended_supply_used' => $ozonRecommendedSupply,
+                    'deprecated_ozon_recommended_supply_seen' => $deprecatedOzonRecommendedSupply,
+                    'protective_quantity_guard' => $quantityGuardResult,
                     'qty_rounded' => $qtyRounded,
                     'cover_before' => round($coverBefore, 2),
                     'cover_after' => round($coverAfter, 2),
@@ -842,6 +1097,14 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
                     'missing_sources' => $missingSources,
                     'fallbacks' => $dailyDemand === 0.0 ? ['no_sales_data'] : [],
                     'low_confidence_trial' => $isLowDemandTrial,
+                    'confidence_level' => $confidenceLevel,
+                    'confidence_reasons' => $confidenceReasons,
+                    'sources' => [
+                        'demand' => $demandSource,
+                        'stock' => $ozonStockData ? 'analytics_stocks' : (!empty($ozonProductStocks[$wh->sku]) ? 'product_info_stocks' : 'inventory_warehouses'),
+                        'turnover' => $ozonTurnoverData ? 'turnover_stocks' : null,
+                        'in_transit' => $inTransitSupplies > 0 ? 'supply_orders' : ($inTransitApi > 0 ? 'marketplace_inventory' : null),
+                    ],
                 ],
                 'trend' => [
                     'sales_7d' => $sales7,
@@ -859,6 +1122,8 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
                 ],
                 'ozon_analytics' => [
                     'recommended_supply' => $ozonRecommendedSupply,
+                    'deprecated_recommended_supply' => $deprecatedOzonRecommendedSupply,
+                    'recommended_supply_policy' => 'deprecated_not_used_for_quantity',
                     'lost_profit' => $ozonLostProfit,
                     'avg_delivery_time' => $ozonAvgDeliveryTime,
                     'attention_level' => $ozonAttentionLevel,
@@ -886,6 +1151,43 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
                     'logistics_cost' => $logisticsCost,
                     'redemption_rate' => $redemptionRate,
                     'roi_percent' => $roiPercent,
+                    'expected_profit_before_ads' => round($expectedProfitBeforeAds, 2),
+                    'expected_ads_cost' => round($expectedAdvertisingCost, 2),
+                    'expected_profit_after_ads' => round($expectedProfit, 2),
+                ],
+                'ozon_performance' => [
+                    'source' => $advertisingImpact ? 'ozon_performance_product_report' : null,
+                    'report_uuid' => $ozonAdvertisingImpact['uuid'] ?? null,
+                    'offer_id' => $advertisingImpact['offer_id'] ?? null,
+                    'ozon_sku' => $advertisingImpact['ozon_sku'] ?? null,
+                    'ad_enabled' => $advertisingImpact['ad_enabled'] ?? null,
+                    'ad_spend' => $advertisingImpact['ad_spend'] ?? null,
+                    'ad_revenue' => $advertisingImpact['ad_revenue'] ?? null,
+                    'ad_orders' => $advertisingImpact['ad_orders'] ?? null,
+                    'ad_drr_percent' => $advertisingImpact['ad_drr_percent'] ?? null,
+                    'ad_spend_per_order' => $advertisingImpact['ad_spend_per_order'] ?? null,
+                    'signals' => $advertisingImpact['signals'] ?? [],
+                    'signals_ru' => $advertisingImpact['signals_ru'] ?? [],
+                ],
+                'regional_demand' => [
+                    'source' => $ue?->marketplace_data ? 'unit_economics.marketplace_data' : null,
+                    'route_label' => $ue?->route_label,
+                    'expected_locality_rate' => $this->numericOrNull($ue?->marketplace_data['expected_locality_rate'] ?? null),
+                    'dominant_demand_cluster_id' => $ue?->marketplace_data['dominant_demand_cluster_id'] ?? null,
+                    'dominant_demand_cluster_share' => $this->numericOrNull($ue?->marketplace_data['dominant_demand_cluster_share'] ?? null),
+                    'dominant_sales_cluster_id' => $ue?->marketplace_data['dominant_sales_cluster_id'] ?? null,
+                    'dominant_sales_cluster_share' => $this->numericOrNull($ue?->marketplace_data['dominant_sales_cluster_share'] ?? null),
+                    'dominant_stock_cluster_id' => $ue?->marketplace_data['dominant_stock_cluster_id'] ?? null,
+                    'dominant_stock_cluster_share' => $this->numericOrNull($ue?->marketplace_data['dominant_stock_cluster_share'] ?? null),
+                    'clusters_summary' => $this->compactRegionalProfile($ue?->marketplace_data['clusters_summary'] ?? null),
+                    'sales_profile' => $this->compactRegionalProfile($ue?->marketplace_data['sales_profile'] ?? null),
+                    'delivery_fo_profile' => $this->compactRegionalProfile(
+                        $ue?->marketplace_data['delivery_fo_profile']
+                            ?? $ue?->marketplace_data['by_delivery_fo']
+                            ?? null
+                    ),
+                    'warehouse_sales_profile' => $this->compactRegionalProfile($ue?->marketplace_data['warehouse_sales_profile'] ?? null),
+                    'stock_profile' => $this->compactRegionalProfile($ue?->marketplace_data['stock_profile'] ?? null),
                 ],
                 'simulation_summary' => [
                     'oos_date' => $oosDate,
@@ -905,11 +1207,6 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
 
             // Пропускаем строки с нулевым количеством
             if ($qtyRounded <= 0) {
-                continue;
-            }
-
-            if ($skipNegativeProfit && $expectedProfit < 0) {
-                $skippedNegativeProfitLines++;
                 continue;
             }
 
@@ -1063,6 +1360,31 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
             $totalQty = array_sum(array_map(fn (array $line) => (int) ($line['qty_rounded'] ?? 0), $lines));
         }
 
+        $lines = $constraintService->appendMarketplaceNeedCandidates($lines, $plan, $marketplace, $products, $unitEconomics);
+        $candidateLinesBeforeConstraints = count($lines);
+        $candidateQtyBeforeConstraints = array_sum(array_map(fn (array $line): int => (int) ($line['qty_rounded'] ?? 0), $lines));
+        $constraintResult = $constraintService->apply($lines, $plan, $marketplace);
+        $lines = $constraintResult['lines'];
+        $constraintsSummary = $constraintResult['summary'];
+
+        $lines = app(TerritorialPlanningService::class)->enrichLines($lines, $plan);
+
+        $budgetLimit = (float) ($plan->budget_limit ?? 0);
+        $optimization = app(PlanLineOptimizer::class)->optimize($lines, $plan, [
+            'min_cover_days' => $minCoverDays,
+            'marketplace' => $marketplace,
+            'source_candidates_total' => $candidateLinesBeforeConstraints,
+            'source_qty_total' => $candidateQtyBeforeConstraints,
+            'constraints_summary' => $constraintsSummary,
+        ]);
+        $lines = $optimization['lines'];
+        $selectionSummary = $optimization['summary'];
+        $skippedNegativeProfitLines = (int) ($selectionSummary['negative_profit_skipped_lines'] ?? 0);
+        $budgetSkippedLines = (int) ($selectionSummary['budget_skipped_lines'] ?? 0);
+        $budgetUsed = (float) ($selectionSummary['budget_used'] ?? 0);
+        $totalLines = count($lines);
+        $totalQty = array_sum(array_map(fn (array $line) => (int) ($line['qty_rounded'] ?? 0), $lines));
+
         // Bulk insert lines
         if (!empty($lines)) {
             foreach (array_chunk($lines, 500) as $chunk) {
@@ -1132,7 +1454,78 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
             unset($defInfo);
         }
 
-        $resultJson = ['redistribution' => $redistributionSuggestions];
+        $economicsSummary = [
+            'total_supply_cost' => 0.0,
+            'total_expected_revenue' => 0.0,
+            'total_expected_profit' => 0.0,
+            'budget_limit' => $budgetLimit > 0 ? $budgetLimit : null,
+            'budget_used' => $budgetLimit > 0 ? round($budgetUsed, 2) : null,
+            'budget_skipped_lines' => $budgetSkippedLines,
+        ];
+
+        foreach ($lines as $line) {
+            $economicsSummary['total_supply_cost'] += (float) ($line['supply_cost_estimate'] ?? 0);
+            $economicsSummary['total_expected_revenue'] += (float) ($line['expected_revenue'] ?? 0);
+            $economicsSummary['total_expected_profit'] += (float) ($line['expected_profit'] ?? 0);
+        }
+        $economicsSummary['total_supply_cost'] = round($economicsSummary['total_supply_cost'], 2);
+        $economicsSummary['total_expected_revenue'] = round($economicsSummary['total_expected_revenue'], 2);
+        $economicsSummary['total_expected_profit'] = round($economicsSummary['total_expected_profit'], 2);
+
+        $deficitSurplusSummary = app(DeficitSurplusPlanningService::class)->analyze($lines, $plan, [
+            'min_cover_days' => $minCoverDays,
+            'target_cover_days' => $targetCoverDays,
+        ]);
+        $deficitSummary = $deficitSurplusSummary['deficit_summary'];
+        $surplusSummary = $deficitSurplusSummary['surplus_summary'];
+
+        $inventoryLastUpdated = $warehouses->max('updated_at');
+        $inventoryLastUpdatedIso = $inventoryLastUpdated
+            ? Carbon::parse($inventoryLastUpdated)->toISOString()
+            : null;
+
+        $factsFreshness = [
+            'inventory_warehouses' => [
+                'items' => $warehouses->count(),
+                'last_updated_at' => $inventoryLastUpdatedIso,
+            ],
+            'products' => [
+                'items' => $products->count(),
+            ],
+            'unit_economics' => [
+                'items' => $unitEconomics->count(),
+            ],
+        ];
+
+        $demandGranularity = match ($marketplace) {
+            'ozon' => 'cluster',
+            'yandex', 'yandex_market' => 'sku',
+            default => 'warehouse',
+        };
+        $marketplaceCapabilities = app(MarketplacePlanningCapabilityService::class)->forMarketplace($marketplace);
+        $territorialSummary = app(TerritorialPlanningService::class)->summarize($lines, $plan);
+        $planQualityAudit = app(PlanQualityAuditService::class)->audit($lines, $plan, [
+            'selection_summary' => $selectionSummary,
+            'constraints_summary' => $constraintsSummary,
+            'territorial_summary' => $territorialSummary,
+            'economics_summary' => $economicsSummary,
+            'deficit_surplus_summary' => $deficitSurplusSummary,
+        ]);
+
+        $resultJson = [
+            'redistribution' => $redistributionSuggestions,
+            'facts_freshness' => $factsFreshness,
+            'demand_granularity' => $demandGranularity,
+            'deficit_summary' => $deficitSummary,
+            'surplus_summary' => $surplusSummary,
+            'deficit_surplus_summary' => $deficitSurplusSummary,
+            'economics_summary' => $economicsSummary,
+            'selection_summary' => $selectionSummary,
+            'constraints_summary' => $constraintsSummary,
+            'territorial_summary' => $territorialSummary,
+            'plan_quality_audit' => $planQualityAudit,
+            'marketplace_capabilities' => $marketplaceCapabilities,
+        ];
 
         // --- Locality summary (Ozon only) ---
         if ($marketplace === 'ozon') {
@@ -1155,57 +1548,162 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
             $totalSkus, $qStocksCoverage, $qSalesHistory,
             $qInTransit, $qDestination, $qBarcode, $marketplace
         );
-        $fallbackLongShare = $totalLines > 0 ? round(($fallbackLongLines / $totalLines) * 100, 2) : 0.0;
+        $demandEvaluatedLines = max(1, array_sum($demandSourceCounts));
+        $fallbackLongShare = min(100.0, round(($fallbackLongLines / $demandEvaluatedLines) * 100, 2));
+        $remainingNegativeProfitLines = max(0, $negativeProfitLines - $skippedNegativeProfitLines);
         $negativeProfitShare = ($totalLines + $skippedNegativeProfitLines) > 0
-            ? round(($negativeProfitLines / max($totalLines + $skippedNegativeProfitLines, 1)) * 100, 2)
+            ? min(100.0, round(($remainingNegativeProfitLines / max($totalLines + $skippedNegativeProfitLines, 1)) * 100, 2))
             : 0.0;
         $qualityGateStatus = 'good';
         $qualityGateReasons = [];
 
         if ($marketplace === 'ozon') {
-            if (! $hasOzonReport) {
-                $qualityGateReasons[] = 'нет Ozon order report';
+            $hasOzonPostingDemand = !empty($ozonPostingDemand['by_offer']);
+            $hasTrustedOzonDemand = $hasOzonReport || $hasOzonPostingDemand;
+            if (! $hasTrustedOzonDemand) {
+                $qualityGateReasons[] = 'нет автоматического спроса из заказов Ozon';
             }
             if (count($ozonStockAnalytics) === 0 && count($ozonStockAnalyticsCluster) === 0) {
-                $qualityGateReasons[] = 'нет Ozon stock analytics';
+                $qualityGateReasons[] = 'нет аналитики остатков Ozon';
             }
-            if (count($ozonAnalytics) === 0 || $ozonRecommendedLines === 0) {
-                $qualityGateReasons[] = 'нет рекомендаций Ozon';
+            if (count($ozonAnalytics) === 0) {
+                $qualityGateReasons[] = 'нет сводки Ozon по скорости доставки';
             }
             if ($fallbackLongLines > 0) {
-                $qualityGateReasons[] = "{$fallbackLongLines} строк рассчитаны по fallback_long";
+                $qualityGateReasons[] = "{$fallbackLongLines} строк рассчитаны только по длинному окну продаж: коротких данных недостаточно";
             }
-            if ($negativeProfitLines > 0) {
-                $qualityGateReasons[] = "{$negativeProfitLines} строк с отрицательной прибылью";
+            if ($remainingNegativeProfitLines > 0) {
+                $qualityGateReasons[] = "{$remainingNegativeProfitLines} строк с отрицательной прибылью";
+            }
+            if ($skippedNegativeProfitLines > 0) {
+                $qualityGateReasons[] = "{$skippedNegativeProfitLines} убыточных строк отсечены";
             }
             if ($manualReviewLines > 0) {
                 $qualityGateReasons[] = "{$manualReviewLines} строк требуют проверки спроса";
             }
+            if ($advertisingDrivenLines > 0) {
+                $qualityGateReasons[] = "{$advertisingDrivenLines} строк со спросом, поддержанным рекламой";
+            }
+            if ($advertisingHighDrrLines > 0) {
+                $qualityGateReasons[] = "{$advertisingHighDrrLines} строк с высоким ДРР";
+            }
 
-            if (! $hasOzonReport || $fallbackLongShare >= 50 || $negativeProfitShare >= 40) {
+            if (! $hasTrustedOzonDemand || $fallbackLongShare >= 50 || $negativeProfitShare >= 40) {
                 $qualityGateStatus = 'bad';
             } elseif ($qualityGateReasons !== []) {
                 $qualityGateStatus = 'warning';
             }
         }
 
+        $planningFactSources = [
+            'demand' => !empty($ozonPostingDemand['by_offer']) ? 'posting_fbo_v3' : ($hasOzonReport ? 'ozon_order_report' : null),
+            'stock' => (count($ozonStockAnalytics) > 0 || count($ozonStockAnalyticsCluster) > 0)
+                ? 'analytics_stocks'
+                : (count($ozonProductStocks) > 0 ? 'product_info_stocks' : 'inventory_warehouses'),
+            'turnover' => count($ozonTurnover) > 0 ? 'turnover_stocks' : null,
+            'delivery_health' => count($ozonAnalytics) > 0 ? 'average_delivery_time_summary' : null,
+            'in_transit' => $includeInTransit && count($supplyInTransit) > 0 ? 'supply_orders' : null,
+            'advertising' => ($ozonAdvertisingImpact['success'] ?? false) ? 'ozon_performance_product_report' : null,
+        ];
+        $planningFactSources = app(PlanningFactSnapshotService::class)->withConstraintSources($planningFactSources, $constraintsSummary);
+
         $qualityJson['meta'] = array_merge($qualityJson['meta'] ?? [], [
             'quality_gate_status' => $qualityGateStatus,
             'quality_gate_reasons' => $qualityGateReasons,
             'demand_source_counts' => $demandSourceCounts,
             'missing_source_counts' => $missingSourceCounts,
+            'planning_fact_sources' => $planningFactSources,
+            'analysis_period_days' => $analysisPeriodDays,
+            'ozon_posting_demand_skus' => count($ozonPostingDemand['by_offer'] ?? []),
+            'ozon_product_stock_skus' => count($ozonProductStocks),
             'fallback_long_lines' => $fallbackLongLines,
             'fallback_long_share_percent' => $fallbackLongShare,
-            'negative_profit_lines' => $negativeProfitLines,
+            'negative_profit_lines' => $remainingNegativeProfitLines,
             'negative_profit_share_percent' => $negativeProfitShare,
             'skipped_negative_profit_lines' => $skippedNegativeProfitLines,
-            'ozon_recommended_lines' => $ozonRecommendedLines,
+            'ozon_recommended_lines' => 0,
+            'deprecated_ozon_recommended_lines' => $deprecatedOzonRecommendedLines,
             'manual_review_lines' => $manualReviewLines,
             'low_confidence_trial_lines' => $lowConfidenceTrialLines,
+            'advertising_report_uuid' => $ozonAdvertisingImpact['uuid'] ?? null,
+            'advertising_report_loaded' => (bool) ($ozonAdvertisingImpact['success'] ?? false),
+            'advertising_products_count' => (int) ($ozonAdvertisingImpact['summary']['products_count'] ?? 0),
+            'advertising_driven_lines' => $advertisingDrivenLines,
+            'advertising_high_drr_lines' => $advertisingHighDrrLines,
+            'advertising_profit_adjusted_lines' => $advertisingProfitAdjustedLines,
+            'plan_quality_audit' => $planQualityAudit,
             'advanced_params_applied' => [
+                'analysis_period_days' => $analysisPeriodDays,
                 'demand_seasonality_multiplier' => $seasonalityMultiplier,
+                'trend_multiplier' => $trendMultiplier,
+                'promo_mode' => $promoMode,
+                'include_in_transit' => $includeInTransit,
                 'ozon_qty_anchor' => $ozonQtyAnchor,
+                'requested_ozon_qty_anchor' => $requestedOzonQtyAnchor,
+                'ozon_qty_anchor_deprecated' => $ozonQtyAnchorWasDeprecated,
                 'skip_negative_profit' => $skipNegativeProfit,
+                'budget_limit' => $budgetLimit > 0 ? $budgetLimit : null,
+                'budget_used' => $budgetLimit > 0 ? round($budgetUsed, 2) : null,
+                'budget_skipped_lines' => $budgetSkippedLines,
+                'selection_summary' => $selectionSummary,
+                'constraints_summary' => $constraintsSummary,
+                'territorial_summary' => $territorialSummary,
+                'performance_report_uuid' => $ozonAdvertisingImpact['uuid'] ?? null,
+                'performance_summary' => $ozonAdvertisingImpact['summary'] ?? null,
+                'plan_quality_audit' => $planQualityAudit,
+            ],
+        ]);
+
+        app(PlanningFactSnapshotService::class)->complete($plan, [
+            'facts_freshness' => $factsFreshness,
+            'planning_sources' => $planningFactSources,
+            'demand_facts' => [
+                'analysis_period_days' => $analysisPeriodDays,
+                'ozon_posting_demand_days' => (int) ($ozonPostingDemand['days'] ?? $analysisPeriodDays),
+                'source_counts' => $demandSourceCounts,
+                'fallback_long_lines' => $fallbackLongLines,
+                'manual_review_lines' => $manualReviewLines,
+                'low_confidence_trial_lines' => $lowConfidenceTrialLines,
+                'granularity' => $demandGranularity,
+                'advertising_driven_lines' => $advertisingDrivenLines,
+                'advertising_high_drr_lines' => $advertisingHighDrrLines,
+            ],
+            'stock_facts' => [
+                'inventory_rows' => $warehouses->count(),
+                'ozon_product_stock_skus' => count($ozonProductStocks),
+                'ozon_stock_analytics_skus' => count($ozonStockAnalytics),
+            ],
+            'supply_facts' => [
+                'include_in_transit' => $includeInTransit,
+                'supply_orders_skus' => count($supplyInTransit),
+            ],
+            'economics_facts' => array_merge($economicsSummary, [
+                'advertising_report_uuid' => $ozonAdvertisingImpact['uuid'] ?? null,
+                'advertising_summary' => $ozonAdvertisingImpact['summary'] ?? null,
+                'advertising_profit_adjusted_lines' => $advertisingProfitAdjustedLines,
+            ]),
+            'constraints_facts' => [
+                'selected_cluster_ids' => $selectedOzonClusterIds,
+                'budget_limit' => $budgetLimit > 0 ? $budgetLimit : null,
+                'budget_used' => $budgetLimit > 0 ? round($budgetUsed, 2) : null,
+                'budget_skipped_lines' => $budgetSkippedLines,
+                'constraints_summary' => $constraintsSummary,
+                'constraint_metadata' => $params['constraint_metadata'] ?? null,
+                'territorial_summary' => $territorialSummary,
+                'plan_quality_audit' => $planQualityAudit,
+                'marketplace_capabilities' => $marketplaceCapabilities,
+            ],
+            'summary' => [
+                'total_lines' => $totalLines,
+                'total_qty' => $totalQty,
+                'deficit_summary' => $deficitSummary,
+                'surplus_summary' => $surplusSummary,
+                'deficit_surplus_summary' => $deficitSurplusSummary,
+                'economics_summary' => $economicsSummary,
+                'selection_summary' => $selectionSummary,
+                'constraints_summary' => $constraintsSummary,
+                'territorial_summary' => $territorialSummary,
+                'plan_quality_audit' => $planQualityAudit,
             ],
         ]);
         $qualityScore = $qualityJson['total'];
@@ -1233,7 +1731,10 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
         ]);
 
         $plan = AutoSupplyPlan::find($this->planId);
-        $plan?->markError('Job failed: ' . $exception->getMessage());
+        if ($plan) {
+            app(PlanningFactSnapshotService::class)->fail($plan, $exception->getMessage());
+            $plan->markError('Job failed: ' . $exception->getMessage());
+        }
     }
 
     /**
@@ -1325,6 +1826,171 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
         $normalizedName = OzonWarehouseCluster::normalizeWarehouseName($warehouse->warehouse_name);
 
         return $clusterMapping[$normalizedName] ?? null;
+    }
+
+    private function numericOrNull(mixed $value): ?float
+    {
+        return is_numeric($value) ? (float) $value : null;
+    }
+
+    /**
+     * @param array<string, mixed> $params
+     * @return array<string, mixed>
+     */
+    private function loadOzonAdvertisingImpact(AutoSupplyPlan $plan, array $params): array
+    {
+        if ($plan->marketplace !== 'ozon') {
+            return [
+                'success' => false,
+                'status' => 'not_applicable',
+            ];
+        }
+
+        $uuid = trim((string) ($params['performance_report_uuid'] ?? $params['ozon_performance_report_uuid'] ?? ''));
+        if ($uuid === '') {
+            return [
+                'success' => false,
+                'status' => 'not_requested',
+            ];
+        }
+
+        try {
+            $integration = Integration::find((int) $plan->integration_id);
+            $workspaceId = (int) ($integration?->work_space_id ?? 0);
+            $remote = app(SellicoApiService::class)->getIntegrationById(
+                (int) $plan->integration_id,
+                $workspaceId > 0 ? $workspaceId : null
+            );
+
+            if (! ($remote['success'] ?? false)) {
+                return [
+                    'success' => false,
+                    'status' => 'integration_credentials_unavailable',
+                    'uuid' => $uuid,
+                    'message' => $remote['error'] ?? 'Не удалось получить интеграцию из основного backend',
+                ];
+            }
+
+            $impact = app(OzonPerformanceApiService::class)->productAdvertisingImpact(
+                is_array($remote['credentials'] ?? null) ? $remote['credentials'] : [],
+                $uuid,
+                5000,
+                is_array($params['performance_period'] ?? null) ? ($params['performance_period']['date_from'] ?? null) : null,
+                is_array($params['performance_period'] ?? null) ? ($params['performance_period']['date_to'] ?? null) : null
+            );
+            $impact['uuid'] = $uuid;
+
+            return $impact;
+        } catch (\Throwable $e) {
+            Log::warning('CalculateAutoSupplyPlanJob: Ozon Performance impact failed', [
+                'plan_id' => $plan->id,
+                'integration_id' => $plan->integration_id,
+                'uuid' => $uuid,
+                'error' => $e->getMessage(),
+            ]);
+
+            return [
+                'success' => false,
+                'status' => 'request_failed',
+                'uuid' => $uuid,
+                'message' => $e->getMessage(),
+            ];
+        }
+    }
+
+    /**
+     * Период анализа продаж управляет источником спроса, а horizon_days —
+     * горизонтом покрытия. Раньше Ozon postings всегда грузились за 60 дней,
+     * из-за чего выбранный пользователем период не влиял на главный сигнал.
+     *
+     * @param array<string, mixed> $params
+     */
+    private function analysisPeriodDays(array $params, int $horizonDays): int
+    {
+        $value = (int) ($params['analysis_period_days'] ?? $horizonDays);
+        $allowed = [7, 14, 28, 30, 56, 60, 90];
+
+        if (in_array($value, $allowed, true)) {
+            return $value;
+        }
+
+        $closest = 30;
+        $smallestDiff = PHP_INT_MAX;
+        foreach ($allowed as $allowedValue) {
+            $diff = abs($allowedValue - $value);
+            if ($diff < $smallestDiff) {
+                $closest = $allowedValue;
+                $smallestDiff = $diff;
+            }
+        }
+
+        return $closest;
+    }
+
+    /**
+     * Ozon no longer has a confirmed per-SKU/per-cluster recommended_supply API
+     * contract for supply quantity. Keep old request values accepted for
+     * backwards compatibility, but always route Ozon quantity through the
+     * internal planning engine.
+     */
+    private function effectiveOzonQtyAnchor(string $requestedAnchor, string $marketplace): string
+    {
+        if ($marketplace !== 'ozon') {
+            return 'internal';
+        }
+
+        return 'internal';
+    }
+
+    /**
+     * @return list<array<string, mixed>>
+     */
+    private function compactRegionalProfile(mixed $profile): array
+    {
+        if (! is_array($profile)) {
+            return [];
+        }
+
+        $rows = [];
+        foreach ($profile as $key => $row) {
+            if (is_array($row)) {
+                $rows[] = $row;
+                continue;
+            }
+
+            if (is_numeric($row) && (string) $key !== '') {
+                $rows[] = [
+                    'region' => (string) $key,
+                    'name' => (string) $key,
+                    'orders' => (float) $row,
+                ];
+            }
+        }
+
+        $totalOrders = array_sum(array_map(
+            static fn (mixed $row): float => is_array($row) && is_numeric($row['orders'] ?? null) ? (float) $row['orders'] : 0.0,
+            $rows
+        ));
+        $compact = [];
+        foreach (array_slice($rows, 0, 8) as $row) {
+            if (! is_array($row)) {
+                continue;
+            }
+
+            $compact[] = array_filter([
+                'cluster_id' => $row['cluster_id'] ?? $row['id'] ?? null,
+                'cluster_name' => $row['cluster_name'] ?? $row['name'] ?? null,
+                'warehouse_id' => $row['warehouse_id'] ?? null,
+                'warehouse_name' => $row['warehouse_name'] ?? null,
+                'region' => $row['region'] ?? $row['fo'] ?? $row['district'] ?? null,
+                'share_percent' => $this->numericOrNull($row['share_percent'] ?? $row['share'] ?? $row['percent'] ?? null)
+                    ?? ($totalOrders > 0 && is_numeric($row['orders'] ?? null) ? round(((float) $row['orders'] / $totalOrders) * 100, 2) : null),
+                'orders' => $this->numericOrNull($row['orders'] ?? $row['qty'] ?? $row['quantity'] ?? null),
+                'locality_rate' => $this->numericOrNull($row['locality_rate'] ?? $row['local_share_percent'] ?? null),
+            ], static fn ($value): bool => $value !== null && $value !== '');
+        }
+
+        return $compact;
     }
 
     /**

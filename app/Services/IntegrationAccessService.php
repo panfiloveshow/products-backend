@@ -215,9 +215,17 @@ class IntegrationAccessService
 
     private function sanitizeStoredCredentials(array $credentials): array
     {
+        $runtimeOnlyKeys = [
+            'performance_api_key',
+            'performance_client_secret',
+        ];
+
         return array_filter(
             $credentials,
-            static fn ($value, $key) => $value !== null && $value !== '' && ! str_starts_with((string) $key, '_'),
+            static fn ($value, $key) => $value !== null
+                && $value !== ''
+                && ! str_starts_with((string) $key, '_')
+                && ! in_array((string) $key, $runtimeOnlyKeys, true),
             ARRAY_FILTER_USE_BOTH
         );
     }

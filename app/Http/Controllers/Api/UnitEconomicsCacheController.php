@@ -11,6 +11,7 @@ use App\Jobs\RecalculateUnitEconomicsCacheJob;
 use App\Jobs\SyncUnitEconomicsJob;
 use App\Models\Integration;
 use App\Models\InventoryWarehouse;
+use App\Models\LocalityMetricDaily;
 use App\Models\Product;
 use App\Models\UnitEconomics;
 use App\Models\UnitEconomicsCache;
@@ -47,6 +48,14 @@ use Symfony\Component\HttpFoundation\StreamedResponse;
  */
 class UnitEconomicsCacheController extends Controller
 {
+    private const EXPORT_TEMPLATE_VERSION = '2026-05-25-04';
+
+    private const EXPORT_TEMPLATE_FORMAT = 'v2';
+
+    private const EXPORT_TEMPLATE_SOURCE = 'UnitEconomicsCacheController::exportExcel';
+
+    private const EXPORT_TEMPLATE_MARKER_CELL = 'AZ1';
+
     private UnitEconomicsCacheService $cacheService;
 
     private UnitEconomicsService $unitEconomicsService;
@@ -80,11 +89,24 @@ class UnitEconomicsCacheController extends Controller
             'fulfillment_type' => 'required|string|in:FBO,FBS,RFBS,EXPRESS,DBS,EDBS,DBW,MIXED,FBY,fbo,fbs,rfbs,express,dbs,edbs,dbw,mixed,fby',
             'search' => 'nullable|string|max:255',
             'profitable' => 'nullable|boolean',
+            'quick_filter' => 'nullable|string|in:unprofitable,negative_margin,no_sales_28d,low_confidence,high_non_locality,locality_risk,high_non_local_markup,data_gap',
             'margin_min' => 'nullable|numeric',
             'margin_max' => 'nullable|numeric',
+            'profit_min' => 'nullable|numeric',
+            'profit_max' => 'nullable|numeric',
+            'roi_min' => 'nullable|numeric',
+            'roi_max' => 'nullable|numeric',
             'price_min' => 'nullable|numeric',
             'price_max' => 'nullable|numeric',
-            'sort' => 'nullable|string|in:sku,product_name,price,net_profit,margin_percent,commission_percent,stock,total_stock,current_stock,days_of_stock',
+            'logistics_min' => 'nullable|numeric',
+            'logistics_max' => 'nullable|numeric',
+            'sales_min' => 'nullable|integer|min:0',
+            'sales_max' => 'nullable|integer|min:0',
+            'non_local_markup_min' => 'nullable|numeric',
+            'non_local_markup_max' => 'nullable|numeric',
+            'confidence' => 'nullable|string|in:low,medium,high',
+            'locality_state' => 'nullable|string|in:local,non_local,mixed,no_sales',
+            'sort' => 'nullable|string|in:sku,product_name,price,net_profit,margin_percent,commission_percent,sales_count,stock,total_stock,current_stock,days_of_stock,relevance',
             'sort_order' => 'nullable|string|in:asc,desc',
             'limit' => 'nullable|integer|min:1|max:500',
             'page' => 'nullable|integer|min:1',
@@ -113,13 +135,25 @@ class UnitEconomicsCacheController extends Controller
             ->forScheme($validated['fulfillment_type'])
             ->search($validated['search'] ?? null)
             ->profitable($validated['profitable'] ?? null)
+            ->quickFilter($validated['quick_filter'] ?? null)
             ->marginRange($validated['margin_min'] ?? null, $validated['margin_max'] ?? null)
-            ->priceRange($validated['price_min'] ?? null, $validated['price_max'] ?? null);
+            ->profitRange($validated['profit_min'] ?? null, $validated['profit_max'] ?? null)
+            ->roiRange($validated['roi_min'] ?? null, $validated['roi_max'] ?? null)
+            ->priceRange($validated['price_min'] ?? null, $validated['price_max'] ?? null)
+            ->effectiveLogisticsRange($validated['logistics_min'] ?? null, $validated['logistics_max'] ?? null)
+            ->salesRange($validated['sales_min'] ?? null, $validated['sales_max'] ?? null)
+            ->nonLocalMarkupRange($validated['non_local_markup_min'] ?? null, $validated['non_local_markup_max'] ?? null)
+            ->confidence($validated['confidence'] ?? null)
+            ->localityState($validated['locality_state'] ?? null);
         $statsQuery = clone $query;
 
         // Сортировка
-        $sortField = $validated['sort'] ?? 'sku';
+        $searchQuery = trim((string) ($validated['search'] ?? ''));
+        $sortField = $validated['sort'] ?? ($searchQuery !== '' ? 'relevance' : 'sku');
         $sortOrder = $validated['sort_order'] ?? 'asc';
+        if ($sortField === 'relevance' && $searchQuery === '') {
+            $sortField = 'sku';
+        }
         if ($marketplace === 'wildberries' && in_array($sortField, ['stock', 'total_stock', 'current_stock', 'days_of_stock'], true)) {
             $sortField = 'sku';
         }
@@ -128,7 +162,8 @@ class UnitEconomicsCacheController extends Controller
             $sortField,
             $sortOrder,
             (int) $validated['integration_id'],
-            $marketplace
+            $marketplace,
+            $searchQuery
         );
 
         // Пагинация без paginate(): стандартный paginate() делает COUNT(*) до
@@ -207,7 +242,8 @@ class UnitEconomicsCacheController extends Controller
         string $sortField,
         string $sortOrder,
         ?int $integrationId = null,
-        ?string $marketplace = null
+        ?string $marketplace = null,
+        ?string $searchQuery = null
     ): void {
         $sortOrder = strtolower($sortOrder) === 'desc' ? 'desc' : 'asc';
 
@@ -287,6 +323,25 @@ class UnitEconomicsCacheController extends Controller
             )->orderBy('unit_economics_cache.sku');
 
             return;
+        }
+
+        if ($sortField === 'relevance') {
+            $search = trim((string) $searchQuery);
+            if ($search !== '') {
+                $driver = $query->getConnection()->getDriverName();
+                $likeOperator = $driver === 'pgsql' ? 'ilike' : 'like';
+                $query->orderByRaw(
+                    'CASE WHEN unit_economics_cache.sku = ? THEN 0 '.
+                    'WHEN unit_economics_cache.sku '.$likeOperator.' ? THEN 1 '.
+                    'WHEN unit_economics_cache.product_name '.$likeOperator.' ? THEN 2 '.
+                    'ELSE 3 END asc',
+                    [$search, "{$search}%", "%{$search}%"]
+                )->orderBy('unit_economics_cache.sku');
+
+                return;
+            }
+
+            $sortField = 'sku';
         }
 
         $query->orderBy($sortField, $sortOrder);
@@ -978,10 +1033,23 @@ class UnitEconomicsCacheController extends Controller
             // ровно то, что менеджер видит на странице, без листания пагинации.
             'search' => 'nullable|string|max:255',
             'profitable' => 'nullable|boolean',
+            'quick_filter' => 'nullable|string|in:unprofitable,negative_margin,no_sales_28d,low_confidence,high_non_locality,locality_risk,high_non_local_markup,data_gap',
             'margin_min' => 'nullable|numeric',
             'margin_max' => 'nullable|numeric',
+            'profit_min' => 'nullable|numeric',
+            'profit_max' => 'nullable|numeric',
+            'roi_min' => 'nullable|numeric',
+            'roi_max' => 'nullable|numeric',
             'price_min' => 'nullable|numeric',
             'price_max' => 'nullable|numeric',
+            'logistics_min' => 'nullable|numeric',
+            'logistics_max' => 'nullable|numeric',
+            'sales_min' => 'nullable|integer|min:0',
+            'sales_max' => 'nullable|integer|min:0',
+            'non_local_markup_min' => 'nullable|numeric',
+            'non_local_markup_max' => 'nullable|numeric',
+            'confidence' => 'nullable|string|in:low,medium,high',
+            'locality_state' => 'nullable|string|in:local,non_local,mixed,no_sales',
         ])->validate();
 
         $resolution = $this->integrationAccessService->ensureAccessibleIntegration(
@@ -995,6 +1063,12 @@ class UnitEconomicsCacheController extends Controller
 
         $fulfillmentType = $validated['fulfillment_type'];
         $integrationId = (int) $validated['integration_id'];
+        $ozonLocalitySnapshotDate = $marketplace === 'ozon'
+            ? LocalityMetricDaily::query()
+                ->where('integration_id', $integrationId)
+                ->where('period_days', 28)
+                ->max('snapshot_date')
+            : null;
 
         // Те же фильтры, что в index — выгружаем «то что видит менеджер»
         // (без пагинации: Excel должен содержать ВСЕ отфильтрованные строки).
@@ -1007,7 +1081,15 @@ class UnitEconomicsCacheController extends Controller
             ->search($validated['search'] ?? null)
             ->profitable($validated['profitable'] ?? null)
             ->marginRange($validated['margin_min'] ?? null, $validated['margin_max'] ?? null)
+            ->quickFilter($validated['quick_filter'] ?? null)
+            ->profitRange($validated['profit_min'] ?? null, $validated['profit_max'] ?? null)
+            ->roiRange($validated['roi_min'] ?? null, $validated['roi_max'] ?? null)
             ->priceRange($validated['price_min'] ?? null, $validated['price_max'] ?? null)
+            ->effectiveLogisticsRange($validated['logistics_min'] ?? null, $validated['logistics_max'] ?? null)
+            ->salesRange($validated['sales_min'] ?? null, $validated['sales_max'] ?? null)
+            ->nonLocalMarkupRange($validated['non_local_markup_min'] ?? null, $validated['non_local_markup_max'] ?? null)
+            ->confidence($validated['confidence'] ?? null)
+            ->localityState($validated['locality_state'] ?? null)
             ->with('product')
             ->orderBy('sku')
             ->orderBy('id');
@@ -1017,12 +1099,30 @@ class UnitEconomicsCacheController extends Controller
             &$enrichedItems,
             $integrationId,
             $marketplace,
-            $fulfillmentType
+            $fulfillmentType,
+            $ozonLocalitySnapshotDate
         ) {
             $settingsMap = UnitEconomicsSettings::where('integration_id', $integrationId)
                 ->whereIn('sku', $items->pluck('sku')->unique()->values()->all())
                 ->get()
                 ->keyBy('sku');
+
+            $localityBySku = collect();
+            if ($marketplace === 'ozon' && $ozonLocalitySnapshotDate) {
+                $localityBySku = LocalityMetricDaily::query()
+                    ->where('integration_id', $integrationId)
+                    ->where('period_days', 28)
+                    ->where('snapshot_date', $ozonLocalitySnapshotDate)
+                    ->whereIn('sku', $items->pluck('sku')->unique()->values()->all())
+                    ->get([
+                        'sku',
+                        'orders_count',
+                        'local_share_percent',
+                        'avg_markup_percent',
+                        'calculation_confidence',
+                    ])
+                    ->keyBy('sku');
+            }
 
             $pageContext = $this->buildUnitEconomicsPageContext($marketplace, $items);
 
@@ -1031,8 +1131,15 @@ class UnitEconomicsCacheController extends Controller
             // те же net_profit/margin/to_settlement, что менеджер видит в UI.
             foreach ($items as $cache) {
                 $settings = $settingsMap->get($cache->sku);
+                /** @var LocalityMetricDaily|null $localityRow */
+                $localityRow = $localityBySku->get($cache->sku);
 
-                $enrichedItems[] = $this->enrichCacheItem($cache, $fulfillmentType, $settings, $pageContext);
+                $enriched = $this->enrichCacheItem($cache, $fulfillmentType, $settings, $pageContext);
+                if ($marketplace === 'ozon') {
+                    $enriched = $this->applyOzonLocalityMetricsToExportItem($enriched, $localityRow);
+                }
+
+                $enrichedItems[] = $enriched;
             }
         });
 
@@ -1056,14 +1163,7 @@ class UnitEconomicsCacheController extends Controller
             $writer = new Xlsx($spreadsheet);
             $writer->save('php://output');
             $spreadsheet->disconnectWorksheets();
-        }, 200, [
-            'Content-Type' => 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-            'Content-Disposition' => "attachment; filename=\"{$filename}\"",
-            'Cache-Control' => 'no-store, no-cache, must-revalidate, max-age=0',
-            'Pragma' => 'no-cache',
-            'Expires' => '0',
-            'X-Unit-Economics-Export-Version' => '2026-05-25-02',
-        ]);
+        }, 200, $this->buildExportHeaders($filename));
     }
 
     /**
@@ -1133,9 +1233,14 @@ class UnitEconomicsCacheController extends Controller
             'AP' => ['header' => 'Нелок. ожид., %',       'width' => 15, 'field' => 'weighted_non_local_markup_percent', 'format' => '0.00"%"'],
             'AQ' => ['header' => 'Источник наценки',      'width' => 20, 'field' => 'non_local_markup_source',  'format' => '@'],
         ];
-
-        $lastCol = 'AQ';
         $isWildberriesExport = $marketplace === 'wildberries';
+        if (! $isWildberriesExport) {
+            // Ozon export: не показываем WB-специфичные столбцы.
+            foreach (['AG', 'AH', 'AI', 'AJ', 'AK', 'AL', 'AM', 'AN', 'AO', 'AP', 'AQ'] as $wbColumn) {
+                unset($columns[$wbColumn]);
+            }
+        }
+        $lastCol = array_key_last($columns) ?: 'AF';
 
         // ── Ширины колонок ──
         foreach ($columns as $col => $def) {
@@ -1239,9 +1344,9 @@ class UnitEconomicsCacheController extends Controller
         $currentRow = $dataStartRow;
 
         // Текстовые колонки (формат '@')
-        $textColumns = ['A', 'B', 'U', 'X', 'Z', 'AQ'];
+        $textColumns = array_values(array_intersect(['A', 'B', 'U', 'X', 'Z', 'AQ'], array_keys($columns)));
         // Колонки, которые должны отображаться пустыми при null (а не как 0)
-        $nullableNumericColumns = ['V', 'AF'];
+        $nullableNumericColumns = array_values(array_intersect(['V', 'AF'], array_keys($columns)));
 
         foreach ($items as $item) {
             $isEvenRow = ($currentRow - $dataStartRow) % 2 === 1;
@@ -1412,7 +1517,10 @@ class UnitEconomicsCacheController extends Controller
         $sheet->setCellValue("A{$summaryRow}", 'ИТОГО');
 
         // SUM формулы для денежных колонок и количеств
-        $sumCols = ['C', 'F', 'G', 'J', 'K', 'L', 'M', 'N', 'O', 'AA', 'AB', 'AE', 'AH', 'AJ', 'AN', 'AO'];
+        $sumCols = array_values(array_intersect(
+            ['C', 'F', 'G', 'J', 'K', 'L', 'M', 'N', 'O', 'AA', 'AB', 'AE', 'AH', 'AJ', 'AN', 'AO'],
+            array_keys($columns)
+        ));
         foreach ($sumCols as $col) {
             if ($dataEndRow >= $dataStartRow) {
                 $sheet->setCellValue("{$col}{$summaryRow}", "=SUM({$col}{$dataStartRow}:{$col}{$dataEndRow})");
@@ -1422,7 +1530,10 @@ class UnitEconomicsCacheController extends Controller
         }
 
         // AVERAGE формулы для процентных/относительных колонок
-        $avgCols = ['E', 'H', 'I', 'P', 'Q', 'R', 'S', 'T', 'V', 'W', 'Y', 'AC', 'AD', 'AF', 'AG', 'AI', 'AK', 'AM', 'AP'];
+        $avgCols = array_values(array_intersect(
+            ['E', 'H', 'I', 'P', 'Q', 'R', 'S', 'T', 'V', 'W', 'Y', 'AC', 'AD', 'AF', 'AG', 'AI', 'AK', 'AM', 'AP'],
+            array_keys($columns)
+        ));
         foreach ($avgCols as $col) {
             if ($dataEndRow >= $dataStartRow) {
                 $sheet->setCellValue("{$col}{$summaryRow}", "=AVERAGE({$col}{$dataStartRow}:{$col}{$dataEndRow})");
@@ -1468,7 +1579,40 @@ class UnitEconomicsCacheController extends Controller
         // Активный лист при открытии — основной
         $spreadsheet->setActiveSheetIndex(0);
 
+        $this->writeExportTemplateMarker($spreadsheet);
+
         return $spreadsheet;
+    }
+
+    /**
+     * Build mandatory export headers so clients can safely detect legacy responses.
+     *
+     * @return array<string, string>
+     */
+    private function buildExportHeaders(string $filename): array
+    {
+        return [
+            'Content-Type' => 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            'Content-Disposition' => "attachment; filename=\"{$filename}\"",
+            'Cache-Control' => 'no-store, no-cache, must-revalidate, max-age=0',
+            'Pragma' => 'no-cache',
+            'Expires' => '0',
+            'X-Unit-Economics-Export-Version' => self::EXPORT_TEMPLATE_VERSION,
+            'X-Unit-Economics-Export-Format' => self::EXPORT_TEMPLATE_FORMAT,
+            'X-Unit-Economics-Export-Source' => self::EXPORT_TEMPLATE_SOURCE,
+            // For cross-origin frontends we must expose custom headers explicitly.
+            'Access-Control-Expose-Headers' => 'Content-Disposition, X-Unit-Economics-Export-Version, X-Unit-Economics-Export-Format, X-Unit-Economics-Export-Source',
+        ];
+    }
+
+    /**
+     * Write a hidden machine-readable export marker to the main worksheet.
+     */
+    private function writeExportTemplateMarker(Spreadsheet $spreadsheet): void
+    {
+        $sheet = $spreadsheet->getSheet(0);
+        $sheet->setCellValue(self::EXPORT_TEMPLATE_MARKER_CELL, self::EXPORT_TEMPLATE_VERSION);
+        $sheet->getColumnDimension('AZ')->setVisible(false);
     }
 
     /**
@@ -1829,6 +1973,9 @@ class UnitEconomicsCacheController extends Controller
             ['Маркетплейс',          $marketplace],
             ['Схема',                strtoupper($fulfillmentType)],
             ['Дата генерации',       now()->format('d.m.Y H:i')],
+            ['Export template version', self::EXPORT_TEMPLATE_VERSION],
+            ['Export format',        self::EXPORT_TEMPLATE_FORMAT],
+            ['Export source',        self::EXPORT_TEMPLATE_SOURCE],
             ['Количество SKU',       count($items)],
             ['Версии тарифов',       implode(', ', array_keys($tariffVersions)) ?: '—'],
             ['Источники тарифов',    implode(', ', array_keys($tariffSources)) ?: '—'],
@@ -1865,16 +2012,63 @@ class UnitEconomicsCacheController extends Controller
             return 'Локальная';
         }
 
+        if ($isLocal === false) {
+            return 'Нелокальная';
+        }
+
         $localityRate = $item['expected_locality_rate'] ?? null;
         if ($localityRate !== null) {
+            $localityRate = (float) $localityRate;
+            if ($localityRate >= 99.99) {
+                return 'Локальная';
+            }
+            if ($localityRate <= 0.01) {
+                return 'Нелокальная';
+            }
+
             return 'Оценка ' . round((float) $localityRate) . '%';
         }
 
-        if ($isLocal === false) {
-            return 'Не локальная';
+        return '';
+    }
+
+    /**
+     * Для Ozon-экспорта подмешиваем per-SKU locality-метрики тем же правилом,
+     * что и на UI (period=28): local_share_percent + avg_markup_percent.
+     */
+    private function applyOzonLocalityMetricsToExportItem(array $item, ?LocalityMetricDaily $localityRow): array
+    {
+        if (! $localityRow || (int) ($localityRow->orders_count ?? 0) <= 0) {
+            return $item;
         }
 
-        return '';
+        $localityRate = $localityRow->local_share_percent !== null
+            ? round((float) $localityRow->local_share_percent, 2)
+            : ($item['expected_locality_rate'] ?? null);
+        $markupPercent = $localityRow->avg_markup_percent !== null
+            ? round((float) $localityRow->avg_markup_percent, 2)
+            : ($item['non_local_markup_percent'] ?? 0.0);
+
+        $item['expected_locality_rate'] = $localityRate;
+        $item['raw_non_local_markup_percent'] = $markupPercent;
+        $item['non_local_markup_percent'] = $markupPercent;
+        $item['weighted_non_local_markup_percent'] = $markupPercent;
+        $item['non_local_markup_source'] = 'locality_metrics_daily';
+
+        if ($localityRate !== null) {
+            if ($localityRate >= 99.99) {
+                $item['is_local_sale'] = true;
+            } elseif ($localityRate <= 0.01) {
+                $item['is_local_sale'] = false;
+            } else {
+                // Для смешанной локальности не форсируем legacy boolean-метку.
+                $item['is_local_sale'] = null;
+            }
+        }
+
+        $item['calculation_confidence'] = (string) ($localityRow->calculation_confidence ?: ($item['calculation_confidence'] ?? 'medium'));
+
+        return $item;
     }
 
     /**
@@ -2066,7 +2260,27 @@ class UnitEconomicsCacheController extends Controller
 
     private function canUseFastStats(array $validated): bool
     {
-        foreach (['search', 'profitable', 'margin_min', 'margin_max', 'price_min', 'price_max'] as $field) {
+        foreach ([
+            'search',
+            'profitable',
+            'quick_filter',
+            'margin_min',
+            'margin_max',
+            'profit_min',
+            'profit_max',
+            'roi_min',
+            'roi_max',
+            'price_min',
+            'price_max',
+            'logistics_min',
+            'logistics_max',
+            'sales_min',
+            'sales_max',
+            'non_local_markup_min',
+            'non_local_markup_max',
+            'confidence',
+            'locality_state',
+        ] as $field) {
             if (array_key_exists($field, $validated) && $validated[$field] !== null && $validated[$field] !== '') {
                 return false;
             }

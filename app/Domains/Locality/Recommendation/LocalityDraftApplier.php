@@ -77,26 +77,35 @@ class LocalityDraftApplier
      * Используется AutoSupplyPlanController::createClusterDrafts, когда план уже split по кластерам.
      *
      * @param list<array{sku:int, quantity:int}> $items уже с числовым ozon SKU (не offer_id)
-     * @return array{success:bool, draft_id:?string, error:?string}
+     * @param array<string, mixed> $options
+     * @return array{success:bool, draft_id:?string, error:?string, supply_method?:string}
      */
-    public function applyBatch(Integration $integration, array $items, int $clusterId): array
+    public function applyBatch(Integration $integration, array $items, int $clusterId, array $options = []): array
     {
         if (empty($items)) {
             return ['success' => false, 'draft_id' => null, 'error' => 'empty_items'];
         }
 
         $api = new FboSupplyOrdersApi(OzonClient::fromIntegration($integration));
+        $supplyMethod = (($options['supply_method'] ?? null) === 'crossdock') ? 'crossdock' : 'direct';
+        $draftType = $supplyMethod === 'crossdock' ? 'CREATE_TYPE_CROSSDOCK' : 'CREATE_TYPE_DIRECT';
+        $dropOffPointWarehouseId = isset($options['drop_off_point_warehouse_id'])
+            ? (int) $options['drop_off_point_warehouse_id']
+            : null;
 
         $result = $api->createDirectDraft(
             $items,
             [$clusterId],
-            'CREATE_TYPE_DIRECT',
+            $draftType,
+            $dropOffPointWarehouseId,
         );
 
         if (! ($result['success'] ?? false)) {
             Log::channel('locality')->warning('LocalityDraftApplier applyBatch createDirectDraft failed', [
                 'integration_id' => $integration->id,
                 'cluster_id' => $clusterId,
+                'supply_method' => $supplyMethod,
+                'drop_off_point_warehouse_id' => $dropOffPointWarehouseId,
                 'items_count' => count($items),
                 'error' => $result['error'] ?? null,
             ]);
@@ -109,7 +118,7 @@ class LocalityDraftApplier
             return ['success' => false, 'draft_id' => null, 'error' => 'draft_status_timeout'];
         }
 
-        return ['success' => true, 'draft_id' => $draftId, 'error' => null];
+        return ['success' => true, 'draft_id' => $draftId, 'error' => null, 'supply_method' => $supplyMethod];
     }
 
     private function pollDraftId(FboSupplyOrdersApi $api, string $operationId): ?string

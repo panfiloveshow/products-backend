@@ -8,7 +8,7 @@ use Illuminate\Support\Facades\Log;
  * API для аналитики остатков и оборачиваемости Ozon
  *
  * Эндпоинты:
- * - GET /v1/analytics/stocks — остатки + продажи + оборачиваемость по SKU×кластер (обновлён 17.06.2025)
+ * - POST /v1/analytics/stocks — остатки + продажи + оборачиваемость по SKU×кластер
  * - POST /v1/analytics/turnover/stocks — оборачиваемость по SKU (ads за 60д, turnover, idc_grade)
  *
  * @see https://docs.ozon.ru/api/seller
@@ -22,7 +22,7 @@ class StockAnalyticsApi
     /**
      * Получить аналитику остатков по SKU × склад/кластер
      *
-     * GET /v1/analytics/stocks
+     * POST /v1/analytics/stocks
      *
      * Возвращает по каждому SKU × кластер:
      * - ads — ср. продажи/день за 28д (все кластеры)
@@ -33,7 +33,8 @@ class StockAnalyticsApi
      * - turnover_grade / turnover_grade_cluster
      * - valid_stock_count, warehouse_name, offer_id, sku
      *
-     * Лимит: до 100 SKU за запрос
+     * API отдаёт постраничный список. Запрошенные SKU фильтруем локально,
+     * чтобы не зависеть от спорной поддержки sku-фильтра в этом методе.
      *
      * @param array $skus SKU (Ozon numeric SKU), макс 100
      * @param array $warehouseIds Фильтр по складам (опционально)
@@ -46,35 +47,57 @@ class StockAnalyticsApi
             return [];
         }
 
+        $requestedSkus = array_fill_keys(array_map('strval', $skus), true);
+        $warehouseFilter = array_fill_keys(array_map('strval', $warehouseIds), true);
+        $clusterFilter = array_fill_keys(array_map('strval', $clusterIds), true);
         $allItems = [];
+        $limit = 1000;
+        $offset = 0;
 
-        // API принимает макс 100 SKU за запрос
-        foreach (array_chunk($skus, 100) as $chunk) {
-            $params = [
-                'skus' => array_map('strval', $chunk),
+        do {
+            $body = [
+                'limit' => $limit,
+                'offset' => $offset,
+                'warehouse_type' => 'ALL',
             ];
 
-            if (!empty($warehouseIds)) {
-                $params['warehouse_ids'] = array_map('strval', $warehouseIds);
-            }
-
-            if (!empty($clusterIds)) {
-                $params['cluster_ids'] = array_map('strval', $clusterIds);
-            }
-
-            $response = $this->client->get('/v1/analytics/stocks', $params);
+            $response = $this->client->post('/v1/analytics/stocks', $body);
 
             if (!$response || !empty($response['_error'])) {
                 Log::warning('Ozon StockAnalytics: ошибка /v1/analytics/stocks', [
-                    'skus_count' => count($chunk),
+                    'skus_count' => count($skus),
+                    'offset' => $offset,
                     'error' => $response['message'] ?? $response['error'] ?? 'unknown',
                 ]);
-                continue;
+                break;
             }
 
-            $items = $response['items'] ?? [];
-            $allItems = array_merge($allItems, $items);
-        }
+            $items = $response['items'] ?? $response['result']['items'] ?? [];
+            foreach ($items as $item) {
+                $sku = (string) ($item['sku'] ?? '');
+                if ($sku === '' || !isset($requestedSkus[$sku])) {
+                    continue;
+                }
+
+                if ($warehouseFilter !== []) {
+                    $warehouseId = (string) ($item['warehouse_id'] ?? '');
+                    if ($warehouseId === '' || !isset($warehouseFilter[$warehouseId])) {
+                        continue;
+                    }
+                }
+
+                if ($clusterFilter !== []) {
+                    $clusterId = (string) ($item['cluster_id'] ?? '');
+                    if ($clusterId === '' || !isset($clusterFilter[$clusterId])) {
+                        continue;
+                    }
+                }
+
+                $allItems[] = $item;
+            }
+
+            $offset += $limit;
+        } while (count($items) === $limit);
 
         Log::info('Ozon StockAnalytics: загружено записей', [
             'requested_skus' => count($skus),

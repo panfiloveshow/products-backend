@@ -8,7 +8,7 @@ use Illuminate\Support\Facades\Log;
  * API для работы с отправлениями FBO (аналитика)
  * 
  * Endpoints:
- * - POST /v2/posting/fbo/list — список отправлений
+ * - POST /v3/posting/fbo/list — список отправлений
  * - POST /v2/posting/fbo/get — детали отправления
  */
 class FboPostingsApi
@@ -36,15 +36,15 @@ class FboPostingsApi
             $body['filter'] = $filter;
         }
 
-        $response = $this->client->post('/v2/posting/fbo/list', $body);
+        $response = $this->client->post('/v3/posting/fbo/list', $body);
 
         Log::info('Ozon FBO postings/list', [
             'filter' => $filter,
-            'count' => count($response['result'] ?? []),
+            'count' => count($response['result']['postings'] ?? $response['result'] ?? []),
         ]);
 
         return [
-            'postings' => $response['result'] ?? [],
+            'postings' => $response['result']['postings'] ?? $response['result'] ?? [],
         ];
     }
 

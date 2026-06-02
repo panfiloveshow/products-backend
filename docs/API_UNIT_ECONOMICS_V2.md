@@ -24,11 +24,24 @@ GET /api/unit-economics/{marketplace}
 | `fulfillment_type` | string | ✅ | Схема: FBO, FBS, RFBS, EXPRESS |
 | `search` | string | - | Поиск по SKU/названию |
 | `profitable` | boolean | - | Фильтр по прибыльности |
+| `quick_filter` | string | - | Быстрый пресет: `unprofitable`, `no_sales_28d`, `low_confidence`, `high_non_locality`, `high_non_local_markup`, `data_gap` |
 | `margin_min` | number | - | Минимальная маржа % |
 | `margin_max` | number | - | Максимальная маржа % |
+| `profit_min` | number | - | Минимальная прибыль, ₽ |
+| `profit_max` | number | - | Максимальная прибыль, ₽ |
+| `roi_min` | number | - | Минимальный ROI, % |
+| `roi_max` | number | - | Максимальный ROI, % |
 | `price_min` | number | - | Минимальная цена |
 | `price_max` | number | - | Максимальная цена |
-| `sort` | string | - | Поле сортировки |
+| `logistics_min` | number | - | Минимальная эфф. логистика, ₽ |
+| `logistics_max` | number | - | Максимальная эфф. логистика, ₽ |
+| `sales_min` | int | - | Минимум продаж, шт |
+| `sales_max` | int | - | Максимум продаж, шт |
+| `non_local_markup_min` | number | - | Мин. нелокальная наценка, % |
+| `non_local_markup_max` | number | - | Макс. нелокальная наценка, % |
+| `confidence` | string | - | Качество: `low`, `medium`, `high` |
+| `locality_state` | string | - | Локальность: `local`, `non_local`, `mixed`, `no_sales` |
+| `sort` | string | - | Поле сортировки (`relevance` доступен при search) |
 | `sort_order` | string | - | asc/desc |
 | `limit` | int | - | Лимит (1-500, default: 50) |
 | `page` | int | - | Страница |

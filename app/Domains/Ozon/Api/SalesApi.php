@@ -2,6 +2,7 @@
 
 namespace App\Domains\Ozon\Api;
 
+use Carbon\Carbon;
 use Illuminate\Support\Facades\Log;
 
 /**
@@ -97,7 +98,7 @@ class SalesApi
     }
 
     /**
-     * Получить продажи по SKU и складу через /v2/posting/fbo/list за последние N дней.
+     * Получить продажи по SKU и складу через /v3/posting/fbo/list за последние N дней.
      * Каждое FBO-отправление содержит analytics_data.warehouse_id и список товаров.
      * Агрегируем количество по offer_id + warehouse_id.
      *
@@ -111,11 +112,13 @@ class SalesApi
             $offset = 0;
             $limit  = 1000;
 
-            // rawUnits[offer_id][warehouse_id] = ['units' => int, 'warehouse_name' => string]
+            $now = now();
+
+            // rawUnits[offer_id][warehouse_id] = demand facts by real posting dates.
             $rawUnits = [];
 
             do {
-                $response = $this->client->post('/v2/posting/fbo/list', [
+                $response = $this->client->post('/v3/posting/fbo/list', [
                     'dir'    => 'ASC',
                     'filter' => [
                         'since'  => $since,
@@ -130,7 +133,7 @@ class SalesApi
                     ],
                 ]);
 
-                $postings = $response['result'] ?? [];
+                $postings = $response['result']['postings'] ?? $response['result'] ?? [];
 
                 foreach ($postings as $posting) {
                     $warehouseId = (string)($posting['analytics_data']['warehouse_id'] ?? '');
@@ -157,10 +160,35 @@ class SalesApi
                         }
 
                         $qty = (int)($product['quantity'] ?? 0);
-                        if (!isset($rawUnits[$offerId][$warehouseId])) {
-                            $rawUnits[$offerId][$warehouseId] = ['units' => 0, 'warehouse_name' => $whName];
+                        if (! isset($rawUnits[$offerId][$warehouseId])) {
+                            $rawUnits[$offerId][$warehouseId] = [
+                                'units' => 0,
+                                'warehouse_name' => $whName,
+                                'sales_7_days' => 0,
+                                'sales_14_days' => 0,
+                                'sales_30_days' => 0,
+                                'daily_units' => [],
+                            ];
                         }
+
                         $rawUnits[$offerId][$warehouseId]['units'] += $qty;
+
+                        $postingDate = $this->resolvePostingDate($posting);
+                        if ($postingDate !== null) {
+                            $dayKey = $postingDate->toDateString();
+                            $rawUnits[$offerId][$warehouseId]['daily_units'][$dayKey] =
+                                ($rawUnits[$offerId][$warehouseId]['daily_units'][$dayKey] ?? 0) + $qty;
+
+                            if ($postingDate->gte($now->copy()->subDays(7)->startOfDay())) {
+                                $rawUnits[$offerId][$warehouseId]['sales_7_days'] += $qty;
+                            }
+                            if ($postingDate->gte($now->copy()->subDays(14)->startOfDay())) {
+                                $rawUnits[$offerId][$warehouseId]['sales_14_days'] += $qty;
+                            }
+                            if ($postingDate->gte($now->copy()->subDays(30)->startOfDay())) {
+                                $rawUnits[$offerId][$warehouseId]['sales_30_days'] += $qty;
+                            }
+                        }
                     }
                 }
 
@@ -171,21 +199,40 @@ class SalesApi
             $result = [];
             foreach ($rawUnits as $offerId => $warehouses) {
                 foreach ($warehouses as $warehouseId => $data) {
-                    $units    = $data['units'];
+                    $units = $data['units'];
                     $avgDaily = $days > 0 ? round($units / $days, 2) : 0;
+                    $shapeStats = $this->calculateDailyShapeStats($data['daily_units'] ?? [], $units, $days);
+
+                    $sales7 = (int) ($data['sales_7_days'] ?? 0);
+                    $sales14 = (int) ($data['sales_14_days'] ?? 0);
+                    $sales30 = (int) ($data['sales_30_days'] ?? 0);
+
+                    // If Ozon stops returning posting dates, keep the old proportional
+                    // fallback but mark it as low-quality through empty active_days.
+                    if ($sales7 === 0 && $sales14 === 0 && $sales30 === 0 && $units > 0 && empty($data['daily_units'])) {
+                        $sales7 = (int) round($units * 7 / $days);
+                        $sales14 = (int) round($units * 14 / $days);
+                        $sales30 = (int) round($units * 30 / $days);
+                    }
 
                     $result[$offerId][$warehouseId] = [
                         'warehouse_name'      => $data['warehouse_name'],
-                        'sales_7_days'        => (int)round($units * 7  / $days),
-                        'sales_14_days'       => (int)round($units * 14 / $days),
-                        'sales_30_days'       => (int)round($units * 30 / $days),
+                        'sales_7_days'        => $sales7,
+                        'sales_14_days'       => $sales14,
+                        'sales_30_days'       => $sales30,
                         'avg_daily_sales'     => $avgDaily,
                         'ordered_units_total' => $units,
+                        'active_days' => $shapeStats['active_days'],
+                        'peak_day_units' => $shapeStats['peak_day_units'],
+                        'peak_share' => $shapeStats['peak_share'],
+                        'median_nonzero_daily_units' => $shapeStats['median_nonzero_daily_units'],
+                        'winsorized_units_total' => $shapeStats['winsorized_units_total'],
+                        'winsorized_avg_daily_sales' => $shapeStats['winsorized_avg_daily_sales'],
                     ];
                 }
             }
 
-            Log::info('Ozon getSalesBySkuAndWarehouse (FBO postings) loaded', [
+            Log::info('Ozon getSalesBySkuAndWarehouse (FBO postings v3) loaded', [
                 'days'       => $days,
                 'skus_count' => count($result),
             ]);
@@ -195,6 +242,63 @@ class SalesApi
             Log::error('Ozon getSalesBySkuAndWarehouse error', ['error' => $e->getMessage()]);
             return [];
         }
+    }
+
+    private function resolvePostingDate(array $posting): ?Carbon
+    {
+        foreach (['delivered_at', 'delivery_date', 'shipment_date', 'in_process_at', 'created_at'] as $field) {
+            if (empty($posting[$field])) {
+                continue;
+            }
+
+            try {
+                return Carbon::parse($posting[$field])->startOfDay();
+            } catch (\Throwable) {
+                continue;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * @return array{active_days:int, peak_day_units:int, peak_share:float, median_nonzero_daily_units:float, winsorized_units_total:float, winsorized_avg_daily_sales:float}
+     */
+    private function calculateDailyShapeStats(array $dailyUnits, int $totalUnits, int $days): array
+    {
+        $activeDays = count(array_filter($dailyUnits, fn ($units) => (int) $units > 0));
+        $peakDayUnits = empty($dailyUnits) ? 0 : (int) max($dailyUnits);
+        $nonZero = array_values(array_filter(array_map('intval', $dailyUnits), fn ($units) => $units > 0));
+        sort($nonZero);
+
+        $median = 0.0;
+        $count = count($nonZero);
+        if ($count > 0) {
+            $middle = intdiv($count, 2);
+            $median = $count % 2 === 1
+                ? (float) $nonZero[$middle]
+                : (($nonZero[$middle - 1] + $nonZero[$middle]) / 2);
+        }
+
+        $periodAvg = $days > 0 ? $totalUnits / $days : 0.0;
+        $cap = max(3.0, $median * 3.0, $periodAvg * 1.5);
+        $winsorizedTotal = 0.0;
+        foreach ($dailyUnits as $units) {
+            $winsorizedTotal += min((int) $units, $cap);
+        }
+
+        if (empty($dailyUnits) && $totalUnits > 0) {
+            $winsorizedTotal = $totalUnits;
+        }
+
+        return [
+            'active_days' => $activeDays,
+            'peak_day_units' => $peakDayUnits,
+            'peak_share' => $totalUnits > 0 ? round($peakDayUnits / $totalUnits, 4) : 0.0,
+            'median_nonzero_daily_units' => round($median, 4),
+            'winsorized_units_total' => round($winsorizedTotal, 4),
+            'winsorized_avg_daily_sales' => $days > 0 ? round($winsorizedTotal / $days, 4) : 0.0,
+        ];
     }
 
     /**

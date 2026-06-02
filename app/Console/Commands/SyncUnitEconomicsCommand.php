@@ -1570,6 +1570,9 @@ class SyncUnitEconomicsCommand extends Command
                 $data['localization_rate'] = $wbLocalizationData['localization_rate'] ?? null;
                 $data['local_orders'] = $wbLocalizationData['local_orders'] ?? null;
                 $data['local_orders_count'] = $wbLocalizationData['total_orders'] ?? null;
+                $data['by_delivery_fo'] = $wbLocalizationData['by_delivery_fo'] ?? [];
+                $data['delivery_fo_profile'] = $this->buildRegionalDemandProfile($wbLocalizationData['by_delivery_fo'] ?? []);
+                $data['warehouse_sales_profile'] = $this->buildRegionalDemandProfile($wbLocalizationData['by_warehouse'] ?? [], 'warehouse_name');
                 $data['orders_count'] = $wbRedemptionData['orders_count'] ?? null;
 
                 // Коэффициент габаритов (штраф за превышение)
@@ -2248,6 +2251,38 @@ class SyncUnitEconomicsCommand extends Command
         }
 
         return $detailed;
+    }
+
+    /**
+     * @return list<array<string, mixed>>
+     */
+    private function buildRegionalDemandProfile(array $distribution, string $nameKey = 'region'): array
+    {
+        $total = array_sum(array_map(
+            static fn (mixed $value): float => is_numeric($value) ? (float) $value : 0.0,
+            $distribution
+        ));
+
+        if ($total <= 0) {
+            return [];
+        }
+
+        $profile = [];
+        foreach ($distribution as $name => $orders) {
+            if (! is_numeric($orders) || (float) $orders <= 0) {
+                continue;
+            }
+
+            $profile[] = [
+                $nameKey => (string) $name,
+                'orders' => (float) $orders,
+                'share_percent' => round(((float) $orders / $total) * 100, 2),
+            ];
+        }
+
+        usort($profile, static fn (array $a, array $b): int => ((float) ($b['orders'] ?? 0)) <=> ((float) ($a['orders'] ?? 0)));
+
+        return array_slice($profile, 0, 12);
     }
 
     private function loadYandexTariffsData(

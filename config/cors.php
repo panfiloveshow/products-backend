@@ -14,7 +14,12 @@ return [
         '#^https?://127\.0\.0\.1(:\d+)?$#',
     ],
     'allowed_headers' => ['*'],
-    'exposed_headers' => [],
+    'exposed_headers' => [
+        'Content-Disposition',
+        'X-Unit-Economics-Export-Version',
+        'X-Unit-Economics-Export-Format',
+        'X-Unit-Economics-Export-Source',
+    ],
     'max_age' => 0,
     'supports_credentials' => false,
 ];

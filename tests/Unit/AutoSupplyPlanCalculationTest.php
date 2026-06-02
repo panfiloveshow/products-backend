@@ -2,8 +2,10 @@
 
 namespace Tests\Unit;
 
+use App\Jobs\CalculateAutoSupplyPlanJob;
 use App\Services\AutoSupplyPlanService;
 use PHPUnit\Framework\TestCase;
+use ReflectionClass;
 
 /**
  * Unit tests для алгоритма автопланирования поставок
@@ -49,6 +51,31 @@ class AutoSupplyPlanCalculationTest extends TestCase
         $result = $this->service->calculateDailyDemand(0.35, 0, 0, 0);
         $this->assertEquals(0.0, $result['daily_demand']);
         $this->assertTrue($result['needs_manual_review']);
+    }
+
+    public function test_analysis_period_days_uses_user_window_for_demand_facts(): void
+    {
+        $job = new CalculateAutoSupplyPlanJob('test-plan-id');
+        $method = (new ReflectionClass($job))->getMethod('analysisPeriodDays');
+        $method->setAccessible(true);
+
+        $this->assertSame(28, $method->invoke($job, ['analysis_period_days' => 28], 60));
+        $this->assertSame(56, $method->invoke($job, ['analysis_period_days' => 56], 30));
+        $this->assertSame(30, $method->invoke($job, [], 30));
+        $this->assertSame(56, $method->invoke($job, ['analysis_period_days' => 55], 30));
+    }
+
+    public function test_ozon_qty_anchor_is_forced_to_internal_engine(): void
+    {
+        $job = new CalculateAutoSupplyPlanJob('test-plan-id');
+        $method = (new ReflectionClass($job))->getMethod('effectiveOzonQtyAnchor');
+        $method->setAccessible(true);
+
+        $this->assertSame('internal', $method->invoke($job, 'ozon', 'ozon'));
+        $this->assertSame('internal', $method->invoke($job, 'max', 'ozon'));
+        $this->assertSame('internal', $method->invoke($job, 'average', 'ozon'));
+        $this->assertSame('internal', $method->invoke($job, 'internal', 'ozon'));
+        $this->assertSame('internal', $method->invoke($job, 'ozon', 'wildberries'));
     }
 
     // === 3.2 Базовые формулы ===
@@ -188,6 +215,188 @@ class AutoSupplyPlanCalculationTest extends TestCase
         $result = $this->service->emptyQualityJson();
         $this->assertEquals(0, $result['total']);
         $this->assertEquals(0, $result['skus_analyzed']);
+    }
+
+    public function test_posting_fbo_v3_can_be_marked_as_real_demand_source(): void
+    {
+        $result = $this->service->calculateDailyDemandV2(
+            0.35,
+            0,
+            0,
+            0,
+            2.5,
+            2.5,
+            30,
+            100,
+            'stable',
+            0,
+            0,
+            'posting_fbo_v3'
+        );
+
+        $this->assertEqualsWithDelta(2.5, $result['daily_demand'], 0.01);
+        $this->assertSame('posting_fbo_v3', $result['source']);
+        $this->assertFalse($result['needs_manual_review']);
+    }
+
+    public function test_posting_fbo_v3_positive_trend_does_not_double_boost_observed_demand(): void
+    {
+        $result = $this->service->calculateDailyDemandV2(
+            0.35,
+            70,
+            35,
+            150,
+            10.0,
+            10.0,
+            30,
+            100,
+            'growing',
+            20,
+            0,
+            'posting_fbo_v3'
+        );
+
+        $this->assertEqualsWithDelta(10.0, $result['daily_demand'], 0.01);
+        $this->assertSame('posting_fbo_v3', $result['source']);
+    }
+
+    public function test_ozon_posting_demand_shape_caps_suspected_promo_spike(): void
+    {
+        $result = $this->service->shapeOzonPostingDemand([
+            'sales_7_days' => 7,
+            'sales_14_days' => 167,
+            'sales_30_days' => 260,
+            'ordered_units_total' => 780,
+            'avg_daily_sales' => 26.0,
+            'winsorized_avg_daily_sales' => 18.0,
+            'peak_day_units' => 155,
+            'peak_share' => 0.1987,
+            'active_days' => 12,
+            'median_nonzero_daily_units' => 8,
+        ]);
+
+        $this->assertTrue($result['suspected_spike']);
+        $this->assertSame('warning', $result['confidence_level']);
+        $this->assertLessThan(26.0, $result['daily_demand']);
+        $this->assertLessThanOrEqual(13.0, $result['daily_demand']);
+        $this->assertContains('promo_spike_peak_vs_median', $result['confidence_reasons']);
+    }
+
+    public function test_ozon_posting_demand_spike_guard_does_not_use_stale_external_average_as_floor(): void
+    {
+        $result = $this->service->shapeOzonPostingDemand([
+            'sales_7_days' => 7,
+            'sales_14_days' => 167,
+            'sales_30_days' => 260,
+            'ordered_units_total' => 780,
+            'avg_daily_sales' => 26.0,
+            'winsorized_avg_daily_sales' => 18.0,
+            'peak_day_units' => 155,
+            'peak_share' => 0.1987,
+            'active_days' => 12,
+            'median_nonzero_daily_units' => 8,
+        ], localAvgDaily: 26.0, ozonAds: 20.0);
+
+        $this->assertTrue($result['suspected_spike']);
+        $this->assertTrue($result['capped_external_daily_demand']);
+        $this->assertLessThanOrEqual(5.0, $result['daily_demand']);
+        $this->assertSame($result['guardrail_cap_daily_demand'], $result['daily_demand']);
+        $this->assertContains('external_sources_capped_by_spike_guard', $result['confidence_reasons']);
+    }
+
+    public function test_ozon_aggregate_demand_shape_caps_post_promo_cooldown(): void
+    {
+        $result = $this->service->shapeOzonAggregateDemand(
+            dailyDemand: 26.0,
+            sales7: 7,
+            sales14: 28,
+            sales30: 780,
+            avgDailySalesApi: 26.0
+        );
+
+        $this->assertTrue($result['suspected_spike']);
+        $this->assertSame('warning', $result['confidence_level']);
+        $this->assertLessThan(26.0, $result['daily_demand']);
+        $this->assertLessThanOrEqual(13.0, $result['daily_demand']);
+        $this->assertContains('aggregate_sales_no_postings', $result['confidence_reasons']);
+        $this->assertContains('post_promo_cooldown', $result['confidence_reasons']);
+    }
+
+    public function test_ozon_aggregate_demand_shape_low_when_no_recent_sales_after_spike(): void
+    {
+        $result = $this->service->shapeOzonAggregateDemand(
+            dailyDemand: 26.0,
+            sales7: 0,
+            sales14: 0,
+            sales30: 780,
+            avgDailySalesApi: 26.0
+        );
+
+        $this->assertTrue($result['suspected_spike']);
+        $this->assertSame('low', $result['confidence_level']);
+        $this->assertLessThanOrEqual(13.0, $result['daily_demand']);
+        $this->assertContains('no_recent_sales_after_30d_spike', $result['confidence_reasons']);
+    }
+
+    public function test_ozon_posting_demand_prevents_false_order_report_missing_source(): void
+    {
+        $warehouse = (object) [
+            'sales_30_days' => 0,
+            'sales_14_days' => 0,
+            'real_avg_daily_sales' => 0,
+        ];
+
+        $missing = $this->service->detectMissingSources(
+            $warehouse,
+            (object) ['barcode' => null],
+            'ozon',
+            (object) ['cost_price' => 100],
+            false,
+            true
+        );
+
+        $this->assertNotContains('sales_history', $missing);
+        $this->assertNotContains('ozon_order_report', $missing);
+        $this->assertNotContains('ozon_posting_demand', $missing);
+    }
+
+    public function test_protective_quantity_guard_caps_post_promo_quantity_to_trial_cover(): void
+    {
+        $result = $this->service->applyProtectiveQuantityGuard(
+            qty: 693,
+            dailyDemand: 26.0,
+            currentStock: 38,
+            inTransit: 0,
+            packMultiple: 1,
+            confidenceReasons: ['promo_spike_peak_vs_median', 'post_promo_cooldown'],
+            lowConfidenceTrial: true,
+            promoMode: 'post_promo',
+            marketplace: 'ozon',
+        );
+
+        $this->assertTrue($result['applied']);
+        $this->assertSame(196, $result['qty']);
+        $this->assertSame(7, $result['trial_cover_days']);
+        $this->assertSame('protective_post_promo_trial_quantity', $result['reason']);
+        $this->assertContains('protective_trial_quantity_cap', $result['reasons']);
+    }
+
+    public function test_protective_quantity_guard_does_not_touch_stable_quantity(): void
+    {
+        $result = $this->service->applyProtectiveQuantityGuard(
+            qty: 80,
+            dailyDemand: 4.0,
+            currentStock: 10,
+            inTransit: 0,
+            packMultiple: 1,
+            confidenceReasons: [],
+            lowConfidenceTrial: false,
+            promoMode: 'none',
+            marketplace: 'ozon',
+        );
+
+        $this->assertFalse($result['applied']);
+        $this->assertSame(80, $result['qty']);
     }
 
     // === 5. Export validation ===
@@ -346,8 +555,8 @@ class AutoSupplyPlanCalculationTest extends TestCase
     public function test_demand_v2_applies_trend_adjustment(): void
     {
         $result = $this->service->calculateDailyDemandV2(
-            0.35, 70, 35, 150,
-            realAvgDailySales: 10.0,
+            0.35, 0, 0, 0,
+            avgDailySalesApi: 10.0,
             salesTrend: 'growing',
             salesTrendPercent: 20
         );

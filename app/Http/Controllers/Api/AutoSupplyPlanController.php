@@ -5,6 +5,7 @@ namespace App\Http\Controllers\Api;
 use App\Http\Controllers\Controller;
 use App\Http\Requests\AutoSupplyPlan\StoreAutoSupplyPlanRequest;
 use App\Jobs\CalculateAutoSupplyPlanJob;
+use App\Models\AutoSupplyConstraintFile;
 use App\Models\AutoSupplyPlan;
 use App\Models\AutoSupplyPlanLine;
 use App\Models\InventoryWarehouse;
@@ -12,10 +13,15 @@ use App\Models\Integration;
 use App\Models\LocalityRecommendation;
 use App\Models\OzonWarehouseCluster;
 use App\Models\Product;
+use App\Services\AutoSupplyPlanning\MarketplaceConstraintFileParser;
+use App\Services\AutoSupplyPlanning\MarketplacePlanningCapabilityService;
+use App\Services\AutoSupplyPlanning\OzonCrossdockDropOffPointService;
+use App\Services\AutoSupplyPlanning\PlanningReadinessChecklistService;
 use App\Services\IntegrationAccessService;
 use App\Services\LimitsSyncService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Validator;
 use PhpOffice\PhpSpreadsheet\Spreadsheet;
 use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
@@ -70,6 +76,41 @@ class AutoSupplyPlanController extends Controller
     }
 
     /**
+     * GET /api/auto-supply-plans/capabilities?marketplace=ozon
+     */
+    public function capabilities(Request $request, MarketplacePlanningCapabilityService $service): JsonResponse
+    {
+        $validated = $request->validate([
+            'integration_id' => 'nullable|integer',
+            'marketplace' => 'nullable|string|in:ozon,wildberries,yandex,yandex_market',
+        ]);
+
+        $marketplace = $validated['marketplace'] ?? null;
+
+        if (! empty($validated['integration_id'])) {
+            $integrationAccess = $this->integrationAccessService
+                ->ensureAccessibleIntegration($request, (int) $validated['integration_id']);
+
+            if (! ($integrationAccess['success'] ?? false)) {
+                return response()->json([
+                    'message' => $integrationAccess['message'] ?? 'Интеграция не найдена',
+                ], $integrationAccess['status'] ?? 404);
+            }
+
+            /** @var Integration $integration */
+            $integration = $integrationAccess['integration'];
+            $marketplace = (string) $integration->marketplace;
+        }
+
+        $marketplace ??= 'ozon';
+
+        return response()->json([
+            'message' => 'Возможности автопланирования',
+            'data' => $service->forMarketplace($marketplace),
+        ]);
+    }
+
+    /**
      * POST /api/auto-supply-plans
      */
     public function store(StoreAutoSupplyPlanRequest $request): JsonResponse
@@ -105,17 +146,42 @@ class AutoSupplyPlanController extends Controller
             ));
         }
 
+        $planningMode = (string) $request->input('planning_mode', $request->input('mode', AutoSupplyPlan::MODE_BALANCED));
+        $analysisPeriodDays = (int) $request->input('analysis_period_days', $request->input('horizon_days', 28));
+        $seasonalityMultiplier = $request->input('seasonality_multiplier', $request->input('demand_seasonality_multiplier'));
+        $draftSupplyMethod = $this->normalizeDraftSupplyMethod((string) $request->input('draft_supply_method', $request->input('supply_method', '')));
+        $constraintFile = $this->resolveConstraintFile($request, $integration);
+        $warehouseConstraints = $request->input('warehouse_constraints', $constraintFile?->warehouse_constraints_json);
+        $clusterConstraints = $request->input('cluster_constraints', $constraintFile?->cluster_constraints_json);
+        $constraintMetadata = $request->input('constraint_metadata', $constraintFile?->toPlanMetadata());
+
         $params = array_filter([
+            'planning_mode' => $planningMode,
+            'analysis_period_days' => $analysisPeriodDays,
             'target_days' => $request->input('target_cover_days', 21),
             'safety_days' => $request->input('safety_stock_days', 5),
             'lead_time_days' => $request->input('lead_time_days', 7),
             'ewma_alpha' => 0.35,
             'warehouse_ids' => $warehouseIds,
             'cluster_ids' => $normalizedClusterIds,
+            'warehouse_constraints' => $warehouseConstraints,
+            'cluster_constraints' => $clusterConstraints,
+            'constraint_file_id' => $constraintFile?->id ?? $request->input('constraint_file_id'),
+            'use_latest_constraint_file' => $request->boolean('use_latest_constraint_file', false),
+            'constraint_metadata' => $constraintMetadata,
+            'target_ktr' => $request->input('target_ktr'),
+            'baseline_ktr' => $request->input('baseline_ktr'),
+            'draft_supply_method' => $draftSupplyMethod,
+            'supply_method' => $draftSupplyMethod,
+            'drop_off_point_warehouse_id' => $request->input('drop_off_point_warehouse_id', $request->input('crossdock_drop_off_point_warehouse_id')),
 
             // Advanced (используются алгоритмом расчёта — см. CalculateAutoSupplyPlanJob)
             'ozon_qty_anchor' => $request->input('ozon_qty_anchor'),
-            'demand_seasonality_multiplier' => $request->input('demand_seasonality_multiplier'),
+            'demand_seasonality_multiplier' => $seasonalityMultiplier,
+            'seasonality_multiplier' => $seasonalityMultiplier,
+            'trend_multiplier' => $request->input('trend_multiplier'),
+            'promo_mode' => $request->input('promo_mode', $planningMode === AutoSupplyPlan::MODE_POST_PROMO_CAREFUL ? 'post_promo' : null),
+            'include_in_transit' => $request->input('include_in_transit'),
             'skip_negative_profit' => $request->input('skip_negative_profit'),
             'include_wb_supplies_api_in_transit' => $request->input('include_wb_supplies_api_in_transit'),
 
@@ -132,8 +198,8 @@ class AutoSupplyPlanController extends Controller
             'mp_account_id' => $integration->id,
             'marketplace' => $integration->marketplace,
             'status' => AutoSupplyPlan::STATUS_PENDING,
-            'mode' => $request->input('mode', 'balanced'),
-            'horizon_days' => $request->input('horizon_days', 28),
+            'mode' => $planningMode,
+            'horizon_days' => $request->input('horizon_days', $analysisPeriodDays),
             'min_cover_days' => $request->input('min_cover_days', 7),
             'target_cover_days' => $request->input('target_cover_days', 21),
             'max_cover_days' => $request->input('max_cover_days', 42),
@@ -149,12 +215,253 @@ class AutoSupplyPlanController extends Controller
             $this->limitsSync->syncWorkspaceAutoplanningLimit((int) $integration->work_space_id);
         }
 
+        $constraintFile?->forceFill(['last_used_at' => now()])->save();
+
         CalculateAutoSupplyPlanJob::dispatch($plan->id);
 
         return response()->json([
             'message' => 'План создан, расчёт запущен',
             'data' => $plan->load('integration'),
         ], 201);
+    }
+
+    /**
+     * POST /api/auto-supply-plans/constraints/preview
+     */
+    public function previewConstraints(Request $request, MarketplaceConstraintFileParser $parser): JsonResponse
+    {
+        $validated = $request->validate([
+            'integration_id' => 'required|integer',
+            'file' => 'required|file|mimes:csv,txt,xlsx,xls|max:51200',
+        ]);
+
+        $integrationAccess = $this->integrationAccessService
+            ->ensureAccessibleIntegration($request, (int) $validated['integration_id']);
+
+        if (! ($integrationAccess['success'] ?? false)) {
+            return response()->json([
+                'message' => $integrationAccess['message'] ?? 'Интеграция не найдена',
+            ], $integrationAccess['status'] ?? 404);
+        }
+
+        /** @var Integration $integration */
+        $integration = $integrationAccess['integration'];
+        $result = $parser->parse($request->file('file'), (string) $integration->marketplace);
+        if ($result['success'] ?? false) {
+            $constraintFile = $this->persistConstraintFile($integration, $result['data']);
+            $result['data']['constraint_file_id'] = $constraintFile->id;
+        }
+
+        return response()->json($result, ($result['success'] ?? false) ? 200 : 422);
+    }
+
+    /**
+     * GET /api/auto-supply-plans/constraints
+     */
+    public function constraintFiles(Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'integration_id' => 'required|integer',
+            'limit' => 'nullable|integer|min:1|max:50',
+        ]);
+
+        $integrationAccess = $this->integrationAccessService
+            ->ensureAccessibleIntegration($request, (int) $validated['integration_id']);
+
+        if (! ($integrationAccess['success'] ?? false)) {
+            return response()->json([
+                'message' => $integrationAccess['message'] ?? 'Интеграция не найдена',
+            ], $integrationAccess['status'] ?? 404);
+        }
+
+        /** @var Integration $integration */
+        $integration = $integrationAccess['integration'];
+        $files = AutoSupplyConstraintFile::query()
+            ->where('integration_id', $integration->id)
+            ->where('marketplace', $integration->marketplace)
+            ->orderByDesc('created_at')
+            ->limit((int) ($validated['limit'] ?? 10))
+            ->get()
+            ->map(fn (AutoSupplyConstraintFile $file): array => $this->constraintFileResource($file))
+            ->values();
+
+        return response()->json([
+            'message' => 'Файлы ограничений',
+            'data' => $files,
+        ]);
+    }
+
+    /**
+     * GET /api/auto-supply-plans/crossdock-drop-off-points
+     */
+    public function crossdockDropOffPoints(Request $request, OzonCrossdockDropOffPointService $service): JsonResponse
+    {
+        $validated = $request->validate([
+            'integration_id' => 'required|integer',
+            'search' => 'nullable|string|max:100',
+            'limit' => 'nullable|integer|min:1|max:200',
+        ]);
+
+        $integrationAccess = $this->integrationAccessService
+            ->ensureAccessibleIntegration($request, (int) $validated['integration_id']);
+
+        if (! ($integrationAccess['success'] ?? false)) {
+            return response()->json([
+                'message' => $integrationAccess['message'] ?? 'Интеграция не найдена',
+            ], $integrationAccess['status'] ?? 404);
+        }
+
+        /** @var Integration $integration */
+        $integration = $integrationAccess['integration'];
+        if ((string) $integration->marketplace !== 'ozon') {
+            return response()->json([
+                'message' => 'Точки кросс-докинг отгрузки доступны только для Ozon',
+                'error' => 'unsupported_marketplace',
+            ], 422);
+        }
+
+        $data = $service->list(
+            $integration,
+            trim((string) ($validated['search'] ?? '')),
+            (int) ($validated['limit'] ?? 100)
+        );
+
+        return response()->json([
+            'message' => 'Точки отгрузки Ozon для кросс-докинга',
+            'data' => $data,
+        ]);
+    }
+
+    private function resolveConstraintFile(Request $request, Integration $integration): ?AutoSupplyConstraintFile
+    {
+        $constraintFileId = $request->input('constraint_file_id');
+        if ($constraintFileId !== null && $constraintFileId !== '') {
+            return AutoSupplyConstraintFile::query()
+                ->whereKey((int) $constraintFileId)
+                ->where('integration_id', $integration->id)
+                ->where('marketplace', $integration->marketplace)
+                ->first();
+        }
+
+        if (! $request->boolean('use_latest_constraint_file', false)) {
+            return null;
+        }
+
+        if ($request->has('warehouse_constraints') || $request->has('cluster_constraints')) {
+            return null;
+        }
+
+        return $this->latestUsableConstraintFile($integration);
+    }
+
+    private function latestUsableConstraintFile(Integration $integration): ?AutoSupplyConstraintFile
+    {
+        return AutoSupplyConstraintFile::query()
+            ->where('integration_id', $integration->id)
+            ->where('marketplace', $integration->marketplace)
+            ->orderByDesc('parsed_at')
+            ->orderByDesc('created_at')
+            ->limit(25)
+            ->get()
+            ->first(fn (AutoSupplyConstraintFile $file): bool => $this->constraintFileHasPlanningPayload($file));
+    }
+
+    private function constraintFileHasPlanningPayload(AutoSupplyConstraintFile $file): bool
+    {
+        $summary = is_array($file->summary_json) ? $file->summary_json : [];
+        $planningRoles = is_array($summary['planning_roles'] ?? null) ? $summary['planning_roles'] : [];
+        $sourceTypeCounts = is_array($summary['source_type_counts'] ?? null) ? $summary['source_type_counts'] : [];
+
+        if ((int) $file->constraints_count > 0 || (int) ($summary['constraints_count'] ?? 0) > 0) {
+            return true;
+        }
+
+        if (
+            (int) ($summary['marketplace_needs_count'] ?? 0) > 0
+            || (int) ($summary['coefficient_lines_count'] ?? 0) > 0
+            || (int) ($summary['limit_lines_count'] ?? 0) > 0
+            || (int) ($summary['blocked_lines_count'] ?? 0) > 0
+            || (int) ($sourceTypeCounts['marketplace_need'] ?? 0) > 0
+            || (int) ($sourceTypeCounts['constraint_and_need'] ?? 0) > 0
+        ) {
+            return true;
+        }
+
+        foreach (['used_as_constraints', 'used_as_marketplace_needs', 'used_as_coefficients'] as $roleKey) {
+            if (! empty($planningRoles[$roleKey])) {
+                return true;
+            }
+        }
+
+        return count($file->cluster_constraints_json ?? []) > 0
+            || count($file->warehouse_constraints_json ?? []) > 0;
+    }
+
+    /**
+     * @param array<string, mixed> $data
+     */
+    private function persistConstraintFile(Integration $integration, array $data): AutoSupplyConstraintFile
+    {
+        $file = is_array($data['file'] ?? null) ? $data['file'] : [];
+        $summary = is_array($data['summary'] ?? null) ? $data['summary'] : [];
+        $hash = $file['sha256'] ?? null;
+        $attributes = [
+            'integration_id' => $integration->id,
+            'marketplace' => (string) $integration->marketplace,
+            'file_name' => (string) ($file['name'] ?? 'constraints'),
+            'file_size_bytes' => isset($file['size_bytes']) ? (int) $file['size_bytes'] : null,
+            'file_hash' => $hash,
+            'parser_version' => $summary['parser_version'] ?? null,
+            'rows_total' => (int) ($summary['rows_total'] ?? 0),
+            'constraints_count' => (int) ($summary['constraints_count'] ?? 0),
+            'warnings_count' => (int) ($summary['warnings_count'] ?? count($data['warnings'] ?? [])),
+            'cluster_constraints_json' => $data['cluster_constraints'] ?? [],
+            'warehouse_constraints_json' => $data['warehouse_constraints'] ?? [],
+            'summary_json' => $summary,
+            'warnings_json' => $data['warnings'] ?? [],
+            'parsed_at' => now(),
+        ];
+
+        if ($hash) {
+            return AutoSupplyConstraintFile::query()->updateOrCreate([
+                'integration_id' => $integration->id,
+                'file_hash' => $hash,
+            ], $attributes);
+        }
+
+        return AutoSupplyConstraintFile::query()->create($attributes);
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    private function constraintFileResource(AutoSupplyConstraintFile $file): array
+    {
+        $summary = is_array($file->summary_json) ? $file->summary_json : [];
+
+        return [
+            'id' => $file->id,
+            'integration_id' => $file->integration_id,
+            'marketplace' => $file->marketplace,
+            'file_name' => $file->file_name,
+            'file_size_bytes' => $file->file_size_bytes,
+            'file_hash' => $file->file_hash,
+            'parser_version' => $file->parser_version,
+            'rows_total' => $file->rows_total,
+            'constraints_count' => $file->constraints_count,
+            'marketplace_needs_count' => (int) ($summary['marketplace_needs_count'] ?? 0),
+            'coefficient_lines_count' => (int) ($summary['coefficient_lines_count'] ?? 0),
+            'warnings_count' => $file->warnings_count,
+            'usable_for_planning' => $this->constraintFileHasPlanningPayload($file),
+            'planning_roles' => is_array($summary['planning_roles'] ?? null) ? $summary['planning_roles'] : [],
+            'cluster_constraints' => $file->cluster_constraints_json ?? [],
+            'warehouse_constraints' => $file->warehouse_constraints_json ?? [],
+            'summary' => $summary,
+            'warnings' => $file->warnings_json ?? [],
+            'parsed_at' => $file->parsed_at?->toIso8601String(),
+            'last_used_at' => $file->last_used_at?->toIso8601String(),
+            'created_at' => $file->created_at?->toIso8601String(),
+        ];
     }
 
     /**
@@ -351,6 +658,23 @@ class AutoSupplyPlanController extends Controller
                     'total_qty' => $scopedTotalQty,
                     'data_quality_score' => $plan->data_quality_score,
                     'data_quality_json' => $plan->data_quality_json,
+                    'snapshot_id' => $plan->snapshot_id,
+                    'facts_freshness' => $plan->facts_freshness,
+                    'planning_sources' => $plan->planning_sources,
+                    'planning_source_cards' => $this->planningSourceCards($plan),
+                    'planning_readiness' => app(PlanningReadinessChecklistService::class)->build($plan),
+                    'demand_granularity' => $plan->demand_granularity,
+                    'quality_gate_status' => $plan->quality_gate_status,
+                    'quality_gate_reasons' => $plan->quality_gate_reasons,
+                    'deficit_summary' => $plan->deficit_summary,
+                    'surplus_summary' => $plan->surplus_summary,
+                    'deficit_surplus_summary' => $plan->deficit_surplus_summary,
+                    'economics_summary' => $plan->economics_summary,
+                    'selection_summary' => $plan->selection_summary,
+                    'constraints_summary' => $plan->constraints_summary,
+                    'territorial_summary' => $plan->territorial_summary,
+                    'plan_quality_audit' => $plan->plan_quality_audit,
+                    'marketplace_capabilities' => $plan->marketplace_capabilities,
                     'risk_breakdown' => [
                         'high' => $this->planLinesQueryForSelectedClusters($plan)->where('risk_level', 'high')->count(),
                         'med' => $this->planLinesQueryForSelectedClusters($plan)->where('risk_level', 'med')->count(),
@@ -370,6 +694,195 @@ class AutoSupplyPlanController extends Controller
                 ],
             ],
         ]);
+    }
+
+    /**
+     * POST /api/auto-supply-plans/{id}/fix-ktr-baseline
+     */
+    public function fixKtrBaseline(Request $request, string $id): JsonResponse
+    {
+        $validated = $request->validate([
+            'target_ktr' => 'nullable|numeric|min:1|max:100',
+        ]);
+
+        $plan = AutoSupplyPlan::with('integration')->findOrFail($id);
+
+        $integrationAccess = $this->integrationAccessService
+            ->ensureAccessibleIntegration($request, (int) $plan->integration_id);
+
+        if (! ($integrationAccess['success'] ?? false)) {
+            return response()->json([
+                'message' => $integrationAccess['message'] ?? 'Доступ запрещён',
+            ], $integrationAccess['status'] ?? 403);
+        }
+
+        $territorial = $plan->territorial_summary;
+        $ktr = is_array($territorial['ktr'] ?? null) ? $territorial['ktr'] : [];
+        $currentKtr = isset($ktr['value']) && is_numeric($ktr['value'])
+            ? round(max(0.0, min(100.0, (float) $ktr['value'])), 2)
+            : null;
+
+        if ($currentKtr === null) {
+            return response()->json([
+                'message' => 'КТР ещё не рассчитан для этого плана',
+                'error' => 'ktr_not_available',
+            ], 422);
+        }
+
+        $params = is_array($plan->params ?? null) ? $plan->params : [];
+        $targetKtr = isset($validated['target_ktr']) && is_numeric($validated['target_ktr'])
+            ? round(max(1.0, min(100.0, (float) $validated['target_ktr'])), 2)
+            : round(max(1.0, min(100.0, (float) ($ktr['target_value'] ?? $params['target_ktr'] ?? 80))), 2);
+
+        $params['baseline_ktr'] = $currentKtr;
+        $params['target_ktr'] = $targetKtr;
+
+        $resultJson = is_array($plan->result_json ?? null) ? $plan->result_json : [];
+        $resultJson['territorial_summary'] = $this->territorialSummaryWithFixedKtr(
+            $territorial,
+            $currentKtr,
+            $targetKtr
+        );
+
+        $plan->forceFill([
+            'params' => $params,
+            'result_json' => $resultJson,
+        ])->save();
+        $plan->refresh();
+
+        return response()->json([
+            'message' => 'КТР зафиксирован как база сравнения',
+            'data' => [
+                'plan' => $plan,
+                'baseline_ktr' => $currentKtr,
+                'target_ktr' => $targetKtr,
+                'territorial_summary' => $plan->territorial_summary,
+                'planning_readiness' => app(PlanningReadinessChecklistService::class)->build($plan),
+            ],
+        ]);
+    }
+
+    /**
+     * @param array<string, mixed> $territorial
+     * @return array<string, mixed>
+     */
+    private function territorialSummaryWithFixedKtr(array $territorial, float $baselineKtr, float $targetKtr): array
+    {
+        $ktr = is_array($territorial['ktr'] ?? null) ? $territorial['ktr'] : [];
+        $targetGap = round(max(0.0, $targetKtr - $baselineKtr), 2);
+        $baselineGap = round($targetKtr - $baselineKtr, 2);
+
+        $ktr['baseline_value'] = $baselineKtr;
+        $ktr['target_value'] = $targetKtr;
+        $ktr['baseline_gap_pp'] = $baselineGap;
+        $ktr['improvement_vs_baseline_pp'] = 0.0;
+        $ktr['target_gap_pp'] = $targetGap;
+
+        $fixation = is_array($ktr['fixation'] ?? null) ? $ktr['fixation'] : [];
+        $fixation['version'] = $fixation['version'] ?? 'ktr-fixation-1';
+        $fixation['can_fix_current_value'] = true;
+        $fixation['current_value'] = $baselineKtr;
+        $fixation['fixed_baseline_value'] = $baselineKtr;
+        $fixation['target_value'] = $targetKtr;
+        $fixation['tracking_status'] = 'unchanged';
+        $fixation['tracking_status_ru'] = 'зафиксирован';
+        $fixation['improvement_vs_fixed_pp'] = 0.0;
+        $fixation['target_gap_pp'] = $targetGap;
+        $fixation['freeze_payload'] = [
+            'baseline_ktr' => $baselineKtr,
+            'target_ktr' => $targetKtr,
+        ];
+        $fixation['state_ru'] = 'КТР зафиксирован как база сравнения.';
+        $fixation['next_action_ru'] = $targetGap <= 0
+            ? 'Цель КТР достигнута: контролируйте экономику, ограничения и стабильность распределения.'
+            : 'Следующие планы будут сравниваться с этой базой: система покажет, улучшилось или ухудшилось территориальное распределение.';
+        $fixation['explanation_ru'] = 'Фиксация КТР сохраняет текущее территориальное распределение как базу. Следующие планы сравниваются с этой базой, чтобы показывать реальное улучшение или ухудшение.';
+        $ktr['fixation'] = $fixation;
+
+        $controlLoop = is_array($ktr['control_loop'] ?? null) ? $ktr['control_loop'] : [];
+        $controlLoop['version'] = $controlLoop['version'] ?? 'ktr-control-loop-1';
+        $controlLoop['current_value'] = $baselineKtr;
+        $controlLoop['fixed_baseline_value'] = $baselineKtr;
+        $controlLoop['target_value'] = $targetKtr;
+        $controlLoop['state_ru'] = $fixation['state_ru'];
+        $controlLoop['next_action_ru'] = $fixation['next_action_ru'];
+        $ktr['control_loop'] = $controlLoop;
+
+        $territorial['ktr'] = $ktr;
+
+        return $territorial;
+    }
+
+    /**
+     * @return list<array<string, mixed>>
+     */
+    private function planningSourceCards(AutoSupplyPlan $plan): array
+    {
+        $sources = $plan->planning_sources;
+        $cards = [
+            $this->sourceCard('demand', 'Спрос', $sources['demand'] ?? null),
+            $this->sourceCard('stock', 'Остатки', $sources['stock'] ?? null),
+            $this->sourceCard('turnover', 'Оборачиваемость', $sources['turnover'] ?? null),
+            $this->sourceCard('in_transit', 'Товары в пути', $sources['in_transit'] ?? null),
+            $this->sourceCard('constraints', 'Ограничения', $sources['constraints'] ?? null, [
+                'status' => $sources['constraints_status'] ?? null,
+                'file' => $sources['constraint_source_file'] ?? null,
+                'parser_version' => $sources['constraint_parser_version'] ?? null,
+                'requires_review' => $sources['constraints_requires_review'] ?? false,
+            ]),
+            $this->sourceCard('marketplace_needs', 'Потребности маркетплейса', $sources['marketplace_needs'] ?? null, [
+                'status' => $sources['marketplace_needs_status'] ?? null,
+                'file' => $sources['constraint_source_file'] ?? null,
+                'qty' => $sources['marketplace_need_qty'] ?? null,
+                'requires_review' => $sources['constraints_has_unmatched_marketplace_needs'] ?? false,
+            ]),
+        ];
+
+        return array_values(array_filter($cards, static fn (array $card): bool => $card['source'] !== null || $card['status'] !== 'missing'));
+    }
+
+    /**
+     * @param array<string, mixed> $extra
+     * @return array<string, mixed>
+     */
+    private function sourceCard(string $key, string $title, mixed $source, array $extra = []): array
+    {
+        $source = $source !== null && trim((string) $source) !== '' ? (string) $source : null;
+        $status = $source !== null ? 'connected' : 'missing';
+
+        if (($extra['requires_review'] ?? false) === true) {
+            $status = 'review';
+        }
+
+        return array_merge([
+            'key' => $key,
+            'title_ru' => $title,
+            'source' => $source,
+            'source_label_ru' => $this->planningSourceLabel($source),
+            'status' => $status,
+            'status_ru' => match ($status) {
+                'connected' => 'используется',
+                'review' => 'нужна проверка',
+                default => 'нет данных',
+            },
+        ], $extra);
+    }
+
+    private function planningSourceLabel(?string $source): ?string
+    {
+        return match ($source) {
+            'posting_fbo_v3' => 'Заказы FBO из API Ozon',
+            'ozon_order_report' => 'Отчёт заказов Ozon',
+            'analytics_stocks' => 'Аналитика остатков маркетплейса',
+            'product_info_stocks' => 'Текущие остатки товаров',
+            'inventory_warehouses' => 'Синхронизированные остатки',
+            'turnover_stocks' => 'Оборачиваемость Ozon',
+            'average_delivery_time_summary' => 'Среднее время доставки Ozon',
+            'supply_orders' => 'Заявки поставки в пути',
+            'constraint_file' => 'Файл ограничений/потребностей',
+            'request_params' => 'Параметры запроса',
+            default => $source,
+        };
     }
 
     private function paginateAggregatedPlanLines(AutoSupplyPlan $plan, $query, int $perPage)
@@ -403,6 +916,9 @@ class AutoSupplyPlanController extends Controller
         $planIdSelect = $driver === 'pgsql'
             ? 'MIN(auto_supply_plan_id::text) as auto_supply_plan_id'
             : 'MIN(auto_supply_plan_id) as auto_supply_plan_id';
+        $explainSelect = $driver === 'pgsql'
+            ? 'MIN(explain_json::text) as explain_json'
+            : 'MIN(explain_json) as explain_json';
 
         return $query
             ->selectRaw("
@@ -447,7 +963,8 @@ class AutoSupplyPlanController extends Controller
                 MAX(turnover_days) as turnover_days,
                 SUM(storage_cost_daily) as storage_cost_daily,
                 SUM(storage_cost_monthly) as storage_cost_monthly,
-                SUM(lost_revenue_daily) as lost_revenue_daily
+                SUM(lost_revenue_daily) as lost_revenue_daily,
+                {$explainSelect}
             ")
             ->when($isOzon, fn ($q) => $q->groupBy('sku', 'cluster_id'), fn ($q) => $q->groupBy('sku'))
             ->orderByRaw("CASE MAX(risk_level) WHEN 'high' THEN 0 WHEN 'med' THEN 1 ELSE 2 END")
@@ -1011,30 +1528,37 @@ class AutoSupplyPlanController extends Controller
             return response()->json(['message' => $access['message'] ?? 'Доступ запрещён'], $access['status'] ?? 403);
         }
 
-        $groups = $this->clusterDraftLinesQuery($plan)
-            ->when($this->selectedPlanClusterIds($plan) !== [], function ($query) use ($plan) {
-                $query->whereIn('cluster_id', $this->selectedPlanClusterIds($plan));
-            })
-            ->orderBy('cluster_id')
-            ->get()
-            ->groupBy('cluster_id')
-            ->map(function ($linesInCluster) {
-                $first = $linesInCluster->first();
-                return [
-                    'cluster_id' => (string) $first->cluster_id,
-                    'cluster_name' => (string) $first->cluster_name,
-                    'items' => $linesInCluster->map(fn ($l) => [
-                        'sku' => (string) $l->sku,
-                        'offer_id' => $l->offer_id,
-                        'product_name' => $l->product_name,
-                        'quantity' => (int) $l->qty_rounded,
-                    ])->values()->all(),
-                    'total_qty' => (int) $linesInCluster->sum('qty_rounded'),
-                    'expected_savings_rub' => round((float) $linesInCluster->sum('expected_savings_rub'), 2),
-                ];
-            })
-            ->values()
-            ->all();
+        if ($plan->marketplace !== 'ozon') {
+            return response()->json(['message' => 'Превью черновиков доступно только для Ozon-планов', 'error' => 'not_ozon'], 422);
+        }
+
+        if ($plan->status !== AutoSupplyPlan::STATUS_READY) {
+            return response()->json([
+                'message' => 'План ещё не готов к созданию черновика Ozon. Дождитесь завершения расчёта и откройте предпросмотр заново.',
+                'error' => 'plan_not_ready',
+                'data' => [
+                    'status' => $plan->status,
+                    'required_status' => AutoSupplyPlan::STATUS_READY,
+                    'message_ru' => 'Черновик Ozon можно создавать только из полностью рассчитанного плана.',
+                ],
+            ], 409);
+        }
+
+        $groups = $this->buildClusterDraftPreviewGroups($plan);
+        $confirmationToken = bin2hex(random_bytes(24));
+        $expiresAt = now()->addMinutes(30);
+        $dropOffPointWarehouseId = $this->requestDropOffPointWarehouseId($request);
+        $summary = $this->buildClusterDraftPreviewSummary($plan, $groups, $expiresAt, $dropOffPointWarehouseId);
+        Cache::put($this->clusterDraftConfirmationCacheKey($plan, $confirmationToken), [
+            'plan_id' => (string) $plan->id,
+            'fingerprint' => $this->clusterDraftPreviewStateFingerprint($plan, $groups, $dropOffPointWarehouseId),
+            'summary' => $summary,
+            'draft_creation_allowed' => (bool) ($summary['draft_creation_allowed'] ?? false),
+            'confirmation_phrase' => (string) $summary['confirmation_phrase'],
+            'drop_off_point_warehouse_id' => $summary['drop_off_point_warehouse_id'] ?? null,
+            'created_at' => now()->toISOString(),
+            'expires_at' => $expiresAt->toISOString(),
+        ], $expiresAt);
 
         return response()->json([
             'message' => 'Success',
@@ -1042,6 +1566,16 @@ class AutoSupplyPlanController extends Controller
                 'clusters' => $groups,
                 'total_drafts' => count($groups),
                 'total_qty' => array_sum(array_column($groups, 'total_qty')),
+                'total_sku' => array_sum(array_column($groups, 'items_count')),
+                'summary' => $summary,
+                'safe_flow_contract' => $summary['safe_flow_contract'],
+                'warnings' => $summary['warnings'],
+                'notes' => $summary['notes'],
+                'confirmation_required' => true,
+                'confirmation_token' => $confirmationToken,
+                'confirmation_expires_at' => $expiresAt->toISOString(),
+                'confirmation_phrase' => (string) $summary['confirmation_phrase'],
+                'confirmation_note' => $summary['confirmation_note'],
             ],
         ]);
     }
@@ -1063,6 +1597,96 @@ class AutoSupplyPlanController extends Controller
             return response()->json(['message' => 'Только для Ozon-планов', 'error' => 'not_ozon'], 422);
         }
 
+        if ($plan->status !== AutoSupplyPlan::STATUS_READY) {
+            return response()->json([
+                'message' => 'План ещё не готов к созданию черновика Ozon. Дождитесь завершения расчёта и откройте предпросмотр заново.',
+                'error' => 'plan_not_ready',
+                'data' => [
+                    'status' => $plan->status,
+                    'required_status' => AutoSupplyPlan::STATUS_READY,
+                    'message_ru' => 'Черновик Ozon можно создавать только из полностью рассчитанного плана.',
+                ],
+            ], 409);
+        }
+
+        $qualityGate = $this->planQualityAllowsOzonDraft($plan);
+        if (! $qualityGate['allowed']) {
+            return response()->json([
+                'message' => 'Аудит качества плана требует ручной проверки. Создание черновиков Ozon остановлено.',
+                'error' => 'plan_quality_audit_failed',
+                'data' => [
+                    'quality_audit' => $qualityGate,
+                ],
+            ], 409);
+        }
+
+        $confirmationToken = (string) $request->input('confirmation_token', '');
+        if ($confirmationToken === '') {
+            return response()->json([
+                'message' => 'Сначала откройте предпросмотр черновиков и подтвердите создание',
+                'error' => 'confirmation_required',
+            ], 409);
+        }
+
+        $previewGroups = $this->buildClusterDraftPreviewGroups($plan);
+        $confirmation = Cache::get($this->clusterDraftConfirmationCacheKey($plan, $confirmationToken));
+        if (! is_array($confirmation)) {
+            return response()->json([
+                'message' => 'Подтверждение устарело или не найдено. Откройте предпросмотр заново.',
+                'error' => 'confirmation_expired',
+            ], 409);
+        }
+
+        $expectedConfirmationPhrase = (string) ($confirmation['confirmation_phrase'] ?? $this->clusterDraftConfirmationPhrase());
+        $confirmationText = trim((string) $request->input('confirmation_text', ''));
+        if ($confirmationText !== $expectedConfirmationPhrase) {
+            return response()->json([
+                'message' => 'Введите точную фразу подтверждения из предпросмотра перед созданием черновиков Ozon.',
+                'error' => 'confirmation_phrase_required',
+                'expected_confirmation_phrase' => $expectedConfirmationPhrase,
+            ], 409);
+        }
+
+        $confirmedDropOffPointWarehouseId = $this->normalizeDropOffPointWarehouseId(
+            $confirmation['drop_off_point_warehouse_id']
+                ?? ($confirmation['summary']['drop_off_point_warehouse_id'] ?? null)
+        );
+        $requestDropOffPointWarehouseId = $this->requestDropOffPointWarehouseId($request);
+        if (
+            $requestDropOffPointWarehouseId !== null
+            && $confirmedDropOffPointWarehouseId !== null
+            && $requestDropOffPointWarehouseId !== $confirmedDropOffPointWarehouseId
+        ) {
+            return response()->json([
+                'message' => 'Точка отгрузки отличается от предпросмотра. Откройте предпросмотр заново с нужной точкой.',
+                'error' => 'drop_off_point_changed',
+            ], 409);
+        }
+
+        $currentSummary = $this->buildClusterDraftPreviewSummary(
+            $plan,
+            $previewGroups,
+            now()->addMinutes(30),
+            $confirmedDropOffPointWarehouseId
+        );
+        if (! (bool) ($confirmation['draft_creation_allowed'] ?? ($confirmation['summary']['draft_creation_allowed'] ?? false))
+            || ! (bool) ($currentSummary['draft_creation_allowed'] ?? false)) {
+            return response()->json([
+                'message' => 'Предпросмотр не разрешает создание черновика. Откройте предпросмотр и устраните предупреждения перед созданием.',
+                'error' => 'preview_not_allowed',
+                'data' => [
+                    'summary' => $currentSummary,
+                ],
+            ], 409);
+        }
+
+        if (($confirmation['fingerprint'] ?? null) !== $this->clusterDraftPreviewStateFingerprint($plan, $previewGroups, $confirmedDropOffPointWarehouseId)) {
+            return response()->json([
+                'message' => 'Состав плана изменился после предпросмотра. Откройте предпросмотр заново перед созданием черновика.',
+                'error' => 'preview_changed',
+            ], 409);
+        }
+
         $groups = $this->clusterDraftLinesQuery($plan)
             ->when($this->selectedPlanClusterIds($plan) !== [], function ($query) use ($plan) {
                 $query->whereIn('cluster_id', $this->selectedPlanClusterIds($plan));
@@ -1079,6 +1703,8 @@ class AutoSupplyPlanController extends Controller
 
         $applier = app(\App\Domains\Locality\Recommendation\LocalityDraftApplier::class);
         $results = ['drafts' => [], 'errors' => []];
+        $supplyMethod = $this->draftSupplyMethod($plan);
+        $dropOffPointWarehouseId = $confirmedDropOffPointWarehouseId ?? $this->draftDropOffPointWarehouseId($plan);
 
         foreach ($groups as $clusterId => $lines) {
             $itemsByOzonSku = [];
@@ -1112,12 +1738,19 @@ class AutoSupplyPlanController extends Controller
             }
 
             try {
-                $result = $applier->applyBatch($plan->integration, $items, (int) $clusterId);
+                $result = $supplyMethod === 'crossdock'
+                    ? $applier->applyBatch($plan->integration, $items, (int) $clusterId, [
+                        'supply_method' => 'crossdock',
+                        'drop_off_point_warehouse_id' => $dropOffPointWarehouseId,
+                    ])
+                    : $applier->applyBatch($plan->integration, $items, (int) $clusterId);
                 if (($result['success'] ?? false) && ($result['draft_id'] ?? null)) {
                     $results['drafts'][] = [
                         'cluster_id' => (string) $clusterId,
                         'cluster_name' => (string) $lines->first()->cluster_name,
                         'draft_id' => (string) $result['draft_id'],
+                        'supply_method' => $result['supply_method'] ?? $supplyMethod,
+                        'drop_off_point_warehouse_id' => $dropOffPointWarehouseId,
                         'items_count' => count($items),
                         'total_qty' => array_sum(array_column($items, 'quantity')),
                     ];
@@ -1140,14 +1773,37 @@ class AutoSupplyPlanController extends Controller
         // Сохраним результат в план для истории
         $plan->result_json = array_merge($plan->result_json ?? [], ['cluster_drafts' => $results]);
         $plan->save();
+        Cache::forget($this->clusterDraftConfirmationCacheKey($plan, $confirmationToken));
 
         return response()->json([
             'message' => sprintf(
-                'Создано %d draft(ов) из %d кластеров',
+                'Создано черновиков Ozon: %d из %d кластеров',
                 count($results['drafts']),
                 $groups->count()
             ),
-            'data' => $results,
+            'data' => array_merge($results, [
+                'safe_flow' => 'preview_confirmed',
+                'confirmation_checked' => true,
+                'preview_fingerprint_verified' => true,
+                'safety_checks_passed' => true,
+                'supply_method' => $supplyMethod,
+                'drop_off_point_warehouse_id' => $dropOffPointWarehouseId,
+                'accepted_at' => now()->toISOString(),
+                'acceptance_audit' => $this->buildClusterDraftAcceptanceAudit(
+                    allowed: true,
+                    stage: 'create',
+                    selectedClusterIds: $this->selectedPlanClusterIds($plan),
+                    previewClusterIds: array_values(array_filter(
+                        array_map(static fn ($clusterId): int => (int) $clusterId, $groups->keys()->all()),
+                        static fn (int $clusterId): bool => $clusterId > 0
+                    )),
+                    supplyMethod: $supplyMethod,
+                    dropOffPointWarehouseId: $dropOffPointWarehouseId,
+                    qualityAllowed: true,
+                    warnings: [],
+                ),
+                'message_ru' => 'Черновики созданы только после предпросмотра и повторной сверки состава плана.',
+            ]),
         ]);
     }
 
@@ -1299,6 +1955,555 @@ class AutoSupplyPlanController extends Controller
                     ->where('is_cluster_split', true)
                     ->orWhere('destination_type', 'cluster');
             });
+    }
+
+    /**
+     * @return list<array<string, mixed>>
+     */
+    private function buildClusterDraftPreviewGroups(AutoSupplyPlan $plan): array
+    {
+        return $this->clusterDraftLinesQuery($plan)
+            ->when($this->selectedPlanClusterIds($plan) !== [], function ($query) use ($plan) {
+                $query->whereIn('cluster_id', $this->selectedPlanClusterIds($plan));
+            })
+            ->orderBy('cluster_id')
+            ->orderBy('sku')
+            ->get()
+            ->groupBy('cluster_id')
+            ->map(function ($linesInCluster) {
+                $first = $linesInCluster->first();
+
+                return [
+                    'cluster_id' => (string) $first->cluster_id,
+                    'cluster_name' => (string) $first->cluster_name,
+                    'items_count' => $linesInCluster->count(),
+                    'sku_count' => $linesInCluster->pluck('sku')->unique()->count(),
+                    'items' => $linesInCluster->map(fn ($line) => [
+                        'sku' => (string) $line->sku,
+                        'offer_id' => $line->offer_id,
+                        'product_name' => $line->product_name,
+                        'quantity' => (int) $line->qty_rounded,
+                    ])->values()->all(),
+                    'total_qty' => (int) $linesInCluster->sum('qty_rounded'),
+                    'expected_savings_rub' => round((float) $linesInCluster->sum('expected_savings_rub'), 2),
+                ];
+            })
+            ->values()
+            ->all();
+    }
+
+    /**
+     * @param list<array<string, mixed>> $groups
+     * @return array<string, mixed>
+     */
+    private function buildClusterDraftPreviewSummary(
+        AutoSupplyPlan $plan,
+        array $groups,
+        \Carbon\CarbonInterface $expiresAt,
+        ?int $dropOffPointWarehouseIdOverride = null
+    ): array
+    {
+        $selectedClusterIds = $this->selectedPlanClusterIds($plan);
+        $previewClusterIds = array_values(array_filter(
+            array_map(static fn (array $group): int => (int) ($group['cluster_id'] ?? 0), $groups),
+            static fn (int $clusterId): bool => $clusterId > 0
+        ));
+        $totalQty = array_sum(array_map(static fn (array $group): int => (int) ($group['total_qty'] ?? 0), $groups));
+        $totalSku = array_sum(array_map(static fn (array $group): int => (int) ($group['items_count'] ?? 0), $groups));
+        $supplyMethod = $this->draftSupplyMethod($plan);
+        $dropOffPointWarehouseId = $supplyMethod === 'crossdock'
+            ? ($dropOffPointWarehouseIdOverride ?? $this->draftDropOffPointWarehouseId($plan))
+            : null;
+        $previewFingerprint = $this->clusterDraftPreviewStateFingerprint($plan, $groups, $dropOffPointWarehouseId);
+        $warnings = [];
+        $qualityGate = $this->planQualityAllowsOzonDraft($plan);
+        $missingSelectedClusterIds = [];
+
+        if ($groups === []) {
+            $warnings[] = 'В плане нет строк с кластерами Ozon, поэтому черновик создать нельзя.';
+        }
+
+        if ($selectedClusterIds !== []) {
+            $missingSelectedClusterIds = array_values(array_diff($selectedClusterIds, $previewClusterIds));
+            if ($missingSelectedClusterIds !== []) {
+                $warnings[] = 'Часть выбранных кластеров не попала в предпросмотр, потому что в плане нет строк к поставке для этих кластеров: ' . implode(', ', $missingSelectedClusterIds) . '. Создание черновика остановлено, чтобы не создать частичную поставку.';
+            }
+        } else {
+            $warnings[] = 'В плане не зафиксирован список выбранных кластеров: предпросмотр показывает все кластеры, которые есть в строках плана.';
+        }
+
+        if (! $qualityGate['allowed']) {
+            $warnings[] = $qualityGate['summary']
+                ?: 'Аудит качества плана требует ручной проверки перед созданием черновиков Ozon.';
+        }
+        if ($supplyMethod === 'crossdock' && $dropOffPointWarehouseId === null) {
+            $warnings[] = 'Для кросс-докинга Ozon укажите ID точки отгрузки: без неё сервер не будет создавать черновик.';
+        }
+
+        $notes = [
+            'Это безопасный предпросмотр: на этом шаге запрос в Ozon на создание черновика не отправляется.',
+            'После подтверждения сервер повторно сверит состав плана. Если количество или SKU изменились, создание будет остановлено.',
+            'Автобронирование слотов не выполняется: сервис только создаёт черновик после ручного подтверждения.',
+        ];
+
+        $draftCreationAllowed = $groups !== []
+            && $qualityGate['allowed']
+            && $missingSelectedClusterIds === []
+            && ($supplyMethod !== 'crossdock' || $dropOffPointWarehouseId !== null);
+
+        $summary = [
+            'human_status' => $groups === []
+                ? 'Черновик Ozon создать нельзя: нет строк с кластерами'
+                : 'Предпросмотр готов: проверьте кластеры, SKU и количество перед созданием черновиков Ozon',
+            'safe_flow' => 'preview_only',
+            'ozon_api_called' => false,
+            'autobooking' => false,
+            'draft_creation_blocked' => ! $draftCreationAllowed,
+            'draft_creation_policy' => 'Только после ручного подтверждения предпросмотра',
+            'destination_label' => 'кластеры Ozon',
+            'supply_method' => $supplyMethod,
+            'supply_method_label' => $supplyMethod === 'crossdock' ? 'Кросс-докинг Ozon' : 'Прямая поставка Ozon',
+            'drop_off_point_warehouse_id' => $dropOffPointWarehouseId,
+            'selected_cluster_ids' => $selectedClusterIds,
+            'selected_clusters_count' => count($selectedClusterIds),
+            'missing_selected_cluster_ids' => $missingSelectedClusterIds,
+            'selected_clusters_complete' => $missingSelectedClusterIds === [],
+            'preview_cluster_ids' => $previewClusterIds,
+            'preview_clusters_count' => count($groups),
+            'total_drafts' => count($groups),
+            'total_qty' => $totalQty,
+            'total_sku' => $totalSku,
+            'preview_fingerprint_short' => substr($previewFingerprint, 0, 12),
+            'safety_checks' => [
+                [
+                    'key' => 'preview_only',
+                    'label' => 'Предпросмотр не создаёт черновик в Ozon',
+                    'passed' => true,
+                ],
+                [
+                    'key' => 'selected_clusters_locked',
+                    'label' => $selectedClusterIds === []
+                        ? 'План создан без фиксированного списка кластеров: используются все кластеры из строк плана'
+                        : ($missingSelectedClusterIds === []
+                            ? 'Выбранные кластеры зафиксированы и полностью попали в предпросмотр'
+                            : 'Не все выбранные кластеры попали в предпросмотр: создание частичного черновика запрещено'),
+                    'passed' => $missingSelectedClusterIds === [],
+                ],
+                [
+                    'key' => 'fingerprint_will_be_verified',
+                    'label' => 'Перед созданием сервер повторно сверит SKU, количество и кластеры по контрольной подписи предпросмотра',
+                    'passed' => true,
+                ],
+                [
+                    'key' => 'no_autobooking',
+                    'label' => 'Автобронирование слотов не выполняется',
+                    'passed' => true,
+                ],
+                [
+                    'key' => 'plan_quality_audit',
+                    'label' => $qualityGate['allowed']
+                        ? 'Аудит качества плана разрешает создание черновика'
+                        : 'Аудит качества плана требует ручной проверки: черновик создавать нельзя',
+                    'passed' => $qualityGate['allowed'],
+                ],
+                [
+                    'key' => 'crossdock_drop_off_configured',
+                    'label' => $supplyMethod === 'crossdock'
+                        ? ($dropOffPointWarehouseId !== null
+                            ? 'Кросс-докинг включён: точка отгрузки указана'
+                            : 'Кросс-докинг включён, но точка отгрузки не указана')
+                        : 'Кросс-докинг не включён: будет создан прямой черновик Ozon',
+                    'passed' => $supplyMethod !== 'crossdock' || $dropOffPointWarehouseId !== null,
+                ],
+            ],
+            'draft_creation_allowed' => $draftCreationAllowed,
+            'quality_audit_status' => $qualityGate['status'],
+            'quality_audit_summary' => $qualityGate['summary'],
+            'quality_audit_actions' => $qualityGate['actions'],
+            'quality_audit_examples' => $qualityGate['examples'],
+            'quality_audit_manual_review_reason' => $qualityGate['manual_review_reason_ru'],
+            'blocking_reasons_ru' => $warnings,
+            'required_user_action_ru' => $groups === []
+                ? 'Пересчитайте план или проверьте выбранные кластеры: сейчас нечего передавать в черновик Ozon.'
+                : 'Проверьте кластеры, SKU, количество и введите точную фразу подтверждения перед созданием черновиков Ozon.',
+            'confirmation_expires_at' => $expiresAt->toISOString(),
+            'confirmation_phrase' => $this->clusterDraftConfirmationPhrase($supplyMethod),
+            'confirmation_note' => 'Создание черновиков Ozon доступно только после просмотра предпросмотра. Перед созданием сервер повторно сверит SKU, количество и кластеры плана.',
+            'acceptance_audit' => $this->buildClusterDraftAcceptanceAudit(
+                allowed: $draftCreationAllowed,
+                stage: 'preview',
+                selectedClusterIds: $selectedClusterIds,
+                previewClusterIds: $previewClusterIds,
+                supplyMethod: $supplyMethod,
+                dropOffPointWarehouseId: $dropOffPointWarehouseId,
+                qualityAllowed: (bool) $qualityGate['allowed'],
+                warnings: $warnings,
+            ),
+            'warnings' => $warnings,
+            'notes' => $notes,
+        ];
+
+        $summary['safe_flow_contract'] = $this->buildClusterDraftSafeFlowContract($summary);
+
+        return $summary;
+    }
+
+    /**
+     * @param array<string, mixed> $summary
+     * @return array<string, mixed>
+     */
+    private function buildClusterDraftSafeFlowContract(array $summary): array
+    {
+        $supplyMethod = (string) ($summary['supply_method'] ?? 'direct');
+        $draftCreationAllowed = (bool) ($summary['draft_creation_allowed'] ?? false);
+        $blockingReasons = array_values((array) ($summary['blocking_reasons_ru'] ?? []));
+        $confirmationPhrase = (string) ($summary['confirmation_phrase'] ?? $this->clusterDraftConfirmationPhrase($supplyMethod));
+        $isCrossdock = $supplyMethod === 'crossdock';
+        $primaryAction = $isCrossdock ? 'Создать кросс-докинг Ozon' : 'Создать черновики Ozon';
+
+        return [
+            'version' => 'ozon-draft-safe-flow-ui-1',
+            'title_ru' => $isCrossdock
+                ? 'Безопасное создание кросс-докинга Ozon'
+                : 'Безопасное создание черновиков Ozon',
+            'status' => $draftCreationAllowed ? 'ready_for_confirmation' : 'blocked',
+            'status_ru' => $draftCreationAllowed
+                ? 'Можно создать после ручного подтверждения'
+                : 'Создание заблокировано до устранения причин',
+            'primary_action_ru' => $primaryAction,
+            'primary_action_enabled' => $draftCreationAllowed,
+            'disabled_reason_ru' => $draftCreationAllowed
+                ? null
+                : ($blockingReasons[0] ?? 'Предпросмотр не разрешает создание черновика Ozon. Проверьте предупреждения.'),
+            'manual_policy_ru' => 'Автобронирование не выполняется: сервис создаёт только черновик после предпросмотра и ручного подтверждения.',
+            'steps_ru' => [
+                'Проверить предпросмотр: кластеры, SKU и количество.',
+                'Проверить защиту данных и убедиться, что план не заблокирован.',
+                $isCrossdock
+                    ? 'Проверить точку отгрузки для кросс-докинга Ozon.'
+                    : 'Проверить, что будет создан прямой черновик Ozon.',
+                'Ввести точную фразу подтверждения.',
+                $primaryAction . '.',
+            ],
+            'frontend_flags' => [
+                'show_confirmation_input' => true,
+                'show_blocking_reasons' => ! $draftCreationAllowed,
+                'show_no_autobooking_notice' => true,
+                'show_drop_off_selector' => $isCrossdock && ($summary['drop_off_point_warehouse_id'] ?? null) === null,
+                'can_submit_create' => $draftCreationAllowed,
+            ],
+            'payload_requirements' => [
+                [
+                    'field' => 'confirmation_token',
+                    'required' => true,
+                    'source_ru' => 'Возьмите из ответа предпросмотра: data.confirmation_token.',
+                ],
+                [
+                    'field' => 'confirmation_text',
+                    'required' => true,
+                    'source_ru' => 'Пользователь должен ввести точную фразу подтверждения.',
+                    'expected_value' => $confirmationPhrase,
+                ],
+                [
+                    'field' => 'drop_off_point_warehouse_id',
+                    'required' => $isCrossdock,
+                    'source_ru' => $isCrossdock
+                        ? 'Для кросс-докинга точка отгрузки должна быть сохранена в параметрах плана до открытия предпросмотра.'
+                        : 'Для прямого черновика не требуется.',
+                    'current_value' => $summary['drop_off_point_warehouse_id'] ?? null,
+                ],
+            ],
+            'confirmation_phrase' => $confirmationPhrase,
+            'confirmation_phrase_ru' => 'Введите точно: ' . $confirmationPhrase,
+            'blocking_checks_ru' => collect((array) ($summary['acceptance_audit'] ?? []))
+                ->filter(fn (array $check): bool => (bool) ($check['passed'] ?? false) === false)
+                ->map(fn (array $check): string => (string) ($check['details_ru'] ?? $check['title_ru'] ?? 'Проверка не пройдена'))
+                ->values()
+                ->all(),
+            'next_action_ru' => $draftCreationAllowed
+                ? 'Покажите пользователю фразу подтверждения и активируйте кнопку создания после ввода точного текста.'
+                : 'Покажите причины блокировки и не отправляйте запрос создания, пока preview не станет разрешённым.',
+        ];
+    }
+
+    /**
+     * @return list<array<string, mixed>>
+     */
+    private function buildClusterDraftAcceptanceAudit(
+        bool $allowed,
+        string $stage,
+        array $selectedClusterIds,
+        array $previewClusterIds,
+        string $supplyMethod,
+        ?int $dropOffPointWarehouseId,
+        bool $qualityAllowed,
+        array $warnings = []
+    ): array {
+        $isCreateStage = $stage === 'create';
+        $hasLines = $previewClusterIds !== [];
+        $crossdockConfigured = $supplyMethod !== 'crossdock' || $dropOffPointWarehouseId !== null;
+        $missingSelectedClusterIds = $selectedClusterIds === []
+            ? []
+            : array_values(array_diff($selectedClusterIds, $previewClusterIds));
+        $unexpectedClusterIds = $selectedClusterIds === []
+            ? []
+            : array_values(array_diff($previewClusterIds, $selectedClusterIds));
+        $selectedClustersPassed = $missingSelectedClusterIds === [] && $unexpectedClusterIds === [];
+
+        return [
+            [
+                'key' => 'preview_loaded',
+                'status' => 'passed',
+                'passed' => true,
+                'title_ru' => 'Предпросмотр построен',
+                'details_ru' => $hasLines
+                    ? 'Система собрала строки плана по выбранным кластерам.'
+                    : 'В предпросмотре нет строк для создания черновика.',
+            ],
+            [
+                'key' => 'ozon_api_call',
+                'status' => $isCreateStage ? 'passed' : 'pending',
+                'passed' => $isCreateStage,
+                'title_ru' => $isCreateStage
+                    ? 'Вызов Ozon разрешён после подтверждения'
+                    : 'Запрос в Ozon ещё не отправлялся',
+                'details_ru' => $isCreateStage
+                    ? 'Сервер дошёл до создания черновика только после подтверждённого preview.'
+                    : 'На этапе предпросмотра сервер ничего не создаёт в Ozon.',
+            ],
+            [
+                'key' => 'manual_confirmation',
+                'status' => $isCreateStage ? 'passed' : 'required',
+                'passed' => $isCreateStage,
+                'title_ru' => $isCreateStage
+                    ? 'Ручное подтверждение принято'
+                    : 'Нужно ручное подтверждение',
+                'details_ru' => $isCreateStage
+                    ? 'Пользователь ввёл точную фразу подтверждения.'
+                    : 'Без точной фразы подтверждения черновики не будут созданы.',
+            ],
+            [
+                'key' => 'fingerprint',
+                'status' => $isCreateStage ? 'passed' : 'pending',
+                'passed' => $isCreateStage,
+                'title_ru' => $isCreateStage
+                    ? 'Контрольная подпись preview совпала'
+                    : 'Контрольная подпись будет проверена перед созданием',
+                'details_ru' => $isCreateStage
+                    ? 'SKU, количество, кластеры и способ поставки не изменились после предпросмотра.'
+                    : 'Если SKU, количество, кластеры или способ поставки изменятся, создание остановится.',
+            ],
+            [
+                'key' => 'selected_clusters',
+                'status' => $selectedClustersPassed ? 'passed' : 'failed',
+                'passed' => $selectedClustersPassed,
+                'title_ru' => 'Кластеры сверены',
+                'details_ru' => match (true) {
+                    $selectedClusterIds === [] => 'План создан без фиксированного списка кластеров: используются все кластеры из строк плана.',
+                    $missingSelectedClusterIds !== [] => 'Не все выбранные кластеры попали в предпросмотр: отсутствуют ' . implode(', ', $missingSelectedClusterIds) . '.',
+                    $unexpectedClusterIds !== [] => 'В предпросмотр попали кластеры вне выбора пользователя: ' . implode(', ', $unexpectedClusterIds) . '.',
+                    default => 'В черновик допускаются только выбранные кластеры: ' . implode(', ', $selectedClusterIds) . '.',
+                },
+                'selected_cluster_ids' => $selectedClusterIds,
+                'preview_cluster_ids' => $previewClusterIds,
+                'missing_selected_cluster_ids' => $missingSelectedClusterIds,
+                'unexpected_cluster_ids' => $unexpectedClusterIds,
+            ],
+            [
+                'key' => 'quality_gate',
+                'status' => $qualityAllowed ? 'passed' : 'failed',
+                'passed' => $qualityAllowed,
+                'title_ru' => $qualityAllowed
+                    ? 'Защита данных разрешает создание'
+                    : 'Защита данных остановила создание',
+                'details_ru' => $qualityAllowed
+                    ? 'Качество плана достаточно для draft-flow.'
+                    : 'План требует ручной проверки перед созданием черновика Ozon.',
+            ],
+            [
+                'key' => 'crossdock_drop_off',
+                'status' => $crossdockConfigured ? 'passed' : 'failed',
+                'passed' => $crossdockConfigured,
+                'title_ru' => $supplyMethod === 'crossdock'
+                    ? 'Точка кросс-докинга проверена'
+                    : 'Кросс-докинг не включён',
+                'details_ru' => $supplyMethod === 'crossdock'
+                    ? ($dropOffPointWarehouseId !== null
+                        ? 'Будет использована точка отгрузки Ozon #' . $dropOffPointWarehouseId . '.'
+                        : 'Для кросс-докинга нужна точка отгрузки Ozon.')
+                    : 'Будет создан прямой черновик Ozon.',
+            ],
+            [
+                'key' => 'final_permission',
+                'status' => $allowed ? ($isCreateStage ? 'passed' : 'ready') : 'blocked',
+                'passed' => $allowed,
+                'title_ru' => $allowed
+                    ? ($isCreateStage ? 'Создание прошло через safe-flow' : 'Черновик можно создать после подтверждения')
+                    : 'Создание черновика заблокировано',
+                'details_ru' => $allowed
+                    ? 'Ограничения safe-flow выполнены.'
+                    : (reset($warnings) ?: 'Устраните предупреждения в предпросмотре.'),
+            ],
+        ];
+    }
+
+    /**
+     * @return array{
+     *   allowed: bool,
+     *   status: string|null,
+     *   summary: string|null,
+     *   actions: array<int, mixed>,
+     *   examples: array<int, mixed>,
+     *   manual_review_reason_ru: string|null
+     * }
+     */
+    private function planQualityAllowsOzonDraft(AutoSupplyPlan $plan): array
+    {
+        $audit = $plan->plan_quality_audit;
+        if (! is_array($audit) || $audit === []) {
+            return [
+                'allowed' => true,
+                'status' => null,
+                'summary' => null,
+                'actions' => [],
+                'examples' => [],
+                'manual_review_reason_ru' => null,
+            ];
+        }
+
+        $status = isset($audit['status']) ? (string) $audit['status'] : null;
+        $acceptanceGates = is_array($audit['acceptance_gates'] ?? null) ? $audit['acceptance_gates'] : [];
+        $allowed = array_key_exists('can_create_ozon_draft', $acceptanceGates)
+            ? (bool) $acceptanceGates['can_create_ozon_draft']
+            : $status !== 'bad';
+
+        return [
+            'allowed' => $allowed,
+            'status' => $status,
+            'summary' => isset($audit['summary_ru'])
+                ? (string) $audit['summary_ru']
+                : (isset($audit['status_label']) ? (string) $audit['status_label'] : null),
+            'actions' => array_slice(array_values((array) ($audit['actions'] ?? [])), 0, 4),
+            'examples' => array_slice(array_values((array) ($audit['examples'] ?? [])), 0, 4),
+            'manual_review_reason_ru' => isset($acceptanceGates['manual_review_reason_ru'])
+                ? (string) $acceptanceGates['manual_review_reason_ru']
+                : null,
+        ];
+    }
+
+    /**
+     * @param list<array<string, mixed>> $groups
+     */
+    private function clusterDraftPreviewFingerprint(array $groups): string
+    {
+        $normalized = collect($groups)
+            ->map(function (array $group): array {
+                $items = collect($group['items'] ?? [])
+                    ->map(fn (array $item): array => [
+                        'sku' => (string) ($item['sku'] ?? ''),
+                        'offer_id' => (string) ($item['offer_id'] ?? ''),
+                        'quantity' => (int) ($item['quantity'] ?? 0),
+                    ])
+                    ->sortBy([['sku', 'asc'], ['offer_id', 'asc']])
+                    ->values()
+                    ->all();
+
+                return [
+                    'cluster_id' => (string) ($group['cluster_id'] ?? ''),
+                    'items' => $items,
+                    'total_qty' => (int) ($group['total_qty'] ?? 0),
+                ];
+            })
+            ->sortBy('cluster_id')
+            ->values()
+            ->all();
+
+        return hash('sha256', json_encode($normalized, JSON_UNESCAPED_UNICODE));
+    }
+
+    /**
+     * Fingerprint безопасного preview: учитывает не только строки, но и режим
+     * создания draft. Нельзя подтвердить direct-preview, а затем создать
+     * cross-docking draft с другой точкой отгрузки.
+     *
+     * @param list<array<string, mixed>> $groups
+     */
+    private function clusterDraftPreviewStateFingerprint(AutoSupplyPlan $plan, array $groups, ?int $dropOffPointWarehouseIdOverride = null): string
+    {
+        $supplyMethod = $this->draftSupplyMethod($plan);
+        $dropOffPointWarehouseId = $supplyMethod === 'crossdock'
+            ? ($dropOffPointWarehouseIdOverride ?? $this->draftDropOffPointWarehouseId($plan))
+            : null;
+
+        return hash('sha256', json_encode([
+            'lines_fingerprint' => $this->clusterDraftPreviewFingerprint($groups),
+            'selected_cluster_ids' => $this->selectedPlanClusterIds($plan),
+            'supply_method' => $supplyMethod,
+            'drop_off_point_warehouse_id' => $dropOffPointWarehouseId,
+            'quality_audit_fingerprint' => $this->clusterDraftQualityAuditFingerprint($plan),
+        ], JSON_UNESCAPED_UNICODE));
+    }
+
+    private function clusterDraftQualityAuditFingerprint(AutoSupplyPlan $plan): string
+    {
+        return hash('sha256', json_encode(
+            $plan->plan_quality_audit,
+            JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES
+        ));
+    }
+
+    private function draftSupplyMethod(AutoSupplyPlan $plan): string
+    {
+        $params = is_array($plan->params ?? null) ? $plan->params : [];
+        $method = (string) ($params['draft_supply_method'] ?? $params['supply_method'] ?? 'direct');
+
+        return $this->normalizeDraftSupplyMethod($method);
+    }
+
+    private function normalizeDraftSupplyMethod(string $method): string
+    {
+        $method = strtolower(trim($method));
+
+        return in_array($method, ['crossdock', 'cross_dock', 'cross-dock'], true) ? 'crossdock' : 'direct';
+    }
+
+    private function draftDropOffPointWarehouseId(AutoSupplyPlan $plan): ?int
+    {
+        $params = is_array($plan->params ?? null) ? $plan->params : [];
+        $value = $params['drop_off_point_warehouse_id']
+            ?? $params['crossdock_drop_off_point_warehouse_id']
+            ?? $params['dropoff_warehouse_id']
+            ?? null;
+
+        return $this->normalizeDropOffPointWarehouseId($value);
+    }
+
+    private function requestDropOffPointWarehouseId(Request $request): ?int
+    {
+        return $this->normalizeDropOffPointWarehouseId(
+            $request->input('drop_off_point_warehouse_id', $request->input('crossdock_drop_off_point_warehouse_id'))
+        );
+    }
+
+    private function normalizeDropOffPointWarehouseId(mixed $value): ?int
+    {
+        if (! is_numeric($value) || (int) $value <= 0) {
+            return null;
+        }
+
+        return (int) $value;
+    }
+
+    private function clusterDraftConfirmationPhrase(?string $supplyMethod = null): string
+    {
+        return $supplyMethod === 'crossdock'
+            ? 'СОЗДАТЬ КРОСС-ДОКИНГ OZON'
+            : 'СОЗДАТЬ ЧЕРНОВИКИ OZON';
+    }
+
+    private function clusterDraftConfirmationCacheKey(AutoSupplyPlan $plan, string $token): string
+    {
+        return "auto_supply_plan:{$plan->id}:cluster_draft_confirmation:{$token}";
     }
 
     /**

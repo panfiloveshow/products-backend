@@ -45,6 +45,13 @@ Route::get('/health', fn () => response()->json([
 Route::prefix('integrations')->middleware('sellico.permission')->group(function () {
     Route::get('/', [IntegrationController::class, 'index'])->name('integrations.index');
     Route::get('/{id}/premium-status', [IntegrationController::class, 'getPremiumStatus'])->name('integrations.premiumStatus');
+    Route::get('/{id}/performance-status', [IntegrationController::class, 'performanceStatus'])->name('integrations.performanceStatus');
+    Route::get('/{id}/performance-summary', [IntegrationController::class, 'performanceSummary'])->name('integrations.performanceSummary');
+    Route::get('/{id}/performance-campaigns/{campaignId}/objects', [IntegrationController::class, 'performanceCampaignObjects'])->name('integrations.performanceCampaignObjects');
+    Route::post('/{id}/performance-product-report', [IntegrationController::class, 'requestPerformanceProductReport'])->name('integrations.performanceProductReport');
+    Route::get('/{id}/performance-reports/{uuid}/preview', [IntegrationController::class, 'performanceReportPreview'])->name('integrations.performanceReportPreview');
+    Route::get('/{id}/performance-reports/{uuid}/advertising-impact', [IntegrationController::class, 'performanceAdvertisingImpact'])->name('integrations.performanceAdvertisingImpact');
+    Route::get('/{id}/performance-reports/{uuid}', [IntegrationController::class, 'performanceReportStatus'])->name('integrations.performanceReportStatus');
     Route::put('/{id}/manual-redemption-rate', [IntegrationController::class, 'setManualRedemptionRate'])->name('integrations.manualRedemptionRate');
     Route::get('/{id}/sync-status', [IntegrationController::class, 'syncStatus'])->name('integrations.syncStatus');
     Route::get('/{id}/status', [IntegrationController::class, 'checkStatus'])->name('integrations.status');
@@ -386,8 +393,16 @@ Route::prefix('unit-economics')->middleware('sellico.permission')->group(functio
 |--------------------------------------------------------------------------
 */
 Route::prefix('auto-supply-plans')->middleware('sellico.permission')->group(function () {
+    Route::get('/capabilities', [AutoSupplyPlanController::class, 'capabilities'])
+        ->name('auto-supply-plans.capabilities');
     Route::get('/warehouses', [AutoSupplyPlanController::class, 'warehouses'])->name('auto-supply-plans.warehouses');
     Route::get('/data-health', [AutoSupplyPlanController::class, 'dataHealth'])->name('auto-supply-plans.data-health');
+    Route::get('/constraints', [AutoSupplyPlanController::class, 'constraintFiles'])
+        ->name('auto-supply-plans.constraints.index');
+    Route::post('/constraints/preview', [AutoSupplyPlanController::class, 'previewConstraints'])
+        ->name('auto-supply-plans.constraints.preview');
+    Route::get('/crossdock-drop-off-points', [AutoSupplyPlanController::class, 'crossdockDropOffPoints'])
+        ->name('auto-supply-plans.crossdock-drop-off-points');
     Route::get('/', [AutoSupplyPlanController::class, 'index'])
         ->name('auto-supply-plans.index');
     Route::post('/', [AutoSupplyPlanController::class, 'store'])
@@ -398,6 +413,8 @@ Route::prefix('auto-supply-plans')->middleware('sellico.permission')->group(func
         ->name('auto-supply-plans.destroy');
     Route::post('/{id}/calculate', [AutoSupplyPlanController::class, 'calculate'])
         ->name('auto-supply-plans.calculate');
+    Route::post('/{id}/fix-ktr-baseline', [AutoSupplyPlanController::class, 'fixKtrBaseline'])
+        ->name('auto-supply-plans.fix-ktr-baseline');
     Route::get('/{id}/lines', [AutoSupplyPlanController::class, 'lines'])
         ->name('auto-supply-plans.lines');
     Route::get('/{id}/clusters', [AutoSupplyPlanController::class, 'clusters'])

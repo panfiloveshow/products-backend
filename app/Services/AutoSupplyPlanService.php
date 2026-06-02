@@ -2,6 +2,10 @@
 
 namespace App\Services;
 
+use App\Domains\Ozon\Api\OzonClient;
+use App\Domains\Ozon\Api\SalesApi;
+use App\Models\Integration;
+use App\Models\OzonWarehouseCluster;
 use App\Models\SupplySettings;
 use App\Models\UnitEconomics;
 use Carbon\Carbon;
@@ -253,14 +257,26 @@ class AutoSupplyPlanService
     /**
      * Определить недостающие источники данных.
      */
-    public function detectMissingSources($wh, $product, string $marketplace, $ue = null, bool $hasOzonReport = false): array
+    public function detectMissingSources($wh, $product, string $marketplace, $ue = null, bool $hasOzonReport = false, bool $hasOzonPostingDemand = false): array
     {
         $missing = [];
-        if (($wh->sales_30_days ?? 0) <= 0 && ($wh->sales_14_days ?? 0) <= 0) $missing[] = 'sales_history';
+        if (
+            ($wh->sales_30_days ?? 0) <= 0
+            && ($wh->sales_14_days ?? 0) <= 0
+            && ! ($marketplace === 'ozon' && $hasOzonPostingDemand)
+        ) {
+            $missing[] = 'sales_history';
+        }
         if ($marketplace === 'wildberries' && empty($product?->barcode)) $missing[] = 'wb_barcode_map';
         if (($ue?->cost_price ?? $wh->cost_price ?? 0) <= 0) $missing[] = 'cost_price';
-        // Показываем предупреждение только если CSV-отчёт НЕ загружен для интеграции
-        if (!$hasOzonReport && $marketplace === 'ozon' && ($wh->real_avg_daily_sales ?? 0) <= 0) $missing[] = 'ozon_order_report';
+        if (
+            $marketplace === 'ozon'
+            && ! $hasOzonReport
+            && ! $hasOzonPostingDemand
+            && ($wh->real_avg_daily_sales ?? 0) <= 0
+        ) {
+            $missing[] = 'ozon_posting_demand';
+        }
         return $missing;
     }
 
@@ -380,7 +396,8 @@ class AutoSupplyPlanService
         float  $redemptionRate = 100,
         string $salesTrend = 'stable',
         float  $salesTrendPercent = 0,
-        float  $avgDailySalesApi = 0
+        float  $avgDailySalesApi = 0,
+        string $realAvgSource = 'ozon_order_report'
     ): array {
         $source = 'ewma';
         $needsManualReview = false;
@@ -388,7 +405,7 @@ class AutoSupplyPlanService
         // Приоритет 1: real_avg_daily_sales из отчёта заказов (по складам)
         if ($realAvgDailySales > 0) {
             $baseDemand = $realAvgDailySales;
-            $source = 'ozon_order_report';
+            $source = $realAvgSource;
         }
         // Приоритет 2: effective_daily_sales (с учётом OOS-дней)
         elseif ($effectiveDailySales > 0 && $daysInStock30 > 0 && $daysInStock30 < 28) {
@@ -431,8 +448,13 @@ class AutoSupplyPlanService
             $baseDemand = $baseDemand * ($redemptionRate / 100);
         }
 
-        // Корректировка на тренд (±20% макс)
-        $baseDemand = $this->adjustDemandByTrend($baseDemand, $salesTrend, $salesTrendPercent);
+        // Корректировка на тренд (±20% макс). Для фактического спроса из
+        // postings/отчёта не усиливаем положительный тренд: промо-всплеск уже
+        // находится внутри факта и не должен получать второй аплифт.
+        $trustedObservedSource = in_array($source, ['posting_fbo_v3', 'ozon_order_report'], true);
+        if (! $trustedObservedSource || $salesTrend !== 'growing') {
+            $baseDemand = $this->adjustDemandByTrend($baseDemand, $salesTrend, $salesTrendPercent);
+        }
 
         return [
             'daily_demand' => max(0, $baseDemand),
@@ -500,6 +522,291 @@ class AutoSupplyPlanService
         $minSafety = $dailyDemand * $minSafetyDays;
 
         return max($dynamicSafety, $minSafety);
+    }
+
+    /**
+     * Превратить Ozon postings в устойчивый спрос, не принимая промо-всплеск
+     * за новую норму. Возвращает и объяснение, чтобы UI мог честно показать
+     * "почему количество ограничено".
+     *
+     * @return array{daily_demand:float, suspected_spike:bool, confidence_level:string, confidence_reasons:string[], period_avg:float, recent_7_avg:float, recent_14_avg:float, recent_30_avg:float, winsorized_avg:float, peak_day_units:int, peak_share:float, active_days:int, guardrail_cap_daily_demand:float|null, capped_external_daily_demand:bool}
+     */
+    public function shapeOzonPostingDemand(array $postingData, float $localAvgDaily = 0.0, ?float $ozonAds = null): array
+    {
+        $periodAvg = max(0.0, (float) ($postingData['avg_daily_sales'] ?? 0));
+        $recent7 = max(0.0, ((float) ($postingData['sales_7_days'] ?? 0)) / 7);
+        $recent14 = max(0.0, ((float) ($postingData['sales_14_days'] ?? 0)) / 14);
+        $recent30 = max(0.0, ((float) ($postingData['sales_30_days'] ?? 0)) / 30);
+        $winsorized = max(0.0, (float) ($postingData['winsorized_avg_daily_sales'] ?? $periodAvg));
+        $orderedUnits = (int) ($postingData['ordered_units_total'] ?? 0);
+        $peakDayUnits = (int) ($postingData['peak_day_units'] ?? 0);
+        $peakShare = (float) ($postingData['peak_share'] ?? 0);
+        $activeDays = (int) ($postingData['active_days'] ?? 0);
+        $medianNonZero = (float) ($postingData['median_nonzero_daily_units'] ?? 0);
+        $ozonAds = $ozonAds !== null ? max(0.0, (float) $ozonAds) : 0.0;
+
+        $reasons = [];
+        $baselineCandidates = array_values(array_filter([
+            $winsorized,
+            $recent30,
+            $recent14 > 0 ? $recent14 * 0.85 : 0,
+            $localAvgDaily > 0 ? $localAvgDaily : 0,
+            $ozonAds,
+        ], fn (float $value) => $value > 0));
+
+        $baseline = $baselineCandidates !== []
+            ? array_sum($baselineCandidates) / count($baselineCandidates)
+            : $periodAvg;
+
+        $suspectedSpike = false;
+        if ($orderedUnits >= 10 && $peakShare >= 0.25) {
+            $suspectedSpike = true;
+            $reasons[] = 'promo_spike_peak_share';
+        }
+        if ($medianNonZero > 0 && $peakDayUnits >= max(10, $medianNonZero * 4)) {
+            $suspectedSpike = true;
+            $reasons[] = 'promo_spike_peak_vs_median';
+        }
+        if ($periodAvg > 0 && $recent7 > 0 && $recent7 > $periodAvg * 2.5) {
+            $suspectedSpike = true;
+            $reasons[] = 'recent_spike_vs_period';
+        }
+        if ($periodAvg > 0 && $recent7 < $periodAvg * 0.35 && $peakShare >= 0.15) {
+            $suspectedSpike = true;
+            $reasons[] = 'post_promo_cooldown';
+        }
+
+        $demand = $periodAvg;
+        if ($winsorized > 0) {
+            $demand = min($demand, max($winsorized, $recent7));
+        }
+
+        $guardrailCap = null;
+        $cappedExternalDemand = false;
+        if ($suspectedSpike) {
+            $shapeBaselineCandidates = array_values(array_filter([
+                $winsorized,
+                $recent30,
+                $recent14 > 0 ? $recent14 * 0.85 : 0,
+            ], fn (float $value) => $value > 0));
+            $shapeBaseline = $shapeBaselineCandidates !== []
+                ? array_sum($shapeBaselineCandidates) / count($shapeBaselineCandidates)
+                : $baseline;
+            $cooldownCap = $recent7 > 0 ? max($recent7 * 1.8, $shapeBaseline * 0.35) : $shapeBaseline * 0.5;
+
+            // Если видим распродажный всплеск, внешние агрегаты (старый local avg / ADS)
+            // не могут быть нижней границей спроса: они часто уже содержат тот же пик.
+            $externalFloor = max($ozonAds, $localAvgDaily);
+            if ($externalFloor > $cooldownCap * 1.25) {
+                $cappedExternalDemand = true;
+                $reasons[] = 'external_sources_capped_by_spike_guard';
+            }
+
+            $guardrailCap = max(0.0, $cooldownCap);
+            $demand = min($demand, $guardrailCap);
+        }
+
+        $confidenceLevel = 'good';
+        if ($orderedUnits > 0 && $orderedUnits < 5) {
+            $confidenceLevel = 'low';
+            $reasons[] = 'low_posting_volume';
+            $demand *= 0.4;
+        } elseif ($suspectedSpike || $activeDays > 0 && $activeDays < 5) {
+            $confidenceLevel = 'warning';
+        }
+
+        if ($activeDays > 0 && $activeDays < 5) {
+            $reasons[] = 'few_active_sales_days';
+        }
+
+        return [
+            'daily_demand' => round(max(0.0, $demand), 4),
+            'suspected_spike' => $suspectedSpike,
+            'confidence_level' => $confidenceLevel,
+            'confidence_reasons' => array_values(array_unique($reasons)),
+            'period_avg' => round($periodAvg, 4),
+            'recent_7_avg' => round($recent7, 4),
+            'recent_14_avg' => round($recent14, 4),
+            'recent_30_avg' => round($recent30, 4),
+            'winsorized_avg' => round($winsorized, 4),
+            'peak_day_units' => $peakDayUnits,
+            'peak_share' => round($peakShare, 4),
+            'active_days' => $activeDays,
+            'guardrail_cap_daily_demand' => $guardrailCap !== null ? round($guardrailCap, 4) : null,
+            'capped_external_daily_demand' => $cappedExternalDemand,
+        ];
+    }
+
+    /**
+     * Ограничить агрегированный Ozon-спрос, когда postings API не дал SKU/кластер.
+     * Старые inventory-агрегаты часто держат распродажный пик внутри sales_30_days
+     * и не имеют дневной формы, поэтому считаем их слабым источником и проверяем
+     * охлаждение последних 7/14 дней относительно 30-дневного окна.
+     *
+     * @return array{daily_demand:float, suspected_spike:bool, confidence_level:string, confidence_reasons:string[], input_daily_demand:float, recent_7_avg:float, recent_14_avg:float, recent_30_avg:float, cap_daily_demand:float}
+     */
+    public function shapeOzonAggregateDemand(
+        float $dailyDemand,
+        float $sales7,
+        float $sales14,
+        float $sales30,
+        float $avgDailySalesApi = 0.0
+    ): array {
+        $inputDemand = max(0.0, $dailyDemand);
+        $recent7 = max(0.0, $sales7 / 7);
+        $recent14 = max(0.0, $sales14 / 14);
+        $recent30 = max(0.0, $sales30 / 30);
+        $avgDailySalesApi = max(0.0, $avgDailySalesApi);
+
+        $reasons = ['aggregate_sales_no_postings'];
+        $suspectedSpike = false;
+        $confidenceLevel = 'warning';
+
+        if ($inputDemand <= self::EPS) {
+            return [
+                'daily_demand' => 0.0,
+                'suspected_spike' => false,
+                'confidence_level' => 'low',
+                'confidence_reasons' => $reasons,
+                'input_daily_demand' => 0.0,
+                'recent_7_avg' => round($recent7, 4),
+                'recent_14_avg' => round($recent14, 4),
+                'recent_30_avg' => round($recent30, 4),
+                'cap_daily_demand' => 0.0,
+            ];
+        }
+
+        if ($recent30 > 0 && $recent7 < $recent30 * 0.35 && ($recent14 <= 0 || $recent14 < $recent30 * 0.75)) {
+            $suspectedSpike = true;
+            $reasons[] = 'post_promo_cooldown';
+        }
+        if ($recent30 > 0 && $recent14 > 0 && $recent14 < $recent30 * 0.55) {
+            $suspectedSpike = true;
+            $reasons[] = 'aggregate_recent_decline';
+        }
+        if ($recent30 > 0 && $avgDailySalesApi > $recent30 * 1.5) {
+            $reasons[] = 'aggregate_api_above_recent';
+        }
+
+        if ($recent30 > 0 && $recent7 <= self::EPS && $recent14 <= self::EPS) {
+            $confidenceLevel = 'low';
+            $reasons[] = 'no_recent_sales_after_30d_spike';
+        }
+
+        $capCandidates = [];
+        if ($recent7 > 0) {
+            $capCandidates[] = $recent7 * 1.4;
+        }
+        if ($recent14 > 0) {
+            $capCandidates[] = $recent14 * 0.85;
+        }
+        if ($recent30 > 0) {
+            $capCandidates[] = $suspectedSpike ? $recent30 * 0.35 : $recent30 * 0.8;
+        }
+        if ($avgDailySalesApi > 0) {
+            $apiCap = $recent30 > 0 ? min($avgDailySalesApi, $recent30) : $avgDailySalesApi;
+            $capCandidates[] = $suspectedSpike && $recent30 > 0 ? min($apiCap, $recent30 * 0.5) : $apiCap;
+        }
+
+        $cap = $capCandidates !== [] ? max($capCandidates) : $inputDemand;
+        if ($suspectedSpike) {
+            $cap = min($cap, $recent30 > 0 ? max($recent30 * 0.5, $recent7 * 1.8, $recent14 * 0.75) : $cap);
+            $confidenceLevel = $confidenceLevel === 'low' ? 'low' : 'warning';
+        }
+
+        $demand = min($inputDemand, max(0.0, $cap));
+
+        return [
+            'daily_demand' => round(max(0.0, $demand), 4),
+            'suspected_spike' => $suspectedSpike,
+            'confidence_level' => $confidenceLevel,
+            'confidence_reasons' => array_values(array_unique($reasons)),
+            'input_daily_demand' => round($inputDemand, 4),
+            'recent_7_avg' => round($recent7, 4),
+            'recent_14_avg' => round($recent14, 4),
+            'recent_30_avg' => round($recent30, 4),
+            'cap_daily_demand' => round(max(0.0, $cap), 4),
+        ];
+    }
+
+    /**
+     * Финальная защита от раздутой поставки после акции/всплеска.
+     *
+     * Даже если спрос уже был сглажен, поздние источники вроде внешней
+     * рекомендации или старого среднего могут снова поднять количество. В таких
+     * случаях план должен рекомендовать пробную поставку, а не полный объём.
+     *
+     * @param list<string> $confidenceReasons
+     * @return array{qty:int, applied:bool, cap_qty:int|null, trial_cover_days:int|null, reason:string|null, reasons:list<string>}
+     */
+    public function applyProtectiveQuantityGuard(
+        int $qty,
+        float $dailyDemand,
+        int $currentStock,
+        int $inTransit,
+        int $packMultiple,
+        array $confidenceReasons,
+        bool $lowConfidenceTrial,
+        string $promoMode = 'none',
+        string $marketplace = 'ozon',
+    ): array {
+        $qty = max(0, $qty);
+        $packMultiple = max(1, $packMultiple);
+        $reasons = array_values(array_unique(array_filter($confidenceReasons)));
+        $promoReasons = [
+            'promo_spike_peak_share',
+            'promo_spike_peak_vs_median',
+            'recent_spike_vs_period',
+            'post_promo_cooldown',
+            'no_recent_sales_after_30d_spike',
+            'external_sources_capped_by_spike_guard',
+            'aggregate_recent_decline',
+        ];
+        $hasPromoSpike = array_intersect($reasons, $promoReasons) !== [];
+        $isCautiousPromoMode = in_array($promoMode, ['cautious', 'post_promo'], true);
+
+        if ($marketplace !== 'ozon' || $qty <= 0 || $dailyDemand <= self::EPS || (! $hasPromoSpike && ! $lowConfidenceTrial && ! $isCautiousPromoMode)) {
+            return [
+                'qty' => $qty,
+                'applied' => false,
+                'cap_qty' => null,
+                'trial_cover_days' => null,
+                'reason' => null,
+                'reasons' => $reasons,
+            ];
+        }
+
+        $trialCoverDays = $hasPromoSpike || $isCautiousPromoMode ? 7 : 14;
+        if (in_array('no_recent_sales_after_30d_spike', $reasons, true)) {
+            $trialCoverDays = 3;
+        }
+
+        $available = max(0, $currentStock + $inTransit);
+        $safetyDays = $hasPromoSpike ? 2 : 3;
+        $capRaw = max(0.0, $dailyDemand * ($trialCoverDays + $safetyDays) - $available);
+        $capQty = $capRaw > 0 ? $this->roundToPackMultiple($capRaw, $packMultiple) : 0;
+
+        if ($capQty >= $qty) {
+            return [
+                'qty' => $qty,
+                'applied' => false,
+                'cap_qty' => $capQty,
+                'trial_cover_days' => $trialCoverDays,
+                'reason' => null,
+                'reasons' => $reasons,
+            ];
+        }
+
+        return [
+            'qty' => $capQty,
+            'applied' => true,
+            'cap_qty' => $capQty,
+            'trial_cover_days' => $trialCoverDays,
+            'reason' => $hasPromoSpike || $isCautiousPromoMode
+                ? 'protective_post_promo_trial_quantity'
+                : 'protective_low_confidence_trial_quantity',
+            'reasons' => array_values(array_unique(array_merge($reasons, ['protective_trial_quantity_cap']))),
+        ];
     }
 
     // ─── Нужно с учётом safety stock ─────────────────────────────────
@@ -620,13 +927,218 @@ class AutoSupplyPlanService
             ->toArray();
     }
 
+    /**
+     * Загрузить автоматический спрос Ozon FBO из актуального postings API.
+     *
+     * @return array{
+     *   by_warehouse: array<string, array<string, array>>,
+     *   by_cluster: array<string, array<string, array>>,
+     *   by_offer: array<string, array>,
+     *   source: string,
+     *   days: int
+     * }
+     */
+    public function loadOzonPostingDemand(Integration $integration, $products, array $clusterMapping, int $days = 60): array
+    {
+        if ($integration->marketplace !== 'ozon') {
+            return ['by_warehouse' => [], 'by_cluster' => [], 'by_offer' => [], 'source' => 'posting_fbo_v3', 'days' => $days];
+        }
+
+        try {
+            $productIdToOfferId = [];
+            foreach ($products as $product) {
+                $offerId = (string) ($product->sku ?? '');
+                $ozonData = is_array($product->ozon_data ?? null) ? $product->ozon_data : [];
+
+                foreach (['sku', 'product_id'] as $key) {
+                    if (!empty($ozonData[$key]) && $offerId !== '') {
+                        $productIdToOfferId[(string) $ozonData[$key]] = $offerId;
+                    }
+                }
+            }
+
+            $api = new SalesApi(OzonClient::fromIntegration($integration));
+            $byWarehouse = $api->getSalesBySkuAndWarehouse($days, $productIdToOfferId);
+            $byCluster = [];
+            $byOffer = [];
+
+            foreach ($byWarehouse as $offerId => $warehouseRows) {
+                foreach ($warehouseRows as $warehouseId => $row) {
+                    $units = (int) ($row['ordered_units_total'] ?? 0);
+                    $this->accumulateOzonDemand($byOffer[$offerId], $row, $units, $days);
+
+                    $warehouseName = (string) ($row['warehouse_name'] ?? $warehouseId);
+                    $normalizedName = OzonWarehouseCluster::normalizeWarehouseName($warehouseName);
+                    $cluster = $clusterMapping[$normalizedName] ?? null;
+
+                    if ($cluster === null) {
+                        continue;
+                    }
+
+                    $clusterId = (string) $cluster['cluster_id'];
+                    $this->accumulateOzonDemand($byCluster[$offerId][$clusterId], $row, $units, $days, [
+                        'cluster_id' => (int) $cluster['cluster_id'],
+                        'cluster_name' => $cluster['cluster_name'] ?? null,
+                        'region' => $cluster['region'] ?? null,
+                    ]);
+                }
+            }
+
+            \Illuminate\Support\Facades\Log::info('AutoSupplyPlanService: Ozon posting demand loaded', [
+                'integration_id' => $integration->id,
+                'days' => $days,
+                'offer_ids' => count($byOffer),
+                'cluster_offer_ids' => count($byCluster),
+            ]);
+
+            return [
+                'by_warehouse' => $byWarehouse,
+                'by_cluster' => $byCluster,
+                'by_offer' => $byOffer,
+                'source' => 'posting_fbo_v3',
+                'days' => $days,
+            ];
+        } catch (\Throwable $e) {
+            \Illuminate\Support\Facades\Log::warning('AutoSupplyPlanService: Ozon posting demand failed', [
+                'integration_id' => $integration->id,
+                'error' => $e->getMessage(),
+            ]);
+
+            return ['by_warehouse' => [], 'by_cluster' => [], 'by_offer' => [], 'source' => 'posting_fbo_v3', 'days' => $days];
+        }
+    }
+
+    private function accumulateOzonDemand(?array &$target, array $row, int $units, int $days, array $extra = []): void
+    {
+        $target ??= array_merge([
+            'sales_7_days' => 0,
+            'sales_14_days' => 0,
+            'sales_30_days' => 0,
+            'ordered_units_total' => 0,
+            'avg_daily_sales' => 0.0,
+            'winsorized_units_total' => 0.0,
+            'winsorized_avg_daily_sales' => 0.0,
+            'active_days' => 0,
+            'peak_day_units' => 0,
+            'peak_share' => 0.0,
+            'median_nonzero_daily_units' => 0.0,
+        ], $extra);
+
+        $target['sales_7_days'] += (int) ($row['sales_7_days'] ?? round($units * 7 / max($days, 1)));
+        $target['sales_14_days'] += (int) ($row['sales_14_days'] ?? round($units * 14 / max($days, 1)));
+        $target['sales_30_days'] += (int) ($row['sales_30_days'] ?? round($units * 30 / max($days, 1)));
+        $target['ordered_units_total'] += $units;
+        $target['avg_daily_sales'] = round($target['ordered_units_total'] / max($days, 1), 4);
+        $target['winsorized_units_total'] += (float) ($row['winsorized_units_total'] ?? $units);
+        $target['winsorized_avg_daily_sales'] = round($target['winsorized_units_total'] / max($days, 1), 4);
+        $target['active_days'] = max((int) ($target['active_days'] ?? 0), (int) ($row['active_days'] ?? 0));
+        $target['peak_day_units'] = max((int) ($target['peak_day_units'] ?? 0), (int) ($row['peak_day_units'] ?? 0));
+        $target['peak_share'] = $target['ordered_units_total'] > 0
+            ? round(((int) $target['peak_day_units']) / (int) $target['ordered_units_total'], 4)
+            : 0.0;
+        $target['median_nonzero_daily_units'] = max(
+            (float) ($target['median_nonzero_daily_units'] ?? 0),
+            (float) ($row['median_nonzero_daily_units'] ?? 0)
+        );
+    }
+
+    /**
+     * Загрузить общий FBO/FBS остаток товара из актуального Ozon stocks API.
+     *
+     * @return array<string, array{total:int, reserved:int, source:string}>
+     */
+    public function loadOzonProductStocks(Integration $integration, $products): array
+    {
+        if ($integration->marketplace !== 'ozon') {
+            return [];
+        }
+
+        $offerIds = [];
+        foreach ($products as $product) {
+            if (!empty($product->sku)) {
+                $offerIds[] = (string) $product->sku;
+            }
+        }
+        $offerIds = array_values(array_unique($offerIds));
+
+        if ($offerIds === []) {
+            return [];
+        }
+
+        try {
+            $client = OzonClient::fromIntegration($integration);
+            $result = [];
+
+            foreach (array_chunk($offerIds, 1000) as $chunk) {
+                $cursor = '';
+                do {
+                    $body = [
+                        'filter' => [
+                            'visibility' => 'ALL',
+                            'offer_id' => $chunk,
+                        ],
+                        'limit' => 1000,
+                    ];
+                    if ($cursor !== '') {
+                        $body['cursor'] = $cursor;
+                    }
+
+                    $response = $client->post('/v4/product/info/stocks', $body);
+                    if (!$response || !empty($response['_error'])) {
+                        break;
+                    }
+
+                    $items = $response['items'] ?? $response['result']['items'] ?? [];
+                    $cursor = (string) ($response['cursor'] ?? $response['result']['cursor'] ?? '');
+
+                    foreach ($items as $item) {
+                        $offerId = (string) ($item['offer_id'] ?? '');
+                        if ($offerId === '') {
+                            continue;
+                        }
+
+                        $total = 0;
+                        $reserved = 0;
+                        foreach ($item['stocks'] ?? [] as $stock) {
+                            $total += (int) ($stock['present'] ?? 0);
+                            $reserved += (int) ($stock['reserved'] ?? 0);
+                        }
+
+                        $result[$offerId] = [
+                            'total' => $total,
+                            'reserved' => $reserved,
+                            'source' => 'product_info_stocks',
+                        ];
+                    }
+                } while ($cursor !== '' && count($items) === 1000);
+            }
+
+            \Illuminate\Support\Facades\Log::info('AutoSupplyPlanService: Ozon product stocks loaded', [
+                'integration_id' => $integration->id,
+                'requested_offer_ids' => count($offerIds),
+                'received_offer_ids' => count($result),
+            ]);
+
+            return $result;
+        } catch (\Throwable $e) {
+            \Illuminate\Support\Facades\Log::warning('AutoSupplyPlanService: Ozon product stocks failed', [
+                'integration_id' => $integration->id,
+                'error' => $e->getMessage(),
+            ]);
+
+            return [];
+        }
+    }
+
     // ─── Ozon DeliveryAnalytics ──────────────────────────────────────
 
     /**
-     * Загрузить рекомендации Ozon по поставкам через Ozon API напрямую.
-     * Подход скопирован из SupplyRecommendationService.getOzonDeliveryAnalytics().
+     * Загрузить общий health-сигнал среднего времени доставки Ozon.
      *
-     * @return array<string, array{total_recommended_supply: int, total_lost_profit: float, max_delivery_time: int, max_attention_level: string, clusters: array}>
+     * Старый /v1/analytics/average-delivery-time больше не используем:
+     * production Ozon отвечает "obsolete method cannot be used".
+     *
+     * @return array<string, mixed>
      */
     public function loadOzonDeliveryAnalytics(\App\Models\Integration $integration): array
     {
@@ -635,101 +1147,17 @@ class AutoSupplyPlanService
         }
 
         try {
-            $marketplace = \App\Domains\Marketplace\MarketplaceFactory::create(
-                $integration->marketplace,
-                $integration->getDecryptedCredentials(),
-                $integration
-            );
-            $client = $marketplace->api();
-
-            // Получаем список кластеров
-            $clusterList = $client->post('/v1/cluster/list', ['cluster_type' => 'CLUSTER_TYPE_OZON']);
-            $clusterNames = [];
-            foreach ($clusterList['clusters'] ?? [] as $c) {
-                $clusterNames[$c['id']] = $c['name'] ?? "Кластер {$c['id']}";
-            }
-
-            // Получаем общую аналитику для списка кластеров
-            $overallResponse = $client->post('/v1/analytics/average-delivery-time', [
-                'filters' => [
-                    'delivery_schema' => 'FBO',
-                    'supply_period' => 'EIGHT_WEEKS',
-                ]
-            ]);
-
-            $deliveryClusterIds = [];
-            foreach ($overallResponse['data'] ?? [] as $item) {
-                $clusterId = $item['delivery_cluster_id'] ?? null;
-                if ($clusterId) {
-                    $deliveryClusterIds[] = $clusterId;
-                }
-            }
-            $deliveryClusterIds = array_unique($deliveryClusterIds);
-
-            // Собираем данные по товарам из всех кластеров
-            $result = [];
-
-            foreach ($deliveryClusterIds as $clusterId) {
-                $detailsResponse = $client->post('/v1/analytics/average-delivery-time/details', [
-                    'cluster_id' => $clusterId,
-                    'limit' => 1000,
-                    'offset' => 0,
-                    'filters' => [
-                        'delivery_schema' => 'FBO',
-                        'supply_period' => 'EIGHT_WEEKS',
-                    ],
-                ]);
-
-                foreach ($detailsResponse['data'] ?? [] as $item) {
-                    $itemData = $item['item'] ?? [];
-                    $metrics = $item['metrics'] ?? [];
-
-                    $sku = $itemData['offer_id'] ?? null;
-                    if (!$sku) continue;
-
-                    $avgTime = $metrics['average_delivery_time'] ?? 0;
-                    $attentionLevel = $metrics['attention_level'] ?? 'LOW';
-                    $recSupply = $metrics['recommended_supply'] ?? 0;
-                    $lostProfit = $metrics['lost_profit'] ?? 0;
-
-                    if (!isset($result[$sku])) {
-                        $result[$sku] = [
-                            'clusters' => [],
-                            'total_recommended_supply' => 0,
-                            'total_lost_profit' => 0,
-                            'max_delivery_time' => 0,
-                            'max_attention_level' => 'LOW',
-                        ];
-                    }
-
-                    $result[$sku]['total_recommended_supply'] += $recSupply;
-                    $result[$sku]['total_lost_profit'] += $lostProfit;
-                    if ($avgTime > $result[$sku]['max_delivery_time']) {
-                        $result[$sku]['max_delivery_time'] = $avgTime;
-                    }
-                    $attentionOrder = ['LOW' => 0, 'ATTENTION_MEDIUM' => 1, 'ATTENTION_HI' => 2];
-                    if (($attentionOrder[$attentionLevel] ?? 0) > ($attentionOrder[$result[$sku]['max_attention_level']] ?? 0)) {
-                        $result[$sku]['max_attention_level'] = $attentionLevel;
-                    }
-
-                    $result[$sku]['clusters'][$clusterId] = [
-                        'cluster_id' => $clusterId,
-                        'cluster_name' => $clusterNames[$clusterId] ?? "Кластер {$clusterId}",
-                        'recommended_supply' => $recSupply,
-                        'lost_profit' => $lostProfit,
-                        'average_delivery_time' => $avgTime,
-                        'attention_level' => $attentionLevel,
-                    ];
-                }
-            }
+            $client = OzonClient::fromIntegration($integration);
+            $summary = $client->post('/v1/analytics/average-delivery-time/summary', [], true);
 
             \Illuminate\Support\Facades\Log::info('AutoSupplyPlanService: Ozon delivery analytics loaded', [
                 'integration_id' => $integration->id,
-                'skus' => count($result),
-                'clusters' => count($deliveryClusterIds),
+                'has_summary' => ! empty($summary) && empty($summary['_error']),
             ]);
 
-            return $result;
+            return empty($summary) || ! empty($summary['_error'])
+                ? []
+                : ['__summary' => $summary];
         } catch (\Exception $e) {
             \Illuminate\Support\Facades\Log::warning('AutoSupplyPlanService: Ozon delivery analytics failed', [
                 'integration_id' => $integration->id,
@@ -743,7 +1171,7 @@ class AutoSupplyPlanService
      * Загрузить аналитику остатков и оборачиваемости из Ozon API
      *
      * Использует:
-     * - GET /v1/analytics/stocks — ads_cluster, idc_cluster, turnover_grade_cluster по SKU×склад
+     * - POST /v1/analytics/stocks — ads_cluster, idc_cluster, turnover_grade_cluster по SKU×склад
      * - POST /v1/analytics/turnover/stocks — ads за 60д, turnover, idc_grade по SKU
      *
      * @param \App\Models\Integration $integration

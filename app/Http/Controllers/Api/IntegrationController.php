@@ -9,6 +9,7 @@ use App\Models\Integration;
 use App\Models\SyncLog;
 use App\Services\IntegrationAccessService;
 use App\Services\LimitsSyncService;
+use App\Services\Ozon\OzonPerformanceApiService;
 use App\Services\ProductService;
 use App\Services\SellicoApiService;
 use App\Support\ActivityLogger;
@@ -439,6 +440,297 @@ class IntegrationController extends Controller
                 'recent_syncs' => $lastSyncs,
             ],
         ]);
+    }
+
+    public function performanceStatus(
+        Request $request,
+        int $id,
+        SellicoApiService $sellicoApi,
+        OzonPerformanceApiService $performanceApi
+    ): JsonResponse {
+        $resolved = $this->resolveOzonPerformanceRuntime($request, $id, $sellicoApi);
+        if ($resolved instanceof JsonResponse) {
+            return $resolved;
+        }
+
+        $integration = $resolved['integration'];
+        $credentials = $resolved['credentials'];
+        $check = $performanceApi->checkCredentials(is_array($credentials) ? $credentials : []);
+
+        return response()->json([
+            'success' => (bool) ($check['success'] ?? false),
+            'data' => [
+                'integration_id' => $integration->id,
+                'name' => $integration->name,
+                'marketplace' => $integration->marketplace,
+                'source' => 'sellico_runtime_credentials',
+                'has_performance_api_key' => (bool) ($credentials['performance_api_key'] ?? false),
+                'has_performance_client_secret' => (bool) ($credentials['performance_client_secret'] ?? false),
+                'performance_api' => $check,
+            ],
+        ], ($check['success'] ?? false) ? 200 : 422);
+    }
+
+    public function performanceSummary(
+        Request $request,
+        int $id,
+        SellicoApiService $sellicoApi,
+        OzonPerformanceApiService $performanceApi
+    ): JsonResponse {
+        $validated = Validator::make($request->all(), [
+            'date_from' => 'nullable|date_format:Y-m-d',
+            'date_to' => 'nullable|date_format:Y-m-d',
+            'campaign_limit' => 'nullable|integer|min:1|max:100',
+        ])->validate();
+
+        $dateTo = $validated['date_to'] ?? now()->subDay()->toDateString();
+        $dateFrom = $validated['date_from'] ?? now()->subDays(30)->toDateString();
+        if ($dateFrom > $dateTo) {
+            return response()->json([
+                'success' => false,
+                'message' => 'date_from не может быть позже date_to',
+            ], 422);
+        }
+
+        $resolved = $this->resolveOzonPerformanceRuntime($request, $id, $sellicoApi);
+        if ($resolved instanceof JsonResponse) {
+            return $resolved;
+        }
+
+        $summary = $performanceApi->advertisingSummary(
+            is_array($resolved['credentials']) ? $resolved['credentials'] : [],
+            $dateFrom,
+            $dateTo,
+            (int) ($validated['campaign_limit'] ?? 50)
+        );
+
+        return response()->json([
+            'success' => (bool) ($summary['success'] ?? false),
+            'data' => [
+                'integration_id' => $resolved['integration']->id,
+                'name' => $resolved['integration']->name,
+                'marketplace' => $resolved['integration']->marketplace,
+                'source' => 'sellico_runtime_credentials',
+                'summary' => $summary,
+            ],
+        ], ($summary['success'] ?? false) ? 200 : 422);
+    }
+
+    public function performanceCampaignObjects(
+        Request $request,
+        int $id,
+        string $campaignId,
+        SellicoApiService $sellicoApi,
+        OzonPerformanceApiService $performanceApi
+    ): JsonResponse {
+        $resolved = $this->resolveOzonPerformanceRuntime($request, $id, $sellicoApi);
+        if ($resolved instanceof JsonResponse) {
+            return $resolved;
+        }
+
+        $objects = $performanceApi->campaignObjects(
+            is_array($resolved['credentials']) ? $resolved['credentials'] : [],
+            $campaignId
+        );
+
+        return response()->json([
+            'success' => (bool) ($objects['success'] ?? false),
+            'data' => [
+                'integration_id' => $resolved['integration']->id,
+                'campaign_id' => $campaignId,
+                'source' => 'sellico_runtime_credentials',
+                'objects' => $objects,
+            ],
+        ], ($objects['success'] ?? false) ? 200 : 422);
+    }
+
+    public function requestPerformanceProductReport(
+        Request $request,
+        int $id,
+        SellicoApiService $sellicoApi,
+        OzonPerformanceApiService $performanceApi
+    ): JsonResponse {
+        $validated = Validator::make($request->all(), [
+            'date_from' => 'required|date_format:Y-m-d',
+            'date_to' => 'required|date_format:Y-m-d',
+        ])->validate();
+
+        if ($validated['date_from'] > $validated['date_to']) {
+            return response()->json([
+                'success' => false,
+                'message' => 'date_from не может быть позже date_to',
+            ], 422);
+        }
+
+        $resolved = $this->resolveOzonPerformanceRuntime($request, $id, $sellicoApi);
+        if ($resolved instanceof JsonResponse) {
+            return $resolved;
+        }
+
+        $report = $performanceApi->requestProductStatisticsReport(
+            is_array($resolved['credentials']) ? $resolved['credentials'] : [],
+            $validated['date_from'],
+            $validated['date_to']
+        );
+
+        return response()->json([
+            'success' => (bool) ($report['success'] ?? false),
+            'data' => [
+                'integration_id' => $resolved['integration']->id,
+                'source' => 'sellico_runtime_credentials',
+                'uuid' => $report['uuid'] ?? null,
+                'state' => $report['state'] ?? null,
+                'status' => $report['status'] ?? null,
+                'http_status' => $report['http_status'] ?? null,
+                'period' => $report['period'] ?? null,
+                'report' => $report,
+            ],
+        ], ($report['success'] ?? false) ? 200 : 422);
+    }
+
+    public function performanceReportStatus(
+        Request $request,
+        int $id,
+        string $uuid,
+        SellicoApiService $sellicoApi,
+        OzonPerformanceApiService $performanceApi
+    ): JsonResponse {
+        $resolved = $this->resolveOzonPerformanceRuntime($request, $id, $sellicoApi);
+        if ($resolved instanceof JsonResponse) {
+            return $resolved;
+        }
+
+        $status = $performanceApi->reportStatus(
+            is_array($resolved['credentials']) ? $resolved['credentials'] : [],
+            $uuid
+        );
+
+        return response()->json([
+            'success' => (bool) ($status['success'] ?? false),
+            'data' => [
+                'integration_id' => $resolved['integration']->id,
+                'source' => 'sellico_runtime_credentials',
+                'uuid' => $status['uuid'] ?? $uuid,
+                'state' => $status['state'] ?? null,
+                'status' => $status['status'] ?? null,
+                'error' => $status['error'] ?? null,
+                'file' => $status['file'] ?? null,
+                'link' => $status['link'] ?? null,
+                'report_status' => $status,
+            ],
+        ], ($status['success'] ?? false) ? 200 : 422);
+    }
+
+    public function performanceReportPreview(
+        Request $request,
+        int $id,
+        string $uuid,
+        SellicoApiService $sellicoApi,
+        OzonPerformanceApiService $performanceApi
+    ): JsonResponse {
+        $validated = Validator::make($request->all(), [
+            'limit' => 'nullable|integer|min:1|max:500',
+        ])->validate();
+
+        $resolved = $this->resolveOzonPerformanceRuntime($request, $id, $sellicoApi);
+        if ($resolved instanceof JsonResponse) {
+            return $resolved;
+        }
+
+        $preview = $performanceApi->productReportPreview(
+            is_array($resolved['credentials']) ? $resolved['credentials'] : [],
+            $uuid,
+            (int) ($validated['limit'] ?? 50)
+        );
+
+        return response()->json([
+            'success' => (bool) ($preview['success'] ?? false),
+            'data' => [
+                'integration_id' => $resolved['integration']->id,
+                'source' => 'sellico_runtime_credentials',
+                'product_report_preview' => $preview,
+            ],
+        ], ($preview['success'] ?? false) ? 200 : 422);
+    }
+
+    public function performanceAdvertisingImpact(
+        Request $request,
+        int $id,
+        string $uuid,
+        SellicoApiService $sellicoApi,
+        OzonPerformanceApiService $performanceApi
+    ): JsonResponse {
+        $validated = Validator::make($request->all(), [
+            'limit' => 'nullable|integer|min:1|max:5000',
+            'date_from' => 'nullable|date_format:Y-m-d',
+            'date_to' => 'nullable|date_format:Y-m-d|after_or_equal:date_from',
+        ])->validate();
+
+        $resolved = $this->resolveOzonPerformanceRuntime($request, $id, $sellicoApi);
+        if ($resolved instanceof JsonResponse) {
+            return $resolved;
+        }
+
+        $impact = $performanceApi->productAdvertisingImpact(
+            is_array($resolved['credentials']) ? $resolved['credentials'] : [],
+            $uuid,
+            (int) ($validated['limit'] ?? 5000),
+            $validated['date_from'] ?? null,
+            $validated['date_to'] ?? null
+        );
+
+        return response()->json([
+            'success' => (bool) ($impact['success'] ?? false),
+            'data' => [
+                'integration_id' => $resolved['integration']->id,
+                'source' => 'sellico_runtime_credentials',
+                'report_uuid' => $impact['report_uuid'] ?? $uuid,
+                'summary' => $impact['summary'] ?? null,
+                'products' => $impact['products'] ?? [],
+                'advertising_impact' => $impact,
+            ],
+        ], ($impact['success'] ?? false) ? 200 : 422);
+    }
+
+    /**
+     * @return array{integration: Integration, credentials: mixed}|JsonResponse
+     */
+    private function resolveOzonPerformanceRuntime(
+        Request $request,
+        int $id,
+        SellicoApiService $sellicoApi
+    ): array|JsonResponse {
+        $integration = $this->authorizedIntegration($request, $id);
+        if ($integration instanceof JsonResponse) {
+            return $integration;
+        }
+
+        if (strtolower((string) $integration->marketplace) !== 'ozon') {
+            return response()->json([
+                'success' => false,
+                'message' => 'Performance API сейчас проверяется только для Ozon',
+            ], 422);
+        }
+
+        $token = $request->bearerToken()
+            ?? $request->header('X-Sellico-Token')
+            ?? $request->header('X-Token');
+        if ($token) {
+            $sellicoApi->setAccessToken($token);
+        }
+
+        $remote = $sellicoApi->getIntegrationById($id, (int) $integration->work_space_id ?: null);
+        if (! ($remote['success'] ?? false)) {
+            return response()->json([
+                'success' => false,
+                'message' => $remote['error'] ?? 'Не удалось получить интеграцию из основного backend',
+            ], 502);
+        }
+
+        return [
+            'integration' => $integration,
+            'credentials' => $remote['credentials'] ?? [],
+        ];
     }
 
     /**

@@ -151,6 +151,8 @@ class LocalizationIndexService
                     'local_orders' => $localOrders,
                     'localization_rate' => round($localizationRate, 2),
                     'ktr' => $ktr,
+                    'by_delivery_fo' => $data['by_delivery_fo'] ?? [],
+                    'by_warehouse' => $data['by_warehouse'] ?? [],
                 ];
                 
                 $totalOrders += $articleOrders;
