@@ -619,6 +619,19 @@ class OzonPerformanceApiService
                 $query['campaignIds'] = $chunk;
             }
 
+            $csvResponse = Http::timeout(30)
+                ->withToken($accessToken)
+                ->accept('*/*')
+                ->get(self::BASE_URL . '/api/client/statistics/campaign/product', $query);
+
+            if ($csvResponse->successful()) {
+                $csvRows = $this->parseCampaignProductCsvRows((string) $csvResponse->body());
+                if ($csvRows !== []) {
+                    $rows = array_merge($rows, $csvRows);
+                    continue;
+                }
+            }
+
             $response = $this->authorized($accessToken)
                 ->get(self::BASE_URL . '/api/client/statistics/campaign/product/json', $query);
 
@@ -957,6 +970,108 @@ class OzonPerformanceApiService
             'rows' => $rows,
             'truncated' => $dataLineCount > count($rows),
         ];
+    }
+
+    /**
+     * @return array<int, array<string, string>>
+     */
+    private function parseCampaignProductCsvRows(string $csv): array
+    {
+        $lines = preg_split("/\r\n|\n|\r/", $csv) ?: [];
+        $header = [];
+        $rows = [];
+
+        foreach ($lines as $line) {
+            $line = trim((string) $line);
+            if ($line === '') {
+                continue;
+            }
+
+            $line = preg_replace('/^\xEF\xBB\xBF/', '', $line) ?? $line;
+            $cells = str_getcsv($line, ';', '"', '\\');
+            $cells = array_map(static fn ($cell): string => trim((string) $cell), $cells);
+
+            if ($header === []) {
+                if ($this->looksLikeCampaignProductCsvHeader($cells)) {
+                    $header = $this->normalizeCampaignProductCsvHeader($cells);
+                }
+                continue;
+            }
+
+            $row = [];
+            foreach ($header as $index => $name) {
+                $row[$name] = (string) ($cells[$index] ?? '');
+            }
+
+            $sku = $this->firstString($row, ['SKU', 'sku']);
+            if ($sku === '' || in_array(mb_strtolower($sku), ['всего', 'итого', 'bcero'], true)) {
+                continue;
+            }
+
+            $row['_source'] = 'campaign_product_stats_cpc_csv';
+            $rows[] = $row;
+        }
+
+        return $rows;
+    }
+
+    /**
+     * @param array<int, string> $cells
+     */
+    private function looksLikeCampaignProductCsvHeader(array $cells): bool
+    {
+        $normalized = array_map(
+            static fn (string $cell): string => mb_strtolower(trim($cell)),
+            $cells
+        );
+
+        $hasSku = in_array('sku', $normalized, true) || in_array('артикул', $normalized, true);
+        $hasAdMetric = false;
+
+        foreach ($normalized as $cell) {
+            if (
+                str_contains($cell, 'показы')
+                || str_contains($cell, 'клики')
+                || str_contains($cell, 'расход')
+                || str_contains($cell, 'ctr')
+            ) {
+                $hasAdMetric = true;
+                break;
+            }
+        }
+
+        return $hasSku && $hasAdMetric;
+    }
+
+    /**
+     * @param array<int, string> $cells
+     * @return array<int, string>
+     */
+    private function normalizeCampaignProductCsvHeader(array $cells): array
+    {
+        return array_map(static function (string $cell): string {
+            $name = trim($cell);
+            $lower = mb_strtolower($name);
+
+            return match (true) {
+                $lower === 'sku' => 'SKU',
+                str_contains($lower, 'название') => 'Название товара',
+                str_contains($lower, 'категор') => 'Категория товара',
+                str_contains($lower, 'цена товара') => 'Цена товара, ₽',
+                str_contains($lower, 'показы') => 'Показы (Оплата за клик)',
+                str_contains($lower, 'клики') => 'Клики (Оплата за клик)',
+                str_contains($lower, 'ctr') => 'CTR (Оплата за клик)',
+                str_contains($lower, 'корзин') => 'В корзину (Оплата за клик)',
+                str_contains($lower, 'ср. цена клика') || str_contains($lower, 'средняя стоимость клика') => 'Ср. цена клика (Оплата за клик)',
+                str_contains($lower, 'расход') => 'Расход (Оплата за клик)',
+                str_contains($lower, 'заказы модели') => 'Заказы модели (Оплата за клик)',
+                str_contains($lower, 'выручка с заказов модели') => 'Выручка с заказов модели (Оплата за клик)',
+                str_contains($lower, 'заказы') => 'Заказы (Оплата за клик)',
+                str_contains($lower, 'выручка') || str_contains($lower, 'продажи') => 'Продажи (Оплата за клик)',
+                str_contains($lower, 'дата добавления') => 'Дата добавления',
+                default => $name,
+            };
+        }, $cells);
     }
 
     /**
