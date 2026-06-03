@@ -1870,6 +1870,9 @@ class OzonPerformanceApiService
         $header = [];
         $rows = [];
 
+        // ID кампании указан в строке-заголовке отчёта: "Кампания по продвижению товаров № 23001632, период…".
+        $campaignId = preg_match('/№\s*(\d+)/u', $csv, $m) ? $m[1] : '';
+
         foreach ($lines as $line) {
             $line = trim((string) $line);
             if ($line === '') {
@@ -1908,6 +1911,7 @@ class OzonPerformanceApiService
             }
 
             $row['_source'] = 'campaign_product_stats_cpc_csv';
+            $row['_campaign_id'] = $campaignId;
             $rows[] = $row;
         }
 
@@ -2010,6 +2014,8 @@ class OzonPerformanceApiService
                     'ad_orders' => 0,
                     'ad_drr_percent' => 0.0,
                     'ad_spend_per_order' => 0.0,
+                    'cart_conversion_percent' => 0.0,
+                    'ad_campaigns' => [],
                     'payment_models' => [],
                     'signals' => [],
                     'signals_ru' => [],
@@ -2058,6 +2064,29 @@ class OzonPerformanceApiService
             $products[$key]['ad_spend'] += $this->sumColumnsContaining($row, ['Расход']);
             $products[$key]['ad_revenue'] += $this->sumColumnsContaining($row, ['Продажи', 'Выручка']);
             $products[$key]['ad_orders'] += (int) $this->sumColumnsContaining($row, ['Заказы']);
+
+            // Разбивка по кампаниям (ID кампании) — как в отчёте «Аналитика продвижения».
+            $campaignId = trim((string) ($row['_campaign_id'] ?? ''));
+            if ($campaignId !== '') {
+                if (! isset($products[$key]['ad_campaigns'][$campaignId])) {
+                    $products[$key]['ad_campaigns'][$campaignId] = [
+                        'campaign_id' => $campaignId,
+                        'impressions' => 0,
+                        'clicks' => 0,
+                        'to_cart' => 0,
+                        'spend' => 0.0,
+                        'revenue' => 0.0,
+                        'orders' => 0,
+                    ];
+                }
+                $products[$key]['ad_campaigns'][$campaignId]['impressions'] += (int) $this->sumColumnsContaining($row, ['Показы']);
+                $products[$key]['ad_campaigns'][$campaignId]['clicks'] += (int) $this->sumColumnsContaining($row, ['Клики']);
+                $products[$key]['ad_campaigns'][$campaignId]['to_cart'] += (int) $this->sumColumnsContaining($row, ['В корзину']);
+                $products[$key]['ad_campaigns'][$campaignId]['spend'] += $this->sumColumnsContaining($row, ['Расход']);
+                $products[$key]['ad_campaigns'][$campaignId]['revenue'] += $this->sumColumnsContaining($row, ['Продажи', 'Выручка']);
+                $products[$key]['ad_campaigns'][$campaignId]['orders'] += (int) $this->sumColumnsContaining($row, ['Заказы']);
+            }
+
             $products[$key]['payment_models'] = $this->mergePaymentModelBreakdown(
                 is_array($products[$key]['payment_models']) ? $products[$key]['payment_models'] : [],
                 $this->extractPaymentModelBreakdown($row)
@@ -2091,6 +2120,7 @@ class OzonPerformanceApiService
             $spendPerOrder = $orders > 0 ? round($spend / $orders, 2) : 0.0;
             $ctr = $impressions > 0 ? round($clicks / $impressions * 100, 2) : 0.0;
             $cpc = $clicks > 0 ? round($spend / $clicks, 2) : 0.0;
+            $cartConversion = $clicks > 0 ? round($toCart / $clicks * 100, 2) : 0.0;
             $signals = [];
 
             if ($spend > 0 || $orders > 0 || $revenue > 0) {
@@ -2113,6 +2143,30 @@ class OzonPerformanceApiService
             $products[$key]['ad_spend_per_order'] = $spendPerOrder;
             $products[$key]['ctr_percent'] = $ctr;
             $products[$key]['average_cpc'] = $cpc;
+            $products[$key]['cart_conversion_percent'] = $cartConversion;
+            $products[$key]['ad_campaigns'] = array_values(array_map(static function (array $c): array {
+                $sp = round((float) ($c['spend'] ?? 0), 2);
+                $rev = round((float) ($c['revenue'] ?? 0), 2);
+                $cl = (int) ($c['clicks'] ?? 0);
+                $imp = (int) ($c['impressions'] ?? 0);
+                $ord = (int) ($c['orders'] ?? 0);
+                $cart = (int) ($c['to_cart'] ?? 0);
+
+                return [
+                    'campaign_id' => (string) ($c['campaign_id'] ?? ''),
+                    'impressions' => $imp,
+                    'clicks' => $cl,
+                    'to_cart' => $cart,
+                    'spend' => $sp,
+                    'revenue' => $rev,
+                    'orders' => $ord,
+                    'ctr_percent' => $imp > 0 ? round($cl / $imp * 100, 2) : 0.0,
+                    'average_cpc' => $cl > 0 ? round($sp / $cl, 2) : 0.0,
+                    'drr_percent' => $rev > 0 ? round($sp / $rev * 100, 2) : 0.0,
+                    'spend_per_order' => $ord > 0 ? round($sp / $ord, 2) : 0.0,
+                    'cart_conversion_percent' => $cl > 0 ? round($cart / $cl * 100, 2) : 0.0,
+                ];
+            }, is_array($product['ad_campaigns'] ?? null) ? $product['ad_campaigns'] : []));
             $products[$key]['payment_models'] = array_values(array_map(
                 fn (array $model): array => [
                     'name' => $model['name'],
@@ -2152,6 +2206,9 @@ class OzonPerformanceApiService
             : 0.0;
         $summary['ctr_percent'] = $summary['total_impressions'] > 0
             ? round($summary['total_clicks'] / $summary['total_impressions'] * 100, 2)
+            : 0.0;
+        $summary['cart_conversion_percent'] = $summary['total_clicks'] > 0
+            ? round($summary['total_to_cart'] / $summary['total_clicks'] * 100, 2)
             : 0.0;
 
         $products = array_values($products);
@@ -2544,6 +2601,7 @@ class OzonPerformanceApiService
                 'CTR (Оплата за клик)' => $ctr,
                 'Ср. цена клика (Оплата за клик)' => $averageCpc,
                 '_source' => 'campaign_product_stats_cpc',
+                '_campaign_id' => (string) ($row['_campaign_id'] ?? $this->firstString($row, ['ID кампании', 'campaignId', 'campaign_id'])),
                 '_mapping_status' => $mapping['status'],
                 '_mapping_key' => $mapping['mapping_key'],
                 '_mapping_source' => $mapping['source'],
