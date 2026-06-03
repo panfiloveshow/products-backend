@@ -2540,6 +2540,13 @@ class UnitEconomicsCacheController extends Controller
 
         $marketplaceData = is_array($data['marketplace_data'] ?? null) ? $data['marketplace_data'] : [];
 
+        // Артикул продавца. sku у WB = штрихкод (для совпадения с кэшем/отчётами), реальный
+        // артикул лежит в products.vendor_code. У Ozon vendor_code = offer_id = sku. Поэтому
+        // единое поле article = vendor_code ?: sku — корректный артикул для всех маркетплейсов.
+        $vendorCode = $product?->vendor_code;
+        $data['vendor_code'] = $vendorCode;
+        $data['article'] = ($vendorCode !== null && $vendorCode !== '') ? $vendorCode : $cache->sku;
+
         // Добавляем поля для совместимости с v1
         $data['actual_weight'] = $product ? (float) ($product->weight ?? 0) / 1000 : 0;
         $data['turnover_days'] = $product?->turnover_days ?? 30;
