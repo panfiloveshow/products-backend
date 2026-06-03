@@ -1051,7 +1051,7 @@ class OzonPerformanceApiService
                     $errors[] = 'Async: ' . $e->getMessage();
                 }
             }
-            $prog = ['uuids' => $uuids, 'rows' => [], 'errors' => $errors, 'created' => time()];
+            $prog = ['uuids' => $uuids, 'rows_by_uuid' => [], 'errors' => $errors, 'created' => time()];
             Cache::put($progKey, $prog, now()->addMinutes(15));
 
             // Если ни один отчёт не создан — не зависаем в pending, отдаём пустой результат.
@@ -1084,7 +1084,9 @@ class OzonPerformanceApiService
             $link = $this->absolutePerformanceUrl((string) (is_array($payload) ? ($payload['link'] ?? '') : ''));
             if ($state === 'OK' && $link !== '') {
                 try {
-                    $prog['rows'] = array_merge($prog['rows'], $this->downloadCampaignStatsReportRows($accessToken, $link));
+                    // Идемпотентно: пишем строки отчёта ПО uuid (перезапись, не append) — повторная
+                    // обработка того же готового отчёта (гонка двух запросов) не задваивает клики/расход.
+                    $prog['rows_by_uuid'][(string) $uuid] = $this->downloadCampaignStatsReportRows($accessToken, $link);
                 } catch (\Throwable $e) {
                     $prog['errors'][] = 'Async: ' . $e->getMessage();
                 }
@@ -1095,17 +1097,20 @@ class OzonPerformanceApiService
             }
         }
 
+        // Накопленные строки из всех скачанных отчётов (плоский список).
+        $accumulated = array_merge([], ...array_values($prog['rows_by_uuid'] ?? []));
+
         $allDone = ! in_array(false, $prog['uuids'], true);
         $stale = (time() - (int) ($prog['created'] ?? time())) > 300; // защита от вечного pending
 
         // Шаг 3: готово (или устарело) — собираем итог и кэшируем.
         if ($allDone || $stale) {
             $stats = $this->assembleCampaignStats(
-                $prog['rows'],
+                $accumulated,
                 $prog['errors'],
-                $prog['rows'] !== [] ? 'async_report' : 'fallback'
+                $accumulated !== [] ? 'async_report' : 'fallback'
             );
-            if ($prog['rows'] !== []) {
+            if ($accumulated !== []) {
                 $stats['from_cache'] = false;
                 Cache::put($dataKey, $stats, now()->addMinutes(30));
             }
@@ -1116,7 +1121,7 @@ class OzonPerformanceApiService
 
         Cache::put($progKey, $prog, now()->addMinutes(15));
 
-        return $this->assembleCampaignStats($prog['rows'], $prog['errors'], 'pending') + ['pending' => true];
+        return $this->assembleCampaignStats($accumulated, $prog['errors'], 'pending') + ['pending' => true];
     }
 
     /**
