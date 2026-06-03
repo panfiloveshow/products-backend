@@ -2,6 +2,7 @@
 
 namespace App\Services\Ozon;
 
+use App\Models\OzonAdStat;
 use App\Models\Product;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Http;
@@ -600,7 +601,8 @@ class OzonPerformanceApiService
         int $limit = 5000,
         ?string $dateFrom = null,
         ?string $dateTo = null,
-        ?int $integrationId = null
+        ?int $integrationId = null,
+        bool $forceRefresh = false
     ): array
     {
         $missing = $this->missingCredentialsResponse($credentials);
@@ -659,7 +661,8 @@ class OzonPerformanceApiService
                         $token['access_token'],
                         $dateFrom,
                         $dateTo,
-                        $campaignIds
+                        $campaignIds,
+                        $forceRefresh
                     );
                 } else {
                     $campaignStats = $this->fetchProductCampaignStats(
@@ -708,6 +711,9 @@ class OzonPerformanceApiService
                     'unmapped_campaign_product_rows' => max(0, count($campaignReportRows) - $mappedCampaignProductRows),
                     'campaign_stats_source' => $campaignStats['source'] ?? null,
                     'campaign_stats_from_cache' => (bool) ($campaignStats['from_cache'] ?? false),
+                    'campaign_stats_from_storage' => (bool) ($campaignStats['from_storage'] ?? false),
+                    'campaign_stats_fetched_at' => $campaignStats['fetched_at'] ?? null,
+                    'campaign_stats_pending' => (bool) ($campaignStats['pending'] ?? false),
                     'campaign_stats_source_error' => $campaignStats['source_error'] ?? null,
                     'campaign_stat_field_keys' => $campaignStats['field_keys'] ?? [],
                     'campaign_sample_rows' => $campaignStats['sample_rows'] ?? [],
@@ -1019,18 +1025,27 @@ class OzonPerformanceApiService
         string $accessToken,
         string $dateFrom,
         string $dateTo,
-        array $campaignIds
+        array $campaignIds,
+        bool $forceRefresh = false
     ): array {
-        $dataKey = "ozon_perf_cpc:{$integrationId}:{$dateFrom}:{$dateTo}";
-        $cached = Cache::get($dataKey);
-        if (is_array($cached) && ($cached['rows'] ?? []) !== []) {
-            $cached['from_cache'] = true;
+        $progKey = "ozon_perf_cpc_prog:{$integrationId}:{$dateFrom}:{$dateTo}";
 
-            return $cached;
+        // Принудительное обновление: сбрасываем активный прогресс, чтобы перегенерить с нуля.
+        // Сохранённую в БД строку НЕ удаляем — перезапишем по готовности (старое видно, пока новое не готово).
+        if ($forceRefresh) {
+            Cache::forget($progKey);
         }
 
-        $progKey = "ozon_perf_cpc_prog:{$integrationId}:{$dateFrom}:{$dateTo}";
         $prog = Cache::get($progKey);
+
+        // Нет активной перегенерации и не форс — мгновенно отдаём сохранённое из БД.
+        // Переживает рестарты и не сбрасывается после обновления страницы (в отличие от Cache TTL).
+        if (! is_array($prog) && ! $forceRefresh) {
+            $stored = $this->readStoredCampaignStats($integrationId, $dateFrom, $dateTo);
+            if ($stored !== null) {
+                return $stored;
+            }
+        }
 
         // Шаг 1: прогресса нет — создаём отчёты по всем чанкам (быстрые POST) и сразу отвечаем 'pending'.
         if (! is_array($prog)) {
@@ -1103,7 +1118,7 @@ class OzonPerformanceApiService
         $allDone = ! in_array(false, $prog['uuids'], true);
         $stale = (time() - (int) ($prog['created'] ?? time())) > 300; // защита от вечного pending
 
-        // Шаг 3: готово (или устарело) — собираем итог и кэшируем.
+        // Шаг 3: готово (или устарело) — собираем итог и СОХРАНЯЕМ В БД (персистентно, с меткой времени).
         if ($allDone || $stale) {
             $stats = $this->assembleCampaignStats(
                 $accumulated,
@@ -1111,8 +1126,8 @@ class OzonPerformanceApiService
                 $accumulated !== [] ? 'async_report' : 'fallback'
             );
             if ($accumulated !== []) {
-                $stats['from_cache'] = false;
-                Cache::put($dataKey, $stats, now()->addMinutes(30));
+                $stats['from_storage'] = false;
+                $stats['fetched_at'] = $this->writeStoredCampaignStats($integrationId, $dateFrom, $dateTo, $stats);
             }
             Cache::forget($progKey);
 
@@ -1122,6 +1137,59 @@ class OzonPerformanceApiService
         Cache::put($progKey, $prog, now()->addMinutes(15));
 
         return $this->assembleCampaignStats($accumulated, $prog['errors'], 'pending') + ['pending' => true];
+    }
+
+    /**
+     * Читает сохранённую per-SKU рекламную статистику из БД.
+     * Возвращает payload с from_storage=true и fetched_at (ISO), либо null если записи нет/она пуста.
+     *
+     * @return array<string, mixed>|null
+     */
+    private function readStoredCampaignStats(int $integrationId, string $dateFrom, string $dateTo): ?array
+    {
+        try {
+            $row = OzonAdStat::query()
+                ->where('integration_id', $integrationId)
+                ->where('date_from', $dateFrom)
+                ->where('date_to', $dateTo)
+                ->first();
+        } catch (\Throwable $e) {
+            return null; // таблицы может не быть до миграции — мягкая деградация
+        }
+
+        if ($row === null) {
+            return null;
+        }
+
+        $payload = is_array($row->payload) ? $row->payload : [];
+        if (($payload['rows'] ?? []) === []) {
+            return null;
+        }
+
+        $payload['from_storage'] = true;
+        $payload['fetched_at'] = optional($row->fetched_at)->toIso8601String();
+
+        return $payload;
+    }
+
+    /**
+     * Сохраняет (upsert) per-SKU рекламную статистику в БД, возвращает метку времени (ISO).
+     *
+     * @param array<string, mixed> $stats
+     */
+    private function writeStoredCampaignStats(int $integrationId, string $dateFrom, string $dateTo, array $stats): ?string
+    {
+        try {
+            $now = now();
+            OzonAdStat::query()->updateOrCreate(
+                ['integration_id' => $integrationId, 'date_from' => $dateFrom, 'date_to' => $dateTo],
+                ['status' => 'ready', 'payload' => $stats, 'fetched_at' => $now]
+            );
+
+            return $now->toIso8601String();
+        } catch (\Throwable $e) {
+            return null; // не валим HTTP-запрос, если запись в БД не удалась
+        }
     }
 
     /**

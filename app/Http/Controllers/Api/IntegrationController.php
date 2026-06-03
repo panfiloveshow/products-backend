@@ -670,6 +670,7 @@ class IntegrationController extends Controller
             'date_from' => 'nullable|date_format:Y-m-d',
             'date_to' => 'nullable|date_format:Y-m-d|after_or_equal:date_from',
             'debug_raw' => 'nullable|boolean',
+            'force_refresh' => 'nullable|boolean',
         ])->validate();
 
         $resolved = $this->resolveOzonPerformanceRuntime($request, $id, $sellicoApi);
@@ -685,7 +686,8 @@ class IntegrationController extends Controller
             (int) ($validated['limit'] ?? 5000),
             $validated['date_from'] ?? null,
             $validated['date_to'] ?? null,
-            (int) $resolved['integration']->id
+            (int) $resolved['integration']->id,
+            $request->boolean('force_refresh')
         );
 
         // Опциональная диагностика per-SKU CPC: ?debug_raw=1 + обе даты.
