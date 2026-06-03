@@ -78,7 +78,7 @@ class WildberriesServiceTest extends TestCase
         Carbon::setTestNow();
     }
 
-    public function test_get_products_uses_new_all_cards_photo_filter_after_wb_cutover(): void
+    public function test_get_products_keeps_all_cards_photo_filter_after_wb_cutover(): void
     {
         Carbon::setTestNow('2026-06-03 00:00:00');
         Http::fake([
@@ -99,7 +99,7 @@ class WildberriesServiceTest extends TestCase
 
         Http::assertSent(function ($request) {
             return str_contains($request->url(), 'content-api.wildberries.ru/content/v2/get/cards/list')
-                && $request->data()['settings']['filter']['withPhoto'] === 0;
+                && $request->data()['settings']['filter']['withPhoto'] === -1;
         });
 
         Carbon::setTestNow();
