@@ -1050,6 +1050,9 @@ class UnitEconomicsCacheController extends Controller
             'non_local_markup_max' => 'nullable|numeric',
             'confidence' => 'nullable|string|in:low,medium,high',
             'locality_state' => 'nullable|string|in:local,non_local,mixed,no_sales',
+            'period' => 'nullable|integer|in:7,28',
+            'period_days' => 'nullable|integer|in:7,28',
+            'as_of' => 'nullable|date',
         ])->validate();
 
         $resolution = $this->integrationAccessService->ensureAccessibleIntegration(
@@ -1063,11 +1066,20 @@ class UnitEconomicsCacheController extends Controller
 
         $fulfillmentType = $validated['fulfillment_type'];
         $integrationId = (int) $validated['integration_id'];
+        $ozonLocalityPeriodDays = (int) ($validated['period_days'] ?? $validated['period'] ?? 28);
         $ozonLocalitySnapshotDate = $marketplace === 'ozon'
-            ? LocalityMetricDaily::query()
-                ->where('integration_id', $integrationId)
-                ->where('period_days', 28)
-                ->max('snapshot_date')
+            ? (
+                isset($validated['as_of'])
+                    ? LocalityMetricDaily::query()
+                        ->where('integration_id', $integrationId)
+                        ->where('period_days', $ozonLocalityPeriodDays)
+                        ->whereDate('snapshot_date', $validated['as_of'])
+                        ->value('snapshot_date')
+                    : LocalityMetricDaily::query()
+                        ->where('integration_id', $integrationId)
+                        ->where('period_days', $ozonLocalityPeriodDays)
+                        ->max('snapshot_date')
+            )
             : null;
 
         // Те же фильтры, что в index — выгружаем «то что видит менеджер»
@@ -1100,7 +1112,8 @@ class UnitEconomicsCacheController extends Controller
             $integrationId,
             $marketplace,
             $fulfillmentType,
-            $ozonLocalitySnapshotDate
+            $ozonLocalitySnapshotDate,
+            $ozonLocalityPeriodDays
         ) {
             $settingsMap = UnitEconomicsSettings::where('integration_id', $integrationId)
                 ->whereIn('sku', $items->pluck('sku')->unique()->values()->all())
@@ -1111,12 +1124,15 @@ class UnitEconomicsCacheController extends Controller
             if ($marketplace === 'ozon' && $ozonLocalitySnapshotDate) {
                 $localityBySku = LocalityMetricDaily::query()
                     ->where('integration_id', $integrationId)
-                    ->where('period_days', 28)
+                    ->where('period_days', $ozonLocalityPeriodDays)
                     ->where('snapshot_date', $ozonLocalitySnapshotDate)
                     ->whereIn('sku', $items->pluck('sku')->unique()->values()->all())
                     ->get([
                         'sku',
+                        'period_days',
+                        'snapshot_date',
                         'orders_count',
+                        'revenue_total',
                         'local_share_percent',
                         'avg_markup_percent',
                         'calculation_confidence',
@@ -1136,7 +1152,13 @@ class UnitEconomicsCacheController extends Controller
 
                 $enriched = $this->enrichCacheItem($cache, $fulfillmentType, $settings, $pageContext);
                 if ($marketplace === 'ozon') {
-                    $enriched = $this->applyOzonLocalityMetricsToExportItem($enriched, $localityRow);
+                    $enriched = $this->applyOzonLocalityMetricsToExportItem(
+                        $enriched,
+                        $localityRow,
+                        $ozonLocalitySnapshotDate !== null,
+                        $ozonLocalityPeriodDays,
+                        $ozonLocalitySnapshotDate
+                    );
                 }
 
                 $enrichedItems[] = $enriched;
@@ -1360,8 +1382,15 @@ class UnitEconomicsCacheController extends Controller
                     // E: Наценка — Excel-формула = Цена / Себестоимость
                     $sheet->setCellValue("E{$currentRow}", "=IF(D{$currentRow}>0,C{$currentRow}/D{$currentRow},0)");
                 } elseif ($col === 'G') {
-                    // G: Выручка — меняется при ручной правке цены или продаж
-                    $sheet->setCellValue("G{$currentRow}", "=C{$currentRow}*F{$currentRow}");
+                    if (! empty($item['export_revenue_is_period_snapshot'])) {
+                        // G: фактическая выручка за выбранный период из locality snapshot.
+                        // Её нельзя пересчитывать как Цена × Продажи: цена могла измениться,
+                        // а в snapshot уже лежит реальная сумма заказов периода.
+                        $sheet->setCellValue("G{$currentRow}", (float) ($item['revenue'] ?? 0));
+                    } else {
+                        // G: Выручка — меняется при ручной правке цены или продаж
+                        $sheet->setCellValue("G{$currentRow}", "=C{$currentRow}*F{$currentRow}");
+                    }
                 } elseif ($col === 'J') {
                     // J: Комиссия ₽ — зависит от цены и комиссии %
                     $sheet->setCellValue("J{$currentRow}", "=C{$currentRow}*I{$currentRow}/100");
@@ -2033,12 +2062,37 @@ class UnitEconomicsCacheController extends Controller
     }
 
     /**
-     * Для Ozon-экспорта подмешиваем per-SKU locality-метрики тем же правилом,
-     * что и на UI (period=28): local_share_percent + avg_markup_percent.
+     * Для Ozon-экспорта подмешиваем per-SKU locality-метрики из snapshot'а
+     * выбранного периода: продажи, выручку, local_share_percent и avg_markup_percent.
      */
-    private function applyOzonLocalityMetricsToExportItem(array $item, ?LocalityMetricDaily $localityRow): array
+    private function applyOzonLocalityMetricsToExportItem(
+        array $item,
+        ?LocalityMetricDaily $localityRow,
+        bool $hasLocalitySnapshot = false,
+        int $periodDays = 28,
+        mixed $snapshotDate = null
+    ): array
     {
-        if (! $localityRow || (int) ($localityRow->orders_count ?? 0) <= 0) {
+        if (! $localityRow && ! $hasLocalitySnapshot) {
+            return $item;
+        }
+
+        $ordersCount = $localityRow ? (int) ($localityRow->orders_count ?? 0) : 0;
+        $revenueTotal = $localityRow ? (float) ($localityRow->revenue_total ?? 0) : 0.0;
+
+        $item['sales_count'] = $ordersCount;
+        $item['orders_count'] = $ordersCount;
+        $item['revenue'] = round($revenueTotal, 2);
+        $item['export_revenue_is_period_snapshot'] = true;
+        $item['export_sales_period_days'] = (int) ($localityRow->period_days ?? $periodDays);
+        $item['export_sales_snapshot_date'] = $localityRow
+            ? optional($localityRow->snapshot_date)->toDateString()
+            : ($snapshotDate instanceof \DateTimeInterface
+                ? $snapshotDate->format('Y-m-d')
+                : ($snapshotDate ? (string) $snapshotDate : null));
+        $item['export_sales_source'] = 'locality_metrics_daily';
+
+        if (! $localityRow) {
             return $item;
         }
 

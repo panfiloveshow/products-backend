@@ -136,7 +136,9 @@ class WildberriesUnitEconomicsCalculator implements UnitEconomicsCalculatorInter
         
         // Хранение (если есть данные о днях хранения)
         $daysInStock = $options['days_in_stock'] ?? 30;
-        $storageCost = $input->storageCost ?? $this->tariffs->calculateStorageCost($volumeInLiters, $daysInStock);
+        $storageCost = $input->storageCost ?? $this->tariffs->calculateStorageCost($volumeInLiters, $daysInStock, [
+            'tariff_breakdown' => $input->tariffBreakdown,
+        ]);
         if (! in_array($scheme, ['FBO', 'FBW'], true)) {
             $storageCost = 0.0;
         }

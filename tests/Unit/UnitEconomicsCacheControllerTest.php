@@ -647,6 +647,41 @@ class UnitEconomicsCacheControllerTest extends TestCase
         $this->assertSame('2026-05-25-04', $templateVersion);
     }
 
+    public function test_excel_export_uses_period_snapshot_revenue_without_price_times_sales_formula(): void
+    {
+        $controller = new UnitEconomicsCacheController(
+            $this->createMock(UnitEconomicsCacheService::class),
+            $this->createMock(UnitEconomicsService::class),
+            $this->createMock(UnitEconomicsOrchestrator::class),
+            $this->createMock(IntegrationAccessService::class),
+        );
+
+        $method = new \ReflectionMethod(UnitEconomicsCacheController::class, 'buildUnitEconomicsSpreadsheet');
+        $method->setAccessible(true);
+
+        $spreadsheet = $method->invoke($controller, [[
+            'sku' => '9137/black',
+            'product_name' => 'Test product',
+            'price' => 1000,
+            'cost_price' => 300,
+            'sales_count' => 2,
+            'revenue' => 1500,
+            'export_revenue_is_period_snapshot' => true,
+            'commission_percent' => 10,
+            'effective_logistics' => 120,
+            'acquiring_percent' => 1.5,
+            'drr_percent' => 5,
+            'our_share_percent' => 2,
+            'tax_percent' => 6,
+            'vat_percent' => 0,
+        ]], 'Test', 'ozon', 'FBO');
+
+        $sheet = $spreadsheet->getActiveSheet();
+
+        $this->assertSame(2.0, $sheet->getCell('F5')->getValue());
+        $this->assertSame(1500.0, $sheet->getCell('G5')->getValue());
+    }
+
     public function test_resolve_locality_label_prefers_actual_locality_over_estimated_rate(): void
     {
         $controller = new UnitEconomicsCacheController(
@@ -689,7 +724,9 @@ class UnitEconomicsCacheControllerTest extends TestCase
 
         $row = new LocalityMetricDaily([
             'sku' => '9137/black',
+            'period_days' => 28,
             'orders_count' => 12,
+            'revenue_total' => 3456.78,
             'local_share_percent' => 50.0,
             'avg_markup_percent' => 4.0,
             'calculation_confidence' => 'high',
@@ -697,17 +734,54 @@ class UnitEconomicsCacheControllerTest extends TestCase
 
         $result = $method->invoke($controller, [
             'sku' => '9137/black',
+            'sales_count' => 999,
+            'orders_count' => 999,
+            'revenue' => 999000,
             'is_local_sale' => false,
             'expected_locality_rate' => 75.0,
             'non_local_markup_percent' => 0.55,
             'calculation_confidence' => 'medium',
         ], $row);
 
+        $this->assertSame(12, $result['sales_count']);
+        $this->assertSame(12, $result['orders_count']);
+        $this->assertSame(3456.78, $result['revenue']);
+        $this->assertTrue($result['export_revenue_is_period_snapshot']);
+        $this->assertSame(28, $result['export_sales_period_days']);
+        $this->assertSame('locality_metrics_daily', $result['export_sales_source']);
         $this->assertSame(50.0, $result['expected_locality_rate']);
         $this->assertSame(4.0, $result['non_local_markup_percent']);
         $this->assertSame(4.0, $result['raw_non_local_markup_percent']);
         $this->assertNull($result['is_local_sale']);
         $this->assertSame('high', $result['calculation_confidence']);
         $this->assertSame('locality_metrics_daily', $result['non_local_markup_source']);
+    }
+
+    public function test_apply_ozon_locality_metrics_to_export_item_zeros_sales_when_snapshot_has_no_sku_row(): void
+    {
+        $controller = new UnitEconomicsCacheController(
+            $this->createMock(UnitEconomicsCacheService::class),
+            $this->createMock(UnitEconomicsService::class),
+            $this->createMock(UnitEconomicsOrchestrator::class),
+            $this->createMock(IntegrationAccessService::class),
+        );
+
+        $method = new \ReflectionMethod(UnitEconomicsCacheController::class, 'applyOzonLocalityMetricsToExportItem');
+        $method->setAccessible(true);
+
+        $result = $method->invoke($controller, [
+            'sku' => '9137/black',
+            'sales_count' => 999,
+            'orders_count' => 999,
+            'revenue' => 999000,
+        ], null, true, 28, '2026-06-03');
+
+        $this->assertSame(0, $result['sales_count']);
+        $this->assertSame(0, $result['orders_count']);
+        $this->assertSame(0.0, $result['revenue']);
+        $this->assertTrue($result['export_revenue_is_period_snapshot']);
+        $this->assertSame(28, $result['export_sales_period_days']);
+        $this->assertSame('2026-06-03', $result['export_sales_snapshot_date']);
+        $this->assertSame('locality_metrics_daily', $result['export_sales_source']);
     }
 }

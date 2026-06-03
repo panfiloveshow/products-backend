@@ -12,6 +12,14 @@ use Illuminate\Support\Facades\Cache;
 
 class UnitEconomicsService
 {
+    private const WB_SMALL_VOLUME_TARIFFS = [
+        ['max_volume' => 0.2, 'rate' => 23.0],
+        ['max_volume' => 0.4, 'rate' => 26.0],
+        ['max_volume' => 0.6, 'rate' => 29.0],
+        ['max_volume' => 0.8, 'rate' => 30.0],
+        ['max_volume' => 1.0, 'rate' => 32.0],
+    ];
+
     private UnitEconomicsOrchestrator $orchestrator;
 
     public function __construct(?UnitEconomicsOrchestrator $orchestrator = null)
@@ -110,9 +118,11 @@ class UnitEconomicsService
         $localizationIndex = (float) ($data['localization_index'] ?? 1.0);
         $deliveryBaseLiter = (float) ($data['delivery_base_liter'] ?? 46);
         $deliveryAdditionalLiter = (float) ($data['delivery_additional_liter'] ?? 14);
-        $baseLogisticsPerUnit = $volumeLiters <= 1
-            ? $deliveryBaseLiter
-            : $deliveryBaseLiter + max(0, $volumeLiters - 1) * $deliveryAdditionalLiter;
+        $baseLogisticsPerUnit = $this->calculateWildberriesFallbackLogisticsBase(
+            (float) $volumeLiters,
+            $deliveryBaseLiter,
+            $deliveryAdditionalLiter
+        );
         $ownDeliveryCost = (float) ($data['own_delivery_cost'] ?? 0);
         $ownReturnCost = (float) ($data['own_return_cost'] ?? 0);
         $logisticsPerUnit = in_array($fulfillmentType, ['DBS', 'EDBS'], true)
@@ -171,6 +181,26 @@ class UnitEconomicsService
                 'to_settlement_account' => round($toSettlementAccount, 2),
             ],
         ];
+    }
+
+    private function calculateWildberriesFallbackLogisticsBase(
+        float $volumeLiters,
+        float $firstLiterOverOne = 46.0,
+        float $additionalLiterOverOne = 14.0
+    ): float {
+        $volumeLiters = max(0.001, $volumeLiters);
+
+        if ($volumeLiters <= 1.0) {
+            foreach (self::WB_SMALL_VOLUME_TARIFFS as $tier) {
+                if ($volumeLiters <= $tier['max_volume']) {
+                    return $tier['rate'];
+                }
+            }
+
+            return 32.0;
+        }
+
+        return round($firstLiterOverOne + (($volumeLiters - 1.0) * $additionalLiterOverOne), 2);
     }
 
     private function calculateOzon(array $data): array

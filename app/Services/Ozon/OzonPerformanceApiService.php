@@ -2120,6 +2120,9 @@ class OzonPerformanceApiService
                     'ad_cpo_revenue' => 0.0,
                     'ad_cpo_orders' => 0,
                     'ad_cpo_drr_percent' => 0.0,
+                    'ordered_amount' => 0.0,
+                    'ad_ordered_amount' => 0.0,
+                    'ad_total_drr_percent' => 0.0,
                     'ad_campaigns' => [],
                     'payment_models' => [],
                     'signals' => [],
@@ -2169,6 +2172,11 @@ class OzonPerformanceApiService
             $products[$key]['ad_spend'] += $this->sumColumnsContaining($row, ['Расход']);
             $products[$key]['ad_revenue'] += $this->sumColumnsContaining($row, ['Продажи', 'Выручка']);
             $products[$key]['ad_orders'] += (int) $this->sumColumnsContaining($row, ['Заказы']);
+            // «Заказано на сумму» — товарный итог (одинаков по кампаниям), поэтому MAX, а не сумма.
+            $products[$key]['ordered_amount'] = max(
+                (float) $products[$key]['ordered_amount'],
+                $this->sumColumnsContaining($row, ['Заказано на сумму'])
+            );
 
             // Разбивка по кампаниям (ID кампании) — как в отчёте «Аналитика продвижения».
             $campaignId = trim((string) ($row['_campaign_id'] ?? ''));
@@ -2249,6 +2257,10 @@ class OzonPerformanceApiService
             $products[$key]['ctr_percent'] = $ctr;
             $products[$key]['average_cpc'] = $cpc;
             $products[$key]['cart_conversion_percent'] = $cartConversion;
+            // Общий ДРР = весь рекламный расход (CPC+CPO) / «Заказано на сумму» (вся выручка товара) × 100.
+            $orderedAmount = round((float) ($product['ordered_amount'] ?? 0), 2);
+            $products[$key]['ad_ordered_amount'] = $orderedAmount;
+            $products[$key]['ad_total_drr_percent'] = $orderedAmount > 0 ? round($spend / $orderedAmount * 100, 2) : 0.0;
             $products[$key]['ad_campaigns'] = array_values(array_map(static function (array $c): array {
                 $sp = round((float) ($c['spend'] ?? 0), 2);
                 $rev = round((float) ($c['revenue'] ?? 0), 2);
@@ -2705,6 +2717,15 @@ class OzonPerformanceApiService
                 'Средняя стоимость клика',
                 'Ср. цена клика (Оплата за клик)',
             ]);
+            // «Заказано на сумму» — вся выручка по заказам товара (рекламные + органические),
+            // знаменатель для «Общего ДРР» (как в кабинете Ozon).
+            $orderedAmount = $this->firstNumber($row, [
+                'Заказано на сумму, ₽',
+                'Заказано на сумму, Р',
+                'Заказано на сумму',
+                'orderedAmount',
+                'ordered_amount',
+            ]);
 
             $pname = $productName ?: (string) ($meta['product_name'] ?? '');
             $cat = $this->firstString($row, ['Категория товара', 'category', 'categoryName', 'category_name'])
@@ -2778,6 +2799,7 @@ class OzonPerformanceApiService
                 'Заказы (Оплата за клик)' => $orders,
                 'CTR (Оплата за клик)' => $ctr,
                 'Ср. цена клика (Оплата за клик)' => $averageCpc,
+                'Заказано на сумму' => $orderedAmount,
                 '_source' => 'campaign_product_stats_cpc',
                 '_campaign_id' => $campId,
                 '_payment_type' => 'cpc',

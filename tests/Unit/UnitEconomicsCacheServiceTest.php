@@ -9,6 +9,7 @@ use App\Domains\UnitEconomics\UnitEconomicsOrchestrator;
 use App\Domains\Wildberries\UnitEconomics\WildberriesUnitEconomicsCalculator;
 use App\Models\Product;
 use App\Services\UnitEconomicsCacheService;
+use App\Services\UnitEconomicsService;
 use PHPUnit\Framework\TestCase;
 
 class UnitEconomicsCacheServiceTest extends TestCase
@@ -445,6 +446,153 @@ class UnitEconomicsCacheServiceTest extends TestCase
 
         $this->assertSame(40.0, $result->metadata['base_logistics']);
         $this->assertSame(40.0, $result->costs->logistics);
+    }
+
+    public function test_wildberries_calculator_uses_current_small_volume_tariff_tiers(): void
+    {
+        $calculator = new WildberriesUnitEconomicsCalculator();
+
+        $result = $calculator->calculate(CalculationInput::fromArray([
+            'sku' => 'wb-small-volume',
+            'integration_id' => 1,
+            'marketplace' => 'wildberries',
+            'fulfillment_type' => 'FBO',
+            'price' => 1000,
+            'cost_price' => 0,
+            'commission_rate' => 0,
+            'length' => 10,
+            'width' => 10,
+            'height' => 5.5,
+            'warehouse_coefficient' => 1,
+            'localization_index' => 1,
+            'redemption_rate' => 100,
+            'storage_cost' => 0,
+            'acquiring_percent' => 0,
+            'tax_percent' => 0,
+        ]));
+
+        $this->assertSame(0.55, $result->metadata['volume_liters']);
+        $this->assertSame(29.0, $result->metadata['base_logistics']);
+        $this->assertSame(29.0, $result->costs->logistics);
+    }
+
+    public function test_wildberries_calculator_uses_fractional_additional_liter_after_one_liter(): void
+    {
+        $calculator = new WildberriesUnitEconomicsCalculator();
+
+        $result = $calculator->calculate(CalculationInput::fromArray([
+            'sku' => 'wb-fractional-volume',
+            'integration_id' => 1,
+            'marketplace' => 'wildberries',
+            'fulfillment_type' => 'FBO',
+            'price' => 1000,
+            'cost_price' => 0,
+            'commission_rate' => 0,
+            'length' => 10,
+            'width' => 10,
+            'height' => 18,
+            'warehouse_coefficient' => 1,
+            'localization_index' => 1,
+            'redemption_rate' => 100,
+            'storage_cost' => 0,
+            'acquiring_percent' => 0,
+            'tax_percent' => 0,
+        ]));
+
+        $this->assertSame(1.8, $result->metadata['volume_liters']);
+        $this->assertSame(57.2, $result->metadata['base_logistics']);
+        $this->assertSame(57.2, $result->costs->logistics);
+    }
+
+    public function test_wildberries_box_tariff_snapshot_keeps_small_volume_tier_and_applies_warehouse_coef(): void
+    {
+        $calculator = new WildberriesUnitEconomicsCalculator();
+
+        $result = $calculator->calculate(CalculationInput::fromArray([
+            'sku' => 'wb-small-volume-snapshot',
+            'integration_id' => 1,
+            'marketplace' => 'wildberries',
+            'fulfillment_type' => 'FBO',
+            'price' => 1000,
+            'cost_price' => 0,
+            'commission_rate' => 0,
+            'length' => 10,
+            'width' => 10,
+            'height' => 5.5,
+            'warehouse_coefficient' => 1,
+            'localization_index' => 1,
+            'redemption_rate' => 100,
+            'storage_cost' => 0,
+            'acquiring_percent' => 0,
+            'tax_percent' => 0,
+            'tariff_breakdown' => [
+                'source' => 'wildberries_tariff_snapshots',
+                'box' => [
+                    'delivery_base' => 46,
+                    'delivery_liter' => 14,
+                    'delivery_coef_percent' => 150,
+                ],
+            ],
+        ]));
+
+        $this->assertSame(29.0, $result->metadata['base_logistics']);
+        $this->assertSame(43.5, $result->costs->logistics);
+        $this->assertSame(150.0, $result->metadata['warehouse_coef_percent']);
+        $this->assertTrue($result->metadata['warehouse_coef_included_in_tariff']);
+    }
+
+    public function test_wildberries_calculator_uses_box_storage_tariff_breakdown_when_storage_cost_missing(): void
+    {
+        $calculator = new WildberriesUnitEconomicsCalculator();
+
+        $result = $calculator->calculate(CalculationInput::fromArray([
+            'sku' => 'wb-storage-snapshot',
+            'integration_id' => 1,
+            'marketplace' => 'wildberries',
+            'fulfillment_type' => 'FBO',
+            'price' => 1000,
+            'cost_price' => 0,
+            'commission_rate' => 0,
+            'length' => 10,
+            'width' => 10,
+            'height' => 18,
+            'warehouse_coefficient' => 1,
+            'localization_index' => 1,
+            'redemption_rate' => 100,
+            'acquiring_percent' => 0,
+            'tax_percent' => 0,
+            'tariff_breakdown' => [
+                'box' => [
+                    'storage_base' => 0.10,
+                    'storage_liter' => 0.05,
+                ],
+            ],
+        ]));
+
+        $this->assertSame(4.2, $result->costs->storageCost);
+    }
+
+    public function test_wildberries_legacy_service_uses_current_small_volume_tariff_tiers(): void
+    {
+        $service = new UnitEconomicsService();
+
+        $result = $service->calculate('wildberries', [
+            'price' => 1000,
+            'cost_price' => 0,
+            'sales_count' => 1,
+            'fulfillment_type' => 'FBO',
+            'commission_percent' => 0,
+            'volume_liters' => 0.55,
+            'warehouse_coefficient' => 1,
+            'localization_index' => 1,
+            'redemption_rate' => 100,
+            'storage_cost' => 0,
+            'acquiring_percent' => 0,
+            'tax_percent' => 0,
+        ]);
+
+        $this->assertSame(29.0, $result['base_logistics_cost']);
+        $this->assertSame(29.0, $result['logistics_cost']);
     }
 
     public function test_wildberries_cache_conversion_persists_localization_index_in_logistics_coefficient(): void
