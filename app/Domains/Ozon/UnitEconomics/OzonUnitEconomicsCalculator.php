@@ -497,6 +497,7 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
         $hasNoSales = $input->redemptionSource === 'no_sales_28d'
             || ($input->ordersCount !== null && $input->ordersCount <= 0);
         $commissionData = $this->pricing->resolveCommission($scheme, $input->categoryId, $input->price);
+        $pricingDate = $input->orderDate ?? $input->tariffEffectiveFrom ?? $this->pricing->getEffectiveFrom();
         $hasExactClusters = ! $hasNoSales && ($input->shippingClusterName !== null || $input->destinationClusterName !== null);
         $clusterLogisticsData = $hasExactClusters
             ? $this->pricing->resolveClusterLogistics(
@@ -504,7 +505,8 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
                 $volume,
                 $input->price,
                 $input->shippingClusterName,
-                $input->destinationClusterName
+                $input->destinationClusterName,
+                $pricingDate
             )
             : null;
         $logisticsData = $clusterLogisticsData
@@ -532,7 +534,7 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
         $routeResolutionStatus = $hasNoSales ? 'unknown' : ($input->routeResolutionStatus ?? ($routeWasProvided ? 'resolved' : ($hasProfile ? 'estimated' : 'unknown')));
         $localityResolutionStatus = $hasNoSales ? 'unknown' : ($input->localityResolutionStatus ?? (($input->isLocalSale !== null || $input->expectedLocalityRate !== null) ? 'resolved' : ($hasProfile ? 'estimated' : 'unknown')));
         $calculationConfidence = $input->calculationConfidence ?? $this->resolveConfidence($dominantClusterShare, $routeResolutionStatus);
-        $profileMetrics = $hasNoSales ? null : $this->resolveWeightedProfileMetrics($scheme, $input, $volume);
+        $profileMetrics = $hasNoSales ? null : $this->resolveWeightedProfileMetrics($scheme, $input, $volume, $pricingDate);
         $expectedLocalityRate = $profileMetrics['expected_locality_rate'] ?? $input->expectedLocalityRate ?? null;
         if ($expectedLocalityRate === null && $input->isLocalSale !== null && $localityResolutionStatus === 'resolved') {
             $expectedLocalityRate = $input->isLocalSale ? 100.0 : 0.0;
@@ -607,7 +609,7 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
         ];
     }
 
-    private function resolveWeightedProfileMetrics(string $scheme, CalculationInput $input, float $volume): ?array
+    private function resolveWeightedProfileMetrics(string $scheme, CalculationInput $input, float $volume, string $pricingDate): ?array
     {
         // Используем наиболее полный источник данных о спросе.
         // clusters_summary (Delivery Analytics API) может содержать неполные данные,
@@ -681,7 +683,8 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
                 $volume,
                 $input->price,
                 $sourceCluster,
-                $destinationCluster
+                $destinationCluster,
+                $pricingDate
             );
 
             $weightedBaseLogistics += ($share / 100) * (float) $clusterLogistics['base_cost'];
@@ -693,10 +696,8 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
             // правило Ozon применяется на момент отгрузки, не на момент обогащения кэша.
             if ($isLocalCluster || ! $markupAllowed) {
                 $clusterMarkup = 0.0;
-            } elseif (array_key_exists('effective_markup_percent', $cluster) && $cluster['effective_markup_percent'] !== null) {
-                $clusterMarkup = (float) $cluster['effective_markup_percent'];
             } else {
-                $clusterMarkup = $this->pricing->resolveDestinationMarkupPercent($destinationCluster);
+                $clusterMarkup = $this->pricing->resolveDestinationMarkupPercent($destinationCluster, $pricingDate);
             }
 
             $weightedMarkupPercent += ($share / 100) * $clusterMarkup;

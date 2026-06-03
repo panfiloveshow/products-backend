@@ -3873,7 +3873,10 @@ class UnitEconomicsCacheController extends Controller
             $resolvedRoute = $pricing->resolveRoute(null, is_string($resolvedName) ? $resolvedName : null);
             $canonicalName = is_string($resolvedName) ? $pricing->resolveClusterName($resolvedName) : null;
             $isLocalCluster = $canonicalName !== null && in_array($canonicalName, $stockClusterCanonical, true);
-            $nonLocalMarkupPercent = $pricing->resolveDestinationMarkupPercent(is_string($resolvedName) ? $resolvedName : null);
+            $nonLocalMarkupPercent = $pricing->resolveDestinationMarkupPercent(
+                is_string($resolvedName) ? $resolvedName : null,
+                $pricing->getEffectiveFrom()
+            );
             $effectiveMarkupPercent = (! $markupAllowed || $isLocalCluster) ? 0.0 : $nonLocalMarkupPercent;
             $markupReason = $cluster['markup_reason']
                 ?? $matched['markup_reason']

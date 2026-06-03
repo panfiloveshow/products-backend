@@ -111,7 +111,8 @@ class OzonOrderUnitEconomicsService
             $volumeLiters,
             (float) ($item->price ?? 0),
             $effectiveShippingClusterName,
-            $destinationClusterName
+            $destinationClusterName,
+            $orderDate?->toDateString()
         );
 
         [$markupApplied, $markupReasonCode, $markupReasonLabel, $markupExceptionStatus] = $this->resolveMarkupDecision(

@@ -1,13 +1,14 @@
 <?php
 
 return [
-    // Актуальная версия тарифов Ozon: с 18.04.2026 — новые наценки
-    // Омск/Пермь/Оренбург/Самара 12%, Воронеж/Ярославль 8% + окно ДВ 0%.
-    'effective_from' => '2026-04-18',
-    'version' => '2026-04-18',
+    // Актуальная версия тарифов Ozon: с 16.06.2026 — новая таблица
+    // логистики FBO/FBS и обновлённые наценки за нелокальную продажу.
+    'effective_from' => '2026-06-16',
+    'version' => '2026-06-16',
     'announcement_dates' => [
         '2026-04-06' => '2026-02-05', // Tariffs announced Feb 5, effective Apr 6
         '2026-04-18' => '2026-04-06', // Markup update announced Apr 6 (вместе с тарифами), effective Apr 18
+        '2026-06-16' => '2026-05-01', // Таблица logistika-fbo-fbs-01052026, effective Jun 16
     ],
     'transitional_periods' => [
         [
@@ -15,10 +16,16 @@ return [
             'end' => '2026-04-05',
             'tariff_version' => '2026-04-06',
         ],
+        [
+            'start' => '2026-04-05',
+            'end' => '2026-04-15',
+            'tariff_version' => '2026-04-06',
+        ],
     ],
     'version_history' => [
         // Each entry: version => effective_from date
         // Sorted chronologically, latest first
+        '2026-06-16' => '2026-06-16',
         '2026-04-18' => '2026-04-18',
         '2026-04-06' => '2026-04-06',
     ],

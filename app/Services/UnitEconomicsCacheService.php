@@ -1433,7 +1433,10 @@ class UnitEconomicsCacheService
                 ? (bool) $cluster['is_local_cluster']
                 : ($canonicalName !== null && in_array($canonicalName, $stockClusterCanonical, true));
             $resolvedRoute = $pricing->resolveRoute(null, is_string($clusterName) ? $clusterName : null);
-            $nonLocalMarkupPercent = $pricing->resolveDestinationMarkupPercent(is_string($clusterName) ? $clusterName : null);
+            $nonLocalMarkupPercent = $pricing->resolveDestinationMarkupPercent(
+                is_string($clusterName) ? $clusterName : null,
+                $pricing->getEffectiveFrom()
+            );
             if (! $markupAllowed || $isLocalCluster) {
                 $effectiveMarkupPercent = 0.0;
             } elseif (array_key_exists('effective_markup_percent', $cluster) && $cluster['effective_markup_percent'] !== null) {

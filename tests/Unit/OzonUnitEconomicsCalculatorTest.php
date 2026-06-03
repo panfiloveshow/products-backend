@@ -115,6 +115,40 @@ class OzonUnitEconomicsCalculatorTest extends TestCase
         $this->assertSame(60.0, $result['base_logistics']);
     }
 
+    public function test_fbo_profile_recalculates_stale_effective_markup_from_current_tariff_date(): void
+    {
+        $calculator = new OzonUnitEconomicsCalculator();
+        $input = CalculationInput::fromArray([
+            'sku' => 'sku-4-stale-profile',
+            'integration_id' => 1,
+            'marketplace' => 'ozon',
+            'fulfillment_type' => 'FBO',
+            'price' => 500,
+            'cost_price' => 200,
+            'length' => 5,
+            'width' => 5,
+            'height' => 8,
+            'sales_7_days' => 80,
+            'tariff_effective_from' => '2026-06-16',
+            'stock_profile' => [
+                ['cluster_name' => 'Казань', 'share_percent' => 100],
+            ],
+            'clusters_summary' => [
+                [
+                    'cluster_id' => 'rostov',
+                    'cluster_name' => 'Ростов',
+                    'orders_percent' => 100,
+                    'effective_markup_percent' => 0.0,
+                ],
+            ],
+        ]);
+
+        $result = $calculator->calculate($input)->toArray();
+
+        $this->assertSame(8.0, $result['non_local_markup_percent']);
+        $this->assertSame(40.0, $result['non_local_markup_amount']);
+    }
+
     public function test_fbs_profile_never_applies_non_local_markup(): void
     {
         $calculator = new OzonUnitEconomicsCalculator();

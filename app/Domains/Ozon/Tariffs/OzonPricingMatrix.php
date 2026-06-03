@@ -177,6 +177,7 @@ class OzonPricingMatrix
         }
 
         $checkDate = $date ?? (function_exists('now') ? now()->toDateString() : date('Y-m-d'));
+        $checkDate = substr((string) $checkDate, 0, 10);
 
         $windows = $this->logisticsMatrix['non_local_markup_windows'] ?? [];
         foreach ($windows as $window) {
@@ -202,8 +203,14 @@ class OzonPricingMatrix
         return 0.0;
     }
 
-    public function resolveClusterLogistics(string $scheme, float $volume, float $price, ?string $sourceCluster, ?string $destinationCluster): array
-    {
+    public function resolveClusterLogistics(
+        string $scheme,
+        float $volume,
+        float $price,
+        ?string $sourceCluster,
+        ?string $destinationCluster,
+        ?string $date = null
+    ): array {
         $scheme = strtoupper($scheme);
         $bucketLabel = $this->resolveTariffBucketKey($this->resolveVolumeBucketLabel($volume));
         $priceKey = $price <= 300.0 ? 'up_to_300' : 'over_300';
@@ -229,7 +236,7 @@ class OzonPricingMatrix
             'base_cost' => round((float) $baseCost, 2),
             'tariff_source' => $usedUniversal ? 'universal' : 'official',
             'used_universal_tariff' => $usedUniversal,
-            'non_local_markup_percent' => $this->resolveDestinationMarkupPercent($destinationCanonical),
+            'non_local_markup_percent' => $this->resolveDestinationMarkupPercent($destinationCanonical, $date),
             'is_local_sale' => $sourceCanonical !== null && $destinationCanonical !== null && $sourceCanonical === $destinationCanonical,
         ];
     }

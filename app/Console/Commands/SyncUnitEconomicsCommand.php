@@ -2465,7 +2465,7 @@ class SyncUnitEconomicsCommand extends Command
                 $clusterName = $cluster['cluster_name'] ?? $clusterMeta['cluster_name'] ?? "Кластер {$clusterId}";
                 $clusterRegion = $cluster['region'] ?? $clusterMeta['region'] ?? null;
                 $route = $pricing->resolveRoute(null, $clusterName);
-                $clusterMarkupPercent = $pricing->resolveDestinationMarkupPercent($clusterName);
+                $clusterMarkupPercent = $pricing->resolveDestinationMarkupPercent($clusterName, $pricing->getEffectiveFrom());
                 $effectiveClusterMarkupPercent = (!$markupAllowed || $isLocalCluster) ? 0.0 : $clusterMarkupPercent;
                 $markupReason = !$markupAllowed
                     ? $markupRuleReason

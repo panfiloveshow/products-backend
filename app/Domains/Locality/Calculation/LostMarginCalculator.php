@@ -45,7 +45,8 @@ class LostMarginCalculator
         }
 
         $salePrice = (float) ($item->sale_price ?? 0);
-        $markupPct = (float) $this->pricing->resolveDestinationMarkupPercent((string) $dest);
+        $orderDate = $item->order_date ?? null;
+        $markupPct = (float) $this->pricing->resolveDestinationMarkupPercent((string) $dest, $orderDate ? (string) $orderDate : null);
         $potentialMarkup = $salePrice > 0 && $markupPct > 0
             ? round($salePrice * ($markupPct / 100), 2)
             : 0.0;
@@ -59,6 +60,7 @@ class LostMarginCalculator
                 $salePrice,
                 (string) $dest,
                 (string) $dest,
+                $orderDate ? (string) $orderDate : null,
             );
             $hypoBase = (float) ($hypothetical['base_cost'] ?? 0);
             $currentBase = (float) $item->base_logistics_tariff;
