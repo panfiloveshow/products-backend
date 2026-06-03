@@ -18,7 +18,9 @@ class SyncUnitEconomicsJob implements ShouldQueue
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
 
     public int $tries = 3;
-    public int $timeout = 600;
+    // Крупные магазины (сотни товаров) не укладывались в 600с → таймаут до диспатча кэша,
+    // из-за чего товары не появлялись в юнит-экономике. Поднимаем лимит.
+    public int $timeout = 1800;
 
     public function __construct(
         public int $integrationId,
@@ -122,8 +124,32 @@ class SyncUnitEconomicsJob implements ShouldQueue
                 'integration_id' => $this->integrationId,
                 'error' => $e->getMessage(),
             ]);
-            
+
             throw $e;
+        }
+    }
+
+    /**
+     * Вызывается очередью при окончательном падении джоба (таймаут / превышение попыток).
+     * Тяжёлый syncFromRealData мог не доехать до диспатча кэша (строка выше), из-за чего
+     * unit_economics_cache не строился и товары пропадали со страницы юнитки. Поэтому здесь
+     * гарантированно ставим пересчёт кэша из уже синхронизированных товаров.
+     */
+    public function failed(\Throwable $exception): void
+    {
+        Log::warning('SyncUnitEconomicsJob failed; dispatching cache rebuild anyway', [
+            'integration_id' => $this->integrationId,
+            'error' => $exception->getMessage(),
+        ]);
+
+        try {
+            RecalculateUnitEconomicsCacheJob::dispatch($this->integrationId)
+                ->onQueue('unit-economics');
+        } catch (\Throwable $e) {
+            Log::error('SyncUnitEconomicsJob::failed could not dispatch cache rebuild', [
+                'integration_id' => $this->integrationId,
+                'error' => $e->getMessage(),
+            ]);
         }
     }
 
