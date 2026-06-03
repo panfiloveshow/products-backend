@@ -438,11 +438,21 @@ class OzonPerformanceApiService
                 ];
             }
 
+            // Бэкофф на 429 (rate limit Ozon): транзиентный лимит не должен ронять всю рекламную
+            // цепочку (фронт получал 422 и не загружал рекламу совсем).
             $response = $this->authorized($token['access_token'])
                 ->post(self::BASE_URL . '/api/client/statistic/products/generate', [
                     'from' => $this->toRfc3339Start($dateFrom),
                     'to' => $this->toRfc3339End($dateTo),
                 ]);
+            for ($attempt = 1; $attempt <= 2 && $response->status() === 429; $attempt++) {
+                sleep(5 * $attempt);
+                $response = $this->authorized($token['access_token'])
+                    ->post(self::BASE_URL . '/api/client/statistic/products/generate', [
+                        'from' => $this->toRfc3339Start($dateFrom),
+                        'to' => $this->toRfc3339End($dateTo),
+                    ]);
+            }
 
             return [
                 'success' => $response->successful(),
