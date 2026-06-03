@@ -881,7 +881,22 @@ class OzonPerformanceApiService
             ?? ''
         ));
 
-        return $type !== '' && str_contains($type, 'SKU');
+        // SKU-кампании (CPC, оплата за клик) + CPO-кампании (оплата за заказ: ALL_SKU_PROMO/SEARCH_PROMO).
+        // Нетоварные типы (REF_VK и т.п.) исключаем — они ломают генерацию товарного отчёта (400).
+        return ($type !== '' && str_contains($type, 'SKU')) || $this->isCpoCampaign($campaign);
+    }
+
+    /**
+     * CPO-кампания («Оплата за заказ» — платишь % от продаж). Per-SKU расход доступен тем же
+     * async-отчётом, что и CPC, но в отдельных колонках («Тип страницы»/«Условие показа»/«Средняя ставка»).
+     *
+     * @param array<string, mixed> $campaign
+     */
+    private function isCpoCampaign(array $campaign): bool
+    {
+        $pay = mb_strtoupper((string) ($campaign['PaymentType'] ?? $campaign['paymentType'] ?? $campaign['payment_type'] ?? ''));
+
+        return $pay === 'CPO';
     }
 
     private function fetchCampaigns(string $accessToken): array
@@ -1941,6 +1956,13 @@ class OzonPerformanceApiService
         // ID кампании указан в строке-заголовке отчёта: "Кампания по продвижению товаров № 23001632, период…".
         $campaignId = preg_match('/№\s*(\d+)/u', $csv, $m) ? $m[1] : '';
 
+        // CPO («Оплата за заказ») vs CPC («Оплата за клик») определяем по характерным колонкам отчёта.
+        $paymentType = (mb_stripos($csv, 'Условие показа') !== false
+            || mb_stripos($csv, 'Тип страницы') !== false
+            || mb_stripos($csv, 'Средняя ставка') !== false)
+            ? 'cpo'
+            : 'cpc';
+
         foreach ($lines as $line) {
             $line = trim((string) $line);
             if ($line === '') {
@@ -1980,6 +2002,7 @@ class OzonPerformanceApiService
 
             $row['_source'] = 'campaign_product_stats_cpc_csv';
             $row['_campaign_id'] = $campaignId;
+            $row['_payment_type'] = $paymentType;
             $rows[] = $row;
         }
 
@@ -2083,6 +2106,10 @@ class OzonPerformanceApiService
                     'ad_drr_percent' => 0.0,
                     'ad_spend_per_order' => 0.0,
                     'cart_conversion_percent' => 0.0,
+                    'ad_cpo_spend' => 0.0,
+                    'ad_cpo_revenue' => 0.0,
+                    'ad_cpo_orders' => 0,
+                    'ad_cpo_drr_percent' => 0.0,
                     'ad_campaigns' => [],
                     'payment_models' => [],
                     'signals' => [],
@@ -2247,6 +2274,23 @@ class OzonPerformanceApiService
                 ],
                 is_array($product['payment_models']) ? $product['payment_models'] : []
             ));
+
+            // Явные поля CPO («Оплата за заказ») из платёжной модели — для отдельного показа в юнитке.
+            $cpoModel = null;
+            foreach ($products[$key]['payment_models'] as $pm) {
+                if (mb_stripos((string) ($pm['name'] ?? ''), 'Оплата за заказ') !== false) {
+                    $cpoModel = $pm;
+                    break;
+                }
+            }
+            $cpoSpend = $cpoModel ? round((float) ($cpoModel['spend'] ?? 0), 2) : 0.0;
+            $cpoRevenue = $cpoModel ? round((float) ($cpoModel['revenue'] ?? 0), 2) : 0.0;
+            $cpoOrders = $cpoModel ? (int) ($cpoModel['orders'] ?? 0) : 0;
+            $products[$key]['ad_cpo_spend'] = $cpoSpend;
+            $products[$key]['ad_cpo_revenue'] = $cpoRevenue;
+            $products[$key]['ad_cpo_orders'] = $cpoOrders;
+            $products[$key]['ad_cpo_drr_percent'] = $cpoRevenue > 0 ? round($cpoSpend / $cpoRevenue * 100, 2) : 0.0;
+
             $products[$key]['source'] = count($products[$key]['sources'] ?? []) > 1
                 ? 'ozon_performance_mixed'
                 : (string) (($products[$key]['sources'] ?? [])[0] ?? $product['source']);
@@ -2652,13 +2696,43 @@ class OzonPerformanceApiService
                 'Ср. цена клика (Оплата за клик)',
             ]);
 
+            $pname = $productName ?: (string) ($meta['product_name'] ?? '');
+            $cat = $this->firstString($row, ['Категория товара', 'category', 'categoryName', 'category_name'])
+                ?: (string) ($meta['category'] ?? '');
+            $campId = (string) ($row['_campaign_id'] ?? $this->firstString($row, ['ID кампании', 'campaignId', 'campaign_id']));
+            $paymentType = (string) ($row['_payment_type'] ?? 'cpc');
+
+            if ($paymentType === 'cpo') {
+                // CPO («Оплата за заказ»): отдаём только стоимостные колонки под этой моделью.
+                // Расход автоматически попадёт в ad_spend (вычитается в юнитке) и в payment_models["Оплата за заказ"].
+                // Клики/показы/CTR НЕ примешиваем к CPC, чтобы не путать «оплату за клик» и «за заказ».
+                $converted[] = [
+                    'SKU' => $ozonSku,
+                    'Артикул' => $mappedOfferId,
+                    'Название товара' => $pname,
+                    'Категория товара' => $cat,
+                    'Продвижение' => 'Включено',
+                    'Расход (Оплата за заказ)' => $spend,
+                    'Продажи (Оплата за заказ)' => $revenue,
+                    'Заказы (Оплата за заказ)' => $orders,
+                    '_source' => 'campaign_cpo_stats',
+                    '_payment_type' => 'cpo',
+                    '_campaign_id' => $campId,
+                    '_mapping_status' => $mapping['status'],
+                    '_mapping_key' => $mapping['mapping_key'],
+                    '_mapping_source' => $mapping['source'],
+                    '_raw_campaign_sku' => $ozonSku,
+                    '_raw_campaign_product_id' => $rawCampaignProductId,
+                ];
+
+                continue;
+            }
+
             $converted[] = [
                 'SKU' => $ozonSku,
                 'Артикул' => $mappedOfferId,
-                'Название товара' => $productName
-                    ?: (string) ($meta['product_name'] ?? ''),
-                'Категория товара' => $this->firstString($row, ['Категория товара', 'category', 'categoryName', 'category_name'])
-                    ?: (string) ($meta['category'] ?? ''),
+                'Название товара' => $pname,
+                'Категория товара' => $cat,
                 'Продвижение' => 'Включено',
                 'Показы (Оплата за клик)' => $impressions,
                 'Клики (Оплата за клик)' => $clicks,
@@ -2669,7 +2743,8 @@ class OzonPerformanceApiService
                 'CTR (Оплата за клик)' => $ctr,
                 'Ср. цена клика (Оплата за клик)' => $averageCpc,
                 '_source' => 'campaign_product_stats_cpc',
-                '_campaign_id' => (string) ($row['_campaign_id'] ?? $this->firstString($row, ['ID кампании', 'campaignId', 'campaign_id'])),
+                '_campaign_id' => $campId,
+                '_payment_type' => 'cpc',
                 '_mapping_status' => $mapping['status'],
                 '_mapping_key' => $mapping['mapping_key'],
                 '_mapping_source' => $mapping['source'],
