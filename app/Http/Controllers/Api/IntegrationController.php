@@ -664,6 +664,7 @@ class IntegrationController extends Controller
             'limit' => 'nullable|integer|min:1|max:5000',
             'date_from' => 'nullable|date_format:Y-m-d',
             'date_to' => 'nullable|date_format:Y-m-d|after_or_equal:date_from',
+            'debug_raw' => 'nullable|boolean',
         ])->validate();
 
         $resolved = $this->resolveOzonPerformanceRuntime($request, $id, $sellicoApi);
@@ -671,8 +672,10 @@ class IntegrationController extends Controller
             return $resolved;
         }
 
+        $credentials = is_array($resolved['credentials']) ? $resolved['credentials'] : [];
+
         $impact = $performanceApi->productAdvertisingImpact(
-            is_array($resolved['credentials']) ? $resolved['credentials'] : [],
+            $credentials,
             $uuid,
             (int) ($validated['limit'] ?? 5000),
             $validated['date_from'] ?? null,
@@ -680,16 +683,33 @@ class IntegrationController extends Controller
             (int) $resolved['integration']->id
         );
 
+        // Опциональная диагностика per-SKU CPC: ?debug_raw=1 + обе даты.
+        // Возвращает сырой ответ Ozon (CSV/JSON/async), чтобы понять, почему нет SKU-разбивки.
+        // Не влияет на обычный ответ; используется только для отладки FALLBACK.
+        $debugRaw = null;
+        if ($request->boolean('debug_raw') && ! empty($validated['date_from']) && ! empty($validated['date_to'])) {
+            $debugRaw = $performanceApi->debugCampaignProductRaw(
+                $credentials,
+                (string) $validated['date_from'],
+                (string) $validated['date_to']
+            );
+            @file_put_contents(
+                storage_path('logs/ozon-cpc-debug.json'),
+                json_encode($debugRaw, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES)
+            );
+        }
+
         return response()->json([
             'success' => (bool) ($impact['success'] ?? false),
-            'data' => [
+            'data' => array_filter([
                 'integration_id' => $resolved['integration']->id,
                 'source' => 'sellico_runtime_credentials',
                 'report_uuid' => $impact['report_uuid'] ?? $uuid,
                 'summary' => $impact['summary'] ?? null,
                 'products' => $impact['products'] ?? [],
                 'advertising_impact' => $impact,
-            ],
+                'debug_raw' => $debugRaw,
+            ], static fn ($v): bool => $v !== null),
         ], ($impact['success'] ?? false) ? 200 : 422);
     }
 

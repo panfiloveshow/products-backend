@@ -3,6 +3,7 @@
 namespace App\Services\Ozon;
 
 use App\Models\Product;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Str;
 
@@ -42,6 +43,249 @@ class OzonPerformanceApiService
                 'message' => $e->getMessage(),
             ];
         }
+    }
+
+    /**
+     * Диагностический сырой дамп per-SKU путей Ozon Performance API.
+     *
+     * НЕ для прода. Используется artisan-командой ozon:debug-cpc, чтобы понять,
+     * что именно отдают эндпоинты статистики кампания/товар и какой из них
+     * реально содержит товарные (SKU) строки. Возвращает сырые HTTP-ответы
+     * (статус, content-type, начало body, структуру JSON) без какой-либо
+     * нормализации/маппинга — чтобы увидеть форму данных как есть.
+     *
+     * @param array<string, mixed> $credentials
+     * @return array<string, mixed>
+     */
+    public function debugCampaignProductRaw(
+        array $credentials,
+        string $dateFrom,
+        string $dateTo,
+        int $campaignSample = 2
+    ): array {
+        $missing = $this->missingCredentialsResponse($credentials);
+        if ($missing !== null) {
+            return ['success' => false, 'stage' => 'credentials', 'detail' => $missing];
+        }
+
+        $token = $this->requestAccessToken($credentials);
+        if (! $token['success']) {
+            return ['success' => false, 'stage' => 'auth', 'detail' => $token];
+        }
+        $accessToken = $token['access_token'];
+
+        $campaigns = $this->fetchCampaigns($accessToken);
+        $campaignList = $campaigns['list'];
+        $sample = array_slice($campaignList, 0, max(1, $campaignSample));
+        $sampleIds = array_values(array_filter(array_map(
+            static fn (array $c): string => (string) ($c['id'] ?? ''),
+            $sample
+        )));
+
+        $result = [
+            'success' => true,
+            'period' => ['date_from' => $dateFrom, 'date_to' => $dateTo],
+            'base_url' => self::BASE_URL,
+            'auth' => [
+                'http_status' => $token['http_status'],
+                'token_received' => $accessToken !== '',
+            ],
+            'campaigns' => [
+                'total' => $campaigns['total'],
+                'loaded' => count($campaignList),
+                'states' => $this->countBy($campaignList, 'state'),
+                'types' => $this->countBy($campaignList, 'advObjectType'),
+                'sample' => array_map([$this, 'compactCampaign'], $sample),
+            ],
+            'sync_campaign_product' => [],
+            'async_statistics' => null,
+        ];
+
+        // 1) Синхронные эндпоинты campaign/product (CSV и JSON) по сэмплу кампаний.
+        foreach ($sampleIds as $campaignId) {
+            $queryString = $this->campaignProductStatsQueryString($dateFrom, $dateTo, [$campaignId]);
+
+            $csvResponse = Http::timeout(30)
+                ->withToken($accessToken)
+                ->accept('*/*')
+                ->get(self::BASE_URL . '/api/client/statistics/campaign/product?' . $queryString);
+            $csvBody = (string) $csvResponse->body();
+
+            $jsonResponse = $this->authorized($accessToken)
+                ->get(self::BASE_URL . '/api/client/statistics/campaign/product/json?' . $queryString);
+            $jsonPayload = $jsonResponse->json();
+            $jsonRows = is_array($jsonPayload) ? $this->extractRows($jsonPayload) : [];
+
+            $result['sync_campaign_product'][] = [
+                'campaign_id' => $campaignId,
+                'query_string' => $queryString,
+                'csv' => [
+                    'endpoint' => '/api/client/statistics/campaign/product',
+                    'http_status' => $csvResponse->status(),
+                    'content_type' => $csvResponse->header('content-type'),
+                    'body_length' => strlen($csvBody),
+                    'looks_like_product_header' => $this->debugCsvHasProductHeader($csvBody),
+                    'first_lines' => $this->debugRawLines($csvBody, 30),
+                ],
+                'json' => [
+                    'endpoint' => '/api/client/statistics/campaign/product/json',
+                    'http_status' => $jsonResponse->status(),
+                    'content_type' => $jsonResponse->header('content-type'),
+                    'top_level_keys' => is_array($jsonPayload) ? array_keys($jsonPayload) : null,
+                    'extracted_rows_count' => count($jsonRows),
+                    'first_row_keys' => isset($jsonRows[0]) && is_array($jsonRows[0])
+                        ? array_keys($jsonRows[0])
+                        : [],
+                    'first_row_has_sku' => isset($jsonRows[0]) && is_array($jsonRows[0])
+                        ? $this->hasCampaignProductIdentifier($jsonRows[0])
+                        : false,
+                    'first_row_sample' => $jsonRows[0] ?? null,
+                    'raw_excerpt' => mb_substr((string) $jsonResponse->body(), 0, 2000),
+                ],
+            ];
+        }
+
+        // 2) Асинхронный отчёт по товарной кампании (per-SKU): POST /api/client/statistics → UUID → poll.
+        $result['async_statistics'] = $this->debugAsyncCampaignStatistics(
+            $accessToken,
+            $sampleIds,
+            $dateFrom,
+            $dateTo
+        );
+
+        return $result;
+    }
+
+    /**
+     * Пробует асинхронную генерацию статистики по товарной кампании и дампит сырой ответ.
+     *
+     * @param array<int, string> $campaignIds
+     * @return array<string, mixed>
+     */
+    private function debugAsyncCampaignStatistics(
+        string $accessToken,
+        array $campaignIds,
+        string $dateFrom,
+        string $dateTo
+    ): array {
+        if ($campaignIds === []) {
+            return ['attempted' => false, 'reason' => 'нет кампаний в сэмпле'];
+        }
+
+        $requestBody = [
+            'campaigns' => array_values($campaignIds),
+            'from' => $this->toRfc3339Start($dateFrom),
+            'to' => $this->toRfc3339End($dateTo),
+            'dateFrom' => $dateFrom,
+            'dateTo' => $dateTo,
+            'groupBy' => 'NO',
+        ];
+
+        $generate = $this->authorized($accessToken)
+            ->post(self::BASE_URL . '/api/client/statistics', $requestBody);
+        $generatePayload = $generate->json();
+        $uuid = (string) ($generate->json('UUID') ?? $generate->json('uuid') ?? '');
+
+        $out = [
+            'attempted' => true,
+            'generate' => [
+                'endpoint' => 'POST /api/client/statistics',
+                'request_body' => $requestBody,
+                'http_status' => $generate->status(),
+                'content_type' => $generate->header('content-type'),
+                'top_level_keys' => is_array($generatePayload) ? array_keys($generatePayload) : null,
+                'uuid' => $uuid !== '' ? $uuid : null,
+                'raw_excerpt' => mb_substr((string) $generate->body(), 0, 1500),
+            ],
+            'poll' => [],
+            'download' => null,
+        ];
+
+        if (! $generate->successful() || $uuid === '') {
+            return $out;
+        }
+
+        // Поллинг до 12 попыток с шагом ~5с (~1 мин). Для дебага этого достаточно.
+        $link = '';
+        $state = '';
+        for ($attempt = 1; $attempt <= 12; $attempt++) {
+            $statusResponse = $this->authorized($accessToken)
+                ->get(self::BASE_URL . '/api/client/statistics/' . rawurlencode($uuid));
+            $statusPayload = $statusResponse->json();
+            $state = (string) ($statusPayload['state'] ?? '');
+            $link = $this->absolutePerformanceUrl((string) ($statusPayload['link'] ?? ''));
+
+            $out['poll'][] = [
+                'attempt' => $attempt,
+                'http_status' => $statusResponse->status(),
+                'state' => $state ?: null,
+                'has_link' => $link !== '',
+                'kind' => $statusPayload['kind'] ?? null,
+            ];
+
+            if ($state === 'OK' && $link !== '') {
+                break;
+            }
+            if (in_array($state, ['ERROR', 'CANCELLED'], true)) {
+                break;
+            }
+
+            usleep(5_000_000);
+        }
+
+        if ($state !== 'OK' || $link === '') {
+            return $out;
+        }
+
+        $download = Http::timeout(60)
+            ->withToken($accessToken)
+            ->accept('*/*')
+            ->get($link);
+        $downloadBody = (string) $download->body();
+
+        $out['download'] = [
+            'http_status' => $download->status(),
+            'content_type' => $download->header('content-type'),
+            'body_length' => strlen($downloadBody),
+            'looks_like_zip' => str_starts_with($downloadBody, "PK\x03\x04"),
+            'looks_like_product_header' => $this->debugCsvHasProductHeader($downloadBody),
+            'first_lines' => $this->debugRawLines($downloadBody, 30),
+        ];
+
+        return $out;
+    }
+
+    /**
+     * @return array<int, string>
+     */
+    private function debugRawLines(string $body, int $limit): array
+    {
+        $lines = preg_split("/\r\n|\n|\r/", $body) ?: [];
+
+        return array_slice(array_map(
+            static fn (string $line): string => mb_substr($line, 0, 500),
+            $lines
+        ), 0, $limit);
+    }
+
+    private function debugCsvHasProductHeader(string $body): bool
+    {
+        $lines = preg_split("/\r\n|\n|\r/", $body) ?: [];
+        foreach (array_slice($lines, 0, 5) as $line) {
+            $line = preg_replace('/^\xEF\xBB\xBF/', '', trim($line)) ?? '';
+            if ($line === '') {
+                continue;
+            }
+            $cells = array_map(
+                static fn ($c): string => trim((string) $c),
+                str_getcsv($line, ';', '"', '\\')
+            );
+            if ($this->looksLikeCampaignProductCsvHeader($cells)) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /**
@@ -393,17 +637,30 @@ class OzonPerformanceApiService
 
             if ($dateFrom !== null && $dateTo !== null) {
                 $campaigns = $this->fetchCampaigns($token['access_token']);
+                // Только товарные (SKU) кампании: per-SKU отчёт возможен лишь для них. Нетоварные
+                // типы (REF_VK, SEARCH_PROMO и пр.) Ozon отбивает 400 на генерации товарного отчёта.
+                $productCampaigns = array_values(array_filter(
+                    $campaigns['list'],
+                    fn (array $campaign): bool => $this->isProductCampaign($campaign)
+                ));
                 $campaignIds = array_values(array_filter(array_map(
                     static fn (array $campaign): string => (string) ($campaign['id'] ?? ''),
-                    $campaigns['list']
+                    $productCampaigns !== [] ? $productCampaigns : $campaigns['list']
                 )));
 
-                $campaignStats = $this->fetchProductCampaignStats(
-                    $token['access_token'],
+                // Async-отчёты Ozon (генерация + поллинг) медленные и лимитируются (429),
+                // поэтому кэшируем удачный per-SKU результат на TTL вместо генерации на каждый запрос.
+                $campaignStats = $this->cachedProductCampaignStats(
+                    $integrationId,
                     $dateFrom,
                     $dateTo,
-                    $campaignIds,
-                    true
+                    fn (): array => $this->fetchProductCampaignStats(
+                        $token['access_token'],
+                        $dateFrom,
+                        $dateTo,
+                        $campaignIds,
+                        true
+                    )
                 );
                 $campaignReportRows = $this->campaignStatsRowsToProductReportRows(
                     $campaignStats['rows'],
@@ -442,6 +699,7 @@ class OzonPerformanceApiService
                     'mapped_campaign_product_rows' => $mappedCampaignProductRows,
                     'unmapped_campaign_product_rows' => max(0, count($campaignReportRows) - $mappedCampaignProductRows),
                     'campaign_stats_source' => $campaignStats['source'] ?? null,
+                    'campaign_stats_from_cache' => (bool) ($campaignStats['from_cache'] ?? false),
                     'campaign_stats_source_error' => $campaignStats['source_error'] ?? null,
                     'campaign_stat_field_keys' => $campaignStats['field_keys'] ?? [],
                     'campaign_sample_rows' => $campaignStats['sample_rows'] ?? [],
@@ -594,6 +852,24 @@ class OzonPerformanceApiService
     /**
      * @return array{list: array<int, array<string, mixed>>, total: int}
      */
+    /**
+     * Товарная ли кампания. Per-SKU статистика (клики/CTR/ДРР по товарам) доступна только для
+     * SKU-кампаний; нетоварные типы (REF_VK, баннеры и т.п.) ломают генерацию товарного отчёта (400).
+     *
+     * @param array<string, mixed> $campaign
+     */
+    private function isProductCampaign(array $campaign): bool
+    {
+        $type = mb_strtoupper((string) (
+            $campaign['advObjectType']
+            ?? $campaign['adv_object_type']
+            ?? $campaign['type']
+            ?? ''
+        ));
+
+        return $type !== '' && str_contains($type, 'SKU');
+    }
+
     private function fetchCampaigns(string $accessToken): array
     {
         $response = $this->authorized($accessToken)
@@ -621,51 +897,70 @@ class OzonPerformanceApiService
         $rows = [];
         $source = 'fallback';
         $sourceErrors = [];
-        $chunks = count($campaignIds) > 0 ? array_chunk($campaignIds, 20) : [[]];
 
-        foreach ($chunks as $chunk) {
-            $queryString = $this->campaignProductStatsQueryString($dateFrom, $dateTo, $chunk);
+        // PRIMARY: асинхронный товарный отчёт Ozon (POST /api/client/statistics → ZIP с CSV по кампаниям).
+        // Именно он отдаёт клики/показы/CTR/расход/ДРР на уровне SKU. Синхронный campaign/product на
+        // многих аккаунтах возвращает агрегаты кампаний без товарного SKU — это и был источник FALLBACK.
+        if ($campaignIds !== []) {
+            $async = $this->fetchProductStatsViaAsyncReport($accessToken, $dateFrom, $dateTo, $campaignIds);
+            if ($async['rows'] !== []) {
+                $rows = $async['rows'];
+                $source = 'async_report';
+            }
+            if ($async['errors'] !== []) {
+                $sourceErrors = array_merge($sourceErrors, $async['errors']);
+            }
+        }
 
-            $csvResponse = Http::timeout(30)
-                ->withToken($accessToken)
-                ->accept('*/*')
-                ->get(self::BASE_URL . '/api/client/statistics/campaign/product?' . $queryString);
+        // FALLBACK: устаревший синхронный путь campaign/product (CSV → JSON). Оставлен на случай
+        // аккаунтов/типов кампаний, где он всё ещё отдаёт товарную детализацию.
+        if ($rows === []) {
+            $chunks = count($campaignIds) > 0 ? array_chunk($campaignIds, 20) : [[]];
 
-            if ($csvResponse->successful()) {
-                $csvRows = $this->parseCampaignProductCsvRows((string) $csvResponse->body());
-                if ($csvRows !== []) {
-                    $rows = array_merge($rows, $csvRows);
-                    $source = 'csv';
+            foreach ($chunks as $chunk) {
+                $queryString = $this->campaignProductStatsQueryString($dateFrom, $dateTo, $chunk);
+
+                $csvResponse = Http::timeout(30)
+                    ->withToken($accessToken)
+                    ->accept('*/*')
+                    ->get(self::BASE_URL . '/api/client/statistics/campaign/product?' . $queryString);
+
+                if ($csvResponse->successful()) {
+                    $csvRows = $this->parseCampaignProductCsvRows((string) $csvResponse->body());
+                    if ($csvRows !== []) {
+                        $rows = array_merge($rows, $csvRows);
+                        $source = 'csv';
+                        continue;
+                    }
+
+                    $sourceErrors[] = 'CSV ответ не содержит товарных строк или заголовок не распознан';
+                } else {
+                    $sourceErrors[] = 'CSV HTTP ' . $csvResponse->status();
+                }
+
+                $response = $this->authorized($accessToken)
+                    ->get(self::BASE_URL . '/api/client/statistics/campaign/product/json?' . $queryString);
+
+                $payload = $response->json();
+                if (! $response->successful() || ! is_array($payload)) {
+                    $sourceErrors[] = 'JSON HTTP ' . $response->status();
                     continue;
                 }
 
-                $sourceErrors[] = 'CSV ответ не содержит товарных строк или заголовок не распознан';
-            } else {
-                $sourceErrors[] = 'CSV HTTP ' . $csvResponse->status();
-            }
+                $jsonRows = $this->extractRows($payload);
+                $productRows = $productDetailOnly
+                    ? array_values(array_filter($jsonRows, fn (array $row): bool => $this->hasCampaignProductIdentifier($row)))
+                    : $jsonRows;
 
-            $response = $this->authorized($accessToken)
-                ->get(self::BASE_URL . '/api/client/statistics/campaign/product/json?' . $queryString);
+                if ($productDetailOnly && $jsonRows !== [] && $productRows === []) {
+                    $sourceErrors[] = 'JSON вернул агрегаты кампаний без товарного SKU';
+                }
 
-            $payload = $response->json();
-            if (! $response->successful() || ! is_array($payload)) {
-                $sourceErrors[] = 'JSON HTTP ' . $response->status();
-                continue;
-            }
-
-            $jsonRows = $this->extractRows($payload);
-            $productRows = $productDetailOnly
-                ? array_values(array_filter($jsonRows, fn (array $row): bool => $this->hasCampaignProductIdentifier($row)))
-                : $jsonRows;
-
-            if ($productDetailOnly && $jsonRows !== [] && $productRows === []) {
-                $sourceErrors[] = 'JSON вернул агрегаты кампаний без товарного SKU';
-            }
-
-            if ($productRows !== []) {
-                $rows = array_merge($rows, $productRows);
-                if ($source !== 'csv') {
-                    $source = 'json';
+                if ($productRows !== []) {
+                    $rows = array_merge($rows, $productRows);
+                    if ($source !== 'csv') {
+                        $source = 'json';
+                    }
                 }
             }
         }
@@ -689,9 +984,246 @@ class OzonPerformanceApiService
             'top_by_spend' => $this->topBySpend($rows),
             'field_keys' => isset($rows[0]) && is_array($rows[0]) ? array_keys($rows[0]) : [],
             'source' => $source,
-            'source_error' => $sourceErrors !== [] ? implode('; ', array_unique($sourceErrors)) : null,
+            // Ошибку показываем только когда товарных строк не получили вовсе. Частичные сбои
+            // отдельных чанков при успешном результате — некритичный шум, в диагностику не выносим.
+            'source_error' => ($rows === [] && $sourceErrors !== [])
+                ? implode('; ', array_unique($sourceErrors))
+                : null,
             'sample_rows' => $this->sampleCampaignRows($rows),
         ];
+    }
+
+    /**
+     * Кэширует удачный per-SKU CPC-результат, чтобы не гонять медленные async-отчёты Ozon
+     * (и не упираться в 429) при каждом открытии страницы. TTL ниже частоты обновления статистики.
+     *
+     * @param \Closure(): array<string, mixed> $resolver
+     * @return array<string, mixed>
+     */
+    private function cachedProductCampaignStats(
+        ?int $integrationId,
+        string $dateFrom,
+        string $dateTo,
+        \Closure $resolver
+    ): array {
+        // Без стабильного ключа интеграции не кэшируем — считаем напрямую.
+        if ($integrationId === null || $integrationId <= 0) {
+            return $resolver();
+        }
+
+        $key = "ozon_perf_cpc:{$integrationId}:{$dateFrom}:{$dateTo}";
+
+        $cached = Cache::get($key);
+        if (is_array($cached) && ($cached['rows'] ?? []) !== []) {
+            $cached['from_cache'] = true;
+
+            return $cached;
+        }
+
+        $fresh = $resolver();
+        // Кэшируем только успешный ответ с товарными строками, чтобы не залипнуть на пустом/ошибочном.
+        if (($fresh['rows'] ?? []) !== []) {
+            $fresh['from_cache'] = false;
+            Cache::put($key, $fresh, now()->addMinutes(30));
+        }
+
+        return $fresh;
+    }
+
+    /**
+     * Асинхронный товарный отчёт Ozon Performance API.
+     *
+     * POST /api/client/statistics (groupBy=NO) → poll GET /api/client/statistics/{uuid} →
+     * скачать отчёт по link (ZIP с одним CSV на кампанию, либо одиночный CSV) → разобрать
+     * товарные строки. Это единственный путь, который отдаёт per-SKU клики/показы/CTR/расход/ДРР.
+     *
+     * @param array<int, string> $campaignIds
+     * @return array{rows: array<int, array<string, string>>, errors: array<int, string>}
+     */
+    private function fetchProductStatsViaAsyncReport(
+        string $accessToken,
+        string $dateFrom,
+        string $dateTo,
+        array $campaignIds
+    ): array {
+        $rows = [];
+        $errors = [];
+
+        // Ozon Performance ограничивает число кампаний в одном запросе статистики (≈10) — больше даёт
+        // HTTP 400. Чанкуем по 10; повторные вызовы защищены бэкоффом на 429 в generateCampaignStatsReport.
+        foreach (array_chunk(array_values(array_filter($campaignIds)), 10) as $chunk) {
+            if ($chunk === []) {
+                continue;
+            }
+
+            try {
+                $uuid = $this->generateCampaignStatsReport($accessToken, $chunk, $dateFrom, $dateTo);
+                if ($uuid === '') {
+                    $errors[] = 'Async: отчёт не создан (нет UUID)';
+                    continue;
+                }
+
+                $link = $this->awaitCampaignStatsReport($accessToken, $uuid);
+                if ($link === '') {
+                    $errors[] = 'Async: отчёт ' . $uuid . ' не готов за отведённое время';
+                    continue;
+                }
+
+                $csvRows = $this->downloadCampaignStatsReportRows($accessToken, $link);
+                if ($csvRows === []) {
+                    $errors[] = 'Async: отчёт ' . $uuid . ' без товарных строк';
+                    continue;
+                }
+
+                $rows = array_merge($rows, $csvRows);
+            } catch (\Throwable $e) {
+                $errors[] = 'Async: ' . $e->getMessage();
+            }
+        }
+
+        return ['rows' => $rows, 'errors' => $errors];
+    }
+
+    /**
+     * @param array<int, string> $campaignIds
+     */
+    private function generateCampaignStatsReport(
+        string $accessToken,
+        array $campaignIds,
+        string $dateFrom,
+        string $dateTo
+    ): string {
+        $body = [
+            'campaigns' => array_values($campaignIds),
+            'from' => $this->toRfc3339Start($dateFrom),
+            'to' => $this->toRfc3339End($dateTo),
+            'groupBy' => 'NO',
+        ];
+
+        // Бэкофф на 429 (rate limit Ozon Performance) и сетевые таймауты.
+        $lastStatus = 0;
+        for ($attempt = 1; $attempt <= 3; $attempt++) {
+            $response = Http::connectTimeout(15)
+                ->timeout(40)
+                ->withToken($accessToken)
+                ->acceptJson()
+                ->asJson()
+                ->post(self::BASE_URL . '/api/client/statistics', $body);
+
+            if ($response->successful()) {
+                return (string) ($response->json('UUID') ?? $response->json('uuid') ?? '');
+            }
+
+            $lastStatus = $response->status();
+            if ($lastStatus === 429 && $attempt < 3) {
+                sleep(5 * $attempt);
+                continue;
+            }
+
+            break;
+        }
+
+        throw new \RuntimeException('POST /api/client/statistics HTTP ' . $lastStatus);
+    }
+
+    /**
+     * Поллинг готовности отчёта. Возвращает абсолютный download-link или '' если не готов/ошибка.
+     */
+    private function awaitCampaignStatsReport(
+        string $accessToken,
+        string $uuid,
+        int $maxAttempts = 15,
+        int $sleepSeconds = 4
+    ): string {
+        for ($attempt = 1; $attempt <= $maxAttempts; $attempt++) {
+            $payload = Http::connectTimeout(15)
+                ->timeout(30)
+                ->withToken($accessToken)
+                ->acceptJson()
+                ->get(self::BASE_URL . '/api/client/statistics/' . rawurlencode($uuid))
+                ->json();
+
+            $state = strtoupper((string) (is_array($payload) ? ($payload['state'] ?? '') : ''));
+            $link = $this->absolutePerformanceUrl((string) (is_array($payload) ? ($payload['link'] ?? '') : ''));
+
+            if ($state === 'OK' && $link !== '') {
+                return $link;
+            }
+            if (in_array($state, ['ERROR', 'CANCELLED'], true)) {
+                return '';
+            }
+            if ($attempt < $maxAttempts) {
+                sleep($sleepSeconds);
+            }
+        }
+
+        return '';
+    }
+
+    /**
+     * Скачивает отчёт (ZIP из CSV по кампаниям либо одиночный CSV) и разбирает товарные строки.
+     *
+     * @return array<int, array<string, string>>
+     */
+    private function downloadCampaignStatsReportRows(string $accessToken, string $link): array
+    {
+        $response = Http::connectTimeout(15)
+            ->timeout(60)
+            ->withToken($accessToken)
+            ->accept('*/*')
+            ->get($link);
+
+        if (! $response->successful()) {
+            throw new \RuntimeException('Скачивание отчёта HTTP ' . $response->status());
+        }
+
+        $body = (string) $response->body();
+        $contentType = strtolower((string) $response->header('content-type'));
+
+        $csvParts = (str_starts_with($body, "PK\x03\x04") || str_contains($contentType, 'zip'))
+            ? $this->extractCsvFromZip($body)
+            : [$body];
+
+        $rows = [];
+        foreach ($csvParts as $csv) {
+            $rows = array_merge($rows, $this->parseCampaignProductCsvRows($csv));
+        }
+
+        return $rows;
+    }
+
+    /**
+     * @return array<int, string> Содержимое каждой CSV-записи внутри ZIP
+     */
+    private function extractCsvFromZip(string $zipBinary): array
+    {
+        $parts = [];
+        $tmp = tempnam(sys_get_temp_dir(), 'ozon-cpc-');
+        if ($tmp === false) {
+            return $parts;
+        }
+
+        try {
+            file_put_contents($tmp, $zipBinary);
+            $zip = new \ZipArchive();
+            if ($zip->open($tmp) === true) {
+                for ($i = 0; $i < $zip->numFiles; $i++) {
+                    $name = (string) $zip->getNameIndex($i);
+                    if (! str_ends_with(strtolower($name), '.csv')) {
+                        continue;
+                    }
+                    $content = $zip->getFromIndex($i);
+                    if ($content !== false && $content !== '') {
+                        $parts[] = $content;
+                    }
+                }
+                $zip->close();
+            }
+        } finally {
+            @unlink($tmp);
+        }
+
+        return $parts;
     }
 
     /**
@@ -1201,7 +1733,7 @@ class OzonPerformanceApiService
                 'objectId',
                 'advObjectId',
             ]);
-            if ($sku === '' || in_array(mb_strtolower($sku), ['всего', 'итого', 'bcero'], true)) {
+            if ($sku === '' || in_array(mb_strtolower($sku), ['всего', 'итого', 'bcero', 'корректировка'], true)) {
                 continue;
             }
 
@@ -1262,7 +1794,7 @@ class OzonPerformanceApiService
                 str_contains($lower, 'ср. цена клика') || str_contains($lower, 'средняя стоимость клика') => 'Ср. цена клика (Оплата за клик)',
                 str_contains($lower, 'расход') => 'Расход (Оплата за клик)',
                 str_contains($lower, 'заказы модели') => 'Заказы модели (Оплата за клик)',
-                str_contains($lower, 'выручка с заказов модели') => 'Выручка с заказов модели (Оплата за клик)',
+                str_contains($lower, 'выручка с заказов модели') || str_contains($lower, 'продажи с заказов модели') => 'Выручка с заказов модели (Оплата за клик)',
                 str_contains($lower, 'заказы') => 'Заказы (Оплата за клик)',
                 str_contains($lower, 'выручка') || str_contains($lower, 'продажи') => 'Продажи (Оплата за клик)',
                 str_contains($lower, 'дата добавления') => 'Дата добавления',

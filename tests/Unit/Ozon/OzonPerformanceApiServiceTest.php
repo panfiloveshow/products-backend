@@ -512,4 +512,90 @@ class OzonPerformanceApiServiceTest extends TestCase
         $this->assertContains('ads_driven_demand', $product['signals']);
         $this->assertContains('high_ad_cost', $product['signals']);
     }
+
+    public function test_product_advertising_impact_uses_async_report_zip_for_per_sku_cpc(): void
+    {
+        // Реальная схема Ozon: per-SKU клики/CTR/ДРР приходят асинхронным отчётом
+        // (POST /api/client/statistics → poll → ZIP с CSV по кампаниям), а не синхронным campaign/product.
+        $campaignCsv = "\xEF\xBB\xBF;Кампания по продвижению товаров № 101, период 04.05.2026-03.06.2026\n"
+            . "sku;Название товара;Цена товара, ₽;Показы;Клики;CTR, %;В корзину;Средняя стоимость клика, ₽;Расход, ₽, с НДС;Заказы;Продажи, ₽;Заказы модели;Продажи с заказов модели, ₽;ДРР, %;Заказано на сумму, ₽;Общий ДРР, %;Дата добавления\n"
+            . "2127759756;Чековая лента 80 мм;259,00;1000;50;5,0;10;2,01;100,50;5;1000,00;3;800,00;10,05;1200,00;8,3;12.03.2026\n"
+            . "Корректировка;;;;;;;;-0,50;;;;;;;;\n"
+            . "Всего;;;1000;50;5,0;10;2,01;100,00;5;1000,00;3;800,00;10,05;1200,00;8,3;\n";
+
+        $zipPath = tempnam(sys_get_temp_dir(), 'ozon-test-zip');
+        $zip = new \ZipArchive();
+        $zip->open($zipPath, \ZipArchive::OVERWRITE);
+        $zip->addFromString('101_04.05.2026-03.06.2026.csv', $campaignCsv);
+        $zip->close();
+        $zipBytes = (string) file_get_contents($zipPath);
+        @unlink($zipPath);
+
+        Http::fake([
+            'https://api-performance.ozon.ru/api/client/token' => Http::response([
+                'access_token' => 'token-value',
+                'token_type' => 'Bearer',
+                'expires_in' => 1800,
+            ]),
+            // Товарный UUID-отчёт (per-order) — даёт SKU↔Артикул для маппинга.
+            'https://api-performance.ozon.ru/api/client/statistics/report-uuid' => Http::response([
+                'UUID' => 'report-uuid',
+                'state' => 'OK',
+                'kind' => 'SEARCH_PROMO_ORGANISATION_PRODUCTS',
+                'link' => '/api/client/statistics/report?UUID=report-uuid',
+            ]),
+            'https://api-performance.ozon.ru/api/client/statistics/report?UUID=report-uuid' => Http::response(
+                "SKU;Артикул;Название товара;Категория товара;Продвижение;Цена товара, ₽\n"
+                . "2127759756;3-02/3846;Чековая лента 80 мм;Кассовые ленты;Включено;259,00\n",
+                200,
+                ['content-type' => 'text/csv; charset=utf-8']
+            ),
+            'https://api-performance.ozon.ru/api/client/campaign' => Http::response([
+                'total' => 2,
+                'list' => [
+                    ['id' => '101', 'title' => 'Чеки 80', 'advObjectType' => 'SKU', 'state' => 'CAMPAIGN_STATE_RUNNING'],
+                    ['id' => '900', 'title' => 'VK реф', 'advObjectType' => 'REF_VK', 'state' => 'CAMPAIGN_STATE_RUNNING'],
+                ],
+            ]),
+            // Async per-SKU отчёт.
+            'https://api-performance.ozon.ru/api/client/statistics' => Http::response(['UUID' => 'stat-uuid']),
+            'https://api-performance.ozon.ru/api/client/statistics/stat-uuid' => Http::response([
+                'UUID' => 'stat-uuid',
+                'state' => 'OK',
+                'link' => '/api/client/statistics/report?UUID=stat-uuid',
+            ]),
+            'https://api-performance.ozon.ru/api/client/statistics/report?UUID=stat-uuid' => Http::response(
+                $zipBytes,
+                200,
+                ['content-type' => 'application/zip']
+            ),
+        ]);
+
+        $result = (new OzonPerformanceApiService())->productAdvertisingImpact([
+            'performance_api_key' => 'performance-client-id',
+            'performance_client_secret' => 'performance-secret',
+        ], 'report-uuid', 5000, '2026-05-04', '2026-06-02');
+
+        $this->assertTrue($result['success']);
+        $this->assertSame('async_report', $result['coverage']['campaign_stats_source']);
+        $this->assertSame(1, $result['coverage']['campaign_product_rows']);
+        $this->assertSame(1, $result['coverage']['mapped_campaign_product_rows']);
+
+        $product = $result['by_offer_id']['3-02/3846'];
+        $this->assertSame('2127759756', $product['ozon_sku']);
+        $this->assertSame(50, $product['clicks']);
+        $this->assertSame(5.0, $product['ctr_percent']);
+        $this->assertSame(100.5, $product['ad_spend']);
+
+        // Нетоварная кампания REF_VK не должна попасть в запрос статистики (иначе Ozon вернёт 400).
+        Http::assertSent(function ($request): bool {
+            if ($request->method() !== 'POST'
+                || $request->url() !== 'https://api-performance.ozon.ru/api/client/statistics') {
+                return false;
+            }
+
+            return in_array('101', $request['campaigns'], true)
+                && ! in_array('900', $request['campaigns'], true);
+        });
+    }
 }
