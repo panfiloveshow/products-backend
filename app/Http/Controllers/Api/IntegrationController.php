@@ -660,6 +660,11 @@ class IntegrationController extends Controller
         SellicoApiService $sellicoApi,
         OzonPerformanceApiService $performanceApi
     ): JsonResponse {
+        // Первый (некэшированный) сбор per-SKU рекламы делает несколько async-отчётов Ozon и
+        // ждёт их готовности — это дольше дефолтных 30с php-fpm. Поднимаем лимит в рамках
+        // nginx fastcgi_read_timeout (120с); повторные запросы отдаются мгновенно из кэша.
+        @set_time_limit(110);
+
         $validated = Validator::make($request->all(), [
             'limit' => 'nullable|integer|min:1|max:5000',
             'date_from' => 'nullable|date_format:Y-m-d',

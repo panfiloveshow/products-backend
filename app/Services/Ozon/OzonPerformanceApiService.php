@@ -648,20 +648,28 @@ class OzonPerformanceApiService
                     $productCampaigns !== [] ? $productCampaigns : $campaigns['list']
                 )));
 
-                // Async-отчёты Ozon (генерация + поллинг) медленные и лимитируются (429),
-                // поэтому кэшируем удачный per-SKU результат на TTL вместо генерации на каждый запрос.
-                $campaignStats = $this->cachedProductCampaignStats(
-                    $integrationId,
-                    $dateFrom,
-                    $dateTo,
-                    fn (): array => $this->fetchProductCampaignStats(
+                // Async-отчёты Ozon (генерация + поллинг) длятся минуты и превышают таймауты
+                // php-fpm/nginx, поэтому в проде (известная интеграция) собираем их ПРОГРЕССИВНО:
+                // каждый HTTP-запрос делает короткий шаг (создать отчёты / проверить готовность /
+                // скачать готовые) и быстро отвечает; пока не готово — source='pending'.
+                // Для CLI/тестов (integrationId<=0) остаётся ограниченный синхронный путь.
+                if ($integrationId !== null && $integrationId > 0) {
+                    $campaignStats = $this->resolveCampaignStatsProgressive(
+                        $integrationId,
+                        $token['access_token'],
+                        $dateFrom,
+                        $dateTo,
+                        $campaignIds
+                    );
+                } else {
+                    $campaignStats = $this->fetchProductCampaignStats(
                         $token['access_token'],
                         $dateFrom,
                         $dateTo,
                         $campaignIds,
                         true
-                    )
-                );
+                    );
+                }
                 $campaignReportRows = $this->campaignStatsRowsToProductReportRows(
                     $campaignStats['rows'],
                     $productReportSkuMap
@@ -994,40 +1002,157 @@ class OzonPerformanceApiService
     }
 
     /**
-     * Кэширует удачный per-SKU CPC-результат, чтобы не гонять медленные async-отчёты Ozon
-     * (и не упираться в 429) при каждом открытии страницы. TTL ниже частоты обновления статистики.
+     * Прогрессивный сбор per-SKU CPC без блокирующего ожидания в HTTP-запросе.
      *
-     * @param \Closure(): array<string, mixed> $resolver
+     * Async-отчёты Ozon готовятся минуты — синхронно ждать нельзя (таймаут php-fpm/nginx → пустой ответ).
+     * Поэтому состояние держим в кэше и каждый HTTP-запрос делает короткий шаг:
+     *   1) нет прогресса     → создаём отчёты по чанкам (быстрые POST), сохраняем UUID, отдаём 'pending';
+     *   2) прогресс есть      → проверяем готовность UUID, скачиваем готовые, копим строки;
+     *   3) всё готово/устарело→ собираем итог, кэшируем на 30 мин, отдаём 'async_report'.
+     * Фронт повторяет запрос, пока source='pending'.
+     *
+     * @param array<int, string> $campaignIds
      * @return array<string, mixed>
      */
-    private function cachedProductCampaignStats(
-        ?int $integrationId,
+    private function resolveCampaignStatsProgressive(
+        int $integrationId,
+        string $accessToken,
         string $dateFrom,
         string $dateTo,
-        \Closure $resolver
+        array $campaignIds
     ): array {
-        // Без стабильного ключа интеграции не кэшируем — считаем напрямую.
-        if ($integrationId === null || $integrationId <= 0) {
-            return $resolver();
-        }
-
-        $key = "ozon_perf_cpc:{$integrationId}:{$dateFrom}:{$dateTo}";
-
-        $cached = Cache::get($key);
+        $dataKey = "ozon_perf_cpc:{$integrationId}:{$dateFrom}:{$dateTo}";
+        $cached = Cache::get($dataKey);
         if (is_array($cached) && ($cached['rows'] ?? []) !== []) {
             $cached['from_cache'] = true;
 
             return $cached;
         }
 
-        $fresh = $resolver();
-        // Кэшируем только успешный ответ с товарными строками, чтобы не залипнуть на пустом/ошибочном.
-        if (($fresh['rows'] ?? []) !== []) {
-            $fresh['from_cache'] = false;
-            Cache::put($key, $fresh, now()->addMinutes(30));
+        $progKey = "ozon_perf_cpc_prog:{$integrationId}:{$dateFrom}:{$dateTo}";
+        $prog = Cache::get($progKey);
+
+        // Шаг 1: прогресса нет — создаём отчёты по всем чанкам (быстрые POST) и сразу отвечаем 'pending'.
+        if (! is_array($prog)) {
+            $uuids = [];
+            $errors = [];
+            foreach (array_chunk(array_values(array_filter($campaignIds)), 10) as $chunk) {
+                if ($chunk === []) {
+                    continue;
+                }
+                try {
+                    $uuid = $this->generateCampaignStatsReport($accessToken, $chunk, $dateFrom, $dateTo);
+                    if ($uuid !== '') {
+                        $uuids[$uuid] = false;
+                    } else {
+                        $errors[] = 'Async: отчёт не создан (нет UUID)';
+                    }
+                } catch (\Throwable $e) {
+                    $errors[] = 'Async: ' . $e->getMessage();
+                }
+            }
+            $prog = ['uuids' => $uuids, 'rows' => [], 'errors' => $errors, 'created' => time()];
+            Cache::put($progKey, $prog, now()->addMinutes(15));
+
+            // Если ни один отчёт не создан — не зависаем в pending, отдаём пустой результат.
+            if ($uuids === []) {
+                Cache::forget($progKey);
+
+                return $this->assembleCampaignStats([], $errors, 'fallback');
+            }
+
+            return $this->assembleCampaignStats([], $errors, 'pending') + ['pending' => true];
         }
 
-        return $fresh;
+        // Шаг 2: проверяем неготовые UUID, скачиваем готовые. Без длинного ожидания.
+        foreach ($prog['uuids'] as $uuid => $done) {
+            if ($done) {
+                continue;
+            }
+            try {
+                $payload = Http::connectTimeout(15)
+                    ->timeout(30)
+                    ->withToken($accessToken)
+                    ->acceptJson()
+                    ->get(self::BASE_URL . '/api/client/statistics/' . rawurlencode((string) $uuid))
+                    ->json();
+            } catch (\Throwable $e) {
+                $prog['errors'][] = 'Async: статус ' . $e->getMessage();
+                continue;
+            }
+            $state = strtoupper((string) (is_array($payload) ? ($payload['state'] ?? '') : ''));
+            $link = $this->absolutePerformanceUrl((string) (is_array($payload) ? ($payload['link'] ?? '') : ''));
+            if ($state === 'OK' && $link !== '') {
+                try {
+                    $prog['rows'] = array_merge($prog['rows'], $this->downloadCampaignStatsReportRows($accessToken, $link));
+                } catch (\Throwable $e) {
+                    $prog['errors'][] = 'Async: ' . $e->getMessage();
+                }
+                $prog['uuids'][$uuid] = true;
+            } elseif (in_array($state, ['ERROR', 'CANCELLED'], true)) {
+                $prog['uuids'][$uuid] = true;
+                $prog['errors'][] = 'Async: отчёт ' . $uuid . ' состояние ' . $state;
+            }
+        }
+
+        $allDone = ! in_array(false, $prog['uuids'], true);
+        $stale = (time() - (int) ($prog['created'] ?? time())) > 300; // защита от вечного pending
+
+        // Шаг 3: готово (или устарело) — собираем итог и кэшируем.
+        if ($allDone || $stale) {
+            $stats = $this->assembleCampaignStats(
+                $prog['rows'],
+                $prog['errors'],
+                $prog['rows'] !== [] ? 'async_report' : 'fallback'
+            );
+            if ($prog['rows'] !== []) {
+                $stats['from_cache'] = false;
+                Cache::put($dataKey, $stats, now()->addMinutes(30));
+            }
+            Cache::forget($progKey);
+
+            return $stats;
+        }
+
+        Cache::put($progKey, $prog, now()->addMinutes(15));
+
+        return $this->assembleCampaignStats($prog['rows'], $prog['errors'], 'pending') + ['pending' => true];
+    }
+
+    /**
+     * Собирает итоговую структуру статистики кампаний из накопленных товарных строк.
+     *
+     * @param array<int, array<string, mixed>> $rows
+     * @param array<int, string> $errors
+     * @return array<string, mixed>
+     */
+    private function assembleCampaignStats(array $rows, array $errors, string $source): array
+    {
+        $totals = $this->sumStatisticRows($rows);
+
+        return [
+            'rows' => $rows,
+            'totals' => $totals,
+            'derived' => [
+                'ctr_percent' => $totals['views'] > 0
+                    ? round($totals['clicks'] / $totals['views'] * 100, 2)
+                    : 0.0,
+                'average_cpc' => $totals['clicks'] > 0
+                    ? round($totals['money_spent'] / $totals['clicks'], 2)
+                    : 0.0,
+                'drr_percent' => $totals['orders_money'] > 0
+                    ? round($totals['money_spent'] / $totals['orders_money'] * 100, 2)
+                    : 0.0,
+            ],
+            'top_by_spend' => $this->topBySpend($rows),
+            'field_keys' => isset($rows[0]) && is_array($rows[0]) ? array_keys($rows[0]) : [],
+            'source' => $source,
+            // Ошибку показываем только при полном отсутствии строк (см. ту же логику в fetchProductCampaignStats).
+            'source_error' => ($rows === [] && $errors !== [])
+                ? implode('; ', array_unique($errors))
+                : null,
+            'sample_rows' => $this->sampleCampaignRows($rows),
+        ];
     }
 
     /**
@@ -1044,38 +1169,77 @@ class OzonPerformanceApiService
         string $accessToken,
         string $dateFrom,
         string $dateTo,
-        array $campaignIds
+        array $campaignIds,
+        int $budgetSeconds = 85
     ): array {
         $rows = [];
         $errors = [];
 
         // Ozon Performance ограничивает число кампаний в одном запросе статистики (≈10) — больше даёт
         // HTTP 400. Чанкуем по 10; повторные вызовы защищены бэкоффом на 429 в generateCampaignStatsReport.
-        foreach (array_chunk(array_values(array_filter($campaignIds)), 10) as $chunk) {
+        $chunks = array_chunk(array_values(array_filter($campaignIds)), 10);
+
+        // Фаза 1: создаём отчёты по всем чанкам (быстрые POST) и собираем UUID.
+        // Отчёты формируются на стороне Ozon параллельно, поэтому ждём их одним общим бюджетом,
+        // а не суммой пер-чанк ожиданий — это держит время запроса в рамках таймаутов nginx/php-fpm.
+        $pending = [];
+        foreach ($chunks as $chunk) {
             if ($chunk === []) {
                 continue;
             }
-
             try {
                 $uuid = $this->generateCampaignStatsReport($accessToken, $chunk, $dateFrom, $dateTo);
                 if ($uuid === '') {
                     $errors[] = 'Async: отчёт не создан (нет UUID)';
                     continue;
                 }
+                $pending[$uuid] = true;
+            } catch (\Throwable $e) {
+                $errors[] = 'Async: ' . $e->getMessage();
+            }
+        }
 
-                $link = $this->awaitCampaignStatsReport($accessToken, $uuid);
-                if ($link === '') {
-                    $errors[] = 'Async: отчёт ' . $uuid . ' не готов за отведённое время';
+        // Фаза 2: общий бюджет ожидания готовности всех отчётов.
+        $links = [];
+        $start = time();
+        while ($pending !== [] && (time() - $start) < $budgetSeconds) {
+            foreach (array_keys($pending) as $uuid) {
+                try {
+                    $payload = Http::connectTimeout(15)
+                        ->timeout(30)
+                        ->withToken($accessToken)
+                        ->acceptJson()
+                        ->get(self::BASE_URL . '/api/client/statistics/' . rawurlencode($uuid))
+                        ->json();
+                } catch (\Throwable $e) {
+                    $errors[] = 'Async: статус ' . $e->getMessage();
                     continue;
                 }
 
-                $csvRows = $this->downloadCampaignStatsReportRows($accessToken, $link);
-                if ($csvRows === []) {
-                    $errors[] = 'Async: отчёт ' . $uuid . ' без товарных строк';
-                    continue;
-                }
+                $state = strtoupper((string) (is_array($payload) ? ($payload['state'] ?? '') : ''));
+                $link = $this->absolutePerformanceUrl((string) (is_array($payload) ? ($payload['link'] ?? '') : ''));
 
-                $rows = array_merge($rows, $csvRows);
+                if ($state === 'OK' && $link !== '') {
+                    $links[] = $link;
+                    unset($pending[$uuid]);
+                } elseif (in_array($state, ['ERROR', 'CANCELLED'], true)) {
+                    unset($pending[$uuid]);
+                    $errors[] = 'Async: отчёт ' . $uuid . ' состояние ' . $state;
+                }
+            }
+
+            if ($pending !== [] && (time() - $start) < $budgetSeconds) {
+                sleep(3);
+            }
+        }
+        if ($pending !== []) {
+            $errors[] = 'Async: ' . count($pending) . ' отчёт(ов) не готовы за ' . $budgetSeconds . 'с';
+        }
+
+        // Фаза 3: скачиваем готовые отчёты и разбираем товарные строки.
+        foreach ($links as $link) {
+            try {
+                $rows = array_merge($rows, $this->downloadCampaignStatsReportRows($accessToken, $link));
             } catch (\Throwable $e) {
                 $errors[] = 'Async: ' . $e->getMessage();
             }
@@ -1100,9 +1264,10 @@ class OzonPerformanceApiService
             'groupBy' => 'NO',
         ];
 
-        // Бэкофф на 429 (rate limit Ozon Performance) и сетевые таймауты.
+        // Лёгкий бэкофф на 429 (rate limit Ozon Performance): одна короткая повторная попытка.
+        // Длинных ожиданий тут быть не должно — генерация вызывается в HTTP-запросе (прогрессивный сбор).
         $lastStatus = 0;
-        for ($attempt = 1; $attempt <= 3; $attempt++) {
+        for ($attempt = 1; $attempt <= 2; $attempt++) {
             $response = Http::connectTimeout(15)
                 ->timeout(40)
                 ->withToken($accessToken)
@@ -1115,8 +1280,8 @@ class OzonPerformanceApiService
             }
 
             $lastStatus = $response->status();
-            if ($lastStatus === 429 && $attempt < 3) {
-                sleep(5 * $attempt);
+            if ($lastStatus === 429 && $attempt < 2) {
+                sleep(3);
                 continue;
             }
 
