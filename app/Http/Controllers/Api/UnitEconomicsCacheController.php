@@ -1378,7 +1378,9 @@ class UnitEconomicsCacheController extends Controller
             foreach ($columns as $col => $def) {
                 $field = $def['field'];
 
-                if ($col === 'E') {
+                if ($col === 'A') {
+                    $sheet->setCellValue("A{$currentRow}", $this->resolveDisplayArticle($item));
+                } elseif ($col === 'E') {
                     // E: Наценка — Excel-формула = Цена / Себестоимость
                     $sheet->setCellValue("E{$currentRow}", "=IF(D{$currentRow}>0,C{$currentRow}/D{$currentRow},0)");
                 } elseif ($col === 'G') {
@@ -1850,7 +1852,7 @@ class UnitEconomicsCacheController extends Controller
         ]);
         $topRow++;
         foreach ($topProfitable as $item) {
-            $sku = $item['sku'] ?? '';
+            $sku = $this->resolveDisplayArticle($item);
             $profit = (float) ($item['net_profit'] ?? 0);
             $sheet->setCellValue("D{$topRow}", $sku . ' — ' . number_format($profit, 2, '.', ' ') . ' ₽');
             $sheet->getStyle("D{$topRow}")->applyFromArray([
@@ -1868,7 +1870,7 @@ class UnitEconomicsCacheController extends Controller
         ]);
         $topRow++;
         foreach ($topLosing as $item) {
-            $sku = $item['sku'] ?? '';
+            $sku = $this->resolveDisplayArticle($item);
             $profit = (float) ($item['net_profit'] ?? 0);
             $sheet->setCellValue("D{$topRow}", $sku . ' — ' . number_format($profit, 2, '.', ' ') . ' ₽');
             $sheet->getStyle("D{$topRow}")->applyFromArray([
@@ -1917,7 +1919,7 @@ class UnitEconomicsCacheController extends Controller
                 if (! is_array($cluster)) {
                     continue;
                 }
-                $sheet->setCellValue("A{$row}", $item['sku'] ?? '');
+                $sheet->setCellValue("A{$row}", $this->resolveDisplayArticle($item));
                 $sheet->setCellValue("B{$row}", $item['product_name'] ?? '');
                 $sheet->setCellValue("C{$row}", (float) ($cluster['orders_percent'] ?? 0));
                 $sheet->setCellValue("D{$row}", ! empty($cluster['is_local_cluster']) ? 'Да' : 'Нет');
@@ -2056,6 +2058,18 @@ class UnitEconomicsCacheController extends Controller
             }
 
             return 'Оценка ' . round((float) $localityRate) . '%';
+        }
+
+        return '';
+    }
+
+    private function resolveDisplayArticle(array $item): string
+    {
+        foreach (['article', 'vendor_code', 'sku'] as $field) {
+            $value = trim((string) ($item[$field] ?? ''));
+            if ($value !== '') {
+                return $value;
+            }
         }
 
         return '';

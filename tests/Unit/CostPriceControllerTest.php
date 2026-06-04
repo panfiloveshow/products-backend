@@ -44,6 +44,28 @@ class CostPriceControllerTest extends TestCase
         );
     }
 
+    public function test_wildberries_template_uses_vendor_code_instead_of_barcode_sku(): void
+    {
+        $integration = Integration::factory()->wildberries()->create(['id' => 61002]);
+        Product::factory()->wildberries()->create([
+            'integration_id' => $integration->id,
+            'sku' => '2038816371456',
+            'barcode' => '2038816371456',
+            'vendor_code' => '8206/brown',
+            'cost_price' => 456.78,
+            'wb_data' => ['vendorCode' => '8206/brown'],
+        ]);
+
+        $controller = new CostPriceController(new CostPriceParserService());
+        $response = $controller->template(Request::create('/api/products/cost-price/template?marketplace=wildberries&integration_id=' . $integration->id));
+
+        $content = $response->getContent();
+
+        $this->assertStringContainsString("Артикул продавца;Себестоимость\r\n", $content);
+        $this->assertStringContainsString("8206/brown;456.78\r\n", $content);
+        $this->assertStringNotContainsString("2038816371456;456.78\r\n", $content);
+    }
+
     public function test_bulk_updates_wildberries_cost_price_by_vendor_code_and_barcode(): void
     {
         $integration = Integration::factory()->wildberries()->create(['id' => 61001]);

@@ -330,18 +330,18 @@ class CostPriceController extends Controller
             $query = Product::where('integration_id', $integrationId)
                 ->whereNotNull('sku')
                 ->where('sku', '!=', '')
-                ->select('sku', 'name', 'cost_price');
+                ->select('sku', 'vendor_code', 'name', 'cost_price', 'wb_data');
 
             if ($marketplace) {
                 $query->where('marketplace', $marketplace);
             }
 
-            $products = $query->orderBy('sku')->limit(5000)->get();
+            $products = $query->orderBy('vendor_code')->orderBy('sku')->limit(5000)->get();
 
             foreach ($products as $product) {
                 $costPrice = (float) $product->cost_price;
                 $rows[] = [
-                    $product->sku,
+                    $this->costPriceTemplateArticle($product),
                     $costPrice > 0 ? number_format($costPrice, 2, '.', '') : '',
                 ];
             }
@@ -381,5 +381,23 @@ class CostPriceController extends Controller
             'Content-Disposition' => 'attachment; filename="' . $asciiFilename . '"; filename*=UTF-8\'\'' . rawurlencode($filename),
             'X-Content-Type-Options' => 'nosniff',
         ]);
+    }
+
+    private function costPriceTemplateArticle(Product $product): string
+    {
+        $wbData = is_array($product->wb_data) ? $product->wb_data : [];
+
+        foreach ([
+            $product->vendor_code,
+            $wbData['vendorCode'] ?? null,
+            $product->sku,
+        ] as $value) {
+            $article = trim((string) ($value ?? ''));
+            if ($article !== '') {
+                return $article;
+            }
+        }
+
+        return '';
     }
 }

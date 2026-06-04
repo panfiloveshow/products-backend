@@ -393,6 +393,62 @@ class UnitEconomicsCacheControllerTest extends TestCase
         $this->assertSame(40.0, $result['localization_amount']);
     }
 
+    public function test_wildberries_enrich_exposes_vendor_code_as_display_article_without_replacing_internal_sku(): void
+    {
+        $controller = new UnitEconomicsCacheController(
+            $this->createMock(UnitEconomicsCacheService::class),
+            $this->createMock(UnitEconomicsService::class),
+            $this->createMock(UnitEconomicsOrchestrator::class),
+            $this->createMock(IntegrationAccessService::class),
+        );
+
+        $product = new Product([
+            'id' => 10,
+            'integration_id' => 13,
+            'marketplace' => 'wildberries',
+            'sku' => '2038816371456',
+            'vendor_code' => '8206/brown',
+            'name' => 'Дорожная сумка из экокожи',
+        ]);
+        $product->fulfillment_type = 'FBO';
+
+        $cache = new UnitEconomicsCache([
+            'integration_id' => 13,
+            'product_id' => 10,
+            'sku' => '2038816371456',
+            'marketplace' => 'wildberries',
+            'fulfillment_type' => 'FBO',
+            'sales_count' => 1,
+            'price' => 4105.92,
+            'cost_price' => 0,
+            'base_logistics_cost' => 100,
+            'logistics_coefficient' => 1,
+            'marketplace_data' => [],
+        ]);
+        $cache->setRelation('product', $product);
+
+        $method = new \ReflectionMethod(UnitEconomicsCacheController::class, 'enrichCacheItem');
+        $method->setAccessible(true);
+
+        \Illuminate\Support\Facades\Cache::shouldReceive('remember')->andReturn(null);
+
+        $result = $method->invoke($controller, $cache, 'FBO', null, [
+            'wb_warehouses_by_product_key' => collect([
+                '10|13' => collect(),
+            ]),
+            'integrations_by_id' => collect([
+                13 => new Integration([
+                    'settings' => ['wb_localization_index' => 1.0],
+                    'localization_index' => 1.0,
+                ]),
+            ]),
+        ]);
+
+        $this->assertSame('2038816371456', $result['sku']);
+        $this->assertSame('8206/brown', $result['vendor_code']);
+        $this->assertSame('8206/brown', $result['article']);
+    }
+
     public function test_profit_range_is_aligned_with_current_net_profit(): void
     {
         $controller = new UnitEconomicsCacheController(
@@ -609,6 +665,7 @@ class UnitEconomicsCacheControllerTest extends TestCase
 
         $spreadsheet = $method->invoke($controller, [[
             'sku' => '9137/black',
+            'article' => '8206/brown',
             'product_name' => 'Test product',
             'price' => 1000,
             'cost_price' => 300,
@@ -629,6 +686,7 @@ class UnitEconomicsCacheControllerTest extends TestCase
         $this->assertNotNull($mainSheet);
         $this->assertSame('Статус данных', $mainSheet->getCell('Z4')->getValue());
         $this->assertSame('Индекс цены', $mainSheet->getCell('AF4')->getValue());
+        $this->assertSame('8206/brown', $mainSheet->getCell('A5')->getValue());
         $this->assertSame('2026-05-25-04', $mainSheet->getCell('AZ1')->getValue());
         $this->assertFalse($mainSheet->getColumnDimension('AZ')->getVisible());
 

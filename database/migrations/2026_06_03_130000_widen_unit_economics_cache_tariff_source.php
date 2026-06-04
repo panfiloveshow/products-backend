@@ -13,13 +13,27 @@ return new class extends Migration
 {
     public function up(): void
     {
-        DB::statement('ALTER TABLE unit_economics_cache ALTER COLUMN tariff_source TYPE varchar(64)');
-        DB::statement('ALTER TABLE unit_economics_cache ALTER COLUMN tariff_version TYPE varchar(64)');
+        $driver = DB::connection()->getDriverName();
+
+        if ($driver === 'pgsql') {
+            DB::statement('ALTER TABLE unit_economics_cache ALTER COLUMN tariff_source TYPE varchar(64)');
+            DB::statement('ALTER TABLE unit_economics_cache ALTER COLUMN tariff_version TYPE varchar(64)');
+        } elseif ($driver === 'mysql') {
+            DB::statement('ALTER TABLE unit_economics_cache MODIFY tariff_source varchar(64)');
+            DB::statement('ALTER TABLE unit_economics_cache MODIFY tariff_version varchar(64)');
+        }
     }
 
     public function down(): void
     {
-        DB::statement('ALTER TABLE unit_economics_cache ALTER COLUMN tariff_source TYPE varchar(32)');
-        DB::statement('ALTER TABLE unit_economics_cache ALTER COLUMN tariff_version TYPE varchar(32)');
+        $driver = DB::connection()->getDriverName();
+
+        if ($driver === 'pgsql') {
+            DB::statement('ALTER TABLE unit_economics_cache ALTER COLUMN tariff_source TYPE varchar(32)');
+            DB::statement('ALTER TABLE unit_economics_cache ALTER COLUMN tariff_version TYPE varchar(32)');
+        } elseif ($driver === 'mysql') {
+            DB::statement('ALTER TABLE unit_economics_cache MODIFY tariff_source varchar(32)');
+            DB::statement('ALTER TABLE unit_economics_cache MODIFY tariff_version varchar(32)');
+        }
     }
 };
