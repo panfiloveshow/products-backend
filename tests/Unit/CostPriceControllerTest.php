@@ -24,6 +24,11 @@ class CostPriceControllerTest extends TestCase
 
         $this->assertSame('text/csv; charset=UTF-8', $response->headers->get('Content-Type'));
         $this->assertSame('nosniff', $response->headers->get('X-Content-Type-Options'));
+        $cacheControl = (string) $response->headers->get('Cache-Control');
+        $this->assertStringContainsString('no-store', $cacheControl);
+        $this->assertStringContainsString('no-cache', $cacheControl);
+        $this->assertStringContainsString('must-revalidate', $cacheControl);
+        $this->assertSame('no-cache', $response->headers->get('Pragma'));
         $this->assertSame(
             "attachment; filename=\"cost-price-template.csv\"; filename*=UTF-8''%D1%88%D0%B0%D0%B1%D0%BB%D0%BE%D0%BD_%D1%81%D0%B5%D0%B1%D0%B5%D1%81%D1%82%D0%BE%D0%B8%D0%BC%D0%BE%D1%81%D1%82%D1%8C.csv",
             $response->headers->get('Content-Disposition')
