@@ -720,6 +720,17 @@ class UnitEconomicsCacheService
             $tariffEffectiveFrom = $tariffBreakdown['effective_date'] ?? $tariffEffectiveFrom;
             $sppPercent = (float) ($settings?->spp_percent ?? $marketplaceData['spp_percent'] ?? $existingUE?->spp_percent ?? 0);
             $warehouseCoefficient = $this->getAverageWarehouseCoefficient($product->integration_id, $product->sku, $marketplace);
+
+            // Делаем средневзвешенный по складам КС авторитетным: записываем его в box-тариф,
+            // чтобы калькулятор не перетирал его коэффициентом одного склада/фолбэка «Цифровой склад».
+            // Логистика по сумме не меняется (КС в ней сокращается), меняется корректный показ КС.
+            if (is_array($tariffBreakdown) && is_array($tariffBreakdown['box'] ?? null) && $warehouseCoefficient > 0) {
+                $coefKey = in_array(strtoupper((string) $fulfillmentType), ['FBS', 'DBW'], true)
+                    ? 'delivery_marketplace_coef_percent'
+                    : 'delivery_coef_percent';
+                $tariffBreakdown['box'][$coefKey] = round($warehouseCoefficient * 100, 2);
+            }
+
             $localizationIndex = (float) (
                 $integrationSettings['wb_localization_index']
                 ?? $integration?->localization_index
@@ -1672,27 +1683,72 @@ class UnitEconomicsCacheService
 
         $this->warmWildberriesTariffSnapshotCache((int) $integration->id);
 
-        $warehousesBySku = InventoryWarehouse::where('integration_id', $integration->id)
-            ->where('marketplace', 'wildberries')
-            ->whereIn('sku', $skus)
-            ->get(['sku', 'warehouse_coefficient', 'quantity'])
-            ->groupBy('sku');
+        // КС (коэффициент склада) считаем средневзвешенно по ОСТАТКАМ из wb_data.stock_warehouses,
+        // где реальные имена складов WB (Электросталь, Коледино…). Коэффициент тянем из box-снапшотов
+        // по имени склада (FBS — маркетплейс-доставка). InventoryWarehouse тут не годится: там все
+        // остатки под общим «Мой склад» и без коэффициента.
+        $snapshotCache = $this->wildberriesTariffSnapshotCache[$integration->id] ?? ['box_by_warehouse' => []];
+        $boxByWarehouse = is_array($snapshotCache['box_by_warehouse'] ?? null) ? $snapshotCache['box_by_warehouse'] : [];
 
-        foreach ($skus as $sku) {
-            $cacheKey = $integration->id.'|wildberries|'.$sku;
-            $warehouses = $warehousesBySku->get($sku, collect());
-            $withStock = $warehouses->filter(fn ($warehouse) => (int) $warehouse->quantity > 0);
-            $totalQuantity = (int) $withStock->sum('quantity');
+        $coefFromSnapshot = function ($snapshot, bool $marketplace): ?float {
+            if (! $snapshot) {
+                return null;
+            }
+            $payload = is_array($snapshot->payload) ? $snapshot->payload : [];
+            $keys = $marketplace
+                ? ['delivery_marketplace_coef_percent', 'boxDeliveryMarketplaceCoefExpr']
+                : ['delivery_coef_percent', 'boxDeliveryCoefExpr'];
+            foreach ($keys as $k) {
+                $v = $payload[$k] ?? null;
+                if ($v === null || $v === '') {
+                    continue;
+                }
+                $v = is_string($v) ? str_replace(',', '.', $v) : $v;
+                if (is_numeric($v) && (float) $v > 0) {
+                    return (float) $v / 100;
+                }
+            }
+            return null;
+        };
 
-            if ($totalQuantity <= 0) {
-                $this->warehouseCoefficientCache[$cacheKey] = 1.0;
+        // Средний КС магазина — разумный дефолт для товаров без остатка (вместо молчаливых 100%).
+        $allCoefs = [];
+        foreach ($boxByWarehouse as $snap) {
+            $c = $coefFromSnapshot($snap, false);
+            if ($c !== null) {
+                $allCoefs[] = $c;
+            }
+        }
+        $integrationAvgCoef = $allCoefs !== [] ? array_sum($allCoefs) / count($allCoefs) : 1.0;
+
+        foreach ($products as $product) {
+            $sku = (string) $product->sku;
+            if ($sku === '') {
                 continue;
             }
+            $cacheKey = $integration->id.'|wildberries|'.$sku;
 
-            $weightedSum = $withStock->sum(
-                fn ($warehouse) => (float) ($warehouse->warehouse_coefficient ?? 1.0) * (int) $warehouse->quantity
-            );
-            $this->warehouseCoefficientCache[$cacheKey] = $weightedSum / $totalQuantity;
+            $wbData = is_array($product->wb_data ?? null) ? $product->wb_data : [];
+            $stockWarehouses = is_array($wbData['stock_warehouses'] ?? null) ? $wbData['stock_warehouses'] : [];
+
+            $weightedSum = 0.0;
+            $totalQuantity = 0;
+            foreach ($stockWarehouses as $w) {
+                $qty = (int) ($w['quantity'] ?? 0);
+                $name = (string) ($w['warehouse_name'] ?? '');
+                if ($qty <= 0 || $name === '') {
+                    continue;
+                }
+                $isMarketplace = in_array(strtoupper((string) ($w['fulfillment_type'] ?? '')), ['FBS', 'DBW', 'DBS', 'EDBS'], true);
+                $snap = $boxByWarehouse[$this->normalizeWildberriesWarehouseName($name)] ?? null;
+                $coef = $coefFromSnapshot($snap, $isMarketplace) ?? $integrationAvgCoef;
+                $weightedSum += $coef * $qty;
+                $totalQuantity += $qty;
+            }
+
+            $this->warehouseCoefficientCache[$cacheKey] = $totalQuantity > 0
+                ? round($weightedSum / $totalQuantity, 4)
+                : round($integrationAvgCoef, 4);
         }
     }
 
