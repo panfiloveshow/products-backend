@@ -80,6 +80,29 @@ class CostPriceParserServiceTest extends TestCase
         $this->assertEquals(12345678.90, $result['data']['items'][1]['cost_price']);
     }
 
+    public function test_splits_numbers_imported_as_single_article_column(): void
+    {
+        $content = "Артикул продавца Себестоимость\n";
+        $content .= "001/black 1290\n";
+        $content .= "0010/black 3790\n";
+        $content .= "003/black2 1190\n";
+        $content .= "004/black 402\n";
+
+        $file = UploadedFile::fake()->createWithContent('test.csv', $content);
+
+        $result = $this->parser->parse($file);
+
+        $this->assertTrue($result['success']);
+        $this->assertEquals('001/black', $result['data']['items'][0]['sku']);
+        $this->assertEquals(1290.0, $result['data']['items'][0]['cost_price']);
+        $this->assertEquals('0010/black', $result['data']['items'][1]['sku']);
+        $this->assertEquals(3790.0, $result['data']['items'][1]['cost_price']);
+        $this->assertEquals('003/black2', $result['data']['items'][2]['sku']);
+        $this->assertEquals(1190.0, $result['data']['items'][2]['cost_price']);
+        $this->assertEquals('004/black', $result['data']['items'][3]['sku']);
+        $this->assertEquals(402.0, $result['data']['items'][3]['cost_price']);
+    }
+
     public function test_marks_invalid_rows(): void
     {
         $content = "Артикул;Себестоимость\n";

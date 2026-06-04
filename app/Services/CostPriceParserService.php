@@ -112,6 +112,13 @@ class CostPriceParserService
         foreach ($rows as $rowIndex => $row) {
             $sku = $this->cleanString($row[$columnIndexes['sku']] ?? '');
             $priceRaw = $row[$columnIndexes['price']] ?? '';
+
+            if ($columnIndexes['sku'] === $columnIndexes['price'] || $this->cleanString($priceRaw) === '') {
+                $split = $this->splitCombinedSkuAndPrice($sku);
+                if ($split !== null) {
+                    [$sku, $priceRaw] = $split;
+                }
+            }
             
             // Пропускаем пустые строки
             if (empty($sku) && empty($priceRaw)) {
@@ -379,6 +386,33 @@ class CostPriceParserService
         }
         
         return (float) $cleaned;
+    }
+
+    /**
+     * Защита от файлов, которые Excel/Numbers импортировал одной колонкой:
+     * "001/black 1290" должно стать ["001/black", "1290"], а не ценой 0011290.
+     *
+     * @return array{0:string,1:string}|null
+     */
+    private function splitCombinedSkuAndPrice(string $value): ?array
+    {
+        $value = trim($value);
+        if ($value === '') {
+            return null;
+        }
+
+        if (! preg_match('/^(.+?)\s+(-?\d[\d\s\x{00A0}]*(?:[,.]\d{1,2})?)\s*(?:₽|руб\.?)?\s*$/u', $value, $matches)) {
+            return null;
+        }
+
+        $sku = trim($matches[1]);
+        $price = trim($matches[2]);
+
+        if ($sku === '' || $price === '') {
+            return null;
+        }
+
+        return [$sku, $price];
     }
 
     /**
