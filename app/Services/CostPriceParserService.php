@@ -117,6 +117,11 @@ class CostPriceParserService
                 $split = $this->splitCombinedSkuAndPrice($sku);
                 if ($split !== null) {
                     [$sku, $priceRaw] = $split;
+                } elseif ($columnIndexes['sku'] === $columnIndexes['price']) {
+                    // Артикул и цена в одной колонке, но цену извлечь не удалось
+                    // (например, чисто числовой артикул без цены). Не подставляем
+                    // сам артикул как себестоимость — помечаем строку без цены.
+                    $priceRaw = '';
                 }
             }
             
@@ -276,17 +281,36 @@ class CostPriceParserService
     {
         $skuIndex = null;
         $priceIndex = null;
+        // Price-матч, попавший в ту же колонку, что и артикул. Используется только как
+        // запасной вариант для combined-формата ("sku price" в одной ячейке), когда
+        // отдельной колонки с ценой нет.
+        $priceCollidingIndex = null;
 
         foreach ($headerRow as $index => $header) {
             $normalized = $this->normalizeHeader($header);
-            
-            if ($skuIndex === null && $this->matchesAliases($normalized, $this->skuAliases)) {
+            $isSku = $this->matchesAliases($normalized, $this->skuAliases);
+            $isPrice = $this->matchesAliases($normalized, $this->priceAliases);
+
+            if ($skuIndex === null && $isSku) {
                 $skuIndex = $index;
             }
-            
-            if ($priceIndex === null && $this->matchesAliases($normalized, $this->priceAliases)) {
-                $priceIndex = $index;
+
+            if ($isPrice) {
+                // Отдельная колонка с ценой имеет приоритет: иначе заголовок вроде
+                // «Артикул и цена» забирал бы цену в колонку артикула, и себестоимость
+                // подставлялась бы равной артикулу (баг с числовыми артикулами).
+                if ($priceIndex === null && $index !== $skuIndex) {
+                    $priceIndex = $index;
+                } elseif ($priceCollidingIndex === null && $index === $skuIndex) {
+                    $priceCollidingIndex = $index;
+                }
             }
+        }
+
+        // Отдельной колонки с ценой нет, но заголовок артикула совпал и с ценой —
+        // это combined-формат: цена в той же ячейке, разбираем её ниже сплитом.
+        if ($priceIndex === null && $priceCollidingIndex !== null) {
+            $priceIndex = $priceCollidingIndex;
         }
 
         // Если заголовки не найдены — используем колонки 0 и 1
