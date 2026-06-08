@@ -3016,11 +3016,15 @@ class UnitEconomicsCacheController extends Controller
             // колонки spp_percent в unit_economics_cache нет.
             $sppPercent = (float) ($settings?->spp_percent ?? $wbData['spp_percent'] ?? $marketplaceData['spp_percent'] ?? $cache->spp_percent ?? 0);
             $data['spp_percent'] = $sppPercent;
-            $data['spp_amount'] = round($price * $sppPercent / 100, 2);
 
-            // Цена покупателя = цена × (1 - СПП%)
-            $customerPrice = $price * (1 - $sppPercent / 100);
+            // СПП на WB финансирует маркетплейс — он информационный и НЕ уменьшает
+            // выручку/комиссию/сумму к перечислению (они считаются от действующей цены).
+            // Цена покупателя (что реально платит покупатель) = цена до СПП (old_price =
+            // зачёркнутая = card.wb.ru basic, от неё и измерен СПП) × (1 - СПП%).
+            $sppBasePrice = max(0.0, (float) ($cache->old_price ?: $price));
+            $customerPrice = $sppBasePrice > 0 ? $sppBasePrice * (1 - $sppPercent / 100) : $price;
             $data['customer_price'] = round($customerPrice, 2);
+            $data['spp_amount'] = round(max(0.0, $sppBasePrice - $customerPrice), 2);
 
             // Наценка, x = цена / себестоимость
             $data['markup_multiplier'] = $costPrice > 0 ? round($price / $costPrice, 2) : 0;
@@ -3106,8 +3110,9 @@ class UnitEconomicsCacheController extends Controller
                              $expectedReturnCost + (float) $cache->storage_cost + (float) ($data['acquiring_amount'] ?? 0);
             $data['total_expenses_percent'] = $price > 0 ? round($totalExpenses / $price * 100, 2) : 0;
 
-            // На р/с (to_settlement_account)
-            $toSettlement = $customerPrice - $commissionAmount -
+            // На р/с (to_settlement_account) — от действующей цены, т.к. СПП финансирует
+            // WB и не уменьшает сумму к перечислению продавцу.
+            $toSettlement = $price - $commissionAmount -
                            (float) $cache->logistics_cost - $expectedReturnCost - (float) $cache->storage_cost - (float) ($data['acquiring_amount'] ?? 0);
             $data['to_settlement_account'] = round($toSettlement, 2);
 

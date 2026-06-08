@@ -63,16 +63,21 @@ class WildberriesUnitEconomicsCalculator implements UnitEconomicsCalculatorInter
         // Наценка, x = цена / себестоимость
         $markupMultiplier = $costPrice > 0 ? round($price / $costPrice, 2) : 0;
         
-        // Цена покупателя = цена × (1 - СПП%)
-        $customerPrice = $price * (1 - $sppPercent / 100);
-        
-        // Комиссия маркетплейса
-        $commissionRate = $input->commissionRate 
+        // СПП на WB финансирует маркетплейс, а не продавец: он НЕ уменьшает выручку.
+        // Поэтому выручка, комиссия и сумма к перечислению считаются от действующей
+        // цены ($price). Цена покупателя (что реально платит покупатель) —
+        // информационная: цена до СПП (oldPrice = зачёркнутая = card.wb.ru basic,
+        // от неё и измерен СПП) × (1 - СПП%). В P&L не участвует.
+        $sppBasePrice = max(0.0, (float) ($input->oldPrice ?? $price));
+        $customerPrice = $sppBasePrice > 0 ? $sppBasePrice * (1 - $sppPercent / 100) : $price;
+
+        // Комиссия маркетплейса — от действующей цены (СПП её не уменьшает)
+        $commissionRate = $input->commissionRate
             ?? $this->commissions->getCommissionRate($input->categoryId ?? 'default');
-        $commission = $customerPrice * ($commissionRate / 100);
-        
-        // СПП, ₽ = цена × СПП%
-        $sppAmount = $price * ($sppPercent / 100);
+        $commission = $price * ($commissionRate / 100);
+
+        // СПП, ₽ — абсолютная скидка покупателю (от цены до СПП), информационно
+        $sppAmount = max(0.0, $sppBasePrice - $customerPrice);
         
         // Тарифная логистика WB. В официальных box tariffs base/liter уже приходят
         // с учётом boxDeliveryCoefExpr / boxDeliveryMarketplaceCoefExpr.
@@ -157,8 +162,9 @@ class WildberriesUnitEconomicsCalculator implements UnitEconomicsCalculatorInter
         // Всего затрат, % = затраты / цена × 100
         $totalExpensesPercent = $price > 0 ? ($marketplaceCosts / $price) * 100 : 0;
         
-        // На р/с = цена покупателя - комиссия - логистика - ожид.возвраты - хранение
-        $toSettlementAccount = $customerPrice - $marketplaceCosts;
+        // На р/с = действующая цена - комиссия - логистика - ожид.возвраты - хранение.
+        // СПП финансирует WB, поэтому база — действующая цена, а не цена покупателя.
+        $toSettlementAccount = $price - $marketplaceCosts;
         
         // ДРР, ₽ = цена × ДРР%
         $drrAmount = $price * ($drrPercent / 100);
@@ -200,7 +206,7 @@ class WildberriesUnitEconomicsCalculator implements UnitEconomicsCalculatorInter
             fulfillmentType: $input->fulfillmentType,
             price: $price,
             costs: $costs,
-            revenue: $customerPrice,
+            revenue: $price,
             totalCosts: $totalCosts,
             netProfit: $netProfit,
             marginPercent: $marginPercent,
