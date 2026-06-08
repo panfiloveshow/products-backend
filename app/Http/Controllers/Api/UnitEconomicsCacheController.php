@@ -3010,8 +3010,11 @@ class UnitEconomicsCacheController extends Controller
             $data['commission_percent'] = $commissionPercent;
             $data['commission_amount'] = round((float) ($cache->commission_amount ?? ($price * $commissionPercent / 100)), 2);
 
-            // СПП (скидка постоянного покупателя) — приоритет: настройки > wb_data > 0
-            $sppPercent = (float) ($settings?->spp_percent ?? $wbData['spp_percent'] ?? $cache->spp_percent ?? 0);
+            // СПП (скидка постоянного покупателя) — приоритет: настройки > wb_data >
+            // marketplace_data кэша (туда синк кладёт витринный/фактический СПП) > 0.
+            // Без marketplace_data СПП всегда 0: wb_data это поле не содержит, а
+            // колонки spp_percent в unit_economics_cache нет.
+            $sppPercent = (float) ($settings?->spp_percent ?? $wbData['spp_percent'] ?? $marketplaceData['spp_percent'] ?? $cache->spp_percent ?? 0);
             $data['spp_percent'] = $sppPercent;
             $data['spp_amount'] = round($price * $sppPercent / 100, 2);
 
