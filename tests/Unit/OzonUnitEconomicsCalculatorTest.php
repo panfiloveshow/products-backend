@@ -299,6 +299,71 @@ class OzonUnitEconomicsCalculatorTest extends TestCase
         $this->assertSame(0.0, $result['return_processing']);
     }
 
+    public function test_full_buyout_with_real_returns_still_adds_return_to_logistics(): void
+    {
+        // Регресс: постинги показывают 100% выкупа (все заказы delivered),
+        // но по /v1/returns/* есть реальные возвраты. Раньше expected_return_cost
+        // занулялся (rate >= 100) и возвраты не попадали в эффективную логистику.
+        $calculator = new OzonUnitEconomicsCalculator();
+        $input = CalculationInput::fromArray([
+            'sku' => 'sku-full-buyout-returns',
+            'integration_id' => 1,
+            'marketplace' => 'ozon',
+            'fulfillment_type' => 'FBS',
+            'price' => 1000,
+            'cost_price' => 200,
+            'length' => 20,
+            'width' => 20,
+            'height' => 20,
+            'redemption_rate' => 100,
+            'redemption_source' => 'postings_28d',
+            'orders_count' => 10,
+            'returns_count' => 2,
+            'delivered_count' => 10,
+            'cancelled_count' => 0,
+        ]);
+
+        $result = $calculator->calculate($input)->toArray();
+
+        // 2 возврата из 10 заказов → доля 0.2 → (return_logistics + return_processing) * 0.2.
+        $expected = round(($result['return_logistics'] + $result['return_processing']) * 0.2, 2);
+        $this->assertGreaterThan(0.0, $result['expected_return_cost']);
+        $this->assertSame($expected, $result['expected_return_cost']);
+        $this->assertSame(
+            $result['costs']['logistics'] + $result['last_mile'] + $result['processing_fee'] + $result['expected_return_cost'],
+            $result['effective_logistics']
+        );
+    }
+
+    public function test_partial_buyout_and_real_returns_are_summed(): void
+    {
+        // 80% выкупа (20% не доехало) + 1 пост-доставочный возврат из 10 заказов (10%)
+        // → суммарная доля возвратной логистики 0.3.
+        $calculator = new OzonUnitEconomicsCalculator();
+        $input = CalculationInput::fromArray([
+            'sku' => 'sku-partial-and-returns',
+            'integration_id' => 1,
+            'marketplace' => 'ozon',
+            'fulfillment_type' => 'FBS',
+            'price' => 1000,
+            'cost_price' => 200,
+            'length' => 20,
+            'width' => 20,
+            'height' => 20,
+            'redemption_rate' => 80,
+            'redemption_source' => 'postings_28d',
+            'orders_count' => 10,
+            'returns_count' => 1,
+            'delivered_count' => 8,
+            'cancelled_count' => 2,
+        ]);
+
+        $result = $calculator->calculate($input)->toArray();
+
+        $expected = round(($result['return_logistics'] + $result['return_processing']) * 0.3, 2);
+        $this->assertSame($expected, $result['expected_return_cost']);
+    }
+
     public function test_cancelled_only_fbo_orders_do_not_apply_non_local_markup(): void
     {
         $calculator = new OzonUnitEconomicsCalculator();

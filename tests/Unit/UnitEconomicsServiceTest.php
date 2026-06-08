@@ -70,6 +70,38 @@ class UnitEconomicsServiceTest extends TestCase
     }
 
     /**
+     * ИРП (индекс распределения продаж): WB-логистика должна включать
+     * наценку = Цена × ИРП%. Формула: base × КС × ИЛ + Цена × ИРП/100.
+     */
+    public function test_calculate_wildberries_applies_sales_distribution_index(): void
+    {
+        $base = [
+            'price' => 1000,
+            'cost_price' => 0,
+            'sales_count' => 1,
+            'volume_liters' => 1.0,      // base логистика = 46 (1-й литр)
+            'fulfillment_type' => 'FBO',
+            'commission_percent' => 0,
+            'redemption_rate' => 100,    // нет возвратов → effective = logistics
+            'warehouse_coefficient' => 1.0,
+            'localization_index' => 1.0,
+        ];
+
+        $without = $this->service->calculate('wildberries', $base);
+        $with = $this->service->calculate('wildberries', array_merge($base, [
+            'sales_distribution_index' => 2.5, // 2.5%
+        ]));
+
+        // Главное: ИРП добавляет к логистике ровно Цена × ИРП/100 = 1000 × 2.5% = 25
+        // (база логистики зависит от тарифных бакетов WB — проверяем именно дельту).
+        $this->assertEqualsWithDelta(25.0, $with['logistics_cost'] - $without['logistics_cost'], 0.01);
+        $this->assertEqualsWithDelta($without['logistics_cost'] + 25.0, $with['logistics_cost'], 0.01);
+        // ИРП = 0 не должен ничего добавлять
+        $zero = $this->service->calculate('wildberries', array_merge($base, ['sales_distribution_index' => 0]));
+        $this->assertEqualsWithDelta($without['logistics_cost'], $zero['logistics_cost'], 0.01);
+    }
+
+    /**
      * Тест расчёта с нулевой себестоимостью
      */
     public function test_calculate_with_zero_cost_price(): void

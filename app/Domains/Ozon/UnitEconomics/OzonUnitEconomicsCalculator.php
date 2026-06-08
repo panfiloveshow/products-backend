@@ -147,7 +147,10 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
             ? (float) $input->ownReturnCost
             : (float) $ownDeliveryCost;
 
-        $returnRate = $input->redemptionRate !== null ? max(0, (100 - $input->redemptionRate) / 100) : 0;
+        // Не доехавшие (100 − % выкупа) + пост-доставочные возвраты (/v1/returns/*),
+        // которые постинги не видят. Без второго слагаемого при выкупе 100% возвраты терялись.
+        $returnRate = $input->redemptionRate !== null ? max(0.0, (100 - $input->redemptionRate) / 100) : 0.0;
+        $returnRate = min(1.0, $returnRate + $this->postDeliveryReturnsFraction($input));
         $expectedReturnCost = $ownReturnCost * $returnRate;
 
         return $this->buildResult(
@@ -202,7 +205,10 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
             ? (float) $input->ownReturnCost
             : (float) $ownDeliveryCost;
 
-        $returnRate = $input->redemptionRate !== null ? max(0, (100 - $input->redemptionRate) / 100) : 0;
+        // Не доехавшие (100 − % выкупа) + пост-доставочные возвраты (/v1/returns/*),
+        // которые постинги не видят. Без второго слагаемого при выкупе 100% возвраты терялись.
+        $returnRate = $input->redemptionRate !== null ? max(0.0, (100 - $input->redemptionRate) / 100) : 0.0;
+        $returnRate = min(1.0, $returnRate + $this->postDeliveryReturnsFraction($input));
         $expectedReturnCost = $ownReturnCost * $returnRate;
 
         return $this->buildResult(
@@ -426,7 +432,31 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
      */
     private function calculateExpectedReturnCosts(string $scheme, float $baseLogistics, ?float $redemptionRate, ?CalculationInput $input = null): array
     {
-        if ($redemptionRate === null || $redemptionRate >= 100 || ! $this->hasReturnRisk($input)) {
+        $schemeCosts = $this->pricing->getSchemeCosts($scheme);
+        $returnLogistics = $baseLogistics;
+        $returnProcessing = (float) ($schemeCosts['return_processing'] ?? 0);
+
+        // Две независимые доли заказов, которым нужна обратная логистика:
+        //
+        // 1) «Не доехавшие» (отмены + невыкупы) — уже зашиты в % выкупа, который
+        //    меряем по постингам (виджет Ozon «Выкупы»). Их доля = (100 − выкуп).
+        //    hasReturnRisk отсекает мусорные SKU (например, единственный
+        //    отменённый заказ без реальных продаж).
+        // 2) Пост-доставочные возвраты (/v1/returns/*) — заказ дошёл (delivered),
+        //    выкуп их НЕ видит (см. OzonPostingsBuyoutCalculator), поэтому в % выкупа
+        //    их нет. Складываем отдельно по returns_count / orders_count. Без этого
+        //    при выкупе 100% реальные возвраты не попадали в эффективную логистику
+        //    вообще.
+        $nonRedeemedFraction = 0.0;
+        if ($redemptionRate !== null && $redemptionRate < 100 && $this->hasReturnRisk($input)) {
+            $nonRedeemedFraction = (100 - $redemptionRate) / 100;
+        }
+
+        $returnsFraction = $this->postDeliveryReturnsFraction($input);
+
+        $totalReturnFraction = min(1.0, $nonRedeemedFraction + $returnsFraction);
+
+        if ($totalReturnFraction <= 0.0) {
             return [
                 'expected' => 0.0,
                 'logistics' => 0.0,
@@ -434,16 +464,35 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
             ];
         }
 
-        $schemeCosts = $this->pricing->getSchemeCosts($scheme);
-        $returnLogistics = $baseLogistics;
-        $returnProcessing = (float) ($schemeCosts['return_processing'] ?? 0);
-        $returnRate = (100 - $redemptionRate) / 100;
-
         return [
-            'expected' => ($returnLogistics + $returnProcessing) * $returnRate,
+            'expected' => ($returnLogistics + $returnProcessing) * $totalReturnFraction,
             'logistics' => $returnLogistics,
             'processing' => $returnProcessing,
         ];
+    }
+
+    /**
+     * Доля пост-доставочных возвратов: returns_count / orders_count.
+     *
+     * Постинги такие возвраты не видят — заказ остаётся в статусе delivered и
+     * считается выкупленным, поэтому в % выкупа они отсутствуют. Возвраты
+     * приходят отдельным API (/v1/returns/*) и складываются с долей
+     * «не доехавших» (100 − % выкупа).
+     */
+    private function postDeliveryReturnsFraction(?CalculationInput $input): float
+    {
+        if ($input === null) {
+            return 0.0;
+        }
+
+        $orders = $input->ordersCount;
+        $returns = $input->returnsCount;
+
+        if ($orders === null || $orders <= 0 || $returns === null || $returns <= 0) {
+            return 0.0;
+        }
+
+        return min(1.0, $returns / $orders);
     }
 
     private function hasReturnRisk(?CalculationInput $input): bool

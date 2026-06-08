@@ -52,6 +52,29 @@ class LocalizationIndexService
     ];
 
     /**
+     * Таблица соответствия доли локализации и КРП (коэффициент распределения продаж, ИРП).
+     * Источник: ЛК WB → Тарифы → Индекс распределения продаж (с 23.03.2026).
+     * Значения в процентах от цены до СПП. При локализации ≥ 60% КРП = 0.
+     * Диапазоны с одинаковым КРП объединены (35–44.99 → 2.10; 45–54.99 → 2.05).
+     *
+     * Диапазон локализации (%) => КРП (%)
+     */
+    private const LOCALIZATION_TO_KRP = [
+        // [min, max] => КРП %
+        [60.00, 100.00, 0.00],
+        [55.00, 59.99, 2.00],
+        [45.00, 54.99, 2.05],
+        [35.00, 44.99, 2.10],
+        [30.00, 34.99, 2.15],
+        [25.00, 29.99, 2.20],
+        [20.00, 24.99, 2.25],
+        [15.00, 19.99, 2.30],
+        [10.00, 14.99, 2.35],
+        [5.00, 9.99, 2.45],
+        [0.00, 4.99, 2.50],
+    ];
+
+    /**
      * Кластеры федеральных округов (объединённые для расчёта локализации)
      * Заказы внутри кластера считаются локальными
      */
@@ -116,16 +139,21 @@ class LocalizationIndexService
     public function calculateLocalizationIndex(Integration $integration): array
     {
         try {
-            $marketplace = WildberriesMarketplace::fromIntegration($integration);
-            
+            // Резолв с Sellico-фолбэком: fromIntegration() берёт только локальный
+            // api_key, а у Sellico-интеграций он пуст → getSalesByRegion возвращал
+            // пусто → ИЛ оставался 1.0. Берём резолвнутые креды.
+            $marketplace = new WildberriesMarketplace($integration->resolveCredentials(), $integration);
+
             // Получаем продажи по регионам (с данными о складе отгрузки)
-            // API /api/v1/supplier/sales ограничен 7 днями
-            // WB считает ИЛ за 13 недель, но API не даёт такие данные
-            $salesByRegion = $marketplace->getSalesByRegion(7);
+            // WB считает ИЛ/ИРП за 13 недель (91 день). /api/v1/supplier/sales
+            // принимает любой dateFrom (не ограничен 7 днями — это было заблуждение),
+            // поэтому берём 91 день, чтобы значения совпадали с ЛК WB.
+            $salesByRegion = $marketplace->getSalesByRegion(91);
             
             if (empty($salesByRegion)) {
                 return [
                     'localization_index' => 1.0,
+                    'sales_distribution_index' => 0.0,
                     'ktr_by_article' => [],
                     'total_orders' => 0,
                     'error' => 'No regional sales data',
@@ -135,6 +163,7 @@ class LocalizationIndexService
             $ktrByArticle = [];
             $totalOrders = 0;
             $weightedKtrSum = 0;
+            $weightedKrpSum = 0;
             
             foreach ($salesByRegion as $nmId => $data) {
                 $articleOrders = $data['total'];
@@ -143,24 +172,28 @@ class LocalizationIndexService
                 // Доля локализации = локальные заказы / все заказы × 100%
                 $localizationRate = $articleOrders > 0 ? ($localOrders / $articleOrders) * 100 : 0;
                 
-                // КТР по таблице
+                // КТР (для ИЛ) и КРП (для ИРП) по таблицам — оба от той же доли локализации
                 $ktr = $this->getKtrByLocalization($localizationRate);
-                
+                $krp = $this->getKrpByLocalization($localizationRate);
+
                 $ktrByArticle[$nmId] = [
                     'total_orders' => $articleOrders,
                     'local_orders' => $localOrders,
                     'localization_rate' => round($localizationRate, 2),
                     'ktr' => $ktr,
+                    'krp' => $krp,
                     'by_delivery_fo' => $data['by_delivery_fo'] ?? [],
                     'by_warehouse' => $data['by_warehouse'] ?? [],
                 ];
-                
+
                 $totalOrders += $articleOrders;
                 $weightedKtrSum += $articleOrders * $ktr;
+                $weightedKrpSum += $articleOrders * $krp;
             }
-            
-            // Средневзвешенный ИЛ
+
+            // Средневзвешенный ИЛ и ИРП (по заказам)
             $localizationIndex = $totalOrders > 0 ? $weightedKtrSum / $totalOrders : 1.0;
+            $salesDistributionIndex = $totalOrders > 0 ? $weightedKrpSum / $totalOrders : 0.0;
             
             Log::info('LocalizationIndex calculated', [
                 'integration_id' => $integration->id,
@@ -171,6 +204,7 @@ class LocalizationIndexService
             
             return [
                 'localization_index' => round($localizationIndex, 2),
+                'sales_distribution_index' => round($salesDistributionIndex, 2),
                 'ktr_by_article' => $ktrByArticle,
                 'total_orders' => $totalOrders,
             ];
@@ -183,6 +217,7 @@ class LocalizationIndexService
             
             return [
                 'localization_index' => 1.0,
+                'sales_distribution_index' => 0.0,
                 'ktr_by_article' => [],
                 'total_orders' => 0,
                 'error' => $e->getMessage(),
@@ -204,6 +239,23 @@ class LocalizationIndexService
         
         // По умолчанию — максимальный КТР для 0% локализации
         return 2.00;
+    }
+
+    /**
+     * Получить КРП (ИРП, % от цены до СПП) по доле локализации.
+     * При локализации ≥ 60% КРП = 0.
+     */
+    public function getKrpByLocalization(float $localizationRate): float
+    {
+        foreach (self::LOCALIZATION_TO_KRP as $range) {
+            [$min, $max, $krp] = $range;
+            if ($localizationRate >= $min && $localizationRate <= $max) {
+                return $krp;
+            }
+        }
+
+        // По умолчанию — максимальный КРП для 0% локализации
+        return 2.50;
     }
 
     /**

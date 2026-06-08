@@ -4,6 +4,7 @@ namespace App\Domains\Wildberries;
 
 use App\Domains\Marketplace\Contracts\MarketplaceInterface;
 use App\Services\Marketplace\MarketplaceInterface as LegacyMarketplaceInterface;
+use App\Domains\Wildberries\Api\CardApi;
 use App\Domains\Wildberries\Api\FbsSuppliesApi;
 use App\Domains\Wildberries\Api\InventoryApi;
 use App\Domains\Wildberries\Api\ProductsApi;
@@ -41,6 +42,8 @@ class WildberriesMarketplace implements MarketplaceInterface, LegacyMarketplaceI
 
     private FbsSuppliesApi $fbsSupplies;
 
+    private CardApi $card;
+
     private ?Integration $integration = null;
 
     public function __construct(array $credentials = [], ?Integration $integration = null)
@@ -55,6 +58,7 @@ class WildberriesMarketplace implements MarketplaceInterface, LegacyMarketplaceI
         $this->realizationReport = new RealizationReportApi($this->client);
         $this->supplies = new SuppliesApi($this->client);
         $this->fbsSupplies = new FbsSuppliesApi($this->client);
+        $this->card = new CardApi();
         $this->integration = $integration;
     }
 
@@ -639,6 +643,19 @@ class WildberriesMarketplace implements MarketplaceInterface, LegacyMarketplaceI
     public function getSppFromSales(int $days = 30): array
     {
         return $this->sales->getSppFromSales($days);
+    }
+
+    /**
+     * Витринный СПП из публичных карточек (card.wb.ru) по nmId.
+     * Используется как фолбэк для товаров без продаж, где СПП из статистики
+     * продаж недоступен.
+     *
+     * @param  array<int|string>  $nmIds
+     * @return array<string,float>  map [nmId => spp%]
+     */
+    public function getDisplayedSppByNmIds(array $nmIds): array
+    {
+        return $this->card->getSppByNmIds($nmIds);
     }
 
     // === Storage ===

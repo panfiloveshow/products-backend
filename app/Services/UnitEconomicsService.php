@@ -125,9 +125,16 @@ class UnitEconomicsService
         );
         $ownDeliveryCost = (float) ($data['own_delivery_cost'] ?? 0);
         $ownReturnCost = (float) ($data['own_return_cost'] ?? 0);
+        // ИРП (индекс распределения продаж) — наценка за нелокальные продажи, в процентах от цены.
+        // Формула WB: base × КС × ИЛ + Цена × ИРП%.
+        $salesDistributionIndex = (float) ($data['sales_distribution_index'] ?? 0);
+        $salesDistributionMarkupPerUnit = $price * ($salesDistributionIndex / 100);
         $logisticsPerUnit = in_array($fulfillmentType, ['DBS', 'EDBS'], true)
             ? $ownDeliveryCost
-            : ($data['logistics_cost'] ?? ($baseLogisticsPerUnit * $warehouseCoefficient * $localizationIndex));
+            : ($data['logistics_cost'] ?? (
+                $baseLogisticsPerUnit * $warehouseCoefficient * $localizationIndex
+                + $salesDistributionMarkupPerUnit
+            ));
         $logisticsCost = $logisticsPerUnit * $salesCount;
         $acceptanceCost = $data['acceptance_cost'] ?? 0;
         $penaltyCost = $data['penalty_cost'] ?? 0;

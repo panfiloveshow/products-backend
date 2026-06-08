@@ -155,8 +155,10 @@ class SyncUnitEconomicsJob implements ShouldQueue
 
     private function syncWildberriesTariffSnapshots(Integration $integration): void
     {
-        $credentials = $integration->getDecryptedCredentials();
-        if (empty($credentials)) {
+        // Резолв с Sellico-фолбэком: у части WB-интеграций api_key хранится в Sellico,
+        // а не локально. Без фолбэка box-тарифы (КС) для них не синкались → КС=100%.
+        $credentials = $integration->resolveCredentials();
+        if (empty($credentials['api_key'] ?? null)) {
             return;
         }
 

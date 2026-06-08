@@ -672,6 +672,38 @@ class SyncUnitEconomicsCommand extends Command
                         $this->info("  Без продаж за 28д: {$noSalesCount} SKU → 0%");
                     }
 
+                    // Шаг 4: реальные пост-доставочные возвраты (/v1/returns/list).
+                    // Постинги их НЕ видят — выкупленный заказ остаётся delivered, —
+                    // поэтому при 100% выкупа возвраты не попадали в эффективную
+                    // логистику. Тянем их отдельно и кладём returns_count в
+                    // redemptionData (по offer_id и по ozon_sku), откуда они доходят
+                    // до CalculationInput->returnsCount и учитываются в расчёте.
+                    try {
+                        $returnsBySku = $ozonService->getReturnsBySku(30); // [offer_id => qty]
+                        $returnsApplied = 0;
+                        foreach ($returnsBySku as $returnOfferId => $returnsCount) {
+                            $returnsCount = (int) $returnsCount;
+                            if ($returnsCount <= 0) {
+                                continue;
+                            }
+                            $keys = [$returnOfferId];
+                            if (isset($offerIdToOzonSkuMap[$returnOfferId])) {
+                                $keys[] = $offerIdToOzonSkuMap[$returnOfferId];
+                            }
+                            foreach ($keys as $key) {
+                                if (isset($redemptionData[$key]) && is_array($redemptionData[$key])) {
+                                    $redemptionData[$key]['returns_count'] = $returnsCount;
+                                    $returnsApplied++;
+                                }
+                            }
+                        }
+                        if ($returnsApplied > 0) {
+                            $this->info("  Возвраты (/v1/returns, 30д): проставлен returns_count для {$returnsApplied} ключей");
+                        }
+                    } catch (\Throwable $returnsException) {
+                        $this->warn('  Не удалось получить возвраты Ozon: '.$returnsException->getMessage());
+                    }
+
                     // TODO: Эквайринг из финансовых транзакций отключён (слишком много данных, OOM)
                     // $acquiringData = $ozonService->getAcquiringBySku();
                     // Используем фиксированный 1.5% (стандартная ставка Ozon)
@@ -693,6 +725,7 @@ class SyncUnitEconomicsCommand extends Command
         $wbStorageData = [];
         $wbTariffsData = [];
         $wbSppData = []; // СПП из статистики продаж
+        $wbCardSppData = []; // Витринный СПП из карточек (фолбэк для товаров без продаж)
         $wbRedemptionData = [];
         $wbLocalizationByNmId = [];
         $wbCommissionsData = [];
@@ -727,9 +760,12 @@ class SyncUnitEconomicsCommand extends Command
                         if (! empty($localizationResult['ktr_by_article'] ?? []) || (int) ($localizationResult['total_orders'] ?? 0) > 0) {
                             $wbLocalizationByNmId = $localizationResult['ktr_by_article'] ?? [];
                             $wbLocalizationIndex = (float) ($localizationResult['localization_index'] ?? 1.0);
+                            // ИРП (КРП) считается из той же доли локализации, что и ИЛ.
+                            $wbSalesDistributionIndex = (float) ($localizationResult['sales_distribution_index'] ?? 0.0);
 
                             $newSettings = array_merge($integrationSettings, [
                                 'wb_localization_index' => $wbLocalizationIndex,
+                                'wb_sales_distribution_index' => $wbSalesDistributionIndex,
                                 'wb_localization_total_orders' => (int) ($localizationResult['total_orders'] ?? 0),
                             ]);
 
@@ -740,9 +776,13 @@ class SyncUnitEconomicsCommand extends Command
                             ]);
 
                             $integrationSettings = $newSettings;
-                            $this->info("  WB ИЛ: {$wbLocalizationIndex} (товаров: ".count($wbLocalizationByNmId).')');
+                            $this->info("  WB ИЛ: {$wbLocalizationIndex} | ИРП: {$wbSalesDistributionIndex}% (товаров: ".count($wbLocalizationByNmId).')');
                         } else {
-                            $this->warn('  WB ИЛ: нет новых данных, сохраняю текущее значение '.($integrationSettings['wb_localization_index'] ?? $integration?->localization_index ?? 1));
+                            // Inline-расчёт пуст — почти всегда это 429 (рейт-лимит WB
+                            // на /api/v1/supplier/sales, ~1 запрос/мин). Ставим расчёт
+                            // ИЛ/ИРП в очередь с backoff (release(90)), чтобы пробить лимит.
+                            $this->warn('  WB ИЛ: нет свежих данных (вероятно 429) — расчёт ИЛ/ИРП поставлен в очередь с backoff');
+                            \App\Jobs\SyncWildberriesLocalizationJob::dispatch($integrationId)->onQueue('unit-economics');
                         }
                     }
 
@@ -773,6 +813,26 @@ class SyncUnitEconomicsCommand extends Command
                     $wbSppData = $wbService->getSppFromSales(30); // За последние 30 дней
                     if (! empty($wbSppData)) {
                         $this->info('  WB СПП: получено для '.count($wbSppData).' товаров');
+                    }
+
+                    // === ВИТРИННЫЙ СПП ИЗ КАРТОЧЕК (фолбэк для товаров без продаж) ===
+                    // У товаров без продаж СПП из статистики недоступен, поэтому
+                    // добираем «витринный» СПП из публичных карточек card.wb.ru.
+                    $wbNmIds = Product::query()
+                        ->where('integration_id', $integrationId)
+                        ->where('marketplace', 'wildberries')
+                        ->get(['wb_data'])
+                        ->map(static fn ($p) => $p->wb_data['nmID'] ?? null)
+                        ->filter()
+                        ->map(static fn ($v) => (string) $v)
+                        ->unique()
+                        ->values()
+                        ->all();
+                    if (! empty($wbNmIds)) {
+                        $wbCardSppData = $wbService->getDisplayedSppByNmIds($wbNmIds);
+                        if (! empty($wbCardSppData)) {
+                            $this->info('  WB СПП (витрина): получено для '.count($wbCardSppData).' товаров');
+                        }
                     }
 
                     $wbRedemptionData = $wbService->getRedemptionStatsByNmId(30);
@@ -984,6 +1044,10 @@ class SyncUnitEconomicsCommand extends Command
                     // WB: получаем СПП по nmId товара
                     $nmId = isset($product->wb_data['nmID']) ? (string) $product->wb_data['nmID'] : null;
                     $productWbSpp = $nmId ? ($wbSppData[$nmId] ?? null) : null;
+                    // Фолбэк: витринный СПП из карточки, если по продажам нет данных
+                    if ($nmId && ($productWbSpp === null || (float) $productWbSpp === 0.0) && isset($wbCardSppData[$nmId])) {
+                        $productWbSpp = $wbCardSppData[$nmId];
+                    }
                     $productWbRedemption = $nmId ? ($wbRedemptionData[$nmId] ?? null) : null;
                     $productWbLocalization = $nmId ? ($wbLocalizationByNmId[$nmId] ?? null) : null;
                     $productYandexTariffs = $yandexTariffsData[$fulfillmentType][$product->sku] ?? null;

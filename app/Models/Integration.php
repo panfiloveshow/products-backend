@@ -144,6 +144,47 @@ class Integration extends Model
         return $this->credentials ?? [];
     }
 
+    /** @var array<string,mixed>|null Мемоизация резолва креды (в т.ч. Sellico-фолбэк) */
+    private ?array $resolvedCredentialsMemo = null;
+
+    /**
+     * Резолв credentials с фолбэком в Sellico.
+     *
+     * У части интеграций api_key хранится не локально, а в Sellico (ID совпадают —
+     * incrementing=false, "ID из Sellico"). Локальные пути синка (товары/остатки)
+     * уже умеют фолбэк, а вот синк тариф-снапшотов (КС) и расчёт ИЛ брали только
+     * локальный ключ → для Sellico-интеграций получали пусто (КС=100%, ИЛ=1).
+     * Этот метод даёт единый резолв: локальный ключ → если пусто, тянем из Sellico.
+     * Результат мемоизируется на инстансе (один HTTP-запрос за время жизни модели).
+     *
+     * @return array<string,mixed>
+     */
+    public function resolveCredentials(): array
+    {
+        if ($this->resolvedCredentialsMemo !== null) {
+            return $this->resolvedCredentialsMemo;
+        }
+
+        $local = $this->credentials ?? [];
+        if (! empty($local['api_key'])) {
+            return $this->resolvedCredentialsMemo = $local;
+        }
+
+        try {
+            $sellico = app(\App\Services\SellicoApiService::class)->getIntegrationById((int) $this->id);
+            if (($sellico['success'] ?? false) && ! empty($sellico['credentials']['api_key'])) {
+                return $this->resolvedCredentialsMemo = array_merge($local, $sellico['credentials']);
+            }
+        } catch (\Throwable $e) {
+            \Illuminate\Support\Facades\Log::warning('Integration::resolveCredentials sellico fallback failed', [
+                'integration_id' => $this->id,
+                'error' => $e->getMessage(),
+            ]);
+        }
+
+        return $this->resolvedCredentialsMemo = $local;
+    }
+
     /**
      * Количество товаров
      */

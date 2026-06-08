@@ -1638,6 +1638,97 @@ class UnitEconomicsCacheService
         return 1.0;
     }
 
+    /**
+     * Per-товарный КС WB + детализация по складам из wb_data.stock_warehouses.
+     *
+     * Единый источник для ОТОБРАЖЕНИЯ (число КС + тултип со складами). Формула
+     * полностью повторяет расчётный warmRecalculateChunkCaches(): взвешенный по
+     * остаткам коэффициент складов товара, а при отсутствии остатков — средний КС
+     * по магазину (а не молчаливые 100%). При правке держать в синхроне с
+     * warmRecalculateChunkCaches().
+     *
+     * @return array{coefficient: float, percent: float, details: array, has_stock: bool, integration_avg: float}
+     */
+    public function resolveWildberriesWarehouseBreakdown(int $integrationId, array $wbData): array
+    {
+        $this->warmWildberriesTariffSnapshotCache($integrationId);
+        $snapshotCache = $this->wildberriesTariffSnapshotCache[$integrationId] ?? ['box_by_warehouse' => []];
+        $boxByWarehouse = is_array($snapshotCache['box_by_warehouse'] ?? null) ? $snapshotCache['box_by_warehouse'] : [];
+
+        $coefFromSnapshot = function ($snapshot, bool $marketplace): ?float {
+            if (! $snapshot) {
+                return null;
+            }
+            $payload = is_array($snapshot->payload) ? $snapshot->payload : [];
+            $keys = $marketplace
+                ? ['delivery_marketplace_coef_percent', 'boxDeliveryMarketplaceCoefExpr']
+                : ['delivery_coef_percent', 'boxDeliveryCoefExpr'];
+            foreach ($keys as $k) {
+                $v = $payload[$k] ?? null;
+                if ($v === null || $v === '') {
+                    continue;
+                }
+                $v = is_string($v) ? str_replace(',', '.', $v) : $v;
+                if (is_numeric($v) && (float) $v > 0) {
+                    return (float) $v / 100;
+                }
+            }
+            return null;
+        };
+
+        // Средний КС магазина — разумный дефолт для товаров без остатка.
+        $allCoefs = [];
+        foreach ($boxByWarehouse as $snap) {
+            $c = $coefFromSnapshot($snap, false);
+            if ($c !== null) {
+                $allCoefs[] = $c;
+            }
+        }
+        $integrationAvgCoef = $allCoefs !== [] ? array_sum($allCoefs) / count($allCoefs) : 1.0;
+
+        $stockWarehouses = is_array($wbData['stock_warehouses'] ?? null) ? $wbData['stock_warehouses'] : [];
+        $weightedSum = 0.0;
+        $totalQuantity = 0;
+        $details = [];
+        foreach ($stockWarehouses as $w) {
+            $qty = (int) ($w['quantity'] ?? 0);
+            $name = (string) ($w['warehouse_name'] ?? '');
+            if ($qty <= 0 || $name === '') {
+                continue;
+            }
+            $isMarketplace = in_array(strtoupper((string) ($w['fulfillment_type'] ?? '')), ['FBS', 'DBW', 'DBS', 'EDBS'], true);
+            $snap = $boxByWarehouse[$this->normalizeWildberriesWarehouseName($name)] ?? null;
+            $coef = $coefFromSnapshot($snap, $isMarketplace) ?? $integrationAvgCoef;
+            $weightedSum += $coef * $qty;
+            $totalQuantity += $qty;
+            $details[] = [
+                'warehouse_name' => $name,
+                'coefficient_raw' => round($coef, 3),
+                'coefficient' => round($coef * 100, 0),
+                'quantity' => $qty,
+            ];
+        }
+
+        $coefficient = $totalQuantity > 0
+            ? round($weightedSum / $totalQuantity, 4)
+            : round($integrationAvgCoef, 4);
+
+        foreach ($details as &$detail) {
+            $detail['share_percent'] = $totalQuantity > 0
+                ? round(($detail['quantity'] / $totalQuantity) * 100, 2)
+                : 0.0;
+        }
+        unset($detail);
+
+        return [
+            'coefficient' => $coefficient,
+            'percent' => round($coefficient * 100, 0),
+            'details' => $details,
+            'has_stock' => $totalQuantity > 0,
+            'integration_avg' => round($integrationAvgCoef, 4),
+        ];
+    }
+
     private function warmRecalculateChunkCaches(Collection $products, array $schemes, Integration $integration): void
     {
         $skus = $products->pluck('sku')

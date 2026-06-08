@@ -2642,14 +2642,32 @@ class UnitEconomicsCacheController extends Controller
         $expectedReturnCost = (float) $cache->expected_return_cost;
         if ($expectedReturnCost <= 0) {
             $redemptionRate = $cache->redemption_rate;
-            if ($redemptionRate !== null) {
-                $returnBase = (float) $cache->return_logistics_cost;
-                if ($returnBase <= 0) {
-                    $returnBase = $deliveryCost;
-                }
+            $returnBase = (float) $cache->return_logistics_cost;
+            if ($returnBase <= 0) {
+                $returnBase = $deliveryCost;
+            }
 
+            // Доля «не доехавших» (отмены + невыкупы) — из % выкупа.
+            $returnFraction = 0.0;
+            if ($redemptionRate !== null) {
                 $rate = max(0, min(100, (float) $redemptionRate));
-                $expectedReturnCost = $returnBase * ((100 - $rate) / 100);
+                $returnFraction = (100 - $rate) / 100;
+            }
+
+            // Ozon: пост-доставочные возвраты (/v1/returns/*) выкуп по постингам
+            // не видит, поэтому добавляем их долю отдельно — так же, как в
+            // OzonUnitEconomicsCalculator. Для WB/Yandex возвраты уже зашиты в
+            // redemption_rate, повторно не учитываем.
+            if ($cache->marketplace === 'ozon') {
+                $ordersForReturns = (int) ($cache->orders_count ?? 0);
+                $returnsForReturns = (int) ($cache->returns_count ?? 0);
+                if ($ordersForReturns > 0 && $returnsForReturns > 0) {
+                    $returnFraction = min(1.0, $returnFraction + ($returnsForReturns / $ordersForReturns));
+                }
+            }
+
+            if ($returnFraction > 0) {
+                $expectedReturnCost = $returnBase * $returnFraction;
             }
         }
 
@@ -3004,57 +3022,35 @@ class UnitEconomicsCacheController extends Controller
             // Наценка, x = цена / себестоимость
             $data['markup_multiplier'] = $costPrice > 0 ? round($price / $costPrice, 2) : 0;
 
-            // КС (коэффициент склада) — средний по всем складам товара
-            // Получаем ВСЕ склады товара для детализации (включая с нулевыми остатками)
-            $wbProductKey = $this->unitEconomicsProductContextKey($cache);
-            if ($pageContext !== null && isset($pageContext['wb_warehouses_by_product_key'])) {
-                $warehouses = $pageContext['wb_warehouses_by_product_key']->get($wbProductKey, collect());
-            } else {
-                $warehouses = InventoryWarehouse::whereIn('sku', $this->resolveInventoryLookupKeys($cache, $product))
-                    ->where('integration_id', $cache->integration_id)
-                    ->where('marketplace', 'wildberries')
-                    ->get(['warehouse_id', 'warehouse_name', 'warehouse_coefficient', 'quantity']);
+            // КС (коэффициент склада). Единый источник с расчётом: взвешенный по
+            // остаткам коэффициент складов товара из wb_data.stock_warehouses +
+            // снапшоты тарифов WB (реальные имена складов: Электросталь, Коледино…).
+            // Раньше тултип брался из InventoryWarehouse, где у WB всё лежит под общим
+            // «Мой склад» без коэффициента — отсюда расхождение «КС 156%, но нет данных
+            // по складам». Теперь число КС и тултип берутся отсюда же.
+            $wbDataForCoef = is_array($product?->wb_data ?? null) ? $product->wb_data : [];
+            $wbBreakdown = $this->cacheService->resolveWildberriesWarehouseBreakdown(
+                (int) $cache->integration_id,
+                $wbDataForCoef
+            );
+            $avgWarehouseCoef = (float) ($wbBreakdown['coefficient'] ?? 1.0);
+            $warehouseCoefPercent = (float) ($wbBreakdown['percent'] ?? ($avgWarehouseCoef * 100));
+            $warehouseDetails = is_array($wbBreakdown['details'] ?? null) ? $wbBreakdown['details'] : [];
+            $wbHasStock = (bool) ($wbBreakdown['has_stock'] ?? false);
+            $wbIntegrationAvg = (float) ($wbBreakdown['integration_avg'] ?? $avgWarehouseCoef);
+
+            // Нет остатков ни на одном складе — показываем честно, что КС это среднее
+            // по магазину, а не пустой тултип «Нет данных по складам» при ненулевом КС.
+            if (! $wbHasStock && $wbIntegrationAvg > 0) {
+                $warehouseDetails = [[
+                    'warehouse_id' => null,
+                    'warehouse_name' => 'Нет остатков — средний КС по магазину',
+                    'coefficient_raw' => round($wbIntegrationAvg, 3),
+                    'coefficient' => round($wbIntegrationAvg * 100, 0),
+                    'quantity' => 0,
+                    'share_percent' => 0.0,
+                ]];
             }
-
-            // Для расчёта среднего КС используем только склады с остатками
-            $warehousesWithStock = $warehouses->filter(fn ($w) => $w->quantity > 0);
-            $totalQuantity = $warehousesWithStock->sum('quantity');
-            $weightedCoefSum = 0;
-            $warehouseDetails = [];
-
-            // Детализация — показываем ВСЕ склады (даже без остатков)
-            foreach ($warehouses as $wh) {
-                $coef = (float) ($wh->warehouse_coefficient ?? 1.0);
-                $qty = (int) $wh->quantity;
-
-                // Для расчёта среднего учитываем только склады с остатками
-                if ($qty > 0) {
-                    $weightedCoefSum += $coef * $qty;
-                }
-
-                // Детализация для всплывающего окна — все склады
-                // Проценты 100-значные: 1.0 = 100%, 1.4 = 140%, 2.05 = 205%
-                $warehouseDetails[] = [
-                    'warehouse_id' => $wh->warehouse_id,
-                    'warehouse_name' => $wh->warehouse_name,
-                    'coefficient_raw' => round($coef, 3),
-                    'coefficient' => round($coef * 100, 0),
-                    'quantity' => $qty,
-                    'share_percent' => $totalQuantity > 0 && $qty > 0
-                        ? round(($qty / $totalQuantity) * 100, 2)
-                        : 0.0,
-                ];
-            }
-
-            // Средний КС (взвешенный по количеству) — только по складам с остатками.
-            // При нулевых остатках используем детерминированный fallback 1.0.
-            if ($totalQuantity > 0) {
-                $avgWarehouseCoef = $weightedCoefSum / $totalQuantity;
-            } else {
-                $avgWarehouseCoef = 1.0;
-            }
-            // Проценты 100-значные: 1.0 = 100%, 1.4 = 140%
-            $warehouseCoefPercent = $avgWarehouseCoef * 100;
 
             $data['warehouse_coef_percent'] = round((float) ($marketplaceData['warehouse_coef_percent'] ?? $warehouseCoefPercent), 0);
             $data['warehouse_coefficient'] = round((float) ($marketplaceData['warehouse_coefficient'] ?? $avgWarehouseCoef), 3);

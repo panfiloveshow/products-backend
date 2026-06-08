@@ -71,32 +71,49 @@ class WarehousesApi
      * Получить возвраты по SKU
      * Использует актуальный endpoint /v1/returns/list (заменяет устаревший /v3/returns/company/fbo)
      */
-    public function getReturnsBySku(): array
+    public function getReturnsBySku(int $days = 30): array
     {
         try {
-            // Используем актуальный endpoint для возвратов FBO и FBS
-            $response = $this->client->post('/v1/returns/list', [
-                'filter' => [
-                    'logistic_return_date' => [
-                        'from' => now()->subDays(30)->format('Y-m-d\TH:i:s\Z'),
-                        'to' => now()->format('Y-m-d\TH:i:s\Z'),
-                    ],
-                ],
-                'limit' => 500, // Максимум 500 согласно документации
-                'last_id' => 0,
-            ]);
-
+            // Используем актуальный endpoint для возвратов FBO и FBS.
+            // Пагинация по last_id (курсор из ответа), чтобы не терять возвраты
+            // у крупных каталогов, где за окно их больше 500.
             $result = [];
-            foreach ($response['returns'] ?? [] as $return) {
-                foreach ($return['products'] ?? [] as $product) {
-                    $sku = $product['offer_id'] ?? null;
-                    if (!$sku) continue;
+            $lastId = 0;
+            $maxPages = 50; // защита от бесконечного цикла (до 25k возвратов)
 
-                    if (!isset($result[$sku])) {
-                        $result[$sku] = 0;
+            for ($page = 0; $page < $maxPages; $page++) {
+                $response = $this->client->post('/v1/returns/list', [
+                    'filter' => [
+                        'logistic_return_date' => [
+                            'from' => now()->subDays($days)->format('Y-m-d\TH:i:s\Z'),
+                            'to' => now()->format('Y-m-d\TH:i:s\Z'),
+                        ],
+                    ],
+                    'limit' => 500, // Максимум 500 согласно документации
+                    'last_id' => $lastId,
+                ]);
+
+                $returns = $response['returns'] ?? [];
+                foreach ($returns as $return) {
+                    foreach ($return['products'] ?? [] as $product) {
+                        $sku = $product['offer_id'] ?? null;
+                        if (!$sku) continue;
+
+                        if (!isset($result[$sku])) {
+                            $result[$sku] = 0;
+                        }
+                        $result[$sku] += (int)($product['quantity'] ?? 1);
                     }
-                    $result[$sku] += (int)($product['quantity'] ?? 1);
                 }
+
+                // Курсор следующей страницы. Останавливаемся, когда API сообщил,
+                // что страниц больше нет, либо не вернул курсор/полную страницу.
+                $nextLastId = (int) ($response['last_id'] ?? 0);
+                $hasNext = $response['has_next'] ?? (count($returns) >= 500);
+                if (! $hasNext || $nextLastId === 0 || $nextLastId === $lastId || empty($returns)) {
+                    break;
+                }
+                $lastId = $nextLastId;
             }
 
             return $result;
