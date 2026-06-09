@@ -1028,7 +1028,7 @@ class UnitEconomicsCacheController extends Controller
         $marketplace = $this->normalizeMarketplace($marketplace);
         $validated = Validator::make($request->all(), [
             'integration_id' => 'required|integer',
-            'fulfillment_type' => 'required|string|in:FBO,FBS,RFBS,EXPRESS,DBS,EDBS,DBW,MIXED,FBY,fbo,fbs,rfbs,express,dbs,edbs,dbw,mixed,fby',
+            'fulfillment_type' => 'required|string|in:FBO,FBW,FBS,RFBS,EXPRESS,DBS,EDBS,DBW,MIXED,FBY,fbo,fbw,fbs,rfbs,express,dbs,edbs,dbw,mixed,fby',
             // Те же фильтры, что принимает index() — чтобы выгрузка матчила
             // ровно то, что менеджер видит на странице, без листания пагинации.
             'search' => 'nullable|string|max:255',
@@ -1064,7 +1064,12 @@ class UnitEconomicsCacheController extends Controller
             abort($resolution['status'] ?? 404, $resolution['message'] ?? 'Интеграция не найдена');
         }
 
-        $fulfillmentType = $validated['fulfillment_type'];
+        $fulfillmentType = strtoupper((string) $validated['fulfillment_type']);
+        // WB «Склад WB» на фронте — FBW, а в кэше схема хранится как FBO. Нормализуем,
+        // иначе forScheme('FBW') не находит строк и выгрузка пустая/невалидная.
+        if ($fulfillmentType === 'FBW') {
+            $fulfillmentType = 'FBO';
+        }
         $integrationId = (int) $validated['integration_id'];
         $ozonLocalityPeriodDays = (int) ($validated['period_days'] ?? $validated['period'] ?? 28);
         $ozonLocalitySnapshotDate = $marketplace === 'ozon'
