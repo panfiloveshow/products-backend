@@ -389,16 +389,43 @@ class SalesApi
     }
 
     /**
+     * Заказ по модели «Маркетплейс» (FBS) — отгрузка со склада продавца.
+     *
+     * WB помечает такие продажи полем warehouseType = «Склад продавца»
+     * (FBW/FBO приходит как «Склад WB»). По методике WB FBS-заказы — исключения
+     * при расчёте индекса локализации (для них КТР = 1.00).
+     *
+     * Если поле отсутствует (старые данные/выгрузка без warehouseType), считаем
+     * заказ FBW, чтобы не исключать лишнего и сохранить прежнее поведение.
+     */
+    private function isFbsSale(array $sale): bool
+    {
+        $warehouseType = trim((string) ($sale['warehouseType'] ?? $sale['warehouse_type'] ?? ''));
+
+        if ($warehouseType === '') {
+            return false;
+        }
+
+        return mb_stripos($warehouseType, 'продав') !== false
+            || mb_stripos($warehouseType, 'seller') !== false;
+    }
+
+    /**
      * Получить продажи по регионам (федеральным округам) для расчёта индекса локализации
      *
      * Использует API /api/v1/supplier/sales который содержит:
      * - warehouseName — склад отгрузки
      * - oblastOkrugName — федеральный округ доставки
+     * - warehouseType — тип склада («Склад WB» = FBW/FBO, «Склад продавца» = FBS)
      *
      * Это позволяет точно определить локальные заказы (склад и доставка в одном ФО)
+     * и отделить FBS-заказы (исключения по методике WB).
+     *
+     * FBS-заказы попадают в total и в excluded_fbs, но НЕ участвуют в подсчёте
+     * локальных заказов (доля локализации считается только по FBW/FBO).
      *
      * @param  int  $days  Количество дней
-     * @return array [nmId => ['total' => int, 'local' => int, 'by_warehouse_fo' => array]]
+     * @return array [nmId => ['total' => int, 'local' => int, 'excluded_fbs' => int, 'by_warehouse' => array, 'by_delivery_fo' => array]]
      */
     public function getSalesByRegion(int $days = 31): array
     {
@@ -440,31 +467,39 @@ class SalesApi
                     continue;
                 }
 
-                // Определяем ФО склада отгрузки
-                $warehouseFo = $warehouseToFo[$warehouseName] ?? $this->guessWarehouseFo($warehouseName);
-
-                // Определяем кластеры
-                $warehouseCluster = $foClusters[$warehouseFo] ?? $warehouseFo;
-                $deliveryCluster = $foClusters[$deliveryFo] ?? $deliveryFo;
-
-                // Заказ локальный, если склад и доставка в одном кластере
-                $isLocal = ($warehouseCluster === $deliveryCluster) && ! empty($warehouseCluster) && ! empty($deliveryCluster);
+                $isFbs = $this->isFbsSale($sale);
 
                 if (! isset($salesByNmId[$nmId])) {
                     $salesByNmId[$nmId] = [
                         'total' => 0,
                         'local' => 0,
+                        'excluded_fbs' => 0,
                         'by_warehouse' => [],
                         'by_delivery_fo' => [],
                     ];
                 }
 
                 $salesByNmId[$nmId]['total'] += $qty;
-                if ($isLocal) {
-                    $salesByNmId[$nmId]['local'] += $qty;
+
+                if ($isFbs) {
+                    // FBS-заказ — исключение по методике WB: в подсчёте локальности
+                    // не участвует, но учитывается в total и excluded_fbs.
+                    $salesByNmId[$nmId]['excluded_fbs'] += $qty;
+                } else {
+                    // Локальность определяем только для FBW/FBO заказов.
+                    $warehouseFo = $warehouseToFo[$warehouseName] ?? $this->guessWarehouseFo($warehouseName);
+                    $warehouseCluster = $foClusters[$warehouseFo] ?? $warehouseFo;
+                    $deliveryCluster = $foClusters[$deliveryFo] ?? $deliveryFo;
+
+                    // Заказ локальный, если склад и доставка в одном кластере
+                    $isLocal = ($warehouseCluster === $deliveryCluster) && ! empty($warehouseCluster) && ! empty($deliveryCluster);
+
+                    if ($isLocal) {
+                        $salesByNmId[$nmId]['local'] += $qty;
+                    }
                 }
 
-                // Статистика по складам и ФО доставки
+                // Статистика по складам и ФО доставки (по всем заказам, для отладки)
                 $salesByNmId[$nmId]['by_warehouse'][$warehouseName] =
                     ($salesByNmId[$nmId]['by_warehouse'][$warehouseName] ?? 0) + $qty;
                 $salesByNmId[$nmId]['by_delivery_fo'][$deliveryFo] =

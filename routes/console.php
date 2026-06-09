@@ -70,6 +70,18 @@ if (filter_var(env('OZON_STORAGE_SCHEDULE', false), FILTER_VALIDATE_BOOLEAN)) {
         ->name('ozon.sync-storage-cost');
 }
 
+// Авто-обновление тарифов складов WB (КС). Между ручными синками КС
+// замораживается (например, Электросталь оставалась 160% после поднятия WB до 180%),
+// поэтому раз в сутки освежаем box-тарифы + inventory-коэффициенты и пересобираем кэш.
+// Нагрузка минимальна (~2 запроса на интеграцию). Отключается через WB_TARIFF_SCHEDULE=false.
+if (filter_var(env('WB_TARIFF_SCHEDULE', true), FILTER_VALIDATE_BOOLEAN)) {
+    \Illuminate\Support\Facades\Schedule::command('wb:refresh-tariffs')
+        ->dailyAt('05:30')
+        ->withoutOverlapping()
+        ->appendOutputTo(storage_path('logs/wb-tariff-refresh.log'))
+        ->name('wb.refresh-tariffs');
+}
+
 // Sanity-check unit_economics_cache запускается через системный cron
 // (/etc/cron.d/ue-sanity-check) — не через Laravel scheduler, потому что
 // schedule:run на этом сервере не настроен. См. `php artisan ue:sanity-check`.

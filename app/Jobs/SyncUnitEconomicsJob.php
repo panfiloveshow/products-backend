@@ -3,7 +3,7 @@
 namespace App\Jobs;
 
 use App\Models\Integration;
-use App\Models\WildberriesTariffSnapshot;
+use App\Services\Wildberries\WildberriesTariffRefresher;
 use App\Services\UnitEconomicsService;
 use App\Domains\Marketplace\MarketplaceFactory;
 use Illuminate\Bus\Queueable;
@@ -155,56 +155,8 @@ class SyncUnitEconomicsJob implements ShouldQueue
 
     private function syncWildberriesTariffSnapshots(Integration $integration): void
     {
-        // Резолв с Sellico-фолбэком: у части WB-интеграций api_key хранится в Sellico,
-        // а не локально. Без фолбэка box-тарифы (КС) для них не синкались → КС=100%.
-        $credentials = $integration->resolveCredentials();
-        if (empty($credentials['api_key'] ?? null)) {
-            return;
-        }
-
-        try {
-            $marketplace = MarketplaceFactory::create('wildberries', $credentials, $integration);
-            if (! method_exists($marketplace, 'getTariffSnapshots')) {
-                return;
-            }
-
-            $snapshots = $marketplace->getTariffSnapshots(now()->format('Y-m-d'));
-            $rows = [];
-            foreach ($snapshots as $snapshot) {
-                $rows[] = [
-                    'integration_id' => $integration->id,
-                    'marketplace' => 'wildberries',
-                    'tariff_type' => $snapshot['tariff_type'] ?? 'unknown',
-                    'effective_date' => $snapshot['effective_date'] ?? null,
-                    'warehouse_id' => (string) ($snapshot['warehouse_id'] ?? ''),
-                    'warehouse_name' => $snapshot['warehouse_name'] ?? null,
-                    'subject_id' => (string) ($snapshot['subject_id'] ?? ''),
-                    'subject_name' => $snapshot['subject_name'] ?? null,
-                    'scheme' => (string) ($snapshot['scheme'] ?? ''),
-                    'payload' => json_encode($snapshot['payload'] ?? [], JSON_UNESCAPED_UNICODE),
-                    'fetched_at' => $snapshot['fetched_at'] ?? now(),
-                    'created_at' => now(),
-                    'updated_at' => now(),
-                ];
-            }
-
-            foreach (array_chunk($rows, 500) as $chunk) {
-                WildberriesTariffSnapshot::upsert(
-                    $chunk,
-                    ['integration_id', 'tariff_type', 'effective_date', 'warehouse_id', 'subject_id', 'scheme'],
-                    ['marketplace', 'warehouse_name', 'subject_name', 'payload', 'fetched_at', 'updated_at']
-                );
-            }
-
-            Log::info('SyncUnitEconomicsJob: WB tariff snapshots synced', [
-                'integration_id' => $integration->id,
-                'count' => count($rows),
-            ]);
-        } catch (\Throwable $e) {
-            Log::warning('SyncUnitEconomicsJob: failed to sync WB tariff snapshots', [
-                'integration_id' => $integration->id,
-                'error' => $e->getMessage(),
-            ]);
-        }
+        // Канонический upsert тарифных снапшотов вынесен в WildberriesTariffRefresher,
+        // чтобы ручной синк (здесь) и плановый wb:refresh-tariffs не расходились.
+        app(WildberriesTariffRefresher::class)->refreshSnapshots($integration);
     }
 }
