@@ -350,14 +350,7 @@ Route::prefix('unit-economics')->middleware('sellico.permission')->group(functio
     Route::put('/settings/{sku}', [UnitEconomicsCacheController::class, 'updateSettings'])
         ->where('sku', '.*')
         ->name('unit-economics.settings.update');
-    Route::post('/wildberries/indexes/import', [UnitEconomicsCacheController::class, 'importWildberriesIndexes'])
-        ->name('unit-economics.wildberries.indexes.import');
 
-    // Recalculate — закрываем IDOR: middleware проверяет доступ к integrationId
-    // до вызова контроллера (раньше любой мог запустить пересчёт чужой интеграции).
-    Route::post('/recalculate/{integrationId}', [UnitEconomicsCacheController::class, 'recalculate'])
-        ->middleware('integration.access')
-        ->name('unit-economics.recalculate');
     Route::get('/cache-stats/{integrationId}', [UnitEconomicsCacheController::class, 'cacheStats'])
         ->middleware('integration.access')
         ->name('unit-economics.cache-stats');

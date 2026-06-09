@@ -18,73 +18,6 @@ use Tests\TestCase;
 
 class UnitEconomicsCacheControllerTest extends TestCase
 {
-    public function test_wildberries_indexes_import_parser_handles_realistic_detail_headers(): void
-    {
-        $controller = new UnitEconomicsCacheController(
-            $this->createMock(UnitEconomicsCacheService::class),
-            $this->createMock(UnitEconomicsService::class),
-            $this->createMock(UnitEconomicsOrchestrator::class),
-            $this->createMock(IntegrationAccessService::class),
-        );
-
-        $spreadsheet = new Spreadsheet();
-        $sheet = $spreadsheet->getActiveSheet();
-        $sheet->fromArray([
-            ['Кол-во заказов, шт', 'Коэфф. территориального распределения', 'КРП, %'],
-            [100, '110%', '1,15%'],
-            [50, '0,80', '0,00%'],
-        ]);
-
-        $path = tempnam(sys_get_temp_dir(), 'wb-indexes-').'.xlsx';
-        (new Xlsx($spreadsheet))->save($path);
-
-        $method = new \ReflectionMethod(UnitEconomicsCacheController::class, 'parseWildberriesIndexesSpreadsheet');
-        $method->setAccessible(true);
-
-        try {
-            $result = $method->invoke($controller, new UploadedFile($path, 'wb-indexes.xlsx', null, null, true));
-        } finally {
-            @unlink($path);
-        }
-
-        $this->assertSame(1.0, $result['localization_index']);
-        $this->assertSame(0.7667, $result['sales_distribution_index']);
-        $this->assertSame('excel_detail_weighted', $result['source']);
-    }
-
-    public function test_wildberries_indexes_import_parser_handles_current_value_labels(): void
-    {
-        $controller = new UnitEconomicsCacheController(
-            $this->createMock(UnitEconomicsCacheService::class),
-            $this->createMock(UnitEconomicsService::class),
-            $this->createMock(UnitEconomicsOrchestrator::class),
-            $this->createMock(IntegrationAccessService::class),
-        );
-
-        $spreadsheet = new Spreadsheet();
-        $sheet = $spreadsheet->getActiveSheet();
-        $sheet->fromArray([
-            ['Текущий ИЛ', '0,92'],
-            ['Значение ИРП', '1,15%'],
-        ]);
-
-        $path = tempnam(sys_get_temp_dir(), 'wb-index-labels-').'.xlsx';
-        (new Xlsx($spreadsheet))->save($path);
-
-        $method = new \ReflectionMethod(UnitEconomicsCacheController::class, 'parseWildberriesIndexesSpreadsheet');
-        $method->setAccessible(true);
-
-        try {
-            $result = $method->invoke($controller, new UploadedFile($path, 'wb-index-labels.xlsx', null, null, true));
-        } finally {
-            @unlink($path);
-        }
-
-        $this->assertSame(0.92, $result['localization_index']);
-        $this->assertSame(1.15, $result['sales_distribution_index']);
-        $this->assertSame('excel_label', $result['source']);
-    }
-
     public function test_wildberries_commissions_static_fallback_is_marked_deprecated(): void
     {
         $controller = new UnitEconomicsCacheController(
@@ -593,7 +526,7 @@ class UnitEconomicsCacheControllerTest extends TestCase
         $this->assertSame('', (string) $sheet->getCell('AG4')->getValue());
     }
 
-    public function test_excel_export_wildberries_finance_formulas_include_spp_and_storage_like_screen(): void
+    public function test_excel_export_wildberries_mirrors_web_layout_with_live_formulas(): void
     {
         $controller = new UnitEconomicsCacheController(
             $this->createMock(UnitEconomicsCacheService::class),
@@ -625,9 +558,21 @@ class UnitEconomicsCacheControllerTest extends TestCase
 
         $sheet = $spreadsheet->getActiveSheet();
 
-        $this->assertSame(70.0, $sheet->getCell('AN5')->getValue());
-        $this->assertSame('=D5+J5+M5+O5+AN5+(C5*P5/100)+(C5*Q5/100)+(C5*S5/100)', $sheet->getCell('AA5')->getValue());
-        $this->assertSame('=C5-J5-M5-O5-AN5-(C5*P5/100)-(C5*Q5/100)-(C5*S5/100)', $sheet->getCell('AE5')->getValue());
+        // Заголовки в веб-порядке (новая WB-раскладка)
+        $this->assertSame('Цена покупателя, ₽', $sheet->getCell('H4')->getValue());
+        $this->assertSame('СПП, %', $sheet->getCell('J4')->getValue());
+        $this->assertSame('Чистая прибыль, ₽', $sheet->getCell('AG4')->getValue());
+        $this->assertSame('Цена для цели, ₽', $sheet->getCell('AI4')->getValue());
+
+        // Значения
+        $this->assertSame(1000.0, $sheet->getCell('F5')->getValue());
+        $this->assertSame(7.0, $sheet->getCell('J5')->getValue());
+        $this->assertSame(20, $sheet->getCell('E3')->getValue()); // целевая маржа для «Цены для цели»
+
+        // Живые формулы. СПП НЕ вычитается из «На р/с» (его финансирует WB).
+        $this->assertSame('=F5-(F5*I5/100)-S5-T5-(F5*U5/100)-Z5-AB5', $sheet->getCell('X5')->getValue());
+        $this->assertSame('=X5-E5', $sheet->getCell('AG5')->getValue());
+        $this->assertSame('=IF(F5>0,AG5/F5*100,0)', $sheet->getCell('AH5')->getValue());
     }
 
     public function test_excel_export_headers_include_version_format_and_source_contract(): void

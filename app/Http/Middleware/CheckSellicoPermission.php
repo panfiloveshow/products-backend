@@ -60,8 +60,6 @@ class CheckSellicoPermission
         'unit-economics.calculate'         => 'unit_economics.calculate',
         'unit-economics.settings.update'   => 'unit_economics.settings.edit',
         'unit-economics.settings.bulk'     => 'unit_economics.settings.edit',
-        'unit-economics.wildberries.indexes.import' => 'unit_economics.settings.edit',
-        'unit-economics.recalculate'       => 'unit_economics.recalculate',
         'unit-economics.stats'             => 'unit_economics.stats.view',
         'unit-economics.stats.marketplace' => 'unit_economics.stats.view',
         'unit-economics.comparison'        => 'unit_economics.stats.view',
