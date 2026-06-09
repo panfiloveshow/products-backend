@@ -1256,7 +1256,10 @@ class UnitEconomicsCacheController extends Controller
             'AQ' => ['header' => 'Источник наценки',      'width' => 20, 'field' => 'non_local_markup_source',  'format' => '@'],
         ];
         $isWildberriesExport = $marketplace === 'wildberries';
-        if (! $isWildberriesExport) {
+        if ($isWildberriesExport) {
+            // WB-экспорт: колонки и порядок 1:1 с веб-таблицей WB-юнит-экономики.
+            $columns = $this->wildberriesExportColumns();
+        } else {
             // Ozon export: не показываем WB-специфичные столбцы.
             foreach (['AG', 'AH', 'AI', 'AJ', 'AK', 'AL', 'AM', 'AN', 'AO', 'AP', 'AQ'] as $wbColumn) {
                 unset($columns[$wbColumn]);
@@ -1270,11 +1273,17 @@ class UnitEconomicsCacheController extends Controller
         }
 
         // ── Группировка колонок (outline) — можно сворачивать/разворачивать в Excel ──
-        $collapsibleGroups = [
-            ['I', 'J'],   // Комиссия (% + ₽)
-            ['P', 'T'],   // Проценты прочих сборов
-            ['V', 'X'],   // Деталь локальности и наценки
-        ];
+        $collapsibleGroups = $isWildberriesExport
+            ? [
+                ['J', 'K'],   // СПП (% + ₽)
+                ['L', 'N'],   // КС / ИЛ / ИРП
+                ['P', 'T'],   // Возвраты / логистика / хранение
+            ]
+            : [
+                ['I', 'J'],   // Комиссия (% + ₽)
+                ['P', 'T'],   // Проценты прочих сборов
+                ['V', 'X'],   // Деталь локальности и наценки
+            ];
         foreach ($collapsibleGroups as [$from, $to]) {
             $fromIndex = \PhpOffice\PhpSpreadsheet\Cell\Coordinate::columnIndexFromString($from);
             $toIndex = \PhpOffice\PhpSpreadsheet\Cell\Coordinate::columnIndexFromString($to);
@@ -1361,20 +1370,45 @@ class UnitEconomicsCacheController extends Controller
         // Автофильтр
         $sheet->setAutoFilter("A{$headerRow}:{$lastCol}{$headerRow}");
 
+        // WB: редактируемая ячейка целевой маржи для колонки «Цена для цели» (формула AI ссылается на $E$3).
+        if ($isWildberriesExport) {
+            $sheet->setCellValue('A3', 'Целевая маржа для «Цены для цели», %:');
+            $sheet->mergeCells('A3:D3');
+            $sheet->getStyle('A3')->applyFromArray([
+                'font' => ['bold' => true, 'size' => 9, 'color' => ['rgb' => '6b7280']],
+                'alignment' => ['horizontal' => Alignment::HORIZONTAL_RIGHT, 'vertical' => Alignment::VERTICAL_CENTER],
+            ]);
+            $sheet->setCellValue('E3', 20);
+            $sheet->getStyle('E3')->getNumberFormat()->setFormatCode('0"%"');
+            $sheet->getStyle('E3')->applyFromArray([
+                'font' => ['bold' => true],
+                'fill' => ['fillType' => Fill::FILL_SOLID, 'startColor' => ['rgb' => 'fef3c7']],
+                'alignment' => ['horizontal' => Alignment::HORIZONTAL_CENTER, 'vertical' => Alignment::VERTICAL_CENTER],
+            ]);
+            $sheet->getRowDimension(3)->setRowHeight(18);
+        }
+
         // ── Row 5+: Данные ──
         $dataStartRow = 5;
         $currentRow = $dataStartRow;
 
         // Текстовые колонки (формат '@')
-        $textColumns = array_values(array_intersect(['A', 'B', 'U', 'X', 'Z', 'AQ'], array_keys($columns)));
+        $textColumns = $isWildberriesExport
+            ? ['A', 'B', 'C']
+            : array_values(array_intersect(['A', 'B', 'U', 'X', 'Z', 'AQ'], array_keys($columns)));
         // Колонки, которые должны отображаться пустыми при null (а не как 0)
-        $nullableNumericColumns = array_values(array_intersect(['V', 'AF'], array_keys($columns)));
+        $nullableNumericColumns = $isWildberriesExport
+            ? []
+            : array_values(array_intersect(['V', 'AF'], array_keys($columns)));
 
         foreach ($items as $item) {
             $isEvenRow = ($currentRow - $dataStartRow) % 2 === 1;
             $isLowConfidence = strtolower((string) ($item['calculation_confidence'] ?? '')) === 'low';
             $isInPromotion = (bool) ($item['is_in_promotion'] ?? false);
 
+            if ($isWildberriesExport) {
+                $this->writeWildberriesExportRow($sheet, $currentRow, $item);
+            } else {
             foreach ($columns as $col => $def) {
                 $field = $def['field'];
 
@@ -1451,6 +1485,7 @@ class UnitEconomicsCacheController extends Controller
                     $sheet->setCellValue("{$col}{$currentRow}", (float) ($item[$field] ?? 0));
                 }
             }
+            }
 
             // Приоритет заливки: low-confidence > акция > чередование
             if ($isLowConfidence) {
@@ -1479,9 +1514,14 @@ class UnitEconomicsCacheController extends Controller
                 ]);
             }
 
-            // Маркер акции: левый синий бордер на колонке C (Цена)
+            // Колонки цены/прибыли/маржи различаются между Ozon- и WB-раскладкой.
+            $priceCol = $isWildberriesExport ? 'F' : 'C';
+            $profitCol = $isWildberriesExport ? 'AG' : 'AB';
+            $marginCol = $isWildberriesExport ? 'AH' : 'AC';
+
+            // Маркер акции: левый синий бордер на колонке цены
             if ($isInPromotion) {
-                $sheet->getStyle("C{$currentRow}")->applyFromArray([
+                $sheet->getStyle("{$priceCol}{$currentRow}")->applyFromArray([
                     'borders' => [
                         'left' => [
                             'borderStyle' => Border::BORDER_THICK,
@@ -1513,18 +1553,18 @@ class UnitEconomicsCacheController extends Controller
                 }
             }
 
-            // Красный цвет для отрицательной прибыли (AB)
+            // Красный цвет для отрицательной прибыли
             $netProfit = (float) ($item['net_profit'] ?? 0);
             if ($netProfit < 0) {
-                $sheet->getStyle("AB{$currentRow}")->applyFromArray([
+                $sheet->getStyle("{$profitCol}{$currentRow}")->applyFromArray([
                     'font' => ['color' => ['rgb' => 'dc2626']],
                 ]);
             }
 
-            // Красный цвет для отрицательной маржи (AC)
+            // Красный цвет для отрицательной маржи
             $marginPercent = (float) ($item['margin_percent'] ?? 0);
             if ($marginPercent < 0) {
-                $sheet->getStyle("AC{$currentRow}")->applyFromArray([
+                $sheet->getStyle("{$marginCol}{$currentRow}")->applyFromArray([
                     'font' => ['color' => ['rgb' => 'dc2626']],
                 ]);
             }
@@ -1549,7 +1589,9 @@ class UnitEconomicsCacheController extends Controller
 
         // SUM формулы для денежных колонок и количеств
         $sumCols = array_values(array_intersect(
-            ['C', 'F', 'G', 'J', 'K', 'L', 'M', 'N', 'O', 'AA', 'AB', 'AE', 'AH', 'AJ', 'AN', 'AO'],
+            $isWildberriesExport
+                ? ['E', 'F', 'K', 'O', 'P', 'R', 'S', 'T', 'V', 'X', 'Z', 'AB', 'AD', 'AF', 'AG']
+                : ['C', 'F', 'G', 'J', 'K', 'L', 'M', 'N', 'O', 'AA', 'AB', 'AE', 'AH', 'AJ', 'AN', 'AO'],
             array_keys($columns)
         ));
         foreach ($sumCols as $col) {
@@ -1562,7 +1604,9 @@ class UnitEconomicsCacheController extends Controller
 
         // AVERAGE формулы для процентных/относительных колонок
         $avgCols = array_values(array_intersect(
-            ['E', 'H', 'I', 'P', 'Q', 'R', 'S', 'T', 'V', 'W', 'Y', 'AC', 'AD', 'AF', 'AG', 'AI', 'AK', 'AM', 'AP'],
+            $isWildberriesExport
+                ? ['D', 'G', 'H', 'I', 'J', 'L', 'M', 'N', 'Q', 'U', 'W', 'Y', 'AA', 'AC', 'AE', 'AH', 'AI']
+                : ['E', 'H', 'I', 'P', 'Q', 'R', 'S', 'T', 'V', 'W', 'Y', 'AC', 'AD', 'AF', 'AG', 'AI', 'AK', 'AM', 'AP'],
             array_keys($columns)
         ));
         foreach ($avgCols as $col) {
@@ -1613,6 +1657,111 @@ class UnitEconomicsCacheController extends Controller
         $this->writeExportTemplateMarker($spreadsheet);
 
         return $spreadsheet;
+    }
+
+    /**
+     * Колонки Excel-экспорта WB — порядок и набор 1:1 с веб-таблицей WB-юнит-экономики.
+     *
+     * @return array<string, array{header:string,width:int,field:string,format:string}>
+     */
+    private function wildberriesExportColumns(): array
+    {
+        $money = '#,##0.00 "₽"';
+        $pct = '0.00"%"';
+
+        return [
+            'A'  => ['header' => 'Артикул',            'width' => 15, 'field' => 'sku',                       'format' => '@'],
+            'B'  => ['header' => 'Наименование',       'width' => 38, 'field' => 'product_name',              'format' => '@'],
+            'C'  => ['header' => 'Схема',              'width' => 8,  'field' => 'scheme',                    'format' => '@'],
+            'D'  => ['header' => 'Объём, л',           'width' => 9,  'field' => 'volume_liters',             'format' => '0.000'],
+            'E'  => ['header' => 'Себестоимость, ₽',   'width' => 14, 'field' => 'cost_price',                'format' => $money],
+            'F'  => ['header' => 'Действующая цена, ₽','width' => 15, 'field' => 'price',                     'format' => $money],
+            'G'  => ['header' => 'Наценка, x',         'width' => 10, 'field' => 'markup_percent',            'format' => '0.00'],
+            'H'  => ['header' => 'Цена покупателя, ₽', 'width' => 15, 'field' => 'customer_price',            'format' => $money],
+            'I'  => ['header' => 'Комиссия, %',        'width' => 11, 'field' => 'commission_percent',        'format' => $pct],
+            'J'  => ['header' => 'СПП, %',             'width' => 9,  'field' => 'spp_percent',               'format' => $pct],
+            'K'  => ['header' => 'СПП, ₽',             'width' => 10, 'field' => 'spp_amount',                'format' => $money],
+            'L'  => ['header' => 'КС, %',              'width' => 9,  'field' => 'warehouse_coef_percent',    'format' => $pct],
+            'M'  => ['header' => 'ИЛ',                 'width' => 8,  'field' => 'localization_index',        'format' => '0.00'],
+            'N'  => ['header' => 'ИРП, %',             'width' => 9,  'field' => 'sales_distribution_index',  'format' => $pct],
+            'O'  => ['header' => 'Логистика, ₽',       'width' => 12, 'field' => 'logistics_cost',            'format' => $money],
+            'P'  => ['header' => 'Обр. логистика, ₽',  'width' => 14, 'field' => 'return_logistics',          'format' => $money],
+            'Q'  => ['header' => '% выкупа',           'width' => 10, 'field' => 'redemption_rate',           'format' => $pct],
+            'R'  => ['header' => 'Ожид. возвраты, ₽',  'width' => 15, 'field' => 'expected_return_cost',      'format' => $money],
+            'S'  => ['header' => 'Эфф. логистика, ₽',  'width' => 15, 'field' => 'effective_logistics',       'format' => $money],
+            'T'  => ['header' => 'Хранение, ₽',        'width' => 12, 'field' => 'storage_cost',              'format' => $money],
+            'U'  => ['header' => 'Эквайринг, %',       'width' => 12, 'field' => 'acquiring_percent',         'format' => $pct],
+            'V'  => ['header' => 'Эквайринг, ₽',       'width' => 12, 'field' => 'acquiring_amount',          'format' => $money],
+            'W'  => ['header' => 'Всего затрат, %',    'width' => 13, 'field' => 'total_expenses_percent',    'format' => $pct],
+            'X'  => ['header' => 'На р/с, ₽',          'width' => 12, 'field' => 'to_settlement_account',     'format' => $money],
+            'Y'  => ['header' => 'ДРР, %',             'width' => 9,  'field' => 'drr_percent',               'format' => $pct],
+            'Z'  => ['header' => 'ДРР, ₽',             'width' => 10, 'field' => 'drr_amount',                'format' => $money],
+            'AA' => ['header' => 'Налог, %',           'width' => 9,  'field' => 'tax_percent',               'format' => $pct],
+            'AB' => ['header' => 'Налог, ₽',           'width' => 10, 'field' => 'tax_amount',                'format' => $money],
+            'AC' => ['header' => 'НДС, %',             'width' => 8,  'field' => 'vat_percent',               'format' => $pct],
+            'AD' => ['header' => 'НДС, ₽',             'width' => 10, 'field' => 'vat_amount',                'format' => $money],
+            'AE' => ['header' => 'Наша часть, %',      'width' => 12, 'field' => 'our_share_percent',         'format' => $pct],
+            'AF' => ['header' => 'Наша часть, ₽',      'width' => 12, 'field' => 'our_share_amount',          'format' => $money],
+            'AG' => ['header' => 'Чистая прибыль, ₽',  'width' => 14, 'field' => 'net_profit',                'format' => $money],
+            'AH' => ['header' => 'Маржа, %',           'width' => 10, 'field' => 'margin_percent',            'format' => $pct],
+            'AI' => ['header' => 'Цена для цели, ₽',   'width' => 14, 'field' => 'target_price',              'format' => $money],
+        ];
+    }
+
+    /**
+     * Запись строки WB-экспорта: статичные значения + живые Excel-формулы для
+     * вычисляемых ячеек (наценка, эквайринг ₽, всего %, на р/с, ДРР/налог/НДС ₽,
+     * наша часть ₽, прибыль, маржа, цена для цели). Раскладка — wildberriesExportColumns().
+     * СПП в прибыль не входит (его финансирует WB) — как в вебе и на сервере.
+     * «Цена для цели» использует целевую маржу из редактируемой ячейки $E$3.
+     */
+    private function writeWildberriesExportRow($sheet, int $r, array $item): void
+    {
+        $num = static fn ($key) => (float) ($item[$key] ?? 0);
+        $scheme = strtoupper((string) ($item['scheme_info']['code'] ?? $item['fulfillment_type'] ?? $item['scheme'] ?? 'FBW'));
+
+        // Статичные значения (источник — рассчитанные поля строки).
+        $sheet->setCellValue("A{$r}", $this->resolveDisplayArticle($item));
+        $sheet->setCellValue("B{$r}", (string) ($item['product_name'] ?? $item['name'] ?? ''));
+        $sheet->setCellValue("C{$r}", $scheme);
+        $sheet->setCellValue("D{$r}", $num('volume_liters'));
+        $sheet->setCellValue("E{$r}", $num('cost_price'));
+        $sheet->setCellValue("F{$r}", $num('price'));
+        $sheet->setCellValue("H{$r}", $num('customer_price'));
+        $sheet->setCellValue("I{$r}", $num('commission_percent'));
+        $sheet->setCellValue("J{$r}", $num('spp_percent'));
+        $sheet->setCellValue("K{$r}", $num('spp_amount'));
+        $sheet->setCellValue("L{$r}", $num('warehouse_coef_percent'));
+        $sheet->setCellValue("M{$r}", (float) ($item['localization_index'] ?? 1));
+        $sheet->setCellValue("N{$r}", $num('sales_distribution_index'));
+        $sheet->setCellValue("O{$r}", $num('logistics_cost'));
+        $sheet->setCellValue("P{$r}", (float) ($item['return_logistics'] ?? $item['return_logistics_cost'] ?? 0));
+        $sheet->setCellValue("Q{$r}", $num('redemption_rate'));
+        $sheet->setCellValue("R{$r}", $num('expected_return_cost'));
+        $sheet->setCellValue("S{$r}", (float) ($item['effective_logistics'] ?? $item['logistics_cost'] ?? 0));
+        $sheet->setCellValue("T{$r}", $num('storage_cost'));
+        $sheet->setCellValue("U{$r}", (float) ($item['acquiring_percent'] ?? 0));
+        $sheet->setCellValue("Y{$r}", $num('drr_percent'));
+        $sheet->setCellValue("AA{$r}", $num('tax_percent'));
+        $sheet->setCellValue("AC{$r}", $num('vat_percent'));
+        $sheet->setCellValue("AE{$r}", $num('our_share_percent'));
+
+        // Живые формулы (пересчитываются при ручной правке в Excel).
+        $sheet->setCellValue("G{$r}",  "=IF(E{$r}>0,F{$r}/E{$r},0)");
+        $sheet->setCellValue("V{$r}",  "=F{$r}*U{$r}/100");
+        $sheet->setCellValue("W{$r}",  "=IF(F{$r}>0,(F{$r}*I{$r}/100+S{$r}+T{$r}+F{$r}*U{$r}/100)/F{$r}*100,0)");
+        $sheet->setCellValue("X{$r}",  "=F{$r}-(F{$r}*I{$r}/100)-S{$r}-T{$r}-(F{$r}*U{$r}/100)-Z{$r}-AB{$r}");
+        $sheet->setCellValue("Z{$r}",  "=F{$r}*Y{$r}/100");
+        $sheet->setCellValue("AB{$r}", "=F{$r}*AA{$r}/100");
+        $sheet->setCellValue("AD{$r}", "=F{$r}*AC{$r}/100");
+        $sheet->setCellValue("AF{$r}", "=AG{$r}*AE{$r}/100");
+        $sheet->setCellValue("AG{$r}", "=X{$r}-E{$r}");
+        $sheet->setCellValue("AH{$r}", "=IF(F{$r}>0,AG{$r}/F{$r}*100,0)");
+        $sheet->setCellValue(
+            "AI{$r}",
+            "=IF((1-(I{$r}+U{$r}+Y{$r}+AA{$r})/100-\$E\$3/100)>0,"
+            . "(S{$r}+T{$r}+E{$r})/(1-(I{$r}+U{$r}+Y{$r}+AA{$r})/100-\$E\$3/100),\"\")"
+        );
     }
 
     /**
@@ -1678,15 +1827,20 @@ class UnitEconomicsCacheController extends Controller
             $vatAmount = $isWildberriesExport ? 0.0 : $price * $vatPercent / 100;
             $drrAmount = $price * $drrPercent / 100;
             $ourShareAmount = $isWildberriesExport ? 0.0 : $price * $ourSharePercent / 100;
-            $sppAmount = $isWildberriesExport ? $price * $sppPercent / 100 : 0.0;
+            // СПП на WB финансирует маркетплейс — он информационный и НЕ входит в прибыль.
+            // СПП ₽ = серверное значение (цена до СПП − цена покупателя), как в вебе.
+            $sppAmountDisplay = $isWildberriesExport
+                ? (float) ($item['spp_amount']
+                    ?? max(0.0, ((float) ($item['old_price'] ?? $price)) - (float) ($item['customer_price'] ?? $price)))
+                : 0.0;
 
             $toSettlement = $price - $commissionAmount - $effectiveLogistics
                 - $acquiringAmount - $taxAmount - $vatAmount
-                - $ourShareAmount - $drrAmount - $storageCost - $sppAmount;
+                - $ourShareAmount - $drrAmount - $storageCost;
             $netProfit = $toSettlement - $costPrice;
             $totalCosts = $costPrice + $commissionAmount + $effectiveLogistics
                 + $acquiringAmount + $taxAmount + $vatAmount
-                + $ourShareAmount + $drrAmount + $storageCost + $sppAmount;
+                + $ourShareAmount + $drrAmount + $storageCost;
 
             $item['commission_amount'] = round($commissionAmount, 2);
             $item['acquiring_amount'] = round($acquiringAmount, 2);
@@ -1694,7 +1848,7 @@ class UnitEconomicsCacheController extends Controller
             $item['vat_amount'] = round($vatAmount, 2);
             $item['drr_amount'] = round($drrAmount, 2);
             $item['our_share_amount'] = round($ourShareAmount, 2);
-            $item['spp_amount'] = round($sppAmount, 2);
+            $item['spp_amount'] = round($sppAmountDisplay, 2);
             $item['total_costs'] = round($totalCosts, 2);
             $item['to_settlement_account'] = round($toSettlement, 2);
             $item['net_profit'] = round($netProfit, 2);
