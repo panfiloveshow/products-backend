@@ -842,9 +842,17 @@ class SyncUnitEconomicsCommand extends Command
                         }
                     }
 
+                    // Авторитетный % выкупа из воронки продаж WB (как в ЛК). Приоритетнее
+                    // трейлингового sales/orders, которое ломается из-за лага выкупа
+                    // (свежие заказы ещё не выкуплены → 0%).
+                    $wbFunnelBuyout = $wbService->getBuyoutStatsByNmId(30);
+                    if (! empty($wbFunnelBuyout)) {
+                        $this->info('  WB Выкуп (воронка): получено для '.count($wbFunnelBuyout).' товаров');
+                    }
+
                     $wbRedemptionData = $wbService->getRedemptionStatsByNmId(30);
                     if (! empty($wbRedemptionData)) {
-                        $this->info('  WB Выкуп: получено для '.count($wbRedemptionData).' товаров');
+                        $this->info('  WB Выкуп (sales/orders): получено для '.count($wbRedemptionData).' товаров');
                     }
                     // Ручной % выкупа из интеграции
                     $manualRedemptionRate = $integration?->manual_redemption_rate ?? null;
