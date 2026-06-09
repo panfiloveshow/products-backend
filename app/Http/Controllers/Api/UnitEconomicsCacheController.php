@@ -1462,10 +1462,10 @@ class UnitEconomicsCacheController extends Controller
             $drrAmount = $price * $drrPercent / 100;
             $ourShareAmount = $isWildberriesExport ? 0.0 : $price * $ourSharePercent / 100;
             // СПП на WB финансирует маркетплейс — он информационный и НЕ входит в прибыль.
-            // СПП ₽ = серверное значение (цена до СПП − цена покупателя), как в вебе.
+            // СПП ₽ = действующая цена − цена покупателя (СПП считается от действующей цены).
             $sppAmountDisplay = $isWildberriesExport
                 ? (float) ($item['spp_amount']
-                    ?? max(0.0, ((float) ($item['old_price'] ?? $price)) - (float) ($item['customer_price'] ?? $price)))
+                    ?? max(0.0, $price - (float) ($item['customer_price'] ?? $price)))
                 : 0.0;
 
             $toSettlement = $price - $commissionAmount - $effectiveLogistics
@@ -2802,17 +2802,32 @@ class UnitEconomicsCacheController extends Controller
             // marketplace_data кэша (туда синк кладёт витринный/фактический СПП) > 0.
             // Без marketplace_data СПП всегда 0: wb_data это поле не содержит, а
             // колонки spp_percent в unit_economics_cache нет.
-            $sppPercent = (float) ($settings?->spp_percent ?? $wbData['spp_percent'] ?? $marketplaceData['spp_percent'] ?? $cache->spp_percent ?? 0);
-            $data['spp_percent'] = $sppPercent;
-
             // СПП на WB финансирует маркетплейс — он информационный и НЕ уменьшает
             // выручку/комиссию/сумму к перечислению (они считаются от действующей цены).
-            // Цена покупателя (что реально платит покупатель) = цена до СПП (old_price =
-            // зачёркнутая = card.wb.ru basic, от неё и измерен СПП) × (1 - СПП%).
-            $sppBasePrice = max(0.0, (float) ($cache->old_price ?: $price));
-            $customerPrice = $sppBasePrice > 0 ? $sppBasePrice * (1 - $sppPercent / 100) : $price;
+            //
+            // СПП показываем как процент от ДЕЙСТВУЮЩЕЙ цены (а не от зачёркнутой), чтобы
+            // выполнялась формула «Цена покупателя = Действующая цена × (1 − СПП/100)».
+            // Реальная цена покупателя сохраняется: для авто-СПП (витринный из card.wb.ru,
+            // измерен от зачёркнутой) сначала получаем цену покупателя, затем переводим
+            // процент к действующей цене. Ручной СПП трактуем как процент от действующей.
+            $rawSppPercent = (float) ($settings?->spp_percent ?? $wbData['spp_percent'] ?? $marketplaceData['spp_percent'] ?? $cache->spp_percent ?? 0);
+            $manualSpp = $settings?->spp_percent;
+
+            if ($manualSpp !== null && $manualSpp !== '') {
+                $sppPercent = max(0.0, (float) $manualSpp);
+                $customerPrice = $price * (1 - $sppPercent / 100);
+            } else {
+                $sppBasePrice = max(0.0, (float) ($cache->old_price ?: $price));
+                $buyerPrice = $sppBasePrice > 0 ? $sppBasePrice * (1 - $rawSppPercent / 100) : $price;
+                $sppPercent = $price > 0 ? max(0.0, (1 - $buyerPrice / $price) * 100) : 0.0;
+                // Инвариант: цена покупателя = действующая × (1 − СПП/100). Для штатного
+                // случая (цена покупателя < действующей) это и есть реальная цена покупателя.
+                $customerPrice = $price * (1 - $sppPercent / 100);
+            }
+
+            $data['spp_percent'] = round($sppPercent, 2);
             $data['customer_price'] = round($customerPrice, 2);
-            $data['spp_amount'] = round(max(0.0, $sppBasePrice - $customerPrice), 2);
+            $data['spp_amount'] = round(max(0.0, $price - $customerPrice), 2);
 
             // Наценка, x = цена / себестоимость
             $data['markup_multiplier'] = $costPrice > 0 ? round($price / $costPrice, 2) : 0;
