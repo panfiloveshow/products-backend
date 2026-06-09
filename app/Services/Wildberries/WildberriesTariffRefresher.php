@@ -103,34 +103,64 @@ class WildberriesTariffRefresher
 
     /**
      * Обновить inventory_warehouses.warehouse_coefficient свежими КС из box-тарифов.
-     * Именно эта колонка питает число КС на странице юнит-экономики.
+     * Именно эта колонка питает число КС на странице юнит-экономики
+     * (getAverageWarehouseCoefficient в UnitEconomicsCacheService).
+     *
+     * КС берём из getWarehouseCoefficients() (карта «склад → коэффициент» из
+     * /api/v1/tariffs/box) и матчим к строкам остатков по имени склада, т.к.
+     * getInventory() поле warehouse_coefficient не отдаёт.
      *
      * @return int Количество обновлённых строк inventory_warehouses
      */
     public function refreshInventoryCoefficients(Integration $integration, ?object $marketplace = null): int
     {
         $marketplace ??= $this->resolveMarketplace($integration);
-        if (! $marketplace || ! method_exists($marketplace, 'getInventory')) {
+        if (! $marketplace || ! method_exists($marketplace, 'getWarehouseCoefficients')) {
             return 0;
         }
 
         try {
-            $inventory = $marketplace->getInventory();
+            $coefMap = $marketplace->getWarehouseCoefficients();
+            if (empty($coefMap)) {
+                return 0;
+            }
+
+            // Карта «ключ имени склада → КС (множитель, 1.80 = 180%)». Кладём по
+            // нижнерегистровому имени склада из box-тарифов — так совпадаем с
+            // warehouse_name в inventory_warehouses (оба приходят из WB).
+            $byName = [];
+            foreach ($coefMap as $normalized => $row) {
+                $coef = (float) ($row['delivery_coef'] ?? 0);
+                if ($coef <= 0) {
+                    continue;
+                }
+                $original = (string) ($row['warehouse_name'] ?? '');
+                if ($original !== '') {
+                    $byName[$this->nameKey($original)] = $coef;
+                }
+            }
+
+            if (empty($byName)) {
+                return 0;
+            }
+
             $updated = 0;
+            $names = InventoryWarehouse::where('integration_id', $integration->id)
+                ->where('marketplace', 'wildberries')
+                ->whereNotNull('warehouse_name')
+                ->distinct()
+                ->pluck('warehouse_name');
 
-            foreach ($inventory as $item) {
-                $sku = $item['sku'] ?? null;
-                $warehouseId = $item['warehouse_id'] ?? null;
-                $coefficient = $item['warehouse_coefficient'] ?? null;
-
-                if (! $sku || ! $warehouseId || $coefficient === null) {
+            foreach ($names as $name) {
+                $coef = $byName[$this->nameKey((string) $name)] ?? null;
+                if ($coef === null) {
                     continue;
                 }
 
-                $updated += InventoryWarehouse::where('sku', $sku)
-                    ->where('warehouse_id', $warehouseId)
-                    ->where('integration_id', $integration->id)
-                    ->update(['warehouse_coefficient' => (float) $coefficient]);
+                $updated += InventoryWarehouse::where('integration_id', $integration->id)
+                    ->where('marketplace', 'wildberries')
+                    ->where('warehouse_name', $name)
+                    ->update(['warehouse_coefficient' => $coef]);
             }
 
             Log::info('WildberriesTariffRefresher: inventory coefficients refreshed', [
@@ -147,6 +177,12 @@ class WildberriesTariffRefresher
 
             return 0;
         }
+    }
+
+    /** Ключ для сопоставления имён складов (регистронезависимо). */
+    private function nameKey(string $name): string
+    {
+        return mb_strtolower(trim($name));
     }
 
     /**
