@@ -25,6 +25,7 @@ class WildberriesTariffRefresher
 {
     /**
      * Полное обновление КС интеграции: box-снапшоты + inventory-коэффициенты.
+     * Тянет тарифы по ключу самой интеграции (для одиночного/ручного синка).
      *
      * @return array{snapshots:int, warehouses:int}
      */
@@ -38,6 +39,45 @@ class WildberriesTariffRefresher
         return [
             'snapshots' => $this->refreshSnapshots($integration, $marketplace),
             'warehouses' => $this->refreshInventoryCoefficients($integration, $marketplace),
+        ];
+    }
+
+    /**
+     * Один раз получить тарифные данные WB (снапшоты + карту КС). Тарифы WB
+     * не зависят от продавца (склад/категория — одинаковые для всех), поэтому
+     * для массового обновления тянем их ОДИН раз с любого рабочего ключа и
+     * применяем ко всем интеграциям — это и быстрее, и не упирается в 429.
+     *
+     * @return array{snapshots:array, coefMap:array}
+     */
+    public function fetchSharedTariffData(Integration $anyIntegration): array
+    {
+        $marketplace = $this->resolveMarketplace($anyIntegration);
+        if (! $marketplace) {
+            return ['snapshots' => [], 'coefMap' => []];
+        }
+
+        return [
+            'snapshots' => method_exists($marketplace, 'getTariffSnapshots')
+                ? (array) $marketplace->getTariffSnapshots(now()->format('Y-m-d'))
+                : [],
+            'coefMap' => method_exists($marketplace, 'getWarehouseCoefficients')
+                ? (array) $marketplace->getWarehouseCoefficients()
+                : [],
+        ];
+    }
+
+    /**
+     * Применить заранее полученные тарифные данные к одной интеграции
+     * (без обращения к WB API — для массового обновления).
+     *
+     * @return array{snapshots:int, warehouses:int}
+     */
+    public function applyShared(Integration $integration, array $snapshots, array $coefMap): array
+    {
+        return [
+            'snapshots' => $this->applySnapshots($integration, $snapshots),
+            'warehouses' => $this->applyInventoryCoefficients($integration, $coefMap),
         ];
     }
 
@@ -56,8 +96,24 @@ class WildberriesTariffRefresher
             return 0;
         }
 
+        return $this->applySnapshots($integration, (array) $marketplace->getTariffSnapshots(now()->format('Y-m-d')));
+    }
+
+    /**
+     * Записать набор тарифных снапшотов для интеграции (upsert).
+     *
+     * Канонический upsert тарифных снапшотов: ключ конфликта и обновляемые поля
+     * держать в синхроне с любыми другими записями WildberriesTariffSnapshot.
+     *
+     * @return int Количество записанных строк снапшотов
+     */
+    public function applySnapshots(Integration $integration, array $snapshots): int
+    {
+        if (empty($snapshots)) {
+            return 0;
+        }
+
         try {
-            $snapshots = $marketplace->getTariffSnapshots(now()->format('Y-m-d'));
             $rows = [];
             foreach ($snapshots as $snapshot) {
                 $rows[] = [
@@ -119,12 +175,22 @@ class WildberriesTariffRefresher
             return 0;
         }
 
-        try {
-            $coefMap = $marketplace->getWarehouseCoefficients();
-            if (empty($coefMap)) {
-                return 0;
-            }
+        return $this->applyInventoryCoefficients($integration, (array) $marketplace->getWarehouseCoefficients());
+    }
 
+    /**
+     * Записать КС из готовой карты тарифов в inventory_warehouses интеграции.
+     *
+     * @param  array  $coefMap  Результат getWarehouseCoefficients(): [normName => ['delivery_coef'=>mult, 'warehouse_name'=>..]]
+     * @return int Количество обновлённых строк inventory_warehouses
+     */
+    public function applyInventoryCoefficients(Integration $integration, array $coefMap): int
+    {
+        if (empty($coefMap)) {
+            return 0;
+        }
+
+        try {
             // Карта «ключ имени склада → КС (множитель, 1.80 = 180%)». Кладём по
             // нижнерегистровому имени склада из box-тарифов — так совпадаем с
             // warehouse_name в inventory_warehouses (оба приходят из WB).

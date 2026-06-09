@@ -45,8 +45,29 @@ class RefreshWildberriesTariffsCommand extends Command
 
         $this->info("Обновление КС для {$integrations->count()} WB-интеграций…");
 
+        // Тарифы WB одинаковы для всех продавцов (склад/категория), поэтому тянем
+        // их ОДИН раз — иначе запросы подряд упираются в 429 WB. Источником ключа
+        // берём ЛЮБУЮ активную WB-интеграцию (не только отфильтрованную): если у
+        // целевой #76 свой ключ в 429, тарифы возьмём с другого — они те же.
+        $fetchSources = Integration::query()->active()->where('marketplace', 'wildberries')->get();
+
+        $shared = ['snapshots' => [], 'coefMap' => []];
+        foreach ($fetchSources as $candidate) {
+            $shared = $refresher->fetchSharedTariffData($candidate);
+            if (! empty($shared['snapshots']) || ! empty($shared['coefMap'])) {
+                $this->line("  Тарифы получены с интеграции #{$candidate->id}");
+                break;
+            }
+        }
+
+        if (empty($shared['snapshots']) && empty($shared['coefMap'])) {
+            $this->error('Не удалось получить тарифы WB ни с одного ключа (вероятно 429). Повторите позже.');
+
+            return self::FAILURE;
+        }
+
         foreach ($integrations as $integration) {
-            $result = $refresher->refresh($integration);
+            $result = $refresher->applyShared($integration, $shared['snapshots'], $shared['coefMap']);
 
             $this->line(sprintf(
                 '  #%d %s: снапшотов %d, складов %d',
