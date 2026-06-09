@@ -35,6 +35,15 @@ class SyncWildberriesLocalizationJob implements ShouldQueue
             return;
         }
 
+        // Ручной ввод ИЛ/ИРП из ЛК WB имеет приоритет — авто-расчёт не перетирает.
+        if (($integration->settings['wb_indices_manual'] ?? false) === true) {
+            Log::info('WB localization: manual override active, skip auto-calc', [
+                'integration_id' => $this->integrationId,
+            ]);
+
+            return;
+        }
+
         $result = $localization->calculateLocalizationIndex($integration);
         $orders = (int) ($result['total_orders'] ?? 0);
 

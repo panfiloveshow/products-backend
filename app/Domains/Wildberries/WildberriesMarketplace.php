@@ -640,6 +640,17 @@ class WildberriesMarketplace implements MarketplaceInterface, LegacyMarketplaceI
         return $this->sales->getRedemptionStatsByNmId($days);
     }
 
+    /**
+     * Процент выкупа из воронки продаж WB (Seller Analytics) — авторитетный источник,
+     * как в ЛК. Корректнее трейлингового отношения продажи/заказы.
+     *
+     * @return array<string, array{redemption_rate: float, orders_count: int, buyouts_count: int, returns_count: int, source: string}>
+     */
+    public function getBuyoutStatsByNmId(int $days = 30): array
+    {
+        return $this->products->getBuyoutStatsByNmId($days);
+    }
+
     public function getSppFromSales(int $days = 30): array
     {
         return $this->sales->getSppFromSales($days);

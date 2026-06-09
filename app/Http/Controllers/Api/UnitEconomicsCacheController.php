@@ -494,6 +494,8 @@ class UnitEconomicsCacheController extends Controller
             'localization_index' => 'nullable|numeric|min:0.50|max:2.50',
             // ИРП (индекс распределения продаж) — хранится на уровне WB-интеграции, значение из ЛК WB в процентах
             'sales_distribution_index' => 'nullable|numeric|min:0|max:2.50',
+            // Ручной режим ИЛ/ИРП: true ставит «замок» от авто-расчёта; false сбрасывает на авто.
+            'wb_indices_manual' => 'nullable|boolean',
             // Габариты НЕ редактируемые — берутся из API маркетплейса
         ])->validate();
 
@@ -513,10 +515,20 @@ class UnitEconomicsCacheController extends Controller
         $integrationId = $validated['integration_id'];
         $localizationIndex = $validated['localization_index'] ?? null;
         $salesDistributionIndex = $validated['sales_distribution_index'] ?? null;
-        unset($validated['integration_id'], $validated['localization_index'], $validated['sales_distribution_index']);
+        // null — флаг не передан; true — ручной режим; false — сброс на авто.
+        $manualFlag = array_key_exists('wb_indices_manual', $validated) ? $validated['wb_indices_manual'] : null;
+        $resetToAuto = ($manualFlag === false);
+        unset(
+            $validated['integration_id'],
+            $validated['localization_index'],
+            $validated['sales_distribution_index'],
+            $validated['wb_indices_manual'],
+        );
+
+        $indicesTouched = ($localizationIndex !== null || $salesDistributionIndex !== null || $resetToAuto);
 
         // ИЛ и ИРП — настройки WB-интеграции, а не отдельного SKU.
-        if ($localizationIndex !== null || $salesDistributionIndex !== null) {
+        if ($indicesTouched) {
             $integration = Integration::find($integrationId);
             if ($integration) {
                 $settings = is_array($integration->settings) ? $integration->settings : [];
@@ -533,6 +545,16 @@ class UnitEconomicsCacheController extends Controller
                     $settings['wb_sales_distribution_index'] = (float) $salesDistributionIndex;
                 }
 
+                if ($resetToAuto) {
+                    // Сброс на авто: снимаем «замок» и запускаем свежий пересчёт ИЛ/ИРП.
+                    $settings['wb_indices_manual'] = false;
+                    \App\Jobs\SyncWildberriesLocalizationJob::dispatch((int) $integrationId)->onQueue('unit-economics');
+                } else {
+                    // Ручной ввод ИЛ/ИРП из ЛК WB: ставим «замок», чтобы авто-расчёт
+                    // (SyncWildberriesLocalizationJob / unit-economics:sync) не перетирал значения.
+                    $settings['wb_indices_manual'] = true;
+                }
+
                 $update['settings'] = $settings;
                 $integration->update($update);
             }
@@ -546,7 +568,7 @@ class UnitEconomicsCacheController extends Controller
 
         // ИЛ/ИРП — настройки всей WB-интеграции, поэтому пересчитываем всю интеграцию.
         // Обычные SKU-настройки пересчитывают только выбранный SKU по всем схемам.
-        if ($localizationIndex !== null || $salesDistributionIndex !== null) {
+        if ($indicesTouched) {
             $this->cacheService->onIntegrationSettingsChanged($integrationId);
         } else {
             $this->cacheService->onSettingsChanged($integrationId, $sku);
@@ -566,6 +588,7 @@ class UnitEconomicsCacheController extends Controller
             'settings' => $settings,
             'localization_index' => (float) ($integration->localization_index ?? 1.0),
             'sales_distribution_index' => (float) (($integration->settings['wb_sales_distribution_index'] ?? null) ?? 0.0),
+            'wb_indices_manual' => (bool) ($integration->settings['wb_indices_manual'] ?? false),
             'cache' => $cache,
         ]);
     }

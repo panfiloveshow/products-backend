@@ -441,6 +441,95 @@ class ProductsApi implements ProductsApiInterface
     }
 
     /**
+     * Процент выкупа по nmId из воронки продаж WB (тот же эндпоинт, что и рейтинги).
+     *
+     * Источник — Seller Analytics «Воронка продаж»: statistics.selectedPeriod даёт
+     * ordersCount, buyoutsCount и conversions.buyoutsPercent — ровно то, что продавец
+     * видит в ЛК. Это корректнее, чем трейлинговое отношение продажи/заказы (которое
+     * ломается из-за лага доставки/выкупа: свежие заказы ещё не выкуплены → 0%).
+     *
+     * @param  array<int|string>  $nmIds  пусто = все товары магазина
+     * @return array<string, array{redemption_rate: float, orders_count: int, buyouts_count: int, source: string}>
+     */
+    public function getBuyoutStatsByNmId(int $days = 30, array $nmIds = []): array
+    {
+        $result = [];
+        $limit = 100;
+        $offset = 0;
+
+        $selectedStart = now()->subDays($days)->format('Y-m-d');
+        $selectedEnd = now()->format('Y-m-d');
+        $pastStart = now()->subDays($days * 2)->format('Y-m-d');
+        $pastEnd = now()->subDays($days + 1)->format('Y-m-d');
+
+        try {
+            do {
+                $body = [
+                    'selectedPeriod' => ['start' => $selectedStart, 'end' => $selectedEnd],
+                    'pastPeriod' => ['start' => $pastStart, 'end' => $pastEnd],
+                    'nmIds' => array_values($nmIds),
+                    'limit' => $limit,
+                    'offset' => $offset,
+                ];
+
+                $response = $this->client->analyticsPost('/api/analytics/v3/sales-funnel/products', $body);
+
+                if (! $response || ! isset($response['data']['products'])) {
+                    break;
+                }
+
+                $products = $response['data']['products'];
+
+                foreach ($products as $item) {
+                    $nmId = $item['product']['nmId'] ?? null;
+                    if (! $nmId) {
+                        continue;
+                    }
+
+                    $selected = $item['statistics']['selectedPeriod'] ?? [];
+                    $ordersCount = (int) ($selected['ordersCount'] ?? 0);
+                    if ($ordersCount <= 0) {
+                        // Нет заказов в периоде — выкуп недостоверен, пропускаем (упадёт на фолбэк).
+                        continue;
+                    }
+
+                    $buyoutsCount = (int) ($selected['buyoutsCount'] ?? 0);
+                    $buyoutsPercent = $selected['conversions']['buyoutsPercent'] ?? null;
+                    // Если процент не пришёл — считаем из выкупов/заказов воронки (та же когорта).
+                    $redemptionRate = is_numeric($buyoutsPercent)
+                        ? round((float) $buyoutsPercent, 2)
+                        : round(min(100, ($buyoutsCount / max(1, $ordersCount)) * 100), 2);
+
+                    $result[(string) $nmId] = [
+                        'redemption_rate' => $redemptionRate,
+                        'orders_count' => $ordersCount,
+                        'buyouts_count' => $buyoutsCount,
+                        'returns_count' => max(0, $ordersCount - $buyoutsCount),
+                        'source' => 'wb_sales_funnel',
+                    ];
+                }
+
+                $offset += $limit;
+
+                if (count($products) === $limit) {
+                    usleep(200000);
+                }
+            } while (count($products) === $limit);
+
+            \Illuminate\Support\Facades\Log::info('WB getBuyoutStatsByNmId: completed', [
+                'count' => count($result),
+                'days' => $days,
+            ]);
+        } catch (\Throwable $e) {
+            \Illuminate\Support\Facades\Log::error('WB getBuyoutStatsByNmId error', [
+                'error' => $e->getMessage(),
+            ]);
+        }
+
+        return $result;
+    }
+
+    /**
      * Получить все товары с пагинацией
      */
     public function getAllProducts(Integration $integration, int $batchSize = 100): \Generator

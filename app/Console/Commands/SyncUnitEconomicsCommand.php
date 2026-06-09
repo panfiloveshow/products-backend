@@ -753,7 +753,14 @@ class SyncUnitEconomicsCommand extends Command
                 if (! empty($wbApiKey)) {
                     $wbService = new \App\Domains\Wildberries\WildberriesMarketplace(['api_key' => $wbApiKey], $integration);
 
-                    if ($integration) {
+                    // Ручной ввод ИЛ/ИРП из ЛК WB имеет приоритет — авто-расчёт пропускаем.
+                    $wbIndicesManual = (bool) ($integrationSettings['wb_indices_manual'] ?? false);
+
+                    if ($integration && $wbIndicesManual) {
+                        $this->info('  WB ИЛ/ИРП: ручной режим (значения из ЛК) — авто-расчёт пропущен');
+                    }
+
+                    if ($integration && ! $wbIndicesManual) {
                         $localizationService = app(LocalizationIndexService::class);
                         $localizationResult = $localizationService->calculateLocalizationIndex($integration);
 
