@@ -163,7 +163,7 @@ class WildberriesMarketplace implements MarketplaceInterface, LegacyMarketplaceI
         // Получаем рейтинги карточек через официальный WB Analytics API
         // productRating = рейтинг карточки (качество заполнения, 0-10)
         // feedbackRating = рейтинг по отзывам (0-5)
-        $cardRatings = $this->products->getCardRatings();
+        $cardRatings = $this->products->getCardRatings(array_values($nmIds));
 
         \Illuminate\Support\Facades\Log::info('WB Marketplace: Card ratings loaded', [
             'count' => count($cardRatings),

@@ -423,8 +423,9 @@ class ProductsApi implements ProductsApiInterface
 
                     // % выкупа из воронки продаж WB (как в ЛК). Авторитетнее трейлингового
                     // sales/orders, которое ломается из-за лага доставки/выкупа.
-                    $selected = $item['statistics']['selectedPeriod'] ?? [];
-                    $ordersCount = (int) ($selected['ordersCount'] ?? 0);
+                    // Структура ответа: item.statistic.selected (не statistics.selectedPeriod).
+                    $selected = $item['statistic']['selected'] ?? [];
+                    $ordersCount = (int) ($selected['orderCount'] ?? 0);
                     if ($ordersCount > 0) {
                         $buyoutsCount = (int) ($selected['buyoutsCount'] ?? 0);
                         $buyoutsPercent = $selected['conversions']['buyoutsPercent'] ?? null;
