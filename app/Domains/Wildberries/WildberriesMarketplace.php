@@ -393,6 +393,12 @@ class WildberriesMarketplace implements MarketplaceInterface, LegacyMarketplaceI
             // WB-специфичные данные (аналогично ozon_data)
             'wb_data' => [
                 'nmID' => $card['nmID'],
+                // % выкупа из воронки продаж WB (как в ЛК), полученный вместе с рейтингами.
+                // Приоритетный источник выкупа для юнит-экономики (см. SyncUnitEconomicsCommand).
+                'redemption_rate' => $ratingData['redemption_rate'] ?? null,
+                'redemption_orders_count' => $ratingData['redemption_orders_count'] ?? null,
+                'redemption_buyouts_count' => $ratingData['redemption_buyouts_count'] ?? null,
+                'redemption_source' => $ratingData['redemption_source'] ?? null,
                 'imtID' => $card['imtID'] ?? null,
                 'subjectID' => $card['subjectID'] ?? null,
                 'vendorCode' => $card['vendorCode'] ?? null,
@@ -638,17 +644,6 @@ class WildberriesMarketplace implements MarketplaceInterface, LegacyMarketplaceI
     public function getRedemptionStatsByNmId(int $days = 30): array
     {
         return $this->sales->getRedemptionStatsByNmId($days);
-    }
-
-    /**
-     * Процент выкупа из воронки продаж WB (Seller Analytics) — авторитетный источник,
-     * как в ЛК. Корректнее трейлингового отношения продажи/заказы.
-     *
-     * @return array<string, array{redemption_rate: float, orders_count: int, buyouts_count: int, returns_count: int, source: string}>
-     */
-    public function getBuyoutStatsByNmId(int $days = 30): array
-    {
-        return $this->products->getBuyoutStatsByNmId($days);
     }
 
     public function getSppFromSales(int $days = 30): array

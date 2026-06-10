@@ -842,17 +842,12 @@ class SyncUnitEconomicsCommand extends Command
                         }
                     }
 
-                    // Авторитетный % выкупа из воронки продаж WB (как в ЛК). Приоритетнее
-                    // трейлингового sales/orders, которое ломается из-за лага выкупа
-                    // (свежие заказы ещё не выкуплены → 0%).
-                    $wbFunnelBuyout = $wbService->getBuyoutStatsByNmId(30);
-                    if (! empty($wbFunnelBuyout)) {
-                        $this->info('  WB Выкуп (воронка): получено для '.count($wbFunnelBuyout).' товаров');
-                    }
-
+                    // % выкупа из воронки продаж WB (приоритетный источник) приходит в
+                    // wb_data из синка товаров (getCardRatings). Здесь — трейлинговый
+                    // sales/orders как фолбэк, если воронки по товару нет.
                     $wbRedemptionData = $wbService->getRedemptionStatsByNmId(30);
                     if (! empty($wbRedemptionData)) {
-                        $this->info('  WB Выкуп (sales/orders): получено для '.count($wbRedemptionData).' товаров');
+                        $this->info('  WB Выкуп (sales/orders, фолбэк): получено для '.count($wbRedemptionData).' товаров');
                     }
                     // Ручной % выкупа из интеграции
                     $manualRedemptionRate = $integration?->manual_redemption_rate ?? null;
@@ -1688,9 +1683,20 @@ class SyncUnitEconomicsCommand extends Command
                 }
 
                 // === ПРОЦЕНТ ВЫКУПА ===
-                // Приоритет: 1) расчёт из продаж API, 2) wb_data, 3) ручной ввод, 4) дефолт 80%
-                // Можно рассчитать из продаж/возвратов если есть данные
-                if ($wbRedemptionData && isset($wbRedemptionData['redemption_rate']) && $wbRedemptionData['redemption_rate'] > 0) {
+                // Приоритет: 1) воронка продаж WB (как в ЛК), 2) расчёт sales/orders,
+                // 3) wb_data, 4) ручной ввод, 5) дефолт 80%.
+                if (($wbData['redemption_source'] ?? null) === 'wb_sales_funnel' && isset($wbData['redemption_rate'])) {
+                    // Воронка продаж WB (из wb_data, заполняется синком товаров) —
+                    // авторитетный источник: принимаем значение как есть, включая реальный
+                    // 0% выкуп (orders>0, но ни одного выкупа), который flawed-метод
+                    // sales/orders спутал бы с «нет данных».
+                    $wbFunnelOrders = (int) ($wbData['redemption_orders_count'] ?? 0);
+                    $wbFunnelBuyouts = (int) ($wbData['redemption_buyouts_count'] ?? 0);
+                    $data['redemption_rate'] = (float) $wbData['redemption_rate'];
+                    $data['orders_count'] = $wbFunnelOrders ?: ($data['orders_count'] ?? null);
+                    $data['returns_count'] = $wbFunnelOrders > 0 ? max(0, $wbFunnelOrders - $wbFunnelBuyouts) : null;
+                    $data['redemption_source'] = 'wb_sales_funnel';
+                } elseif ($wbRedemptionData && isset($wbRedemptionData['redemption_rate']) && $wbRedemptionData['redemption_rate'] > 0) {
                     $data['redemption_rate'] = $wbRedemptionData['redemption_rate'];
                     $data['orders_count'] = $wbRedemptionData['orders_count'] ?? ($data['orders_count'] ?? null);
                     $data['returns_count'] = $wbRedemptionData['returns_count'] ?? null;
