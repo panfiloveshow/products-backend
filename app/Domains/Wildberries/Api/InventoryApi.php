@@ -376,9 +376,11 @@ class InventoryApi implements InventoryApiInterface
             'dateFrom' => $dateFrom,
         ]);
 
+        // retriesOn429: остатки по складам критичны для КС (разбивка по складам
+        // в юнит-экономике) — без ретрая 429 склады деградируют до FBS-«Мой склад».
         $response = $this->client->statisticsGet('/api/v1/supplier/stocks', [
             'dateFrom' => $dateFrom,
-        ]);
+        ], retriesOn429: 2);
 
         if ($response === null) {
             Log::warning('WB InventoryApi: Statistics API returned null (check API key permissions)');

@@ -433,30 +433,50 @@ class WildberriesClient
      * Statistics API может быть медленным (особенно /supplier/sales),
      * поэтому используем увеличенный таймаут 60 секунд
      */
-    public function statisticsGet(string $endpoint, array $params = []): ?array
+    public function statisticsGet(string $endpoint, array $params = [], int $retriesOn429 = 0): ?array
     {
-        try {
-            $response = Http::withHeaders($this->getHeaders())
-                ->timeout(60) // Увеличенный таймаут для Statistics API
-                ->get(self::STATISTICS_URL . $endpoint, $params);
+        $attempt = 0;
+        while (true) {
+            try {
+                $response = Http::withHeaders($this->getHeaders())
+                    ->timeout(60) // Увеличенный таймаут для Statistics API
+                    ->get(self::STATISTICS_URL . $endpoint, $params);
 
-            if ($response->successful()) {
-                return $response->json();
+                if ($response->successful()) {
+                    return $response->json();
+                }
+
+                // Лимит Statistics API — ~1 запрос/мин на токен. Во время синка лимит
+                // часто уже сожжён предыдущими вызовами (sales/orders), и критичные
+                // отчёты (остатки по складам WB) молча пустели — склады товара
+                // деградировали до FBS-«Мой склад», КС терял разбивку по складам.
+                // Для таких отчётов ретраим 429 после паузы.
+                if ($response->status() === 429 && $attempt < $retriesOn429) {
+                    $attempt++;
+                    Log::info('WB Statistics API 429 — повтор после паузы', [
+                        'endpoint' => $endpoint,
+                        'attempt' => $attempt,
+                    ]);
+                    sleep(65);
+
+                    continue;
+                }
+
+                Log::warning('WB Statistics API error', [
+                    'endpoint' => $endpoint,
+                    'status' => $response->status(),
+                    'body' => $response->body(),
+                ]);
+
+                return null;
+            } catch (\Exception $e) {
+                Log::error('WB Statistics API exception', [
+                    'endpoint' => $endpoint,
+                    'error' => $e->getMessage(),
+                ]);
+
+                return null;
             }
-
-            Log::warning('WB Statistics API error', [
-                'endpoint' => $endpoint,
-                'status' => $response->status(),
-                'body' => $response->body(),
-            ]);
-
-            return null;
-        } catch (\Exception $e) {
-            Log::error('WB Statistics API exception', [
-                'endpoint' => $endpoint,
-                'error' => $e->getMessage(),
-            ]);
-            return null;
         }
     }
 

@@ -481,12 +481,54 @@ class SyncProductsJob implements ShouldBeUnique, ShouldQueue
             if ($integrationId !== null) {
                 $updateData['integration_id'] = $integrationId;
             }
+            if ($marketplace === 'wildberries') {
+                $updateData = $this->preserveWbFboWarehouses($existingProduct, $updateData);
+            }
             $existingProduct->update($updateData);
 
             return 'updated';
         }
 
         return 'unchanged';
+    }
+
+    /**
+     * WB: не даём складской разбивке деградировать. Отчёт остатков по складам WB
+     * (Statistics API /supplier/stocks) рейт-лимитен и иногда пустеет во время
+     * синка — тогда в stock_warehouses остаются только FBS-склады продавца
+     * («Мой склад»), и КС в юнит-экономике теряет разбивку по реальным складам.
+     * Если в новых данных нет ни одного FBO-склада, а в старых были — сохраняем
+     * старые FBO-строки (FBS-строки берём свежие).
+     */
+    private function preserveWbFboWarehouses(Product $existing, array $updateData): array
+    {
+        if (! isset($updateData['wb_data']) || ! is_array($updateData['wb_data'])) {
+            return $updateData;
+        }
+
+        $newWarehouses = $updateData['wb_data']['stock_warehouses'] ?? [];
+        $newWarehouses = is_array($newWarehouses) ? $newWarehouses : [];
+        $isFbo = static fn ($w) => is_array($w)
+            && strtoupper((string) ($w['fulfillment_type'] ?? 'FBO')) === 'FBO';
+
+        if (array_filter($newWarehouses, $isFbo) !== []) {
+            return $updateData;
+        }
+
+        $oldWarehouses = is_array($existing->wb_data['stock_warehouses'] ?? null)
+            ? $existing->wb_data['stock_warehouses']
+            : [];
+        $oldFbo = array_values(array_filter($oldWarehouses, $isFbo));
+        if ($oldFbo === []) {
+            return $updateData;
+        }
+
+        $newFbs = array_values(array_filter($newWarehouses, static fn ($w) => ! $isFbo($w)));
+        $updateData['wb_data']['stock_warehouses'] = array_merge($oldFbo, $newFbs);
+        // Пометка: FBO-строки унаследованы с прошлого синка (отчёт остатков не пришёл).
+        $updateData['wb_data']['stock_warehouses_fbo_stale'] = true;
+
+        return $updateData;
     }
 
     private function findExistingProduct(string $marketplace, ?int $integrationId, array $productData): ?Product
