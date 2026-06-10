@@ -95,7 +95,17 @@ class WarehousesApi
 
                 $returns = $response['returns'] ?? [];
                 foreach ($returns as $return) {
-                    foreach ($return['products'] ?? [] as $product) {
+                    // /v1/returns/list отдаёт ОДИН товар в поле `product` (объект),
+                    // а не массив `products`. Старый код читал ['products'] → цикл
+                    // всегда пустой → returns_count = 0 у всех SKU → при выкупе 100%
+                    // возвраты не попадали в эффективную логистику. Поддерживаем оба
+                    // варианта на случай иной формы ответа.
+                    $products = $return['products'] ?? null;
+                    if ($products === null && isset($return['product']) && is_array($return['product'])) {
+                        $products = [$return['product']];
+                    }
+
+                    foreach ($products ?? [] as $product) {
                         $sku = $product['offer_id'] ?? null;
                         if (!$sku) continue;
 
