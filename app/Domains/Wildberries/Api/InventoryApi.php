@@ -369,7 +369,7 @@ class InventoryApi implements InventoryApiInterface
      *
      * @see https://dev.wildberries.ru/openapi/reports
      */
-    public function getStocksReport(string $dateFrom = '2019-06-20'): array
+    public function getStocksReport(string $dateFrom = '2019-06-20', int $retriesOn429 = 2): array
     {
         Log::info('WB InventoryApi: Requesting stocks from Statistics API', [
             'endpoint' => '/api/v1/supplier/stocks',
@@ -380,7 +380,7 @@ class InventoryApi implements InventoryApiInterface
         // в юнит-экономике) — без ретрая 429 склады деградируют до FBS-«Мой склад».
         $response = $this->client->statisticsGet('/api/v1/supplier/stocks', [
             'dateFrom' => $dateFrom,
-        ], retriesOn429: 2);
+        ], retriesOn429: $retriesOn429);
 
         if ($response === null) {
             Log::warning('WB InventoryApi: Statistics API returned null (check API key permissions)');
