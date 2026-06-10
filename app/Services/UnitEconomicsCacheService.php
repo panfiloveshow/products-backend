@@ -1949,6 +1949,7 @@ class UnitEconomicsCacheService
 
         $boxByWarehouse = [];
         $boxFallback = null;
+        $boxFallbackHasFboBase = false;
         $returnPayload = [];
 
         foreach ($snapshots as $snapshot) {
@@ -1961,7 +1962,15 @@ class UnitEconomicsCacheService
                 continue;
             }
 
-            $boxFallback ??= $snapshot;
+            // Фолбэк — первый снапшот С FBO-ценами (delivery_base > 0). Склады
+            // «Маркетплейс: …» (FBS-only) приходят с delivery_base=0 и, попав в
+            // фолбэк, обнуляли базовую логистику у товаров без своего склада.
+            $payload = is_array($snapshot->payload) ? $snapshot->payload : [];
+            $hasFboBase = (float) ($payload['delivery_base'] ?? $payload['boxDeliveryBase'] ?? 0) > 0;
+            if ($boxFallback === null || (! $boxFallbackHasFboBase && $hasFboBase)) {
+                $boxFallback = $snapshot;
+                $boxFallbackHasFboBase = $hasFboBase;
+            }
 
             $warehouseName = $snapshot->warehouse_name ? $this->normalizeWildberriesWarehouseName((string) $snapshot->warehouse_name) : null;
             if ($warehouseName && ! isset($boxByWarehouse[$warehouseName])) {

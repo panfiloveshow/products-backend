@@ -128,7 +128,9 @@ class WildberriesTariffs implements TariffsProviderInterface
         if (is_array($return)) {
             $base = $this->firstNumeric($return, ['base', 'return_base', 'returnDeliveryBase', 'boxDeliveryBase']);
             $liter = $this->firstNumeric($return, ['liter', 'return_liter', 'returnDeliveryLiter', 'boxDeliveryLiter']);
-            if ($base !== null) {
+            // Нулевой return-тариф (base=0, liter=0) = «нет данных», а не бесплатный
+            // возврат — падаем на расчёт от базовой логистики FBO.
+            if ($base !== null && ($base > 0 || ($liter !== null && $liter > 0))) {
                 return $this->calculateBasePlusLiter($volume, $base, $liter ?? 0.0);
             }
         }
@@ -162,6 +164,16 @@ class WildberriesTariffs implements TariffsProviderInterface
 
         $base = $this->firstNumeric($boxTariff, $baseKeys);
         $liter = $this->firstNumeric($boxTariff, $literKeys);
+
+        // Склады «Маркетплейс: …» (FBS-only) приходят с нулевыми FBO-полями
+        // (delivery_base=0, delivery_liter=0). Нулевой тариф означает «склад не
+        // обслуживает эту схему», а не бесплатную логистику — игнорируем его и
+        // уходим на ветку coef/официальный фолбэк, иначе базовая логистика
+        // обнуляется (видели на интеграции 76: тариф «Маркетплейс: Грузия СГТ»).
+        if ($base !== null && $base <= 0 && ($liter === null || $liter <= 0)) {
+            $base = null;
+        }
+
         if ($base === null) {
             if ($coef === null || $coef <= 0) {
                 return null;
