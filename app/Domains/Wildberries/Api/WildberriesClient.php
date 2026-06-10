@@ -509,7 +509,10 @@ class WildberriesClient
     public function analyticsPost(string $endpoint, array $data = []): ?array
     {
         $tokenHash = substr(sha1($this->apiKey), 0, 16);
-        $disabledKey = "wb:analytics:disabled:{$tokenHash}";
+        // Disabled flag is endpoint-specific so a 403 on one endpoint (e.g. stocks-report)
+        // doesn't silently block other endpoints (e.g. sales-funnel) that use a different scope.
+        $endpointHash = substr(sha1($endpoint), 0, 12);
+        $disabledKey = "wb:analytics:disabled:{$tokenHash}:{$endpointHash}";
         if (Cache::get($disabledKey)) {
             return null;
         }
