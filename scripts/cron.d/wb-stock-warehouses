@@ -1,0 +1,24 @@
+# Авто-обновление разбивки остатков по складам WB (wb_data.stock_warehouses)
+# для КС юнит-экономики: тултип «какие склады с остатками + их реальные КС»
+# и средневзвешенный КС в поле.
+#
+# Почему отдельной командой: отчёт Statistics API /supplier/stocks лимитирован
+# ~1 запрос/мин на токен, и внутри полного синка товаров он почти всегда
+# проигрывает квоту другим вызовам (sales/orders, локализация). Команда
+# wb:refresh-stock-warehouses делает один запрос с агрессивным ретраем 429;
+# запуск каждые 3 часа гарантирует, что хотя бы один прогон в сутки поймает
+# свободное окно квоты. Данные защищены от деградации (SyncProductsJob не
+# перетирает FBO-разбивку FBS-данными).
+#
+# Установка на сервере (один раз):
+#   sudo cp /var/www/products-backend/scripts/cron.d/wb-stock-warehouses /etc/cron.d/wb-stock-warehouses
+#   sudo chown root:root /etc/cron.d/wb-stock-warehouses
+#   sudo chmod 644 /etc/cron.d/wb-stock-warehouses
+
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+MAILTO=""
+
+# Каждые 3 часа в :17 — обновить разбивку складов всех активных WB-интеграций
+# и пересобрать кэш юнит-экономики (job ставится только при реальных изменениях).
+17 */3 * * * www-data cd /var/www/products-backend && /usr/bin/php artisan wb:refresh-stock-warehouses --all >> /var/www/products-backend/storage/logs/wb-stock-warehouses.log 2>&1
