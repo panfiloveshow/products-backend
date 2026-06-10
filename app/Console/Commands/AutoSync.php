@@ -116,12 +116,23 @@ class AutoSync extends Command
                 if ($syncType === 'products' && (int) ($integration->work_space_id ?? 0) > 0) {
                     $limitCheck = $limitsSync->ensureLimitAvailable((int) $integration->work_space_id, 'products', 1);
                     if (! ($limitCheck['success'] ?? false)) {
+                        // Различаем «лимит реально исчерпан» (403) и «лимит-сервис
+                        // недоступен» (502/timeout). Во втором случае НЕ блокируем
+                        // синк — иначе падение Sellico API навсегда останавливает
+                        // обновление товаров (и % выкупа в юните).
+                        if ((int) ($limitCheck['status'] ?? 0) === 403) {
+                            $this->warn(
+                                "  ⚠️  {$integration->name}: лимит товаров исчерпан "
+                                ."({$limitCheck['current_value']}/".($limitCheck['limit'] ?? '?').")"
+                            );
+                            $skipped++;
+                            continue;
+                        }
+
                         $this->warn(
-                            "  ⚠️  {$integration->name}: лимит товаров исчерпан "
-                            ."({$limitCheck['current_value']}/".($limitCheck['limit'] ?? '?').")"
+                            "  ⚠️  {$integration->name}: проверка лимита недоступна "
+                            ."(".($limitCheck['message'] ?? 'limit service error').") — синкаем без проверки"
                         );
-                        $skipped++;
-                        continue;
                     }
                 }
 
