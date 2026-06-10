@@ -118,7 +118,7 @@ class AutoSync extends Command
                     if (! ($limitCheck['success'] ?? false)) {
                         $this->warn(
                             "  ⚠️  {$integration->name}: лимит товаров исчерпан "
-                            ."({$limitCheck['current_value']}/{$limitCheck['limit']})"
+                            ."({$limitCheck['current_value']}/".($limitCheck['limit'] ?? '?').")"
                         );
                         $skipped++;
                         continue;
