@@ -73,8 +73,13 @@ class UnitEconomicsService
         $totalCostPrice = $costPrice * $salesCount;
         $markupPercent = $costPrice > 0 ? round($price / $costPrice, 2) : 0;
         $roiPercent = $totalCosts > 0 ? ($netProfit / $totalCosts) * 100 : 0;
-        $toSettlementAccount = $calculator['details']['to_settlement_account']
-            ?? ($revenue - $calculator['total_fees']);
+        // «На РС» = деньги, которые перечисляет маркетплейс: выручка − удержания МП
+        // − реклама (ДРР/advertising). Налог, НДС и «наша часть» — выплаты продавца,
+        // маркетплейс их не удерживает, поэтому в «На РС» не входят.
+        $toSettlementAccount = ($calculator['details']['to_settlement_account']
+            ?? ($revenue - $calculator['total_fees']))
+            - $drrAmount
+            - $advertisingCost;
 
         return array_merge([
             'revenue' => round($revenue, 2),
@@ -85,7 +90,6 @@ class UnitEconomicsService
             'markup_percent' => round($markupPercent, 2),
             'markup_multiplier' => round($markupPercent, 2),
             'roi_percent' => round($roiPercent, 2),
-            'to_settlement_account' => round($toSettlementAccount, 2),
             'drr_percent' => round($drrPercent, 2),
             'drr_amount' => round($drrAmount, 2),
             'our_share_percent' => round($ourSharePercent, 2),
@@ -95,7 +99,10 @@ class UnitEconomicsService
             'vat_percent' => round($vatPercent, 2),
             'vat_amount' => round($vatAmount, 2),
             'advertising_cost' => round($advertisingCost, 2),
-        ], $calculator['details']);
+        ], $calculator['details'], [
+            // «На РС» — последним, чтобы перекрыть значение из details (там без ДРР).
+            'to_settlement_account' => round($toSettlementAccount, 2),
+        ]);
     }
 
     private function calculateWB(array $data): array

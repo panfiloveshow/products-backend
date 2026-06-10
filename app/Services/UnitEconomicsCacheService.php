@@ -751,7 +751,7 @@ class UnitEconomicsCacheService
 
         $drrPercent = (float) ($settings?->drr_percent ?? $existingUE?->drr_percent ?? 0);
         $ourSharePercent = (float) ($settings?->our_share_percent ?? $existingUE?->our_share_percent ?? 0);
-        $taxPercent = (float) ($settings?->tax_percent ?? $existingUE?->tax_percent ?? 6);
+        $taxPercent = (float) ($settings?->tax_percent ?? $existingUE?->tax_percent ?? 0);
         $vatPercent = (float) ($settings?->vat_percent ?? $existingUE?->vat_percent ?? 0);
         $existingAcquiringPercent = $existingUE?->acquiring_percent;
         $defaultAcquiring = match ($marketplace) {
@@ -986,7 +986,7 @@ class UnitEconomicsCacheService
         $drrAmount = $price * ($drrPercent / 100);
         $ourSharePercent = $extra['our_share_percent'] ?? 0;
         $ourShareAmount = $price * ($ourSharePercent / 100);
-        $taxPercent = $extra['tax_percent'] ?? 6;
+        $taxPercent = $extra['tax_percent'] ?? 0;
         $vatPercent = $extra['vat_percent'] ?? 0;
         $vatAmount = $price * ($vatPercent / 100);
         $metaDrrAmount = array_key_exists('drr_amount', $result->metadata) ? (float) $result->metadata['drr_amount'] : null;
@@ -1155,7 +1155,15 @@ class UnitEconomicsCacheService
             'total_costs' => $totalCosts,
             'gross_profit' => $result->netProfit,
             'net_profit' => $netProfit,
-            'to_settlement_account' => $result->metadata['to_settlement_account'] ?? ($result->price - $costs->getMarketplaceCosts()),
+            // «На РС» = деньги, которые перечисляет маркетплейс: цена − удержания Ozon
+            // (комиссия/логистика/эквайринг/возвраты/хранение/сборы) − реклама (ДРР).
+            // Налог, НДС и «наша часть» — выплаты продавца, маркетплейс их не удерживает,
+            // поэтому в «На РС» не входят (они вычитаются ниже, в net_profit).
+            'to_settlement_account' => round(
+                ($result->metadata['to_settlement_account'] ?? ($result->price - $costs->getMarketplaceCosts()))
+                - $effectiveDrrAmount,
+                2
+            ),
             'margin_percent' => $marginPercent,
             'markup_percent' => $markupPercent,
             'markup_multiplier' => $markupPercent,
@@ -1266,7 +1274,7 @@ class UnitEconomicsCacheService
             // Настройки пользователя (приоритет: settings > UnitEconomics > default)
             'drr_percent' => (float) ($settings?->drr_percent ?? $existingUE?->drr_percent ?? 0),
             'our_share_percent' => (float) ($settings?->our_share_percent ?? $existingUE?->our_share_percent ?? 0),
-            'tax_percent' => (float) ($settings?->tax_percent ?? $existingUE?->tax_percent ?? 6),
+            'tax_percent' => (float) ($settings?->tax_percent ?? $existingUE?->tax_percent ?? 0),
             'vat_percent' => (float) ($settings?->vat_percent ?? $existingUE?->vat_percent ?? 0),
             // Комиссия из API
             'commission_percent' => (float) $commissionPercent,
@@ -1345,7 +1353,7 @@ class UnitEconomicsCacheService
             'drr_amount' => $calculated['drr_amount'] ?? 0,
             'our_share_percent' => $calculated['our_share_percent'] ?? 0,
             'our_share_amount' => $calculated['our_share_amount'] ?? 0,
-            'tax_percent' => $calculated['tax_percent'] ?? 6,
+            'tax_percent' => $calculated['tax_percent'] ?? 0,
             'tax_amount' => $calculated['tax_amount'] ?? 0,
             'vat_percent' => $calculated['vat_percent'] ?? 0,
             'vat_amount' => $calculated['vat_amount'] ?? 0,

@@ -55,7 +55,7 @@ class WildberriesUnitEconomicsCalculator implements UnitEconomicsCalculatorInter
         );
         $redemptionRate = $input->redemptionRate ?? 100; // % выкупа
         $drrPercent = $input->drrPercent ?? 0; // ДРР, %
-        $taxPercent = $input->taxPercent ?? 6; // Налог, %
+        $taxPercent = $input->taxPercent ?? 0; // Налог, %
         $costPrice = $input->costPrice ?? 0; // Себестоимость
 
         // === РАССЧИТЫВАЕМЫЕ ПОЛЯ ===

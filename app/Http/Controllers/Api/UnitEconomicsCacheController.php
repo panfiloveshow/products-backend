@@ -3042,7 +3042,7 @@ class UnitEconomicsCacheController extends Controller
         // === Настройки пользователя (приоритет: settings > cache) ===
         $data['drr_percent'] = (float) ($settings?->drr_percent ?? $cache->drr_percent ?? 0);
         $data['our_share_percent'] = (float) ($settings?->our_share_percent ?? $cache->our_share_percent ?? 0);
-        $data['tax_percent'] = (float) ($settings?->tax_percent ?? $cache->tax_percent ?? 6);
+        $data['tax_percent'] = (float) ($settings?->tax_percent ?? $cache->tax_percent ?? 0);
         $data['vat_percent'] = (float) ($settings?->vat_percent ?? $cache->vat_percent ?? 0);
 
         // Суммы на основе процентов
