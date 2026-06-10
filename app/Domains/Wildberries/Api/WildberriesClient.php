@@ -561,8 +561,11 @@ class WildberriesClient
                     return null;
                 }
 
-                // 429 — глобальный лимитер. Для stocks-report по документации ~20 секунд.
-                if ($status === 429 && $attempts < $maxAttempts) {
+                // 429 — глобальный лимитер.
+                // stocks-report: ретраим (по документации ~20 сек между попытками).
+                // sales-funnel и прочие аналитические эндпоинты: НЕ ретраим — их лимит жёсткий
+                // (~1-5 запросов в час), и повторные попытки только сжигают квоту впустую.
+                if ($status === 429 && $attempts < $maxAttempts && str_contains($endpoint, 'stocks-report')) {
                     $sleepSeconds = 20;
                     continue;
                 }

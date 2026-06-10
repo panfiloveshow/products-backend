@@ -370,7 +370,9 @@ class ProductsApi implements ProductsApiInterface
     public function getCardRatings(array $nmIds = []): array
     {
         $ratings = [];
-        $limit = 100;
+        // WB analytics funnel: max 1000 per page. Use large limit to get all nmIds in one request
+        // when nmIds filter is provided (avoids multiple rate-limited calls).
+        $limit = 1000;
         $offset = 0;
         
         // Период: последние 30 дней (selectedPeriod должен быть ПОСЛЕ pastPeriod).
