@@ -214,53 +214,51 @@ class UnitEconomicsCache extends Model
             static fn ($token) => trim((string) $token),
             array_slice($tokens, 0, 6)
         ))));
+        $usableTokens = array_values(array_filter($tokens, static fn ($token) => mb_strlen($token) >= 2));
 
         $table = $this->getTable();
         $driver = $query->getConnection()->getDriverName();
         $likeOperator = $driver === 'pgsql' ? 'ilike' : 'like';
 
-        return $query->where(function (Builder $root) use ($tokens, $normalizedSearch, $table, $likeOperator) {
-            // Точный SKU/артикул должен находиться мгновенно.
-            $root->where("{$table}.sku", '=', $normalizedSearch)
-                ->orWhereHas('product', function (Builder $productQuery) use ($normalizedSearch) {
-                    $productQuery->where('products.sku', '=', $normalizedSearch)
-                        ->orWhere('products.vendor_code', '=', $normalizedSearch)
-                        ->orWhere('products.barcode', '=', $normalizedSearch);
+        // Одно значение должно попасть хотя бы в одно из полей карточки/кэша.
+        $matchAnyField = function (Builder $q, string $needle) use ($table, $likeOperator) {
+            $like = '%'.$needle.'%';
+            $q->where("{$table}.sku", $likeOperator, $like)
+                ->orWhere("{$table}.product_name", $likeOperator, $like)
+                ->orWhereHas('product', function (Builder $productQuery) use ($like, $likeOperator) {
+                    $productQuery->where('products.sku', $likeOperator, $like)
+                        ->orWhere('products.vendor_code', $likeOperator, $like)
+                        ->orWhere('products.barcode', $likeOperator, $like)
+                        ->orWhere('products.name', $likeOperator, $like);
                 });
+        };
 
-            // Prefix-поиск для быстрых "sku starts with ...".
-            $root->orWhere("{$table}.sku", $likeOperator, "{$normalizedSearch}%")
-                ->orWhereHas('product', function (Builder $productQuery) use ($normalizedSearch, $likeOperator) {
-                    $productQuery->where('products.sku', $likeOperator, "{$normalizedSearch}%")
-                        ->orWhere('products.vendor_code', $likeOperator, "{$normalizedSearch}%")
-                        ->orWhere('products.barcode', $likeOperator, "{$normalizedSearch}%");
-                });
+        return $query->where(function (Builder $root) use ($normalizedSearch, $usableTokens, $table, $likeOperator, $matchAnyField) {
+            // 1) Точное совпадение кода — находим мгновенно.
+            $root->where(function (Builder $exact) use ($normalizedSearch, $table) {
+                $exact->where("{$table}.sku", '=', $normalizedSearch)
+                    ->orWhereHas('product', function (Builder $productQuery) use ($normalizedSearch) {
+                        $productQuery->where('products.sku', '=', $normalizedSearch)
+                            ->orWhere('products.vendor_code', '=', $normalizedSearch)
+                            ->orWhere('products.barcode', '=', $normalizedSearch);
+                    });
+            });
 
-            // Полное совпадение/подстрока по основным полям.
-            $root->orWhere("{$table}.sku", $likeOperator, "%{$normalizedSearch}%")
-                ->orWhere("{$table}.product_name", $likeOperator, "%{$normalizedSearch}%")
-                ->orWhereHas('product', function (Builder $productQuery) use ($normalizedSearch, $likeOperator) {
-                    $productQuery->where('products.sku', $likeOperator, "%{$normalizedSearch}%")
-                        ->orWhere('products.vendor_code', $likeOperator, "%{$normalizedSearch}%")
-                        ->orWhere('products.barcode', $likeOperator, "%{$normalizedSearch}%")
-                        ->orWhere('products.name', $likeOperator, "%{$normalizedSearch}%");
-                });
+            // 2) Вся строка как подстрока в любом поле (точная фраза / односложный запрос).
+            $root->orWhere(function (Builder $whole) use ($normalizedSearch, $matchAnyField) {
+                $matchAnyField($whole, $normalizedSearch);
+            });
 
-            // По каждому токену требуем попадание хотя бы в одно поле (AND между токенами).
-            foreach ($tokens as $token) {
-                if (mb_strlen($token) < 2) {
-                    continue;
-                }
-
-                $root->where(function (Builder $tokenQuery) use ($token, $table, $likeOperator) {
-                    $tokenQuery->where("{$table}.sku", $likeOperator, "%{$token}%")
-                        ->orWhere("{$table}.product_name", $likeOperator, "%{$token}%")
-                        ->orWhereHas('product', function (Builder $productQuery) use ($token, $likeOperator) {
-                            $productQuery->where('products.sku', $likeOperator, "%{$token}%")
-                                ->orWhere('products.vendor_code', $likeOperator, "%{$token}%")
-                                ->orWhere('products.barcode', $likeOperator, "%{$token}%")
-                                ->orWhere('products.name', $likeOperator, "%{$token}%");
+            // 3) Многословный запрос: КАЖДОЕ слово должно попасть хотя бы в одно поле
+            //    (AND между словами, OR между полями). Порядок слов не важен, поэтому
+            //    «кожаный рюкзак» находит «Рюкзак кожаный натуральный».
+            if (count($usableTokens) >= 2) {
+                $root->orWhere(function (Builder $multi) use ($usableTokens, $matchAnyField) {
+                    foreach ($usableTokens as $token) {
+                        $multi->where(function (Builder $tokenQuery) use ($token, $matchAnyField) {
+                            $matchAnyField($tokenQuery, $token);
                         });
+                    }
                 });
             }
         });

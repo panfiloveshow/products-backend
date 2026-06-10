@@ -246,79 +246,94 @@ class UnitEconomicsCacheController extends Controller
     ): void {
         $sortOrder = strtolower($sortOrder) === 'desc' ? 'desc' : 'asc';
 
-        if (in_array($sortField, ['stock', 'total_stock', 'current_stock', 'days_of_stock'], true)) {
-            $applyInventoryScope = function ($q) use ($integrationId, $marketplace) {
-                $q->when($integrationId !== null, fn ($query) => $query->where('inventory_rows.integration_id', $integrationId))
-                ->when($marketplace !== null, function ($query) use ($marketplace) {
-                    if (in_array($marketplace, ['yandex', 'yandex_market'], true)) {
-                        $query->whereIn('inventory_rows.marketplace', ['yandex', 'yandex_market']);
-                    } else {
-                        $query->where('inventory_rows.marketplace', $marketplace);
-                    }
-                })
-                ->when($marketplace !== null, function ($query) use ($marketplace) {
-                    if (in_array($marketplace, ['yandex', 'yandex_market'], true)) {
-                        $query->whereIn('inventory_products.marketplace', ['yandex', 'yandex_market']);
-                    } else {
-                        $query->where('inventory_products.marketplace', $marketplace);
-                    }
-                });
-            };
+        // === Наличие («в продаже») всегда первым ключом сортировки ===
+        // Товары в продаже — всегда сверху, серые (нет остатков) — всегда снизу,
+        // поверх любой выбранной пользователем сортировки. Наличие считаем так же,
+        // как current_stock на фронте: остаток на складах МП (inventory_warehouses)
+        // + внутренний остаток (products.stock). Для ПОРЯДКА важен только факт >0,
+        // поэтому булев флаг устойчив к возможному задвоению сумм в union-джойне.
+        $applyInventoryScope = function ($q) use ($integrationId, $marketplace) {
+            $q->when($integrationId !== null, fn ($query) => $query->where('inventory_rows.integration_id', $integrationId))
+            ->when($marketplace !== null, function ($query) use ($marketplace) {
+                if (in_array($marketplace, ['yandex', 'yandex_market'], true)) {
+                    $query->whereIn('inventory_rows.marketplace', ['yandex', 'yandex_market']);
+                } else {
+                    $query->where('inventory_rows.marketplace', $marketplace);
+                }
+            })
+            ->when($marketplace !== null, function ($query) use ($marketplace) {
+                if (in_array($marketplace, ['yandex', 'yandex_market'], true)) {
+                    $query->whereIn('inventory_products.marketplace', ['yandex', 'yandex_market']);
+                } else {
+                    $query->where('inventory_products.marketplace', $marketplace);
+                }
+            });
+        };
 
-            $inventoryBySku = DB::table('inventory_warehouses as inventory_rows')
-                ->join('products as inventory_products', function ($join) {
-                    $join->on('inventory_products.integration_id', '=', 'inventory_rows.integration_id')
-                        ->on('inventory_products.sku', '=', 'inventory_rows.sku');
-                })
-                ->tap($applyInventoryScope)
-                ->selectRaw('inventory_products.id as product_id, inventory_rows.quantity, inventory_rows.average_daily_sales');
+        $inventoryBySku = DB::table('inventory_warehouses as inventory_rows')
+            ->join('products as inventory_products', function ($join) {
+                $join->on('inventory_products.integration_id', '=', 'inventory_rows.integration_id')
+                    ->on('inventory_products.sku', '=', 'inventory_rows.sku');
+            })
+            ->tap($applyInventoryScope)
+            ->selectRaw('inventory_products.id as product_id, inventory_rows.quantity, inventory_rows.average_daily_sales');
 
-            $inventoryByBarcode = DB::table('inventory_warehouses as inventory_rows')
-                ->join('products as inventory_products', function ($join) {
-                    $join->on('inventory_products.integration_id', '=', 'inventory_rows.integration_id')
-                        ->on('inventory_products.barcode', '=', 'inventory_rows.sku');
-                })
-                ->whereNotNull('inventory_products.barcode')
-                ->whereColumn('inventory_products.barcode', '!=', 'inventory_products.sku')
-                ->tap($applyInventoryScope)
-                ->selectRaw('inventory_products.id as product_id, inventory_rows.quantity, inventory_rows.average_daily_sales');
+        $inventoryByBarcode = DB::table('inventory_warehouses as inventory_rows')
+            ->join('products as inventory_products', function ($join) {
+                $join->on('inventory_products.integration_id', '=', 'inventory_rows.integration_id')
+                    ->on('inventory_products.barcode', '=', 'inventory_rows.sku');
+            })
+            ->whereNotNull('inventory_products.barcode')
+            ->whereColumn('inventory_products.barcode', '!=', 'inventory_products.sku')
+            ->tap($applyInventoryScope)
+            ->selectRaw('inventory_products.id as product_id, inventory_rows.quantity, inventory_rows.average_daily_sales');
 
-            $inventoryByVendorCode = DB::table('inventory_warehouses as inventory_rows')
-                ->join('products as inventory_products', function ($join) {
-                    $join->on('inventory_products.integration_id', '=', 'inventory_rows.integration_id')
-                        ->on('inventory_products.vendor_code', '=', 'inventory_rows.sku');
-                })
-                ->whereNotNull('inventory_products.vendor_code')
-                ->whereColumn('inventory_products.vendor_code', '!=', 'inventory_products.sku')
-                ->where(function ($query) {
-                    $query->whereNull('inventory_products.barcode')
-                        ->orWhereColumn('inventory_products.vendor_code', '!=', 'inventory_products.barcode');
-                })
-                ->tap($applyInventoryScope)
-                ->selectRaw('inventory_products.id as product_id, inventory_rows.quantity, inventory_rows.average_daily_sales');
+        $inventoryByVendorCode = DB::table('inventory_warehouses as inventory_rows')
+            ->join('products as inventory_products', function ($join) {
+                $join->on('inventory_products.integration_id', '=', 'inventory_rows.integration_id')
+                    ->on('inventory_products.vendor_code', '=', 'inventory_rows.sku');
+            })
+            ->whereNotNull('inventory_products.vendor_code')
+            ->whereColumn('inventory_products.vendor_code', '!=', 'inventory_products.sku')
+            ->where(function ($query) {
+                $query->whereNull('inventory_products.barcode')
+                    ->orWhereColumn('inventory_products.vendor_code', '!=', 'inventory_products.barcode');
+            })
+            ->tap($applyInventoryScope)
+            ->selectRaw('inventory_products.id as product_id, inventory_rows.quantity, inventory_rows.average_daily_sales');
 
-            $inventoryUnion = $inventoryBySku
-                ->unionAll($inventoryByBarcode)
-                ->unionAll($inventoryByVendorCode);
+        $inventoryUnion = $inventoryBySku
+            ->unionAll($inventoryByBarcode)
+            ->unionAll($inventoryByVendorCode);
 
-            $inventoryTotals = DB::query()
-                ->fromSub($inventoryUnion, 'inventory_matches')
-                ->selectRaw('product_id, COALESCE(SUM(quantity), 0) as total_stock, COALESCE(SUM(average_daily_sales), 0) as total_ads')
-                ->groupBy('product_id');
+        $inventoryTotals = DB::query()
+            ->fromSub($inventoryUnion, 'inventory_matches')
+            ->selectRaw('product_id, COALESCE(SUM(quantity), 0) as total_stock, COALESCE(SUM(average_daily_sales), 0) as total_ads')
+            ->groupBy('product_id');
 
-            $query->leftJoinSub($inventoryTotals, 'inventory_totals', function ($join) {
-                $join->on('inventory_totals.product_id', '=', 'unit_economics_cache.product_id');
-            })->select('unit_economics_cache.*');
+        $query->leftJoinSub($inventoryTotals, 'inventory_totals', function ($join) {
+            $join->on('inventory_totals.product_id', '=', 'unit_economics_cache.product_id');
+        })
+            ->leftJoin('products as stock_products', 'stock_products.id', '=', 'unit_economics_cache.product_id')
+            ->select('unit_economics_cache.*');
 
-            if (in_array($sortField, ['stock', 'total_stock', 'current_stock'], true)) {
-                $query->orderByRaw('COALESCE(inventory_totals.total_stock, 0) '.$sortOrder)
-                    ->orderBy('unit_economics_cache.sku');
+        // current_stock = остаток МП + внутренний остаток (как на фронте).
+        $availabilityExpr = '(COALESCE(inventory_totals.total_stock, 0) + COALESCE(stock_products.stock, 0))';
 
-                return;
-            }
+        // Первичный ключ: в продаже (0) выше, нет в продаже (1) ниже.
+        $query->orderByRaw("CASE WHEN {$availabilityExpr} > 0 THEN 0 ELSE 1 END asc");
 
+        // === Вторичная сортировка (внутри групп наличия) ===
+        if (in_array($sortField, ['stock', 'total_stock', 'current_stock'], true)) {
+            $query->orderByRaw("{$availabilityExpr} ".$sortOrder)
+                ->orderBy('unit_economics_cache.sku');
+
+            return;
+        }
+
+        if ($sortField === 'days_of_stock') {
             $query->orderByRaw(
-                'CASE WHEN COALESCE(inventory_totals.total_ads, 0) > 0 THEN COALESCE(inventory_totals.total_stock, 0) / inventory_totals.total_ads ELSE -1 END '.$sortOrder
+                "CASE WHEN COALESCE(inventory_totals.total_ads, 0) > 0 THEN {$availabilityExpr} / inventory_totals.total_ads ELSE -1 END ".$sortOrder
             )->orderBy('unit_economics_cache.sku');
 
             return;
@@ -343,7 +358,7 @@ class UnitEconomicsCacheController extends Controller
             $sortField = 'sku';
         }
 
-        $query->orderBy($sortField, $sortOrder);
+        $query->orderBy('unit_economics_cache.'.$sortField, $sortOrder);
     }
 
     /**
@@ -1491,10 +1506,13 @@ class UnitEconomicsCacheController extends Controller
                     ?? max(0.0, $price - (float) ($item['customer_price'] ?? $price)))
                 : 0.0;
 
+            // «На РС» = деньги, которые перечисляет маркетплейс: цена − удержания Ozon
+            // (комиссия/эфф. логистика/эквайринг/хранение) − реклама (ДРР).
+            // Налог, НДС и «наша часть» — выплаты продавца, в «На РС» не входят.
             $toSettlement = $price - $commissionAmount - $effectiveLogistics
-                - $acquiringAmount - $taxAmount - $vatAmount
-                - $ourShareAmount - $drrAmount - $storageCost;
-            $netProfit = $toSettlement - $costPrice;
+                - $acquiringAmount - $drrAmount - $storageCost;
+            // Прибыль = На РС − себестоимость − налог − НДС − наша часть.
+            $netProfit = $toSettlement - $costPrice - $taxAmount - $vatAmount - $ourShareAmount;
             $totalCosts = $costPrice + $commissionAmount + $effectiveLogistics
                 + $acquiringAmount + $taxAmount + $vatAmount
                 + $ourShareAmount + $drrAmount + $storageCost;
