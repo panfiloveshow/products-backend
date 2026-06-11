@@ -394,6 +394,8 @@ Route::prefix('auto-supply-plans')->middleware('sellico.permission')->group(func
         ->name('auto-supply-plans.constraints.index');
     Route::post('/constraints/preview', [AutoSupplyPlanController::class, 'previewConstraints'])
         ->name('auto-supply-plans.constraints.preview');
+    Route::post('/sync-constraints', [AutoSupplyPlanController::class, 'syncConstraints'])
+        ->name('auto-supply-plans.constraints.sync');
     Route::get('/crossdock-drop-off-points', [AutoSupplyPlanController::class, 'crossdockDropOffPoints'])
         ->name('auto-supply-plans.crossdock-drop-off-points');
     Route::get('/', [AutoSupplyPlanController::class, 'index'])

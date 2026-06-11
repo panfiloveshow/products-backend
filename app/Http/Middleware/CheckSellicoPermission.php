@@ -80,6 +80,7 @@ class CheckSellicoPermission
         'auto-supply-plans.data-health'  => 'auto_supply.view',
         'auto-supply-plans.constraints.index' => 'auto_supply.view',
         'auto-supply-plans.constraints.preview' => 'auto_supply.create',
+        'auto-supply-plans.constraints.sync' => 'auto_supply.create',
         'auto-supply-plans.crossdock-drop-off-points' => 'auto_supply.view',
         'auto-supply-plans.simulate'     => 'auto_supply.simulate',
         'auto-supply-plans.store'        => 'auto_supply.create',
