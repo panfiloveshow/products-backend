@@ -854,6 +854,29 @@ class SyncUnitEconomicsCommand extends Command
                     if ($manualRedemptionRate) {
                         $this->info("  WB Ручной % выкупа: {$manualRedemptionRate}%");
                     }
+
+                    // === ЭКВАЙРИНГ ПО ФАКТУ (отчёт реализации) ===
+                    // acquiring_fee / выручка по каждому SKU. Заменяет дефолт 1.5%.
+                    // Отчёт жёстко лимитирован (429) — getAcquiringBySku ретраит внутри.
+                    try {
+                        $wbAcquiring = $wbService->getAcquiringBySku(4);
+                        $wbAcquiringAvg = (float) ($wbAcquiring['avg'] ?? 0);
+                        foreach (($wbAcquiring['by_sku'] ?? []) as $acqKey => $acqPct) {
+                            $acquiringData[(string) $acqKey] = ['acquiring_percent' => (float) $acqPct];
+                        }
+                        // Средний по магазину — фолбэк для товаров без продаж за период.
+                        // Кладём в settings, чтобы он дошёл до buildCalculationData.
+                        if ($wbAcquiringAvg > 0) {
+                            $integrationSettings['wb_acquiring_avg'] = $wbAcquiringAvg;
+                        }
+                        if (! empty($wbAcquiring['by_sku'])) {
+                            $this->info('  WB Эквайринг (отчёт реализации): '.count($wbAcquiring['by_sku']).' SKU, средний '.$wbAcquiringAvg.'%');
+                        } else {
+                            $this->warn('  WB Эквайринг: отчёт реализации недоступен (вероятно 429) — оставляем текущие значения');
+                        }
+                    } catch (\Throwable $acqEx) {
+                        $this->warn('  WB Эквайринг: '.$acqEx->getMessage());
+                    }
                 } else {
                     $this->warn('  Нет credentials для WB API');
                 }
@@ -1134,7 +1157,13 @@ class SyncUnitEconomicsCommand extends Command
                         $data['our_share_percent'] = (float) $ourShareRecord->our_share_percent;
                     }
 
-                    if ($existing && $existing->acquiring_percent !== null && $existing->acquiring_percent > 0) {
+                    // Точный эквайринг из отчёта реализации (WB) перетирает старое
+                    // авто-значение — иначе застрявшие 4.x%/1.5% не обновлялись бы.
+                    // Ручного ввода эквайринга в системе нет, так что «существующее»
+                    // здесь — это прежний авто-расчёт, а не пользовательское значение.
+                    if (! empty($data['_acquiring_precise'])) {
+                        // оставляем точное значение из отчёта
+                    } elseif ($existing && $existing->acquiring_percent !== null && $existing->acquiring_percent > 0) {
                         $data['acquiring_percent'] = (float) $existing->acquiring_percent;
                     } elseif ($acquiringRecord) {
                         $data['acquiring_percent'] = (float) $acquiringRecord->acquiring_percent;
@@ -1719,6 +1748,20 @@ class SyncUnitEconomicsCommand extends Command
                 } else {
                     $data['redemption_rate'] = 80; // WB обычно ниже выкуп чем Ozon
                     $data['redemption_source'] = 'default';
+                }
+
+                // === ЭКВАЙРИНГ ПО ФАКТУ (отчёт реализации) ===
+                // acquiring_fee / выручка из отчёта реализации. Заменяет дефолт 1.5%.
+                // Приоритет: точное значение по SKU → средний по магазину → не трогаем
+                // (если отчёт недоступен/429, оставляем существующее — не клобберим 1.5%).
+                $wbPreciseAcquiring = isset($acquiringData['acquiring_percent']) ? (float) $acquiringData['acquiring_percent'] : null;
+                $wbAcquiringStoreAvg = (float) ($integrationSettings['wb_acquiring_avg'] ?? 0);
+                if ($wbPreciseAcquiring !== null && $wbPreciseAcquiring > 0) {
+                    $data['acquiring_percent'] = round($wbPreciseAcquiring, 2);
+                    $data['_acquiring_precise'] = true; // транзиентный маркер: не перетирать старым
+                } elseif ($wbAcquiringStoreAvg > 0) {
+                    $data['acquiring_percent'] = round($wbAcquiringStoreAvg, 2);
+                    $data['_acquiring_precise'] = true;
                 }
 
                 // === СВОЯ ДОСТАВКА (DBS) ===

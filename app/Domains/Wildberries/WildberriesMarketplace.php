@@ -712,6 +712,16 @@ class WildberriesMarketplace implements MarketplaceInterface, LegacyMarketplaceI
     }
 
     /**
+     * Фактический эквайринг по SKU из отчёта реализации.
+     *
+     * @return array{by_sku: array<string,float>, avg: float}
+     */
+    public function getAcquiringBySku(int $weeks = 4): array
+    {
+        return $this->realizationReport->getAcquiringBySku($weeks);
+    }
+
+    /**
      * Получить детализацию отчёта реализации за период
      */
     public function getRealizationReport(string $dateFrom, string $dateTo, string $periodicity = 'weekly'): array

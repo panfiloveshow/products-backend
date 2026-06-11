@@ -244,4 +244,97 @@ class RealizationReportApi
             return [];
         }
     }
+
+    /**
+     * Фактический эквайринг по SKU из отчёта реализации.
+     *
+     * WB удерживает эквайринг (acquiring_fee) по каждой строке отчёта.
+     * Считаем эффективную ставку: Σ acquiring_fee / Σ выручка (retail_amount) × 100.
+     * Возврат (doc_type Возврат) приходит отрицательной выручкой/комиссией — суммы
+     * net-ятся естественно.
+     *
+     * @return array{
+     *   by_sku: array<string,float>,   // barcode/nm_id/sa_name => acquiring %
+     *   avg: float                     // средневзвешенный эквайринг по магазину, %
+     * }
+     */
+    public function getAcquiringBySku(int $weeks = 4): array
+    {
+        $dateTo = now()->subDays(1)->format('Y-m-d');
+        $dateFrom = now()->subWeeks($weeks)->format('Y-m-d');
+
+        $agg = [];               // key => ['acq' => float, 'rev' => float]
+        $totalAcq = 0.0;
+        $totalRev = 0.0;
+        $rrdId = 0;
+        $limit = 50000;
+        $maxIterations = 100;
+        $iteration = 0;
+
+        try {
+            do {
+                // Отчёт жёстко лимитирован (429) — ретраим внутри statisticsGet.
+                $response = $this->client->statisticsGet('/api/v5/supplier/reportDetailByPeriod', [
+                    'dateFrom' => $dateFrom,
+                    'dateTo' => $dateTo,
+                    'rrdid' => $rrdId,
+                    'limit' => $limit,
+                ], 3);
+
+                if (empty($response) || ! is_array($response)) {
+                    break;
+                }
+
+                foreach ($response as $item) {
+                    $acquiring = (float) ($item['acquiring_fee'] ?? 0);
+                    $revenue = (float) ($item['retail_amount'] ?? 0);
+
+                    // Ключи, по которым WB-товар матчится на product.sku (=barcode).
+                    foreach ([$item['barcode'] ?? null, $item['nm_id'] ?? null, $item['sa_name'] ?? null] as $key) {
+                        if ($key === null || $key === '') {
+                            continue;
+                        }
+                        $key = (string) $key;
+                        if (! isset($agg[$key])) {
+                            $agg[$key] = ['acq' => 0.0, 'rev' => 0.0];
+                        }
+                        $agg[$key]['acq'] += $acquiring;
+                        $agg[$key]['rev'] += $revenue;
+                    }
+
+                    $totalAcq += $acquiring;
+                    $totalRev += $revenue;
+                }
+
+                $lastItem = end($response);
+                $rrdId = (int) ($lastItem['rrd_id'] ?? 0);
+                $iteration++;
+                unset($response);
+            } while ($rrdId > 0 && $iteration < $maxIterations);
+
+            $bySku = [];
+            foreach ($agg as $key => $v) {
+                if ($v['rev'] > 0) {
+                    // Кап 0–10%: защита от мусорных строк (корректировки, нулевая выручка).
+                    $pct = max(0.0, min(10.0, ($v['acq'] / $v['rev']) * 100));
+                    $bySku[$key] = round($pct, 2);
+                }
+            }
+
+            $avg = $totalRev > 0 ? round(max(0.0, min(10.0, ($totalAcq / $totalRev) * 100)), 2) : 0.0;
+
+            Log::info('WB getAcquiringBySku: completed', [
+                'skus' => count($bySku),
+                'avg_percent' => $avg,
+                'date_from' => $dateFrom,
+                'date_to' => $dateTo,
+            ]);
+
+            return ['by_sku' => $bySku, 'avg' => $avg];
+        } catch (\Exception $e) {
+            Log::error('WB getAcquiringBySku error', ['error' => $e->getMessage()]);
+
+            return ['by_sku' => [], 'avg' => 0.0];
+        }
+    }
 }
