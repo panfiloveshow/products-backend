@@ -260,8 +260,11 @@ class RealizationReportApi
      */
     public function getAcquiringBySku(int $weeks = 4): array
     {
-        $dateTo = now()->subDays(1)->format('Y-m-d');
-        $dateFrom = now()->subWeeks($weeks)->format('Y-m-d');
+        // Только ЗАВЕРШЁННЫЕ недельные отчёты, текущая (неполная) неделя исключена —
+        // как считает менеджер вручную («за три недели, исключая эту»). WB-неделя
+        // Пн–Вс; берём $weeks полных недель до прошлого воскресенья включительно.
+        $dateTo = now()->startOfWeek()->subDay()->format('Y-m-d');         // прошлое воскресенье
+        $dateFrom = now()->startOfWeek()->subWeeks($weeks)->format('Y-m-d'); // понедельник N недель назад
 
         $agg = [];               // key => ['acq' => float, 'rev' => float]
         $totalAcq = 0.0;
