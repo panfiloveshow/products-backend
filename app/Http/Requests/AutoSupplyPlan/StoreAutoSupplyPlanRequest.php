@@ -35,6 +35,7 @@ class StoreAutoSupplyPlanRequest extends FormRequest
             'cluster_constraints' => 'nullable|array',
             'constraint_file_id' => 'nullable|integer',
             'use_latest_constraint_file' => 'nullable|boolean',
+            'use_auto_constraints' => 'nullable|boolean',
             'constraint_metadata' => 'nullable|array',
             'target_ktr' => 'nullable|numeric|min:1|max:100',
             'baseline_ktr' => 'nullable|numeric|min:0|max:100',

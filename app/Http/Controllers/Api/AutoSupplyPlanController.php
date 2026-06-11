@@ -11,6 +11,7 @@ use App\Models\AutoSupplyPlanLine;
 use App\Models\InventoryWarehouse;
 use App\Models\Integration;
 use App\Models\LocalityRecommendation;
+use App\Models\MarketplaceConstraintSnapshot;
 use App\Models\OzonWarehouseCluster;
 use App\Models\Product;
 use App\Services\AutoSupplyPlanning\MarketplaceConstraintFileParser;
@@ -150,10 +151,12 @@ class AutoSupplyPlanController extends Controller
         $analysisPeriodDays = (int) $request->input('analysis_period_days', $request->input('horizon_days', 28));
         $seasonalityMultiplier = $request->input('seasonality_multiplier', $request->input('demand_seasonality_multiplier'));
         $draftSupplyMethod = $this->normalizeDraftSupplyMethod((string) $request->input('draft_supply_method', $request->input('supply_method', '')));
+        // Источник ограничений по приоритету: явный запрос > ручной файл > авто-синк из API.
         $constraintFile = $this->resolveConstraintFile($request, $integration);
-        $warehouseConstraints = $request->input('warehouse_constraints', $constraintFile?->warehouse_constraints_json);
-        $clusterConstraints = $request->input('cluster_constraints', $constraintFile?->cluster_constraints_json);
-        $constraintMetadata = $request->input('constraint_metadata', $constraintFile?->toPlanMetadata());
+        $autoSnapshot = $this->resolveAutoConstraintSnapshot($request, $integration);
+        $warehouseConstraints = $request->input('warehouse_constraints', $constraintFile?->warehouse_constraints_json ?? $autoSnapshot?->warehouse_constraints_json);
+        $clusterConstraints = $request->input('cluster_constraints', $constraintFile?->cluster_constraints_json ?? $autoSnapshot?->cluster_constraints_json);
+        $constraintMetadata = $request->input('constraint_metadata', $constraintFile?->toPlanMetadata() ?? $autoSnapshot?->toPlanMetadata());
 
         $params = array_filter([
             'planning_mode' => $planningMode,
@@ -352,6 +355,29 @@ class AutoSupplyPlanController extends Controller
         }
 
         return $this->latestUsableConstraintFile($integration);
+    }
+
+    /**
+     * Свежий авто-снапшот ограничений из API (этап 1, источник ниже ручного файла по приоритету).
+     * Используется только если продавец не отключил авто-источник (use_auto_constraints)
+     * и в запросе нет явных ограничений (иначе они и так перекроют по приоритету).
+     */
+    private function resolveAutoConstraintSnapshot(Request $request, Integration $integration): ?MarketplaceConstraintSnapshot
+    {
+        if (! $request->boolean('use_auto_constraints', true)) {
+            return null;
+        }
+
+        if ($request->has('warehouse_constraints') || $request->has('cluster_constraints')) {
+            return null;
+        }
+
+        return MarketplaceConstraintSnapshot::query()
+            ->where('integration_id', $integration->id)
+            ->where('marketplace', $integration->marketplace)
+            ->usable()
+            ->orderByDesc('synced_at')
+            ->first();
     }
 
     private function latestUsableConstraintFile(Integration $integration): ?AutoSupplyConstraintFile
