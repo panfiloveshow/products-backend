@@ -1735,7 +1735,7 @@ class UnitEconomicsCacheService
         return $result;
     }
 
-    public function resolveWildberriesWarehouseBreakdown(int $integrationId, array $wbData): array
+    public function resolveWildberriesWarehouseBreakdown(int $integrationId, array $wbData, string $scheme = ''): array
     {
         $this->warmWildberriesTariffSnapshotCache($integrationId);
         $snapshotCache = $this->wildberriesTariffSnapshotCache[$integrationId] ?? ['box_by_warehouse' => []];
@@ -1776,6 +1776,22 @@ class UnitEconomicsCacheService
         $noStockDefaultCoef = $this->getIntegrationStockWeightedCoefficient($integrationId, $integrationAvgCoef);
 
         $stockWarehouses = is_array($wbData['stock_warehouses'] ?? null) ? $wbData['stock_warehouses'] : [];
+
+        // КС зависит от схемы: на FBW/FBO считаем по складам WB (FBO), на схемах
+        // продавца (FBS/DBS/EDBS/DBW) — по складам продавца. Иначе у FBW-товара,
+        // которого нет на складах WB, в КС попадал FBS-«Мой склад» — пользователь
+        // видел остатки FBS вместо FBW. Если по нужной схеме остатков нет —
+        // ниже сработает фолбэк на средний КС магазина.
+        $schemeUpper = strtoupper($scheme);
+        if ($schemeUpper !== '') {
+            $wantsMarketplaceStock = in_array($schemeUpper, ['FBS', 'DBS', 'EDBS', 'DBW'], true);
+            $stockWarehouses = array_values(array_filter($stockWarehouses, function ($w) use ($wantsMarketplaceStock) {
+                $isMarketplace = in_array(strtoupper((string) ($w['fulfillment_type'] ?? 'FBO')), ['FBS', 'DBW', 'DBS', 'EDBS'], true);
+
+                return $wantsMarketplaceStock ? $isMarketplace : ! $isMarketplace;
+            }));
+        }
+
         $weightedSum = 0.0;
         $totalQuantity = 0;
         $details = [];

@@ -2882,7 +2882,8 @@ class UnitEconomicsCacheController extends Controller
             $wbDataForCoef = is_array($product?->wb_data ?? null) ? $product->wb_data : [];
             $wbBreakdown = $this->cacheService->resolveWildberriesWarehouseBreakdown(
                 (int) $cache->integration_id,
-                $wbDataForCoef
+                $wbDataForCoef,
+                (string) $fulfillmentType
             );
             $avgWarehouseCoef = (float) ($wbBreakdown['coefficient'] ?? 1.0);
             $warehouseCoefPercent = (float) ($wbBreakdown['percent'] ?? ($avgWarehouseCoef * 100));
@@ -2890,12 +2891,17 @@ class UnitEconomicsCacheController extends Controller
             $wbHasStock = (bool) ($wbBreakdown['has_stock'] ?? false);
             $wbIntegrationAvg = (float) ($wbBreakdown['integration_avg'] ?? $avgWarehouseCoef);
 
-            // Нет остатков ни на одном складе — показываем честно, что КС это среднее
-            // по магазину, а не пустой тултип «Нет данных по складам» при ненулевом КС.
+            // Нет остатков по складам нужной схемы — показываем честно, что КС это
+            // среднее по магазину, а не FBS-«Мой склад» под видом FBW (и не пустой
+            // тултип «Нет данных» при ненулевом КС).
             if (! $wbHasStock && $wbIntegrationAvg > 0) {
+                $isWbWarehouseScheme = ! in_array(strtoupper((string) $fulfillmentType), ['FBS', 'DBS', 'EDBS', 'DBW'], true);
+                $noStockLabel = $isWbWarehouseScheme
+                    ? 'Нет остатков на складах WB — средний КС по магазину'
+                    : 'Нет остатков — средний КС по магазину';
                 $warehouseDetails = [[
                     'warehouse_id' => null,
-                    'warehouse_name' => 'Нет остатков — средний КС по магазину',
+                    'warehouse_name' => $noStockLabel,
                     'coefficient_raw' => round($wbIntegrationAvg, 3),
                     'coefficient' => round($wbIntegrationAvg * 100, 0),
                     'quantity' => 0,
