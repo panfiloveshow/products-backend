@@ -300,10 +300,34 @@ class IntegrationController extends Controller
         $result = $sellicoApi->getIntegrationById($id);
 
         if (! $result['success']) {
-            return response()->json([
-                'success' => false,
-                'message' => $result['error'] ?? 'Интеграция не найдена в Sellico',
-            ], 404);
+            // Фолбэк: сервисная авторизация Sellico бывает сломана (Unauthenticated /
+            // «не найдена в workspace»), хотя интеграция существует и доступ юзера
+            // к ней уже подтверждён выше (ensureAccessibleIntegration по user-токену).
+            // Если локальная запись содержит credentials — синкаем по ним и не
+            // блокируем пользователя из-за server-to-server авторизации.
+            $localIntegration = $access['integration'] ?? Integration::find($id);
+            $localCredentials = is_array($localIntegration?->credentials) ? $localIntegration->credentials : [];
+
+            if ($localIntegration && ! empty($localCredentials) && ! empty($localIntegration->marketplace)) {
+                Log::warning('Integration sync: Sellico lookup failed, using local credentials', [
+                    'integration_id' => $id,
+                    'sellico_error' => $result['error'] ?? null,
+                ]);
+                $result = [
+                    'success' => true,
+                    'integration' => [
+                        'type' => $localIntegration->marketplace,
+                        'name' => $localIntegration->name,
+                        'work_space_id' => $localIntegration->work_space_id,
+                    ],
+                    'credentials' => $localCredentials,
+                ];
+            } else {
+                return response()->json([
+                    'success' => false,
+                    'message' => $result['error'] ?? 'Интеграция не найдена в Sellico',
+                ], 404);
+            }
         }
 
         $integrationData = $result['integration'];
