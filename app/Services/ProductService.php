@@ -56,13 +56,27 @@ class ProductService
     }
 
     /**
-     * Остаток для витрины: если есть агрегат по складам (после SyncInventoryJob) — только он.
-     * Иначе поле products.stock из синка карточек. Раньше складывали оба — получалось двойное
-     * число и «залипание» после частичного обновления.
+     * Остаток для витрины.
+     *
+     * WB: реальные остатки по складам лежат в products.wb_data.stock_warehouses
+     * (склады WB + FBS), а inventory_warehouses/products.stock для WB пустые —
+     * из-за чего FBW-товары с остатком на складе WB показывались «нет в наличии»
+     * (и счётчики «в наличии/нет» на витрине были занижены). Для WB суммируем
+     * остатки из JSON тем же источником, что юнит-экономика.
+     *
+     * Прочие МП: агрегат по складам (после SyncInventoryJob), иначе products.stock.
+     * Раньше складывали оба — получалось двойное число после частичного обновления.
      */
     public function computedStockExpression(string $inventoryAlias = 'inventory_totals'): string
     {
-        return "COALESCE({$inventoryAlias}.total_stock, products.stock, 0)";
+        $wbJsonSum = "COALESCE((SELECT SUM((elem->>'quantity')::numeric) "
+            ."FROM json_array_elements("
+            ."CASE WHEN json_typeof(products.wb_data->'stock_warehouses') = 'array' "
+            ."THEN products.wb_data->'stock_warehouses' ELSE '[]'::json END) AS elem), 0)";
+
+        return "CASE WHEN products.marketplace = 'wildberries' "
+            ."THEN {$wbJsonSum} "
+            ."ELSE COALESCE({$inventoryAlias}.total_stock, products.stock, 0) END";
     }
 
     public function getProductsStats(array $filters = []): array
