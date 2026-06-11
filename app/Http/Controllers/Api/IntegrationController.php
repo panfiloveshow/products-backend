@@ -366,10 +366,22 @@ class IntegrationController extends Controller
         if ($syncType === 'products' && $workspaceId) {
             $limitCheck = $limitsSync->ensureLimitAvailable((int) $workspaceId, 'products', 1);
             if (! ($limitCheck['success'] ?? false)) {
-                return response()->json(
-                    $limitsSync->limitResponsePayload($limitCheck),
-                    (int) ($limitCheck['status'] ?? 403)
-                );
+                // Блокируем только реальное превышение лимита (403). Если лимит-сервис
+                // Sellico недоступен (Unauthenticated/502) — не оставляем пользователя
+                // без синка из-за server-to-server авторизации (см. AutoSync).
+                if ((int) ($limitCheck['status'] ?? 0) === 403) {
+                    return response()->json(
+                        $limitsSync->limitResponsePayload($limitCheck),
+                        403
+                    );
+                }
+
+                Log::warning('Integration sync: limit check unavailable, proceeding', [
+                    'integration_id' => $id,
+                    'workspace_id' => $workspaceId,
+                    'limit_status' => $limitCheck['status'] ?? null,
+                    'limit_message' => $limitCheck['message'] ?? null,
+                ]);
             }
         }
 
