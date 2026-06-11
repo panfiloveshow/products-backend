@@ -318,7 +318,18 @@ class UnitEconomicsCacheController extends Controller
             ->select('unit_economics_cache.*');
 
         // current_stock = остаток МП + внутренний остаток (как на фронте).
-        $availabilityExpr = '(COALESCE(inventory_totals.total_stock, 0) + COALESCE(stock_products.stock, 0))';
+        // WB: реальные остатки в products.wb_data.stock_warehouses (склады WB + FBS),
+        // а inventory_warehouses для WB пустой/«Мой склад» — поэтому FBW-товары с
+        // остатком уезжали вниз как «нет в продаже». Считаем сумму остатков из JSON
+        // тем же источником, что бейдж и разбивка КС.
+        if ($marketplace === 'wildberries') {
+            $availabilityExpr = "COALESCE((SELECT SUM((elem->>'quantity')::numeric) "
+                ."FROM json_array_elements("
+                ."CASE WHEN json_typeof(stock_products.wb_data->'stock_warehouses') = 'array' "
+                ."THEN stock_products.wb_data->'stock_warehouses' ELSE '[]'::json END) AS elem), 0)";
+        } else {
+            $availabilityExpr = '(COALESCE(inventory_totals.total_stock, 0) + COALESCE(stock_products.stock, 0))';
+        }
 
         // Первичный ключ: в продаже (0) выше, нет в продаже (1) ниже.
         $query->orderByRaw("CASE WHEN {$availabilityExpr} > 0 THEN 0 ELSE 1 END asc");
@@ -3141,6 +3152,24 @@ class UnitEconomicsCacheController extends Controller
 
         $internalStock = (int) ($product?->stock ?? 0);
         $marketplaceStock = (int) $warehouses->sum('quantity');
+
+        // WB: реальные остатки лежат в wb_data.stock_warehouses (склады WB + FBS),
+        // тот же источник, что и разбивка КС. inventory_warehouses для WB часто
+        // содержит лишь пустой агрегат «Мой склад», из-за чего FBW-товар с
+        // остатком на складе WB ошибочно помечался «Нет в продаже». «В продаже» =
+        // любой остаток (свой склад ИЛИ склад маркетплейса) — суммируем всё.
+        if ($cache->marketplace === 'wildberries') {
+            $wbWarehouses = is_array($product?->wb_data['stock_warehouses'] ?? null)
+                ? $product->wb_data['stock_warehouses']
+                : [];
+            if (! empty($wbWarehouses)) {
+                $marketplaceStock = (int) array_sum(array_map(
+                    static fn ($w) => (int) ($w['quantity'] ?? 0),
+                    $wbWarehouses
+                ));
+                $internalStock = 0; // wb_data уже включает все склады
+            }
+        }
         $currentStock = $internalStock + $marketplaceStock;
         $averageDailySales = round((float) $warehouses->sum('average_daily_sales'), 4);
         $daysOfStock = $averageDailySales > 0 ? (int) round($currentStock / $averageDailySales) : null;
