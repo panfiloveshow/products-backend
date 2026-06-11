@@ -765,6 +765,7 @@ class AutoSupplyPlanController extends Controller
                     'selection_summary' => $plan->selection_summary,
                     'constraints_summary' => $plan->constraints_summary,
                     'constraint_source' => $this->constraintSourceDescriptor($plan),
+                    'accuracy' => $plan->accuracy_json,
                     'territorial_summary' => $plan->territorial_summary,
                     'plan_quality_audit' => $plan->plan_quality_audit,
                     'marketplace_capabilities' => $plan->marketplace_capabilities,
