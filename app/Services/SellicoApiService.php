@@ -326,9 +326,16 @@ class SellicoApiService
     /**
      * Получить сервисный токен (логин через .env credentials)
      */
-    public function getServiceToken(): ?string
+    public function getServiceToken(bool $forceRefresh = false): ?string
     {
-        $cached = Cache::get('sellico_service_access_token');
+        if ($forceRefresh) {
+            // Токен Sellico живёт меньше, чем наш 23ч кэш: протухший токен даёт 401
+            // на всех server-to-server вызовах (интеграции, лимиты, reconcile).
+            // forceRefresh сбрасывает кэш и логинится заново.
+            Cache::forget('sellico_service_access_token');
+        }
+
+        $cached = $forceRefresh ? null : Cache::get('sellico_service_access_token');
         if ($cached) {
             return $cached;
         }
@@ -364,6 +371,32 @@ class SellicoApiService
         }
 
         return null;
+    }
+
+    /**
+     * Выполнить запрос с сервисным токеном и авто-перелогином при 401.
+     *
+     * $perform получает токен и должен вернуть Response. Если ответ 401
+     * (кэшированный токен протух раньше нашего 23ч TTL) — сбрасываем кэш,
+     * логинимся заново и повторяем запрос один раз. Возвращает null, только
+     * если сервисный токен вообще не удалось получить.
+     */
+    private function withServiceTokenRetry(\Closure $perform): ?\Illuminate\Http\Client\Response
+    {
+        $token = $this->getServiceToken();
+        if (! $token) {
+            return null;
+        }
+
+        $response = $perform($token);
+        if ($response->status() === 401) {
+            $fresh = $this->getServiceToken(true);
+            if ($fresh && $fresh !== $token) {
+                $response = $perform($fresh);
+            }
+        }
+
+        return $response;
     }
 
     /**
@@ -424,6 +457,29 @@ class SellicoApiService
     public function getIntegrationById(int $integrationId, ?int $workspaceId = null): array
     {
         $serviceToken = $this->getServiceToken();
+        $result = $this->searchIntegrationById($integrationId, $workspaceId, $serviceToken);
+
+        // Кэшированный сервисный токен (23ч) переживает реальный срок жизни токена
+        // Sellico — протухший токен даёт 401, и интеграция «не находится». Один раз
+        // перелогиниваемся свежим токеном и повторяем поиск.
+        if (! ($result['success'] ?? false)) {
+            $freshToken = $this->getServiceToken(true);
+            if ($freshToken && $freshToken !== $serviceToken) {
+                $retry = $this->searchIntegrationById($integrationId, $workspaceId, $freshToken);
+                if ($retry['success'] ?? false) {
+                    return $retry;
+                }
+            }
+        }
+
+        return $result;
+    }
+
+    /**
+     * @return array<string,mixed>
+     */
+    private function searchIntegrationById(int $integrationId, ?int $workspaceId, ?string $serviceToken): array
+    {
         $tokens = [];
 
         if ($this->accessToken) {
@@ -711,23 +767,21 @@ class SellicoApiService
             ];
         }
 
-        $token = $this->getServiceToken();
-
-        if (! $token) {
-            return [
-                'success' => false,
-                'error' => 'Не удалось получить service account token Sellico API',
-                'status' => 401,
-            ];
-        }
-
         try {
-            $response = Http::timeout(8)
+            $response = $this->withServiceTokenRetry(fn (string $token) => Http::timeout(8)
                 ->withToken($token)
                 ->acceptJson()
                 ->get("{$this->baseUrl}/workspaces/{$workspaceId}/limits-external", array_filter([
                     'type' => $type,
-                ]));
+                ])));
+
+            if ($response === null) {
+                return [
+                    'success' => false,
+                    'error' => 'Не удалось получить service account token Sellico API',
+                    'status' => 401,
+                ];
+            }
 
             if ($response->successful()) {
                 return [
@@ -781,21 +835,19 @@ class SellicoApiService
             ];
         }
 
-        $token = $this->getServiceToken();
-
-        if (! $token) {
-            return [
-                'success' => false,
-                'error' => 'Не удалось получить service account token Sellico API',
-                'status' => 401,
-            ];
-        }
-
         try {
-            $response = Http::timeout(8)
+            $response = $this->withServiceTokenRetry(fn (string $token) => Http::timeout(8)
                 ->withToken($token)
                 ->acceptJson()
-                ->post("{$this->baseUrl}/workspaces/{$workspaceId}/limits-external", $payload);
+                ->post("{$this->baseUrl}/workspaces/{$workspaceId}/limits-external", $payload));
+
+            if ($response === null) {
+                return [
+                    'success' => false,
+                    'error' => 'Не удалось получить service account token Sellico API',
+                    'status' => 401,
+                ];
+            }
 
             if ($response->successful()) {
                 return [
@@ -850,26 +902,24 @@ class SellicoApiService
             ];
         }
 
-        $token = $this->getServiceToken();
-
-        if (! $token) {
-            return [
-                'success' => false,
-                'error' => 'Не удалось получить service account token Sellico API',
-                'status' => 401,
-            ];
-        }
-
         try {
             $externalPayload = [
                 'type' => $payload['type'] ?? null,
                 'value' => $payload['current_value'] ?? $payload['value'] ?? null,
             ];
 
-            $response = Http::timeout(8)
+            $response = $this->withServiceTokenRetry(fn (string $token) => Http::timeout(8)
                 ->withToken($token)
                 ->acceptJson()
-                ->put("{$this->baseUrl}/workspaces/{$workspaceId}/limits-external/sync", $externalPayload);
+                ->put("{$this->baseUrl}/workspaces/{$workspaceId}/limits-external/sync", $externalPayload));
+
+            if ($response === null) {
+                return [
+                    'success' => false,
+                    'error' => 'Не удалось получить service account token Sellico API',
+                    'status' => 401,
+                ];
+            }
 
             if ($response->successful()) {
                 return [
