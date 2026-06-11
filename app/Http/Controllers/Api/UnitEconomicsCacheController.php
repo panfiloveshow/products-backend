@@ -2971,10 +2971,15 @@ class UnitEconomicsCacheController extends Controller
                              $expectedReturnCost + (float) $cache->storage_cost + (float) ($data['acquiring_amount'] ?? 0);
             $data['total_expenses_percent'] = $price > 0 ? round($totalExpenses / $price * 100, 2) : 0;
 
-            // На р/с (to_settlement_account) — от действующей цены, т.к. СПП финансирует
-            // WB и не уменьшает сумму к перечислению продавцу.
+            // На р/с (to_settlement_account) — деньги, которые перечисляет WB:
+            // действующая цена − удержания (комиссия/логистика/возвраты/хранение/
+            // эквайринг) − реклама/ДРР. WB удерживает рекламу из выплаты, поэтому ДРР
+            // входит в «На РС» (раньше его тут не вычитали — сумма была завышена).
+            // СПП финансирует WB и не уменьшает сумму к перечислению.
+            $settleDrrPercent = (float) ($settings?->drr_percent ?? $cache->drr_percent ?? 0);
+            $settleDrrAmount = (float) ($cache->drr_amount ?? ($price * $settleDrrPercent / 100));
             $toSettlement = $price - $commissionAmount -
-                           (float) $cache->logistics_cost - $expectedReturnCost - (float) $cache->storage_cost - (float) ($data['acquiring_amount'] ?? 0);
+                           (float) $cache->logistics_cost - $expectedReturnCost - (float) $cache->storage_cost - (float) ($data['acquiring_amount'] ?? 0) - $settleDrrAmount;
             $data['to_settlement_account'] = round($toSettlement, 2);
 
             // Сохраняем wb_data.commissions для фронтенда (аналогично ozon_data)
