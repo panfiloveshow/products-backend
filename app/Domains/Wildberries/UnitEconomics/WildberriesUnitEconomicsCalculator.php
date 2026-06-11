@@ -162,19 +162,21 @@ class WildberriesUnitEconomicsCalculator implements UnitEconomicsCalculatorInter
         // Всего затрат, % = затраты / цена × 100
         $totalExpensesPercent = $price > 0 ? ($marketplaceCosts / $price) * 100 : 0;
         
-        // На р/с = действующая цена - комиссия - логистика - ожид.возвраты - хранение.
-        // СПП финансирует WB, поэтому база — действующая цена, а не цена покупателя.
-        $toSettlementAccount = $price - $marketplaceCosts;
-        
         // ДРР, ₽ = цена × ДРР%
         $drrAmount = $price * ($drrPercent / 100);
-        
+
+        // На р/с = деньги, которые перечисляет маркетплейс: действующая цена −
+        // удержания WB (комиссия, логистика, возвраты, хранение, эквайринг) − реклама/ДРР.
+        // ДРР WB удерживает из выплаты, поэтому он ВХОДИТ в «На РС» (как у Ozon, см.
+        // фронтовый пересчёт WBProductsTable). СПП финансирует WB → база = действующая цена.
+        $toSettlementAccount = $price - $marketplaceCosts - $drrAmount;
+
         // Налог, ₽ = действующая цена × налог%.
         // База налога едина для WB/Ozon/Yandex и не зависит от суммы к перечислению на р/с.
         $taxAmount = $price * ($taxPercent / 100);
-        
-        // Чистая прибыль = на р/с - себестоимость - ДРР - налог
-        $netProfit = $toSettlementAccount - $costPrice - $drrAmount - $taxAmount;
+
+        // Чистая прибыль = на р/с − себестоимость − налог (ДРР уже в «На РС»)
+        $netProfit = $toSettlementAccount - $costPrice - $taxAmount;
         
         // Маржа, % = чистая прибыль / цена × 100
         $marginPercent = $price > 0 ? ($netProfit / $price) * 100 : 0;
