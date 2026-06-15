@@ -10,6 +10,7 @@ use App\Models\PlanLineEvaluation;
 use App\Services\AutoSupplyPlanning\PlanFactReconciler;
 use Carbon\Carbon;
 use Illuminate\Foundation\Testing\LazilyRefreshDatabase;
+use Illuminate\Support\Facades\Config;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
 use Tests\TestCase;
@@ -97,6 +98,38 @@ class EvaluatePlanAccuracyJobTest extends TestCase
         $plan->refresh();
         $this->assertEquals(40.0, $plan->accuracy_json['mape']);
         $this->assertSame(1, $plan->accuracy_json['lines_evaluated']);
+    }
+
+    public function test_accuracy_endpoint_returns_summary_and_lines(): void
+    {
+        Carbon::setTestNow('2026-06-01 10:00:00');
+        Config::set('services.sellico.skip_permission_check', true);
+
+        $integration = Integration::factory()->ozon()->create(['id' => 9403, 'work_space_id' => 3]);
+        $plan = $this->makeReadyPlan($integration->id, '2026-05-01 00:00:00');
+
+        AutoSupplyPlanLine::create([
+            'auto_supply_plan_id' => $plan->id,
+            'sku' => 'ART1',
+            'offer_id' => 'ART1',
+            'cluster_id' => 12,
+            'cluster_name' => 'Москва',
+            'demand_daily' => 2.0,
+            'qty_rounded' => 30,
+        ]);
+        $this->insertPosting('9403', 'Москва', '2026-05-05 10:00:00', 20, 'PX');
+
+        (new EvaluatePlanAccuracyJob($plan->id))->handle(app(PlanFactReconciler::class));
+
+        $response = $this
+            ->withHeader('X-Workspace-Id', '3')
+            ->getJson("/api/auto-supply-plans/{$plan->id}/accuracy");
+
+        $response
+            ->assertOk()
+            ->assertJsonPath('data.evaluation_status', 'evaluated')
+            ->assertJsonPath('data.summary.lines_evaluated', 1)
+            ->assertJsonPath('data.lines.0.sku', 'ART1');
     }
 
     public function test_job_skips_premature_plan_without_writing_accuracy(): void

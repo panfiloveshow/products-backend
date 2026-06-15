@@ -13,6 +13,7 @@ use App\Models\Integration;
 use App\Models\LocalityRecommendation;
 use App\Models\MarketplaceConstraintSnapshot;
 use App\Models\OzonWarehouseCluster;
+use App\Models\PlanLineEvaluation;
 use App\Models\Product;
 use App\Services\AutoSupplyPlanning\MarketplaceConstraintFileParser;
 use App\Services\AutoSupplyPlanning\MarketplaceConstraintSyncService;
@@ -630,6 +631,35 @@ class AutoSupplyPlanController extends Controller
         return response()->json([
             'message' => 'Пересчёт запущен',
             'data' => $plan->fresh()->load('integration'),
+        ]);
+    }
+
+    /**
+     * GET /api/auto-supply-plans/{id}/accuracy
+     * Точность план-факта (этап 2): агрегат по плану + пер-строчные оценки.
+     */
+    public function accuracy(string $id): JsonResponse
+    {
+        $plan = AutoSupplyPlan::findOrFail($id);
+
+        $lines = PlanLineEvaluation::query()
+            ->where('auto_supply_plan_id', $plan->id)
+            ->orderByRaw('abs_pct_error IS NULL, abs_pct_error DESC')
+            ->get([
+                'sku', 'cluster_id', 'warehouse_id', 'horizon_days',
+                'forecast_demand_qty', 'actual_sales_qty', 'abs_pct_error', 'bias_pct',
+                'planned_qty', 'accepted_qty', 'rejected_qty', 'acceptance_rate',
+                'status', 'evaluated_at',
+            ]);
+
+        return response()->json([
+            'message' => 'OK',
+            'data' => [
+                'plan_id' => $plan->id,
+                'evaluation_status' => $plan->accuracy_json === null ? 'not_evaluated' : 'evaluated',
+                'summary' => $plan->accuracy_json,
+                'lines' => $lines,
+            ],
         ]);
     }
 

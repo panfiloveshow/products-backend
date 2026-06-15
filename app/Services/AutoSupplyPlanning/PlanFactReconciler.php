@@ -30,6 +30,7 @@ class PlanFactReconciler
 
         $forecast = $this->forecastDemandQty($line, $horizon);
         $actual = $this->actualSalesQty($plan, $line, $windowStart, $windowEnd);
+        $exec = $this->supplyExecution($plan, $line, $windowStart, $windowEnd);
 
         $base = [
             'auto_supply_plan_id' => $plan->id,
@@ -45,6 +46,10 @@ class PlanFactReconciler
             'forecast_demand_qty' => $forecast,
             'planned_qty' => (int) $line->qty_rounded,
             'demand_fact_source' => 'postings_fbo',
+            // B: исполнение поставки (план vs принято). null, если поставки не найдено.
+            'accepted_qty' => $exec['accepted'] ?? null,
+            'rejected_qty' => $exec['rejected'] ?? null,
+            'acceptance_rate' => $exec['acceptance_rate'] ?? null,
         ];
 
         // Факт = 0 / нет данных → APE неопределён, не считаем фейковую точность.
@@ -99,12 +104,22 @@ class PlanFactReconciler
         $mape = array_sum(array_column($scored, 'abs_pct_error')) / $linesEvaluated;
         $bias = array_sum(array_column($scored, 'bias_pct')) / $linesEvaluated;
 
+        $withSupply = array_values(array_filter(
+            $evaluations,
+            static fn ($e) => ($e['acceptance_rate'] ?? null) !== null
+        ));
+        $acceptance = count($withSupply) > 0
+            ? round(array_sum(array_column($withSupply, 'acceptance_rate')) / count($withSupply), 2)
+            : null;
+
         return [
             'mape' => round($mape, 2),
             'bias' => round($bias, 2),
             'accuracy' => round(max(0, 100 - $mape), 2),
             'lines_evaluated' => $linesEvaluated,
             'lines_insufficient_data' => $insufficient,
+            'acceptance_rate' => $acceptance,
+            'lines_with_supply' => count($withSupply),
             'evaluated_at' => now()->toIso8601String(),
         ];
     }
@@ -164,5 +179,42 @@ class PlanFactReconciler
         }
 
         return (int) $query->sum('pi.quantity');
+    }
+
+    /**
+     * B: исполнение поставки — сколько по SKU реально принято на МП за окно.
+     * Best-effort матч по (integration_id, sku, окно создания поставки); статусы приёмки
+     * accepted_partial/accepted_full/closed. Возвращает null, если поставок не найдено.
+     *
+     * @return array{accepted:int, rejected:int, acceptance_rate:float|null}|null
+     */
+    private function supplyExecution(AutoSupplyPlan $plan, AutoSupplyPlanLine $line, $start, $end): ?array
+    {
+        $offer = $line->offer_id ?: $line->sku;
+
+        $row = DB::table('supply_items as si')
+            ->join('supplies as s', 'si.supply_id', '=', 's.id')
+            ->where('s.integration_id', $plan->integration_id)
+            ->whereIn('s.status', ['accepted_partial', 'accepted_full', 'closed'])
+            ->whereBetween('s.created_at', [$start, $end])
+            ->where(function ($w) use ($offer, $line) {
+                $w->where('si.sku', $line->sku);
+                if ($offer !== $line->sku) {
+                    $w->orWhere('si.sku', $offer);
+                }
+            })
+            ->selectRaw('COALESCE(SUM(si.accepted_qty), 0) acc, COALESCE(SUM(si.rejected_qty), 0) rej, COUNT(*) cnt')
+            ->first();
+
+        if ($row === null || (int) $row->cnt === 0) {
+            return null;
+        }
+
+        $accepted = (int) $row->acc;
+        $rejected = (int) $row->rej;
+        $planned = (int) $line->qty_rounded;
+        $rate = $planned > 0 ? round(min(100, $accepted / $planned * 100), 2) : null;
+
+        return ['accepted' => $accepted, 'rejected' => $rejected, 'acceptance_rate' => $rate];
     }
 }

@@ -47,6 +47,41 @@ class PlanFactReconcilerTest extends TestCase
             $table->string('barcode')->nullable();
             $table->unsignedInteger('quantity')->default(1);
         });
+
+        Schema::dropIfExists('supplies');
+        Schema::dropIfExists('supply_items');
+
+        Schema::create('supplies', function (Blueprint $table) {
+            $table->id();
+            $table->unsignedBigInteger('integration_id');
+            $table->string('status', 50);
+            $table->timestamp('created_at')->nullable();
+        });
+
+        Schema::create('supply_items', function (Blueprint $table) {
+            $table->id();
+            $table->unsignedBigInteger('supply_id');
+            $table->string('sku', 100);
+            $table->integer('planned_qty')->default(0);
+            $table->integer('accepted_qty')->nullable();
+            $table->integer('rejected_qty')->nullable();
+        });
+    }
+
+    private function insertSupply(int $integrationId, string $status, string $createdAt, string $sku, int $accepted, int $rejected): void
+    {
+        $supplyId = DB::table('supplies')->insertGetId([
+            'integration_id' => $integrationId,
+            'status' => $status,
+            'created_at' => $createdAt,
+        ]);
+        DB::table('supply_items')->insert([
+            'supply_id' => $supplyId,
+            'sku' => $sku,
+            'planned_qty' => 30,
+            'accepted_qty' => $accepted,
+            'rejected_qty' => $rejected,
+        ]);
     }
 
     protected function tearDown(): void
@@ -134,6 +169,32 @@ class PlanFactReconcilerTest extends TestCase
         $this->assertEquals(0.0, $result['actual_sales_qty']);
         $this->assertNull($result['abs_pct_error']);
         $this->assertNull($result['bias_pct']);
+    }
+
+    public function test_metric_b_supply_execution_matched_in_window(): void
+    {
+        [$plan, $line] = $this->makePlanAndLine();
+
+        // Принятая поставка в окне → учитывается (25 принято, 3 отклонено).
+        $this->insertSupply(700, 'accepted_full', '2026-05-06 10:00:00', 'ART1', 25, 3);
+        // Непринятая (готовится) → исключается.
+        $this->insertSupply(700, 'preparing', '2026-05-07 10:00:00', 'ART1', 10, 0);
+
+        $result = (new PlanFactReconciler())->evaluateLine($line, $plan);
+
+        $this->assertSame(25, $result['accepted_qty']);
+        $this->assertSame(3, $result['rejected_qty']);
+        $this->assertEquals(83.33, $result['acceptance_rate']); // 25/30*100
+    }
+
+    public function test_metric_b_null_when_no_supply(): void
+    {
+        [$plan, $line] = $this->makePlanAndLine();
+
+        $result = (new PlanFactReconciler())->evaluateLine($line, $plan);
+
+        $this->assertNull($result['accepted_qty']);
+        $this->assertNull($result['acceptance_rate']);
     }
 
     public function test_aggregate_ignores_insufficient_lines(): void
