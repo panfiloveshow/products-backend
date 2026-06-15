@@ -168,7 +168,6 @@ app/
 └── Jobs/
     ├── SyncProductsJob.php
     ├── SyncInventoryJob.php
-    ├── CalculateForecastsJob.php
     ├── GenerateAlertsJob.php
     ├── GenerateShipmentRecommendationsJob.php
     └── CalculateUnitEconomicsJob.php
