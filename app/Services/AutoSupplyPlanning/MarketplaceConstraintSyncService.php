@@ -3,6 +3,7 @@
 namespace App\Services\AutoSupplyPlanning;
 
 use App\Domains\Marketplace\MarketplaceFactory;
+use App\Domains\Ozon\Api\SuppliesApi as OzonSuppliesApi;
 use App\Domains\Wildberries\Api\SuppliesApi as WbSuppliesApi;
 use App\Models\Integration;
 use App\Models\MarketplaceConstraintSnapshot;
@@ -35,7 +36,7 @@ class MarketplaceConstraintSyncService
      */
     public function supportedMarketplaces(): array
     {
-        return ['wildberries'];
+        return ['wildberries', 'ozon'];
     }
 
     /**
@@ -90,8 +91,108 @@ class MarketplaceConstraintSyncService
 
         return match ($integration->marketplace) {
             'wildberries' => $this->buildWbConstraints($mp->supplies()),
+            'ozon' => $this->buildOzonConstraints($mp->supplies()),
             default => $this->unsupportedYet((string) $integration->marketplace),
         };
+    }
+
+    /**
+     * Ozon: кластеры (getClusters) + загрузка складов (getWarehouseWorkload) →
+     * cluster_constraints с доступностью. Ozon планирует по кластерам, а доступность
+     * API даёт по складам, поэтому агрегируем: кластер доступен, если хоть один его
+     * склад приёмки имеет ёмкость > 0. max_qty/коэффициенты Ozon API не отдаёт (null).
+     *
+     * @return array{cluster_constraints: array, warehouse_constraints: array, summary: array, sources: array, status: string}
+     */
+    private function buildOzonConstraints(OzonSuppliesApi $supplies): array
+    {
+        $sources = [];
+
+        try {
+            $clusters = $supplies->getClusters();
+            $sources['clusters'] = ['ok' => true, 'count' => count($clusters)];
+        } catch (Throwable $e) {
+            $clusters = [];
+            $sources['clusters'] = ['ok' => false, 'error' => $e->getMessage()];
+        }
+
+        try {
+            $workload = $supplies->getWarehouseWorkload();
+            $sources['warehouse_workload'] = ['ok' => true, 'count' => count($workload)];
+        } catch (Throwable $e) {
+            $workload = [];
+            $sources['warehouse_workload'] = ['ok' => false, 'error' => $e->getMessage()];
+        }
+
+        // Без обоих источников нельзя достоверно определить доступность кластеров —
+        // не пишем потенциально ложно-блокирующие ограничения.
+        if (! ($sources['clusters']['ok'] ?? false) || ! ($sources['warehouse_workload']['ok'] ?? false)) {
+            return [
+                'cluster_constraints' => [],
+                'warehouse_constraints' => [],
+                'summary' => ['reason' => 'Не удалось получить кластеры или загрузку складов Ozon'],
+                'sources' => $sources,
+                'status' => 'error',
+            ];
+        }
+
+        $records = [];
+        $available = 0;
+        $blocked = 0;
+
+        foreach ($clusters as $cluster) {
+            $clusterId = (string) ($cluster['id'] ?? '');
+            if ($clusterId === '') {
+                continue;
+            }
+
+            $clusterAvailable = false;
+            $maxCapacity = 0;
+            $nearestDate = null;
+
+            foreach (($cluster['warehouse_ids'] ?? []) as $warehouseId) {
+                $w = $workload[(string) $warehouseId] ?? null;
+                if ($w !== null && $w['capacity_per_day'] > 0) {
+                    $clusterAvailable = true;
+                    $maxCapacity = max($maxCapacity, (int) $w['capacity_per_day']);
+                    $date = $w['nearest_date'] ?? null;
+                    if ($date !== null && ($nearestDate === null || $date < $nearestDate)) {
+                        $nearestDate = $date;
+                    }
+                }
+            }
+
+            $records[] = [
+                'cluster_id' => $clusterId,
+                'cluster_name' => $cluster['name'] ?? null,
+                'sku' => null,
+                'max_qty' => null,   // Ozon API не отдаёт жёсткий лимит штук
+                'need_qty' => null,
+                'is_available' => $clusterAvailable,
+                'acceptance_coefficient' => null, // у Ozon нет коэффициента приёмки как у WB
+                'delivery_coefficient' => null,
+                'storage_coefficient' => null,
+                'logistics_coefficient' => null,
+                'reason' => $clusterAvailable
+                    ? sprintf('Приёмка доступна (ёмкость ~%d тов./день%s)', $maxCapacity, $nearestDate ? ", с {$nearestDate}" : '')
+                    : 'Нет доступных складов приёмки в кластере',
+                'source_type' => 'marketplace_constraint',
+            ];
+            $clusterAvailable ? $available++ : $blocked++;
+        }
+
+        return [
+            'cluster_constraints' => $records,
+            'warehouse_constraints' => [],
+            'summary' => [
+                'clusters_total' => count($records),
+                'clusters_available' => $available,
+                'clusters_blocked' => $blocked,
+                'parser_version' => self::SYNC_VERSION,
+            ],
+            'sources' => $sources,
+            'status' => $records === [] ? 'error' : 'ok',
+        ];
     }
 
     /**

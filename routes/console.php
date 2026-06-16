@@ -85,15 +85,23 @@ if (filter_var(env('WB_TARIFF_SCHEDULE', true), FILTER_VALIDATE_BOOLEAN)) {
 // Авто-синхронизация ограничений складов МП (доступность приёмки, коэффициенты)
 // из API в marketplace_constraint_snapshots — заменяет ручную загрузку файла.
 // WB-коэффициенты приёмки датированы и быстро устаревают → обновляем ежечасно.
-// По умолчанию ВЫКЛЮЧЕНО (новый синк, нагрузка на WB API): включить MP_CONSTRAINTS_SCHEDULE=true.
+// По умолчанию ВЫКЛЮЧЕНО (новый синк, нагрузка на API МП): включить MP_CONSTRAINTS_SCHEDULE=true.
 // ВНИМАНИЕ: на проде schedule:run может быть не настроен (см. ниже про системный cron) —
-// тогда задачу нужно завести в /etc/cron.d. Ozon добавится отдельной daily-строкой на этапе 3.
+// тогда задачу нужно завести в /etc/cron.d.
 if (filter_var(env('MP_CONSTRAINTS_SCHEDULE', false), FILTER_VALIDATE_BOOLEAN)) {
+    // WB: коэффициенты приёмки датированы и быстро устаревают → ежечасно.
     \Illuminate\Support\Facades\Schedule::command('mp:sync-constraints --marketplace=wildberries')
         ->hourly()
         ->withoutOverlapping()
         ->appendOutputTo(storage_path('logs/mp-constraints-sync.log'))
         ->name('mp.sync-constraints-wb');
+
+    // Ozon: доступность кластеров/загрузка складов меняется реже → раз в сутки.
+    \Illuminate\Support\Facades\Schedule::command('mp:sync-constraints --marketplace=ozon')
+        ->dailyAt('04:30')
+        ->withoutOverlapping()
+        ->appendOutputTo(storage_path('logs/mp-constraints-sync.log'))
+        ->name('mp.sync-constraints-ozon');
 }
 
 // Оценка точности планов через горизонт N дней (этап 2, план-факт). Раз в сутки

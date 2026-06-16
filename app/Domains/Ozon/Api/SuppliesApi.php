@@ -718,6 +718,49 @@ class SuppliesApi implements SuppliesApiInterface
         }, $clusters);
     }
 
+    /**
+     * Загруженность/доступность складов FBO (этап 1, Ozon-синк ограничений).
+     * POST /v1/supplier/available_warehouses — возвращает доступные для поставки склады
+     * с расписанием: ёмкость приёмки (товаров/день) и ближайшую дату.
+     *
+     * Wire-формат (проверено по docs.ozon.ru / Go-клиенту):
+     *   result[].warehouse.{id,name}
+     *   result[].schedule.{date, capacity[].{start,end,value}}
+     *
+     * @return array<string, array{warehouse_id:string, warehouse_name:?string, capacity_per_day:int, nearest_date:?string}>
+     */
+    public function getWarehouseWorkload(): array
+    {
+        $response = $this->client->post('/v1/supplier/available_warehouses', [], true);
+
+        if (! $response || ($response['_error'] ?? false)) {
+            return [];
+        }
+
+        $out = [];
+        foreach (($response['result'] ?? []) as $row) {
+            $warehouse = $row['warehouse'] ?? [];
+            $id = (string) ($warehouse['id'] ?? '');
+            if ($id === '') {
+                continue;
+            }
+
+            $maxValue = 0;
+            foreach (($row['schedule']['capacity'] ?? []) as $capacity) {
+                $maxValue = max($maxValue, (int) ($capacity['value'] ?? 0));
+            }
+
+            $out[$id] = [
+                'warehouse_id' => $id,
+                'warehouse_name' => $warehouse['name'] ?? null,
+                'capacity_per_day' => $maxValue,
+                'nearest_date' => $row['schedule']['date'] ?? null,
+            ];
+        }
+
+        return $out;
+    }
+
     private function buildClusterWarehouses(): array
     {
         $clusters = $this->getClusters();

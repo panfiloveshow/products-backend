@@ -173,6 +173,61 @@ class MarketplaceConstraintSyncServiceTest extends TestCase
         Http::assertNotSent(fn ($request) => str_contains($request->url(), 'acceptance/coefficients'));
     }
 
+    public function test_ozon_maps_cluster_availability_from_workload(): void
+    {
+        Http::fake([
+            'api-seller.ozon.ru/v1/cluster/list' => Http::response([
+                'result' => ['clusters' => [
+                    ['id' => 100, 'name' => 'Москва', 'logistic_clusters' => [
+                        ['warehouses' => [
+                            ['warehouse_id' => 'W1', 'type' => 'FULL_FILLMENT', 'name' => 'Хоругвино'],
+                            ['warehouse_id' => 'W2', 'type' => 'FULL_FILLMENT', 'name' => 'Пушкино'],
+                        ]],
+                    ]],
+                    ['id' => 200, 'name' => 'СПб', 'logistic_clusters' => [
+                        ['warehouses' => [
+                            ['warehouse_id' => 'W3', 'type' => 'FULL_FILLMENT', 'name' => 'Шушары'],
+                        ]],
+                    ]],
+                ]],
+            ], 200),
+            'api-seller.ozon.ru/v1/supplier/available_warehouses' => Http::response([
+                'result' => [
+                    ['warehouse' => ['id' => 'W1', 'name' => 'Хоругвино'], 'schedule' => ['date' => '2026-06-12', 'capacity' => [['value' => 500]]]],
+                    // W2 отсутствует; W3 ёмкость 0 → кластер 200 заблокирован.
+                    ['warehouse' => ['id' => 'W3', 'name' => 'Шушары'], 'schedule' => ['date' => '2026-06-13', 'capacity' => [['value' => 0]]]],
+                ],
+            ], 200),
+        ]);
+
+        $integration = Integration::create([
+            'id' => 9002,
+            'marketplace' => 'ozon',
+            'credentials' => ['client_id' => '123', 'api_key' => 'test-key'],
+            'is_active' => true,
+        ]);
+
+        $snapshot = (new MarketplaceConstraintSyncService())->syncIntegration($integration);
+
+        $this->assertSame('ok', $snapshot->sync_status);
+        $this->assertNull($snapshot->warehouse_constraints_json);
+
+        $records = collect($snapshot->cluster_constraints_json);
+        $this->assertCount(2, $records);
+
+        $moscow = $records->firstWhere('cluster_id', '100');
+        $this->assertTrue($moscow['is_available']);
+        $this->assertNull($moscow['max_qty']);
+        $this->assertNull($moscow['acceptance_coefficient']);
+
+        $spb = $records->firstWhere('cluster_id', '200');
+        $this->assertFalse($spb['is_available']);
+
+        $summary = $snapshot->summary_json;
+        $this->assertSame(1, $summary['clusters_available']);
+        $this->assertSame(1, $summary['clusters_blocked']);
+    }
+
     public function test_upsert_is_idempotent(): void
     {
         Http::fake([
