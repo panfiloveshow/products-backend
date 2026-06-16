@@ -82,6 +82,39 @@ if (filter_var(env('WB_TARIFF_SCHEDULE', true), FILTER_VALIDATE_BOOLEAN)) {
         ->name('wb.refresh-tariffs');
 }
 
+// Авто-синхронизация ограничений складов МП (доступность приёмки, коэффициенты)
+// из API в marketplace_constraint_snapshots — заменяет ручную загрузку файла.
+// WB-коэффициенты приёмки датированы и быстро устаревают → обновляем ежечасно.
+// По умолчанию ВЫКЛЮЧЕНО (новый синк, нагрузка на API МП): включить MP_CONSTRAINTS_SCHEDULE=true.
+// ВНИМАНИЕ: на проде schedule:run может быть не настроен (см. ниже про системный cron) —
+// тогда задачу нужно завести в /etc/cron.d.
+if (filter_var(env('MP_CONSTRAINTS_SCHEDULE', false), FILTER_VALIDATE_BOOLEAN)) {
+    // WB: коэффициенты приёмки датированы и быстро устаревают → ежечасно.
+    \Illuminate\Support\Facades\Schedule::command('mp:sync-constraints --marketplace=wildberries')
+        ->hourly()
+        ->withoutOverlapping()
+        ->appendOutputTo(storage_path('logs/mp-constraints-sync.log'))
+        ->name('mp.sync-constraints-wb');
+
+    // Ozon: доступность кластеров/загрузка складов меняется реже → раз в сутки.
+    \Illuminate\Support\Facades\Schedule::command('mp:sync-constraints --marketplace=ozon')
+        ->dailyAt('04:30')
+        ->withoutOverlapping()
+        ->appendOutputTo(storage_path('logs/mp-constraints-sync.log'))
+        ->name('mp.sync-constraints-ozon');
+}
+
+// Оценка точности планов через горизонт N дней (этап 2, план-факт). Раз в сутки
+// ставит в очередь EvaluatePlanAccuracyJob для созревших готовых планов.
+// По умолчанию ВЫКЛЮЧЕНО: включить PLAN_ACCURACY_SCHEDULE=true (см. caveat про schedule:run ниже).
+if (filter_var(env('PLAN_ACCURACY_SCHEDULE', false), FILTER_VALIDATE_BOOLEAN)) {
+    \Illuminate\Support\Facades\Schedule::command('plan:evaluate-accuracy')
+        ->dailyAt('06:00')
+        ->withoutOverlapping()
+        ->appendOutputTo(storage_path('logs/plan-accuracy.log'))
+        ->name('plan.evaluate-accuracy');
+}
+
 // Sanity-check unit_economics_cache запускается через системный cron
 // (/etc/cron.d/ue-sanity-check) — не через Laravel scheduler, потому что
 // schedule:run на этом сервере не настроен. См. `php artisan ue:sanity-check`.

@@ -580,6 +580,211 @@ class AutoSupplyPlanCreateTest extends TestCase
         Queue::assertNothingPushed();
     }
 
+    public function test_auto_constraint_snapshot_is_used_when_no_file_provided(): void
+    {
+        Queue::fake();
+        Config::set('services.sellico.skip_permission_check', true);
+        $this->fakeSellicoLimits(30);
+
+        $integration = Integration::factory()->wildberries()->create([
+            'id' => 9301,
+            'work_space_id' => 3,
+        ]);
+
+        $constraints = [[
+            'warehouse_id' => '507',
+            'warehouse_name' => 'Коледино',
+            'sku' => null,
+            'max_qty' => null,
+            'need_qty' => null,
+            'is_available' => true,
+            'acceptance_coefficient' => 1.0,
+            'delivery_coefficient' => 1.1,
+            'storage_coefficient' => 0.9,
+            'logistics_coefficient' => null,
+            'reason' => 'Есть бесплатные окна приёмки в горизонте',
+            'source_type' => 'marketplace_constraint',
+        ]];
+
+        \App\Models\MarketplaceConstraintSnapshot::create([
+            'integration_id' => $integration->id,
+            'marketplace' => 'wildberries',
+            'warehouse_constraints_json' => $constraints,
+            'summary_json' => ['warehouses_total' => 1, 'warehouses_available' => 1, 'warehouses_blocked' => 0],
+            'sync_status' => 'ok',
+            'synced_at' => now(),
+        ]);
+
+        $response = $this
+            ->withHeader('X-Workspace-Id', '3')
+            ->postJson('/api/auto-supply-plans', [
+                'integration_id' => $integration->id,
+                'mode' => 'balanced',
+                'horizon_days' => 28,
+            ]);
+
+        $response
+            ->assertCreated()
+            ->assertJsonPath('data.params.constraint_metadata.source_kind', 'api_sync');
+
+        $plan = AutoSupplyPlan::query()->latest('id')->first();
+        $warehouseConstraints = $plan->params['warehouse_constraints'] ?? [];
+        $this->assertCount(1, $warehouseConstraints);
+        $this->assertSame('507', $warehouseConstraints[0]['warehouse_id']);
+        $this->assertTrue($warehouseConstraints[0]['is_available']);
+    }
+
+    public function test_auto_constraint_snapshot_is_skipped_when_disabled(): void
+    {
+        Queue::fake();
+        Config::set('services.sellico.skip_permission_check', true);
+        $this->fakeSellicoLimits(30);
+
+        $integration = Integration::factory()->wildberries()->create([
+            'id' => 9302,
+            'work_space_id' => 3,
+        ]);
+
+        \App\Models\MarketplaceConstraintSnapshot::create([
+            'integration_id' => $integration->id,
+            'marketplace' => 'wildberries',
+            'warehouse_constraints_json' => [['warehouse_id' => '507', 'is_available' => true]],
+            'sync_status' => 'ok',
+            'synced_at' => now(),
+        ]);
+
+        $response = $this
+            ->withHeader('X-Workspace-Id', '3')
+            ->postJson('/api/auto-supply-plans', [
+                'integration_id' => $integration->id,
+                'mode' => 'balanced',
+                'horizon_days' => 28,
+                'use_auto_constraints' => false,
+            ]);
+
+        $response->assertCreated();
+
+        $plan = AutoSupplyPlan::query()->latest('id')->first();
+        $this->assertArrayNotHasKey('warehouse_constraints', $plan->params);
+    }
+
+    public function test_plan_without_any_constraints_records_source_note(): void
+    {
+        Queue::fake();
+        Config::set('services.sellico.skip_permission_check', true);
+        $this->fakeSellicoLimits(30);
+
+        $integration = Integration::factory()->wildberries()->create([
+            'id' => 9303,
+            'work_space_id' => 3,
+        ]);
+
+        $response = $this
+            ->withHeader('X-Workspace-Id', '3')
+            ->postJson('/api/auto-supply-plans', [
+                'integration_id' => $integration->id,
+                'mode' => 'balanced',
+                'horizon_days' => 28,
+            ]);
+
+        $response->assertCreated();
+
+        $plan = AutoSupplyPlan::query()->latest('id')->first();
+        $this->assertArrayNotHasKey('warehouse_constraints', $plan->params);
+        $this->assertNotEmpty($plan->params['constraint_source_note'] ?? null);
+        $this->assertStringContainsString('не подключены', $plan->params['constraint_source_note']);
+    }
+
+    public function test_data_health_reports_marketplace_constraints(): void
+    {
+        Config::set('services.sellico.skip_permission_check', true);
+
+        $integration = Integration::factory()->wildberries()->create([
+            'id' => 9304,
+            'work_space_id' => 3,
+        ]);
+
+        \App\Models\MarketplaceConstraintSnapshot::create([
+            'integration_id' => $integration->id,
+            'marketplace' => 'wildberries',
+            'warehouse_constraints_json' => [['warehouse_id' => '507', 'is_available' => true]],
+            'summary_json' => ['warehouses_total' => 3, 'warehouses_available' => 2, 'warehouses_blocked' => 1],
+            'sync_status' => 'ok',
+            'synced_at' => now(),
+        ]);
+
+        $response = $this
+            ->withHeader('X-Workspace-Id', '3')
+            ->getJson('/api/auto-supply-plans/data-health?integration_id='.$integration->id);
+
+        $response
+            ->assertOk()
+            ->assertJsonPath('data.marketplace_constraints.available', true)
+            ->assertJsonPath('data.marketplace_constraints.source', 'api_sync')
+            ->assertJsonPath('data.marketplace_constraints.sync_status', 'ok')
+            ->assertJsonPath('data.marketplace_constraints.is_fresh', true)
+            ->assertJsonPath('data.marketplace_constraints.warehouses_total', 3)
+            ->assertJsonPath('data.marketplace_constraints.warehouses_available', 2);
+    }
+
+    public function test_sync_constraints_endpoint_triggers_wb_sync(): void
+    {
+        Config::set('services.sellico.skip_permission_check', true);
+        \Illuminate\Support\Facades\Http::fake([
+            'common-api.wildberries.ru/api/tariffs/v1/acceptance/coefficients*' => \Illuminate\Support\Facades\Http::response([
+                [
+                    'date' => now()->addDay()->toDateString(),
+                    'warehouseID' => '507',
+                    'warehouseName' => 'Коледино',
+                    'coefficient' => 0,
+                    'allowUnload' => true,
+                    'storageCoef' => 1.0,
+                    'deliveryCoef' => 1.0,
+                ],
+            ], 200),
+        ]);
+
+        $integration = Integration::factory()->wildberries()->create([
+            'id' => 9305,
+            'work_space_id' => 3,
+        ]);
+
+        $response = $this
+            ->withHeader('X-Workspace-Id', '3')
+            ->postJson('/api/auto-supply-plans/sync-constraints', [
+                'integration_id' => $integration->id,
+            ]);
+
+        $response
+            ->assertOk()
+            ->assertJsonPath('data.sync_status', 'ok')
+            ->assertJsonPath('data.summary.warehouses_total', 1);
+
+        $this->assertDatabaseHas('marketplace_constraint_snapshots', [
+            'integration_id' => $integration->id,
+            'marketplace' => 'wildberries',
+            'sync_status' => 'ok',
+        ]);
+    }
+
+    public function test_sync_constraints_endpoint_rejects_unsupported_marketplace(): void
+    {
+        Config::set('services.sellico.skip_permission_check', true);
+
+        $integration = Integration::factory()->ozon()->create([
+            'id' => 9306,
+            'work_space_id' => 3,
+        ]);
+
+        $response = $this
+            ->withHeader('X-Workspace-Id', '3')
+            ->postJson('/api/auto-supply-plans/sync-constraints', [
+                'integration_id' => $integration->id,
+            ]);
+
+        $response->assertStatus(422);
+    }
+
     private function fakeSellicoLimits(int $limit): void
     {
         $this->app->instance(SellicoApiService::class, new class($limit) extends SellicoApiService {

@@ -394,6 +394,8 @@ Route::prefix('auto-supply-plans')->middleware('sellico.permission')->group(func
         ->name('auto-supply-plans.constraints.index');
     Route::post('/constraints/preview', [AutoSupplyPlanController::class, 'previewConstraints'])
         ->name('auto-supply-plans.constraints.preview');
+    Route::post('/sync-constraints', [AutoSupplyPlanController::class, 'syncConstraints'])
+        ->name('auto-supply-plans.constraints.sync');
     Route::get('/crossdock-drop-off-points', [AutoSupplyPlanController::class, 'crossdockDropOffPoints'])
         ->name('auto-supply-plans.crossdock-drop-off-points');
     Route::get('/', [AutoSupplyPlanController::class, 'index'])
@@ -410,6 +412,8 @@ Route::prefix('auto-supply-plans')->middleware('sellico.permission')->group(func
         ->name('auto-supply-plans.fix-ktr-baseline');
     Route::get('/{id}/lines', [AutoSupplyPlanController::class, 'lines'])
         ->name('auto-supply-plans.lines');
+    Route::get('/{id}/accuracy', [AutoSupplyPlanController::class, 'accuracy'])
+        ->name('auto-supply-plans.accuracy');
     Route::get('/{id}/clusters', [AutoSupplyPlanController::class, 'clusters'])
         ->name('auto-supply-plans.clusters');
     Route::put('/{id}/lines/{lineId}', [AutoSupplyPlanController::class, 'updateLine'])->name('auto-supply-plans.lines.update');

@@ -13,6 +13,7 @@ use App\Models\SupplySettings;
 use App\Models\WbBarcodeCost;
 use App\Models\UnitEconomics;
 use App\Services\AutoSupplyPlanService;
+use App\Services\AutoSupplyPlanning\ForecastCalibrationService;
 use App\Services\AutoSupplyPlanning\MarketplaceConstraintService;
 use App\Services\AutoSupplyPlanning\MarketplacePlanningCapabilityService;
 use App\Services\AutoSupplyPlanning\PlanningFactSnapshotService;
@@ -669,6 +670,19 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
                 $dailyDemand *= $trendMultiplier;
             }
 
+            // Калибровка по план-факту (этап 4): корректор систематического bias.
+            // Off по умолчанию (флаг autoplanning.calibration.enabled). Виден в explain.
+            $calibration = null;
+            if ($dailyDemand > 0) {
+                $corrector = app(ForecastCalibrationService::class)
+                    ->correctorFor((int) $plan->integration_id, (string) $wh->sku);
+                if ($corrector['applied'] && $corrector['multiplier'] !== 1.0) {
+                    $dailyDemand *= $corrector['multiplier'];
+                    $demandSource .= '+calibrated';
+                    $calibration = $corrector;
+                }
+            }
+
             // v3: Для нового склада — сниженный спрос (пробная партия)
             // Берём 30% от общего avg_daily_sales как тестовый объём
             if ($supplyType === 'new_warehouse' && $dailyDemand > 0) {
@@ -1042,6 +1056,7 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
                     'analysis_period_days' => $analysisPeriodDays,
                     'demand_seasonality_multiplier' => $seasonalityMultiplier,
                     'demand_trend_multiplier' => $trendMultiplier,
+                    'calibration' => $calibration,
                     'promo_mode' => $promoMode,
                     'ewma_alpha' => $ewmaAlpha,
                     'sales_7d' => $sales7,

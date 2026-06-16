@@ -11,9 +11,12 @@ use App\Models\AutoSupplyPlanLine;
 use App\Models\InventoryWarehouse;
 use App\Models\Integration;
 use App\Models\LocalityRecommendation;
+use App\Models\MarketplaceConstraintSnapshot;
 use App\Models\OzonWarehouseCluster;
+use App\Models\PlanLineEvaluation;
 use App\Models\Product;
 use App\Services\AutoSupplyPlanning\MarketplaceConstraintFileParser;
+use App\Services\AutoSupplyPlanning\MarketplaceConstraintSyncService;
 use App\Services\AutoSupplyPlanning\MarketplacePlanningCapabilityService;
 use App\Services\AutoSupplyPlanning\OzonCrossdockDropOffPointService;
 use App\Services\AutoSupplyPlanning\PlanningReadinessChecklistService;
@@ -150,10 +153,14 @@ class AutoSupplyPlanController extends Controller
         $analysisPeriodDays = (int) $request->input('analysis_period_days', $request->input('horizon_days', 28));
         $seasonalityMultiplier = $request->input('seasonality_multiplier', $request->input('demand_seasonality_multiplier'));
         $draftSupplyMethod = $this->normalizeDraftSupplyMethod((string) $request->input('draft_supply_method', $request->input('supply_method', '')));
+        // Источник ограничений по приоритету: явный запрос > ручной файл > авто-синк из API.
         $constraintFile = $this->resolveConstraintFile($request, $integration);
-        $warehouseConstraints = $request->input('warehouse_constraints', $constraintFile?->warehouse_constraints_json);
-        $clusterConstraints = $request->input('cluster_constraints', $constraintFile?->cluster_constraints_json);
-        $constraintMetadata = $request->input('constraint_metadata', $constraintFile?->toPlanMetadata());
+        $autoSnapshot = $this->resolveAutoConstraintSnapshot($request, $integration);
+        $warehouseConstraints = $request->input('warehouse_constraints', $constraintFile?->warehouse_constraints_json ?? $autoSnapshot?->warehouse_constraints_json);
+        $clusterConstraints = $request->input('cluster_constraints', $constraintFile?->cluster_constraints_json ?? $autoSnapshot?->cluster_constraints_json);
+        $constraintMetadata = $request->input('constraint_metadata', $constraintFile?->toPlanMetadata() ?? $autoSnapshot?->toPlanMetadata());
+        // PLAN-2: если применённого источника нет — пометить причину (устарел / ошибка / не подключён).
+        $constraintSourceNote = $this->autoConstraintSourceNote($request, $integration, $autoSnapshot, $constraintFile);
 
         $params = array_filter([
             'planning_mode' => $planningMode,
@@ -169,6 +176,7 @@ class AutoSupplyPlanController extends Controller
             'constraint_file_id' => $constraintFile?->id ?? $request->input('constraint_file_id'),
             'use_latest_constraint_file' => $request->boolean('use_latest_constraint_file', false),
             'constraint_metadata' => $constraintMetadata,
+            'constraint_source_note' => $constraintSourceNote,
             'target_ktr' => $request->input('target_ktr'),
             'baseline_ktr' => $request->input('baseline_ktr'),
             'draft_supply_method' => $draftSupplyMethod,
@@ -352,6 +360,91 @@ class AutoSupplyPlanController extends Controller
         }
 
         return $this->latestUsableConstraintFile($integration);
+    }
+
+    /**
+     * Свежий авто-снапшот ограничений из API (этап 1, источник ниже ручного файла по приоритету).
+     * Используется только если продавец не отключил авто-источник (use_auto_constraints)
+     * и в запросе нет явных ограничений (иначе они и так перекроют по приоритету).
+     */
+    private function resolveAutoConstraintSnapshot(Request $request, Integration $integration): ?MarketplaceConstraintSnapshot
+    {
+        if (! $request->boolean('use_auto_constraints', true)) {
+            return null;
+        }
+
+        if ($request->has('warehouse_constraints') || $request->has('cluster_constraints')) {
+            return null;
+        }
+
+        return MarketplaceConstraintSnapshot::query()
+            ->where('integration_id', $integration->id)
+            ->where('marketplace', $integration->marketplace)
+            ->usable()
+            ->orderByDesc('synced_at')
+            ->first();
+    }
+
+    /**
+     * PLAN-2: причина отсутствия ограничений (для предупреждения в UI). Возвращает null,
+     * если источник есть, продавец сам отключил авто или передал явные ограничения.
+     */
+    private function autoConstraintSourceNote(
+        Request $request,
+        Integration $integration,
+        ?MarketplaceConstraintSnapshot $appliedSnapshot,
+        ?AutoSupplyConstraintFile $appliedFile
+    ): ?string {
+        if ($appliedSnapshot !== null || $appliedFile !== null) {
+            return null;
+        }
+        if (! $request->boolean('use_auto_constraints', true)) {
+            return null;
+        }
+        if ($request->has('warehouse_constraints') || $request->has('cluster_constraints')) {
+            return null;
+        }
+
+        $latest = MarketplaceConstraintSnapshot::query()
+            ->where('integration_id', $integration->id)
+            ->where('marketplace', $integration->marketplace)
+            ->orderByDesc('synced_at')
+            ->first();
+
+        if ($latest === null) {
+            return 'Ограничения МП не подключены: нет ни файла, ни авто-синка. План построен без ограничений складов.';
+        }
+        if ($latest->sync_status === 'error') {
+            return 'Последний авто-синк ограничений завершился ошибкой — ограничения не применены.';
+        }
+
+        return 'Авто-снапшот ограничений устарел (> 48 ч) и не применён. Запустите синк или загрузите файл.';
+    }
+
+    /**
+     * UI-2: компактный дескриптор источника ограничений для summary плана.
+     *
+     * @return array<string, mixed>
+     */
+    private function constraintSourceDescriptor(AutoSupplyPlan $plan): array
+    {
+        $params = is_array($plan->params) ? $plan->params : [];
+        $metadata = is_array($params['constraint_metadata'] ?? null) ? $params['constraint_metadata'] : [];
+        $hasConstraints = ! empty($params['warehouse_constraints']) || ! empty($params['cluster_constraints']);
+        $kind = $metadata['source_kind'] ?? ($hasConstraints ? 'request_params' : 'none');
+
+        return [
+            'kind' => $kind, // api_sync | constraint_file | request_params | none
+            'has_constraints' => $hasConstraints,
+            'synced_at' => $metadata['source']['synced_at'] ?? null,
+            'sync_status' => $metadata['source']['sync_status'] ?? null,
+            'file_name' => $metadata['file']['name'] ?? null,
+            'warning' => $params['constraint_source_note'] ?? null,
+            // Честная граница: лимит штук и потребность по WB/Ozon вводятся вручную.
+            'manual_fields_note' => in_array($plan->marketplace, ['wildberries', 'ozon'], true)
+                ? 'Лимит штук (max_qty) и потребность (need_qty) — вручную: API маркетплейса их не отдаёт'
+                : null,
+        ];
     }
 
     private function latestUsableConstraintFile(Integration $integration): ?AutoSupplyConstraintFile
@@ -542,6 +635,35 @@ class AutoSupplyPlanController extends Controller
     }
 
     /**
+     * GET /api/auto-supply-plans/{id}/accuracy
+     * Точность план-факта (этап 2): агрегат по плану + пер-строчные оценки.
+     */
+    public function accuracy(string $id): JsonResponse
+    {
+        $plan = AutoSupplyPlan::findOrFail($id);
+
+        $lines = PlanLineEvaluation::query()
+            ->where('auto_supply_plan_id', $plan->id)
+            ->orderByRaw('abs_pct_error IS NULL, abs_pct_error DESC')
+            ->get([
+                'sku', 'cluster_id', 'warehouse_id', 'horizon_days',
+                'forecast_demand_qty', 'actual_sales_qty', 'abs_pct_error', 'bias_pct',
+                'planned_qty', 'accepted_qty', 'rejected_qty', 'acceptance_rate',
+                'status', 'evaluated_at',
+            ]);
+
+        return response()->json([
+            'message' => 'OK',
+            'data' => [
+                'plan_id' => $plan->id,
+                'evaluation_status' => $plan->accuracy_json === null ? 'not_evaluated' : 'evaluated',
+                'summary' => $plan->accuracy_json,
+                'lines' => $lines,
+            ],
+        ]);
+    }
+
+    /**
      * GET /api/auto-supply-plans/{id}/lines
      * Агрегирует строки по SKU — одна строка на товар, qty суммируется по всем складам
      */
@@ -672,6 +794,8 @@ class AutoSupplyPlanController extends Controller
                     'economics_summary' => $plan->economics_summary,
                     'selection_summary' => $plan->selection_summary,
                     'constraints_summary' => $plan->constraints_summary,
+                    'constraint_source' => $this->constraintSourceDescriptor($plan),
+                    'accuracy' => $plan->accuracy_json,
                     'territorial_summary' => $plan->territorial_summary,
                     'plan_quality_audit' => $plan->plan_quality_audit,
                     'marketplace_capabilities' => $plan->marketplace_capabilities,
@@ -1211,6 +1335,14 @@ class AutoSupplyPlanController extends Controller
             ->where('marketplace', $integration->marketplace)
             ->max('last_updated');
 
+        $constraintSnapshot = MarketplaceConstraintSnapshot::query()
+            ->where('integration_id', $integration->id)
+            ->where('marketplace', $integration->marketplace)
+            ->orderByDesc('synced_at')
+            ->first();
+
+        $constraintSummary = is_array($constraintSnapshot?->summary_json) ? $constraintSnapshot->summary_json : [];
+
         return response()->json([
             'message' => 'OK',
             'data' => [
@@ -1219,10 +1351,65 @@ class AutoSupplyPlanController extends Controller
                 'freshness' => [
                     'inventory_warehouses_last_updated' => $inventoryLastUpdated,
                     'last_inventory_sync_completed_at' => null,
+                    'marketplace_constraints_synced_at' => $constraintSnapshot?->synced_at?->toIso8601String(),
+                ],
+                'marketplace_constraints' => [
+                    'available' => $constraintSnapshot !== null,
+                    'source' => $constraintSnapshot !== null ? 'api_sync' : null,
+                    'sync_status' => $constraintSnapshot?->sync_status,
+                    'is_fresh' => $constraintSnapshot?->isUsable() ?? false,
+                    'synced_at' => $constraintSnapshot?->synced_at?->toIso8601String(),
+                    'warehouses_total' => $constraintSummary['warehouses_total'] ?? null,
+                    'warehouses_available' => $constraintSummary['warehouses_available'] ?? null,
+                    'warehouses_blocked' => $constraintSummary['warehouses_blocked'] ?? null,
                 ],
                 'ozon_delivery_analytics_cache_active' => null,
             ],
         ]);
+    }
+
+    /**
+     * POST /api/auto-supply-plans/sync-constraints
+     * Ручной триггер авто-синка ограничений для одной интеграции (кнопка «обновить лимиты»).
+     * Синхронный: для одной интеграции это 1–2 запроса к API МП, даёт мгновенный результат.
+     */
+    public function syncConstraints(Request $request, MarketplaceConstraintSyncService $service): JsonResponse
+    {
+        $request->validate([
+            'integration_id' => 'required|integer',
+        ]);
+
+        $integrationAccess = $this->integrationAccessService
+            ->ensureAccessibleIntegration($request, (int) $request->input('integration_id'));
+
+        if (! ($integrationAccess['success'] ?? false)) {
+            return response()->json([
+                'message' => $integrationAccess['message'] ?? 'Интеграция не найдена',
+            ], $integrationAccess['status'] ?? 404);
+        }
+
+        /** @var Integration $integration */
+        $integration = $integrationAccess['integration'];
+
+        if (! in_array($integration->marketplace, $service->supportedMarketplaces(), true)) {
+            return response()->json([
+                'message' => 'Авто-синк ограничений для этого маркетплейса пока не поддержан',
+                'data' => ['supported_marketplaces' => $service->supportedMarketplaces()],
+            ], 422);
+        }
+
+        $snapshot = $service->syncIntegration($integration);
+        $isError = $snapshot->sync_status === 'error';
+
+        return response()->json([
+            'message' => $isError ? 'Синхронизация завершилась с ошибкой' : 'Ограничения обновлены',
+            'data' => [
+                'sync_status' => $snapshot->sync_status,
+                'synced_at' => $snapshot->synced_at?->toIso8601String(),
+                'summary' => $snapshot->summary_json,
+                'sync_error' => $snapshot->sync_error,
+            ],
+        ], $isError ? 422 : 200);
     }
 
     /**

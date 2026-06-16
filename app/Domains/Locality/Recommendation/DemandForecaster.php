@@ -50,6 +50,10 @@ class DemandForecaster
         $coldMin14 = (int) config('locality.forecast.cold_start_min_sales_14d', 3);
         $coldMin28 = (int) config('locality.forecast.cold_start_min_sales_28d', 5);
 
+        // Якорь окна — конец периода (сегодня): по нему раскладываем продажи по
+        // реальным дням, чтобы EWMA учитывал дни без продаж, включая хвостовые нули.
+        $windowEndDate = now()->toDateString();
+
         $result = [];
         foreach ($byKey as $sku => $byCluster) {
             foreach ($byCluster as $clusterName => $daily) {
@@ -68,6 +72,7 @@ class DemandForecaster
                     $alpha,
                     $sales28d,
                     $sales7d,
+                    $windowEndDate,
                     $coldMin14,
                     $coldMin28
                 );
@@ -97,6 +102,7 @@ class DemandForecaster
         float $alpha,
         int $sales28d,
         int $sales7d,
+        string $windowEndDate,
         int $coldMin14,
         int $coldMin28
     ): array {
@@ -107,14 +113,16 @@ class DemandForecaster
 
         // Нормализуем: заполняем все дни окна (с нулями для дней без продаж),
         // чтобы daily_demand отражал СРЕДНЕЕ, а не активность последнего "всплеска" продаж.
+        // ВАЖНО: раскладываем по РЕАЛЬНЫМ смещениям дат относительно конца окна,
+        // а не подряд от индекса 0 — иначе EWMA схлопывает дни без продаж и завышает
+        // вес старых продаж. Самый свежий день → конец массива (макс. вес EWMA).
         $filled = array_fill(0, $windowDays, 0);
-        $i = 0;
-        ksort($dailyCounts);
-        foreach ($dailyCounts as $count) {
-            if ($i >= $windowDays) {
-                break;
-            }
-            $filled[$i++] = (int) $count;
+        $anchorTs = strtotime($windowEndDate);
+        foreach ($dailyCounts as $day => $count) {
+            $daysAgo = (int) round(($anchorTs - strtotime((string) $day)) / 86400);
+            $offset = $windowDays - 1 - $daysAgo;
+            $offset = max(0, min($windowDays - 1, $offset));
+            $filled[$offset] += (int) $count;
         }
 
         // Для малых объёмов (<50 заказов/период) EWMA шумит → используем простое среднее.

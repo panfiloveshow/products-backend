@@ -15,6 +15,13 @@ use Illuminate\Support\Facades\Log;
 /**
  * Legacy-сервис расчёта рекомендаций на поставку (MVP-реализация).
  *
+ * @deprecated Этап 3 дорожной карты автопланирования — единый движок спроса.
+ *   Использует простое среднее по inventory_warehouses, тогда как канонический
+ *   прогноз — App\Domains\Locality\Recommendation\DemandForecaster (EWMA по кластерам,
+ *   источник postings). Это один из нескольких параллельных движков спроса без единой
+ *   истины. Подлежит депрекейту/слиянию — см. docs/TZ_UNIFIED_DEMAND_ENGINE.md.
+ *   Не подключать к новым местам; новые потребители спроса должны идти через DemandForecaster.
+ *
  * Формула потребности:
  *   demand = avg_sales_per_day(window) * target_days
  *   need = max(0, demand - (stock_fbo + in_transit - safety_buffer))

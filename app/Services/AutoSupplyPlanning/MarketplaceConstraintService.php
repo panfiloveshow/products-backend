@@ -175,7 +175,7 @@ class MarketplaceConstraintService
             'summary' => [
                 'marketplace' => $marketplace,
                 'source' => 'Файл или параметры ограничений',
-                'source_kind' => $metadata !== [] ? 'constraint_file' : 'request_params',
+                'source_kind' => $metadata['source_kind'] ?? ($metadata !== [] ? 'constraint_file' : 'request_params'),
                 'source_status' => $this->sourceStatus($matchedLines, $matchedNeedLines, $coefficientLines, $cappedLines, $blockedLines, $metadata, count($unmatchedMarketplaceNeeds)),
                 'human_status' => $this->humanStatus($matchedLines, $matchedNeedLines, $cappedLines, $blockedLines, $metadata, count($unmatchedMarketplaceNeeds)),
                 'decision_ru' => $this->decisionText($matchedLines, $matchedNeedLines, $totalNeedRemainingDeltaQty, $cappedLines, $blockedLines, $unmatchedConstraintsCount, count($unmatchedMarketplaceNeeds), $unmatchedMarketplaceNeedQty),
@@ -807,7 +807,7 @@ class MarketplaceConstraintService
         return [
             'marketplace' => $marketplace,
             'source' => $metadata !== [] ? 'Файл ограничений загружен, но совпадений со строками плана нет' : null,
-            'source_kind' => $metadata !== [] ? 'constraint_file' : 'none',
+            'source_kind' => $metadata['source_kind'] ?? ($metadata !== [] ? 'constraint_file' : 'none'),
             'source_status' => $metadata !== [] ? 'file_loaded_no_matches' : 'not_provided',
             'human_status' => $metadata !== [] ? 'Файл загружен, но в строках плана совпадений не найдено' : 'Файл ограничений не использовался',
             'decision_ru' => $metadata !== []
