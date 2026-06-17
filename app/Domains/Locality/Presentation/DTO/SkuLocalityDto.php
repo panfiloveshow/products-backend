@@ -23,6 +23,7 @@ final readonly class SkuLocalityDto
         public ?float $widthMm,
         public ?float $heightMm,
         public ?float $weightG,
+        public ?array $localityExplanation = null,
     ) {
     }
 
@@ -47,6 +48,7 @@ final readonly class SkuLocalityDto
             'width_mm' => $this->widthMm !== null ? round($this->widthMm, 2) : null,
             'height_mm' => $this->heightMm !== null ? round($this->heightMm, 2) : null,
             'weight_g' => $this->weightG !== null ? round($this->weightG, 2) : null,
+            'locality_explanation' => $this->localityExplanation,
         ];
     }
 }

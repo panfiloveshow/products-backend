@@ -3,6 +3,7 @@
 namespace App\Http\Controllers\Api\Locality;
 
 use App\Domains\Locality\Presentation\DTO\SkuLocalityDto;
+use App\Domains\Locality\Presentation\SkuLocalityExplanationBuilder;
 use App\Http\Controllers\Controller;
 use App\Models\Integration;
 use App\Models\LocalityMetricDaily;
@@ -105,7 +106,9 @@ class LocalitySkuController extends Controller
             ->groupBy('sku')
             ->map->first(); // первый после order = победитель
 
-        $data = $rows->map(function ($row) use ($productNames, $integration, $cacheBySku) {
+        $explanationBuilder = new SkuLocalityExplanationBuilder();
+
+        $data = $rows->map(function ($row) use ($productNames, $integration, $cacheBySku, $explanationBuilder) {
             $meta = is_array($row->meta) ? $row->meta : [];
             /** @var Product|null $product */
             $product = $productNames->get($row->sku);
@@ -153,6 +156,17 @@ class LocalitySkuController extends Controller
                 $volumeWeight,
                 $cacheData['chargeable_volume_liters'] ?? null
             );
+            $localOrders = (int) ($row->local_orders_count ?? 0);
+            $nonLocalOrders = (int) ($row->non_local_orders_count ?? 0);
+            $explanation = $explanationBuilder->build(
+                localSharePercent: $row->local_share_percent !== null ? (float) $row->local_share_percent : null,
+                consideredOrders: $localOrders + $nonLocalOrders,
+                nonLocalOrders: $nonLocalOrders,
+                grossMarkupPercent: (float) ($row->avg_markup_percent ?? 0),
+                overpaymentRub: (float) $row->overpayment_amount,
+                revenueRub: (float) ($row->revenue_total ?? 0),
+            );
+
             $dto = new SkuLocalityDto(
                 sku: (string) $row->sku,
                 productName: $product?->name,
@@ -172,6 +186,7 @@ class LocalitySkuController extends Controller
                 widthMm: $widthMm,
                 heightMm: $heightMm,
                 weightG: $weightG,
+                localityExplanation: $explanation,
             );
             return $dto->toArray();
         })->all();
