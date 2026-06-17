@@ -6,6 +6,7 @@ use App\Domains\Locality\Calculation\OverpaymentCalculator;
 use App\Domains\Locality\Ingestion\PostingEnrichmentReader;
 use App\Domains\Locality\Legacy\LegacyLocalityFacade;
 use App\Domains\Locality\Presentation\DTO\SkuExplanationDto;
+use App\Domains\Locality\Presentation\SkuLocalityExplanationBuilder;
 use App\Domains\Ozon\Tariffs\OzonPricingMatrix;
 use App\Domains\Ozon\UnitEconomics\MarkupReasonCode;
 use App\Models\LocalityMetricDaily;
@@ -31,6 +32,7 @@ class LocalityExplanationService
         private readonly CounterfactualSimulator $counterfactual = new CounterfactualSimulator(),
         private readonly OverpaymentCalculator $overpayCalc = new OverpaymentCalculator(),
         private readonly OzonPricingMatrix $pricing = new OzonPricingMatrix(),
+        private readonly SkuLocalityExplanationBuilder $explanationBuilder = new SkuLocalityExplanationBuilder(),
     ) {
     }
 
@@ -290,8 +292,19 @@ class LocalityExplanationService
         $cancelledOrders = $items->where('markup_reason_code', 'cancelled_order')->count();
         $notRedeemedOrders = $items->where('markup_reason_code', 'not_redeemed')->count();
 
+        $considered = $local + $nonLocalOrders;
+        $explanation = $this->explanationBuilder->build(
+            localSharePercent: $considered > 0 ? round(($local / $considered) * 100, 2) : null,
+            consideredOrders: $considered,
+            nonLocalOrders: $nonLocalOrders,
+            grossMarkupPercent: (float) $breakdown['avg_markup_percent'],
+            overpaymentRub: $potential,
+            revenueRub: $gmv,
+        );
+
         return [
             'orders_total' => $items->count(),
+            'explanation' => $explanation,
             'orders_considered' => $total,
             'orders_cancelled' => $cancelledOrders,
             'orders_not_redeemed' => $notRedeemedOrders,

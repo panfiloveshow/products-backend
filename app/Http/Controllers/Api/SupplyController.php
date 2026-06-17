@@ -1089,21 +1089,52 @@ class SupplyController extends Controller
         $startDate = now()->subDays($periodDays)->startOfDay();
         $endDate = now()->endOfDay();
 
-        // Получаем последнюю аналитику
+        // Получаем последнюю аналитику.
+        // Период в таблице хранится колонкой `date` (см. миграцию create_supply_analytics_table),
+        // а не period_start/calculated_at — иначе запрос падал бы с "column does not exist".
         $analytics = SupplyAnalytics::where('integration_id', $validated['integration_id'])
-            ->where('period_start', '>=', $startDate->subDays(1))
-            ->orderByDesc('calculated_at')
+            ->where('date', '>=', $startDate->copy()->subDays(1)->toDateString())
+            ->orderByDesc('date')
             ->first();
 
         // Если нет данных или устарели — возвращаем базовую статистику
-        if (!$analytics) {
-            $analytics = $this->calculateBasicAnalytics($validated['integration_id'], $startDate, $endDate);
-        }
+        $data = $analytics
+            ? $this->formatStoredAnalytics($analytics, $startDate, $endDate)
+            : $this->calculateBasicAnalytics($validated['integration_id'], $startDate, $endDate);
 
         return response()->json([
             'success' => true,
-            'data' => $analytics,
+            'data' => $data,
         ]);
+    }
+
+    /**
+     * Привести сохранённую строку SupplyAnalytics к контракту фронтенда
+     * (тот же набор ключей, что и calculateBasicAnalytics).
+     *
+     * Колонки таблицы отличаются от ключей API: маппим date→period_end,
+     * supplies_*→*_supplies, avg_lead_time_days→avg_lead_time_hours, demand_vs_actual→forecast_bias.
+     * forecast_accuracy = null означает «нет факта для сверки», а не 100%.
+     */
+    private function formatStoredAnalytics(SupplyAnalytics $analytics, $startDate, $endDate): array
+    {
+        return [
+            'period_start' => $startDate->toDateString(),
+            'period_end' => $analytics->date?->toDateString(),
+            'oos_rate' => $analytics->oos_rate,
+            'forecast_accuracy' => $analytics->forecast_accuracy,
+            'forecast_bias' => $analytics->demand_vs_actual,
+            'avg_lead_time_hours' => $analytics->avg_lead_time_days !== null
+                ? round((float) $analytics->avg_lead_time_days * 24, 1)
+                : null,
+            'total_supplies' => $analytics->supplies_created,
+            'completed_supplies' => $analytics->supplies_completed,
+            'cancelled_supplies' => $analytics->supplies_cancelled,
+            'error_supplies' => $analytics->supplies_with_errors,
+            'acceptance_rate' => $analytics->acceptance_rate,
+            'calculated_at' => $analytics->updated_at?->toIso8601String(),
+            'is_realtime' => false,
+        ];
     }
 
     // ========================================================================
@@ -2646,7 +2677,9 @@ class SupplyController extends Controller
             'error_supplies' => $errors,
             'total_items' => $supplies->sum('items_count'),
             'total_quantity' => $supplies->sum('total_quantity'),
-            'acceptance_rate' => $completed > 0 ? 100 : null,
+            // Базовая аналитика не загружает позиции поставок, поэтому реальную приёмку
+            // не считает — отдаём null ("не измерено"), а не фейковые 100% (ср. forecast_accuracy выше).
+            'acceptance_rate' => null,
             'calculated_at' => now()->toIso8601String(),
             'is_realtime' => true,
         ];

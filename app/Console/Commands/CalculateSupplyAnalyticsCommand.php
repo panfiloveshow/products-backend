@@ -3,6 +3,7 @@
 namespace App\Console\Commands;
 
 use App\Models\Integration;
+use App\Models\Posting;
 use App\Models\Supply;
 use App\Models\SupplyAnalytics;
 use App\Models\SupplyRecommendation;
@@ -76,55 +77,66 @@ class CalculateSupplyAnalyticsCommand extends Command
         // 5. Acceptance Rate (процент приёмки)
         $acceptanceRate = $this->calculateAcceptanceRate($integration, $startDate, $endDate);
 
-        // Сохраняем аналитику
+        // Сохраняем аналитику.
+        // Колонки сопоставлены со схемой миграции 2026_01_22_140600_create_supply_analytics_table:
+        // период хранится как (date, period_type), а не period_start/period_end.
+        // Для MAPE/min/max lead time и детального metrics-блоба отдельных колонок в таблице нет —
+        // bias кладём в demand_vs_actual, остальное не персистим (см. docs/TZ_PLAN_FACT_LOOP.md,
+        // где этот срез метрик планируется перенести в plan_line_evaluations).
         SupplyAnalytics::updateOrCreate(
             [
                 'integration_id' => $integration->id,
-                'period_start' => $startDate->toDateString(),
-                'period_end' => $endDate->toDateString(),
+                'date' => $endDate->toDateString(),
+                'period_type' => $this->resolvePeriodType($period),
             ],
             [
                 'oos_rate' => $oosRate['rate'],
-                'oos_days' => $oosRate['days'],
-                'oos_skus' => $oosRate['skus'],
+                'oos_skus_count' => $oosRate['skus'],
+                // null при status=insufficient_data — больше не пишем фейковые 100%.
                 'forecast_accuracy' => $forecastAccuracy['accuracy'],
-                'forecast_mape' => $forecastAccuracy['mape'],
-                'forecast_bias' => $forecastAccuracy['bias'],
-                'avg_lead_time_hours' => $leadTimeStats['avg_hours'],
-                'min_lead_time_hours' => $leadTimeStats['min_hours'],
-                'max_lead_time_hours' => $leadTimeStats['max_hours'],
-                'total_supplies' => $supplyStats['total'],
-                'completed_supplies' => $supplyStats['completed'],
-                'cancelled_supplies' => $supplyStats['cancelled'],
-                'error_supplies' => $supplyStats['errors'],
-                'total_items' => $supplyStats['total_items'],
-                'total_quantity' => $supplyStats['total_quantity'],
+                'demand_vs_actual' => $forecastAccuracy['bias'],
+                'avg_lead_time_days' => round($leadTimeStats['avg_hours'] / 24, 2),
+                'supplies_created' => $supplyStats['total'],
+                'supplies_completed' => $supplyStats['completed'],
+                'supplies_cancelled' => $supplyStats['cancelled'],
+                'supplies_with_errors' => $supplyStats['errors'],
+                'items_shipped' => $acceptanceRate['total_planned'],
+                'items_accepted' => $acceptanceRate['total_accepted'],
+                'items_rejected' => $acceptanceRate['total_rejected'],
+                // null при status=insufficient_data (нет поставок / нет планового кол-ва) — не пишем фейковые 100%.
                 'acceptance_rate' => $acceptanceRate['rate'],
-                'partial_acceptance_count' => $acceptanceRate['partial_count'],
-                'rejection_rate' => $acceptanceRate['rejection_rate'],
-                'metrics' => [
-                    'oos_details' => $oosRate,
-                    'forecast_details' => $forecastAccuracy,
-                    'lead_time_details' => $leadTimeStats,
-                    'supply_details' => $supplyStats,
-                    'acceptance_details' => $acceptanceRate,
-                ],
-                'calculated_at' => now(),
             ]
         );
+
+        $hasForecast = ($forecastAccuracy['status'] ?? null) === 'ok';
 
         $this->table(
             ['Метрика', 'Значение'],
             [
                 ['OOS Rate', number_format($oosRate['rate'], 2) . '%'],
-                ['Forecast Accuracy', number_format($forecastAccuracy['accuracy'], 2) . '%'],
-                ['MAPE', number_format($forecastAccuracy['mape'], 2) . '%'],
+                ['Forecast Accuracy', $hasForecast ? number_format($forecastAccuracy['accuracy'], 2) . '%' : 'н/д (нет факта)'],
+                ['MAPE', $hasForecast ? number_format($forecastAccuracy['mape'], 2) . '%' : 'н/д'],
+                ['Forecast samples', $forecastAccuracy['samples']],
                 ['Avg Lead Time', number_format($leadTimeStats['avg_hours'], 1) . ' ч'],
                 ['Total Supplies', $supplyStats['total']],
                 ['Completed', $supplyStats['completed']],
-                ['Acceptance Rate', number_format($acceptanceRate['rate'], 2) . '%'],
+                ['Acceptance Rate', ($acceptanceRate['status'] ?? null) === 'ok'
+                    ? number_format($acceptanceRate['rate'], 2) . '%'
+                    : 'н/д (нет поставок)'],
             ]
         );
+    }
+
+    /**
+     * Тип периода для строки аналитики, исходя из глубины расчёта в днях.
+     */
+    private function resolvePeriodType(int $period): string
+    {
+        return match (true) {
+            $period <= 1 => 'daily',
+            $period <= 7 => 'weekly',
+            default => 'monthly',
+        };
     }
 
     /**
@@ -183,11 +195,13 @@ class CalculateSupplyAnalyticsCommand extends Command
             ->get();
 
         if ($recommendations->isEmpty()) {
+            // Нет завершённых рекомендаций для сверки — точность неизвестна, а не "идеальна".
             return [
-                'accuracy' => 100,
-                'mape' => 0,
-                'bias' => 0,
+                'accuracy' => null,
+                'mape' => null,
+                'bias' => null,
                 'samples' => 0,
+                'status' => 'insufficient_data',
             ];
         }
 
@@ -220,11 +234,13 @@ class CalculateSupplyAnalyticsCommand extends Command
         }
 
         if ($count === 0) {
+            // Рекомендации есть, но фактических продаж по ним не нашлось — сверять не с чем.
             return [
-                'accuracy' => 100,
-                'mape' => 0,
-                'bias' => 0,
+                'accuracy' => null,
+                'mape' => null,
+                'bias' => null,
                 'samples' => 0,
+                'status' => 'insufficient_data',
             ];
         }
 
@@ -242,25 +258,34 @@ class CalculateSupplyAnalyticsCommand extends Command
             'mape' => round($mape, 2),
             'bias' => round($bias, 2),
             'samples' => $count,
+            'status' => 'ok',
         ];
     }
 
     /**
-     * Получить фактические продажи SKU за период
+     * Получить фактические продажи SKU за период.
+     *
+     * Источник факта — Ozon FBO postings/posting_items (таблиц orders/order_items в БД нет).
+     * Эталон источника — App\Domains\Locality\Recommendation\DemandForecaster: JOIN postings p /
+     * posting_items pi с группировкой по offer_id. SupplyRecommendation.sku в разных генераторах
+     * содержит либо внутренний sku, либо offer_id продавца (см. LegacySupplyRecommendationService),
+     * поэтому матчим posting_items по обоим полям. Отменённые отправления исключаем.
      */
     private function getActualSales(string $sku, int $integrationId, Carbon $startDate, int $days): float
     {
         $endDate = $startDate->copy()->addDays($days);
 
-        // Пытаемся получить из order_items или sales_history
-        $sales = DB::table('order_items as oi')
-            ->join('orders as o', 'oi.order_id', '=', 'o.id')
-            ->join('products as p', 'oi.product_id', '=', 'p.id')
-            ->where('p.sku', $sku)
-            ->where('p.integration_id', $integrationId)
-            ->whereBetween('o.created_at', [$startDate, $endDate])
-            ->whereIn('o.status', ['delivered', 'completed', 'shipped'])
-            ->sum('oi.quantity');
+        $sales = DB::table('posting_items as pi')
+            ->join('postings as p', 'pi.posting_id', '=', 'p.id')
+            ->where('p.integration_id', (string) $integrationId)
+            ->where(function ($q) use ($sku) {
+                $q->where('pi.offer_id', $sku)
+                    ->orWhere('pi.sku', $sku);
+            })
+            ->whereBetween('p.created_at', [$startDate, $endDate])
+            ->where('p.status', '!=', Posting::STATUS_CANCELLED)
+            ->whereNull('p.cancelled_at')
+            ->sum('pi.quantity');
 
         return (float) $sales;
     }
@@ -343,13 +368,15 @@ class CalculateSupplyAnalyticsCommand extends Command
             ->get();
 
         if ($supplies->isEmpty()) {
+            // Нет завершённых поставок за период — приёмку измерять не на чем, а не "идеальна".
             return [
-                'rate' => 100,
+                'rate' => null,
                 'partial_count' => 0,
                 'rejection_rate' => 0,
                 'total_planned' => 0,
                 'total_accepted' => 0,
                 'total_rejected' => 0,
+                'status' => 'insufficient_data',
             ];
         }
 
@@ -374,8 +401,21 @@ class CalculateSupplyAnalyticsCommand extends Command
             }
         }
 
-        $acceptanceRate = $totalPlanned > 0 ? ($totalAccepted / $totalPlanned) * 100 : 100;
-        $rejectionRate = $totalPlanned > 0 ? ($totalRejected / $totalPlanned) * 100 : 0;
+        if ($totalPlanned <= 0) {
+            // Поставки есть, но планового количества по позициям нет — делить не на что.
+            return [
+                'rate' => null,
+                'partial_count' => $partialCount,
+                'rejection_rate' => 0,
+                'total_planned' => 0,
+                'total_accepted' => $totalAccepted,
+                'total_rejected' => $totalRejected,
+                'status' => 'insufficient_data',
+            ];
+        }
+
+        $acceptanceRate = ($totalAccepted / $totalPlanned) * 100;
+        $rejectionRate = ($totalRejected / $totalPlanned) * 100;
 
         return [
             'rate' => round($acceptanceRate, 2),
@@ -384,6 +424,7 @@ class CalculateSupplyAnalyticsCommand extends Command
             'total_planned' => $totalPlanned,
             'total_accepted' => $totalAccepted,
             'total_rejected' => $totalRejected,
+            'status' => 'ok',
         ];
     }
 }
