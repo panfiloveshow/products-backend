@@ -636,8 +636,11 @@ class InventoryController extends Controller
                 'sales_7_days'         => (int)   $w->sales_7_days,
                 'sales_30_days'        => (int)   $w->sales_30_days,
                 'average_daily_sales'  => (float) $w->average_daily_sales,
-                'days_of_stock'        => $w->days_of_stock,
-                'turnover_days'        => $w->turnover_days,
+                // Считаем на лету от свежих quantity/average_daily_sales (как уровень артикула).
+                // Сохранённые days_of_stock/turnover_days в БД отстают от продаж → давали
+                // «1.4/день, но 63 дня» на одной карточке. Источник истины — avg из синка.
+                'days_of_stock'        => ((float) $w->average_daily_sales) > 0 ? (int) round($w->quantity / (float) $w->average_daily_sales) : null,
+                'turnover_days'        => ((float) $w->average_daily_sales) > 0 ? round($w->quantity / (float) $w->average_daily_sales, 1) : null,
                 'storage_cost_per_day' => (float) ($w->storage_cost_per_day ?? 0),
                 'real_avg_daily_sales' => $w->real_avg_daily_sales,
                 'real_items_sold'      => null,
