@@ -159,3 +159,18 @@ if (filter_var(env('INTEGRATIONS_RECONCILE_SCHEDULE', false), FILTER_VALIDATE_BO
         ->appendOutputTo(storage_path('logs/integrations-reconcile.log'))
         ->name('integrations.reconcile');
 }
+
+// Авто-обновление остатков и продаж ПО СКЛАДАМ из API → inventory_warehouses.
+// Заменяет ручную загрузку CSV-отчёта Ozon в разделе автопланирования: матрица
+// предпочитает свежий average_daily_sales из синка (см. resolveInventoryMatrixDailyDemand).
+// 3 раза в сутки — бережём API МП (синки исторически были ручными именно из-за нагрузки).
+// По умолчанию ВЫКЛЮЧЕНО: включить INVENTORY_SYNC_SCHEDULE=true.
+// ВНИМАНИЕ: на проде schedule:run не настроен — задача заведена в /etc/cron.d/inventory-sync,
+// которая дёргает `php artisan inventory:sync-scheduled` напрямую (как ue-sanity-check выше).
+if (filter_var(env('INVENTORY_SYNC_SCHEDULE', false), FILTER_VALIDATE_BOOLEAN)) {
+    \Illuminate\Support\Facades\Schedule::command('inventory:sync-scheduled')
+        ->cron('20 2,10,18 * * *')
+        ->withoutOverlapping()
+        ->appendOutputTo(storage_path('logs/inventory-sync.log'))
+        ->name('inventory.sync-scheduled');
+}

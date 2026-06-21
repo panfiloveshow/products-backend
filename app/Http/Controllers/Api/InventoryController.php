@@ -826,9 +826,13 @@ class InventoryController extends Controller
     private function resolveInventoryMatrixDailyDemand(object $row): float
     {
         foreach ([
+            // API-синк остатков пишет average_daily_sales по складам → предпочитаем его,
+            // чтобы авто-синк (а не ручной CSV) питал матрицу. На CSV-данных все три поля
+            // равны (OzonOrderReportController пишет одно значение), так что для уже
+            // загруженных отчётов это no-op. real_*/effective_* (CSV) остаются как fallback.
+            ['avg_daily_sales', 'avg_daily_sum'],
             ['real_avg_daily_sales', 'real_avg_daily_sum'],
             ['effective_daily_sales', 'effective_daily_sum'],
-            ['avg_daily_sales', 'avg_daily_sum'],
         ] as [$maxKey, $sumKey]) {
             $v = $this->articleMetricSumOrMax($row, $maxKey, $sumKey);
             if ($v > 0) {
