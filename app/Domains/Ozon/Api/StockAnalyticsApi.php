@@ -52,55 +52,64 @@ class StockAnalyticsApi
         $clusterFilter = array_fill_keys(array_map('strval', $clusterIds), true);
         $allItems = [];
         $limit = 1000;
-        $offset = 0;
 
-        do {
-            $body = [
-                'limit' => $limit,
-                'offset' => $offset,
-                'warehouse_type' => 'ALL',
-            ];
+        // Ozon требует поле skus (1–100 артикулов за запрос), иначе 400
+        // "AnalyticsStocksRequest.Skus: value must contain between 1 and 100 items".
+        // Раньше skus не слался (фильтровали локально) → аналитика всегда падала. Бьём на батчи по 100.
+        $skuBatches = array_chunk(array_values(array_unique(array_map('strval', $skus))), 100);
 
-            $response = $this->client->post('/v1/analytics/stocks', $body);
-
-            if (!$response || !empty($response['_error'])) {
-                Log::warning('Ozon StockAnalytics: ошибка /v1/analytics/stocks', [
-                    'skus_count' => count($skus),
+        foreach ($skuBatches as $batch) {
+            $offset = 0;
+            do {
+                $body = [
+                    'skus' => $batch,
+                    'limit' => $limit,
                     'offset' => $offset,
-                    'error' => $response['message'] ?? $response['error'] ?? 'unknown',
-                ]);
-                break;
-            }
+                    'warehouse_type' => 'ALL',
+                ];
 
-            $items = $response['items'] ?? $response['result']['items'] ?? [];
-            foreach ($items as $item) {
-                $sku = (string) ($item['sku'] ?? '');
-                if ($sku === '' || !isset($requestedSkus[$sku])) {
-                    continue;
+                $response = $this->client->post('/v1/analytics/stocks', $body);
+
+                if (!$response || !empty($response['_error'])) {
+                    Log::warning('Ozon StockAnalytics: ошибка /v1/analytics/stocks', [
+                        'skus_in_batch' => count($batch),
+                        'offset' => $offset,
+                        'error' => $response['message'] ?? $response['error'] ?? 'unknown',
+                    ]);
+                    break;
                 }
 
-                if ($warehouseFilter !== []) {
-                    $warehouseId = (string) ($item['warehouse_id'] ?? '');
-                    if ($warehouseId === '' || !isset($warehouseFilter[$warehouseId])) {
+                $items = $response['items'] ?? $response['result']['items'] ?? [];
+                foreach ($items as $item) {
+                    $sku = (string) ($item['sku'] ?? '');
+                    if ($sku === '' || !isset($requestedSkus[$sku])) {
                         continue;
                     }
-                }
 
-                if ($clusterFilter !== []) {
-                    $clusterId = (string) ($item['cluster_id'] ?? '');
-                    if ($clusterId === '' || !isset($clusterFilter[$clusterId])) {
-                        continue;
+                    if ($warehouseFilter !== []) {
+                        $warehouseId = (string) ($item['warehouse_id'] ?? '');
+                        if ($warehouseId === '' || !isset($warehouseFilter[$warehouseId])) {
+                            continue;
+                        }
                     }
+
+                    if ($clusterFilter !== []) {
+                        $clusterId = (string) ($item['cluster_id'] ?? '');
+                        if ($clusterId === '' || !isset($clusterFilter[$clusterId])) {
+                            continue;
+                        }
+                    }
+
+                    $allItems[] = $item;
                 }
 
-                $allItems[] = $item;
-            }
-
-            $offset += $limit;
-        } while (count($items) === $limit);
+                $offset += $limit;
+            } while (count($items) === $limit);
+        }
 
         Log::info('Ozon StockAnalytics: загружено записей', [
             'requested_skus' => count($skus),
+            'batches' => count($skuBatches),
             'received_items' => count($allItems),
         ]);
 
