@@ -113,6 +113,20 @@ class AutoSupplyPlanCalculationTest extends TestCase
         $this->assertContains('max_cover_days', $result['caps_applied']);
     }
 
+    public function test_max_cover_cap_preserves_safety_stock(): void
+    {
+        // Регрессия: A-товар, horizon=21 → maxCoverDays=21, target=21, safety=50, demand=10, stock=0.
+        // targetStock = 10*21 + 50 = 260 → neededBeforeCaps = 260.
+        // Раньше capStock = 10*21 = 210 срезал весь страховой запас до demand*21 = 210.
+        // Теперь capStock = 10*21 + 50 = 260 → safety сохраняется.
+        $base = $this->service->calculateNeededWithSafety(10.0, 21, 50.0, 0, 0);
+        $this->assertEquals(260.0, $base['needed_before_caps']);
+
+        $result = $this->service->applyMaxCoverCap($base['needed_before_caps'], 10.0, 21, 0, 0, 50.0);
+        $this->assertEquals(260.0, $result['needed']);
+        $this->assertEmpty($result['caps_applied']);
+    }
+
     // === 3.4 Turnover limit ===
 
     public function test_turnover_limit_reduces_needed(): void
@@ -193,6 +207,14 @@ class AutoSupplyPlanCalculationTest extends TestCase
         $this->assertGreaterThanOrEqual(0, $minStock);
     }
 
+    public function test_simulation_uses_configured_lead_time_for_transit(): void
+    {
+        // lead time = 14: товар в пути (100) приходит на день 14, а не на зашитый 7.
+        $sim = $this->service->buildSimulation(0, 100, 5.0, 0, 20, 14);
+        $this->assertSame(0, $sim[6]['transit_arrived']);    // день 7 — прихода больше нет
+        $this->assertSame(100, $sim[13]['transit_arrived']); // день 14 — настоящий lead time
+    }
+
     // === 4. Data quality ===
 
     public function test_data_quality_perfect_ozon(): void
@@ -239,6 +261,39 @@ class AutoSupplyPlanCalculationTest extends TestCase
         $this->assertFalse($result['needs_manual_review']);
     }
 
+    public function test_oos_adjusted_demand_used_when_days_unknown_only_with_flag(): void
+    {
+        // days_in_stock неизвестны (null), есть effective_daily_sales=6.0,
+        // sales30=60 (сырой EWMA = 60/30 = 2.0 — занижен из-за OOS).
+
+        // Flag off (по умолчанию): OOS-коррекция пропускается → EWMA 2.0.
+        $off = $this->service->calculateDailyDemandV2(
+            0.35, 0, 0, 60,
+            0, 6.0, null,
+            100, 'stable', 0, 0, 'ozon_order_report', false
+        );
+        $this->assertSame('fallback_long', $off['source']);
+        $this->assertEqualsWithDelta(2.0, $off['daily_demand'], 0.01);
+
+        // Flag on: берётся OOS-скорректированный спрос 6.0.
+        $on = $this->service->calculateDailyDemandV2(
+            0.35, 0, 0, 60,
+            0, 6.0, null,
+            100, 'stable', 0, 0, 'ozon_order_report', true
+        );
+        $this->assertSame('effective_oos_adjusted', $on['source']);
+        $this->assertEqualsWithDelta(6.0, $on['daily_demand'], 0.01);
+
+        // Известные дни в наличии (<28) → OOS-коррекция работает независимо от флага.
+        $known = $this->service->calculateDailyDemandV2(
+            0.35, 0, 0, 60,
+            0, 6.0, 10,
+            100, 'stable', 0, 0, 'ozon_order_report', false
+        );
+        $this->assertSame('effective_oos_adjusted', $known['source']);
+        $this->assertEqualsWithDelta(6.0, $known['daily_demand'], 0.01);
+    }
+
     public function test_posting_fbo_v3_positive_trend_does_not_double_boost_observed_demand(): void
     {
         $result = $this->service->calculateDailyDemandV2(
@@ -280,6 +335,29 @@ class AutoSupplyPlanCalculationTest extends TestCase
         $this->assertLessThan(26.0, $result['daily_demand']);
         $this->assertLessThanOrEqual(13.0, $result['daily_demand']);
         $this->assertContains('promo_spike_peak_vs_median', $result['confidence_reasons']);
+    }
+
+    public function test_ozon_posting_demand_low_volume_marks_low_without_arbitrary_cut(): void
+    {
+        // <5 заказов: помечаем 'low', но спрос НЕ режем произвольным ×0.4.
+        // Базовый спрос 2.0/день → раньше стал бы 0.8, теперь остаётся 2.0.
+        $result = $this->service->shapeOzonPostingDemand([
+            'sales_7_days' => 14,
+            'sales_14_days' => 28,
+            'sales_30_days' => 60,
+            'ordered_units_total' => 4,
+            'avg_daily_sales' => 2.0,
+            'winsorized_avg_daily_sales' => 2.0,
+            'peak_day_units' => 2,
+            'peak_share' => 0.1,
+            'active_days' => 10,
+            'median_nonzero_daily_units' => 2,
+        ]);
+
+        $this->assertSame('low', $result['confidence_level']);
+        $this->assertContains('low_posting_volume', $result['confidence_reasons']);
+        $this->assertFalse($result['suspected_spike']);
+        $this->assertEqualsWithDelta(2.0, $result['daily_demand'], 0.01);
     }
 
     public function test_ozon_posting_demand_spike_guard_does_not_use_stale_external_average_as_floor(): void
@@ -615,6 +693,41 @@ class AutoSupplyPlanCalculationTest extends TestCase
         $this->assertEquals(0, $result);
     }
 
+    public function test_volatility_for_safety_applies_floor_on_sparse_history(): void
+    {
+        // Одно ненулевое окно → CV недостоверен (0), ставим консервативный пол 0.3.
+        $this->assertEqualsWithDelta(0.3, $this->service->volatilityForSafety(10, 0, 0), 0.0001);
+    }
+
+    public function test_volatility_for_safety_keeps_real_value_with_enough_history(): void
+    {
+        // ≥2 окна: стабильные равные продажи дают реальный 0 (пол не нужен)…
+        $this->assertEqualsWithDelta(0.0, $this->service->volatilityForSafety(5, 5, 5), 0.0001);
+        // …а настоящая волатильность сохраняется.
+        $this->assertGreaterThan(0, $this->service->volatilityForSafety(10, 8, 6));
+    }
+
+    // === Ozon ADS (ads_cluster) ===
+
+    public function test_blend_ozon_ads_caps_inflation_over_fact(): void
+    {
+        // Факт 5/день, ADS 100/день → не более 5×3 = 15 (раньше брался max → 100).
+        $this->assertEqualsWithDelta(15.0, $this->service->blendOzonAdsDemand(5.0, 100.0), 0.0001);
+    }
+
+    public function test_blend_ozon_ads_used_when_no_history(): void
+    {
+        // Нет факта (новый товар) → ADS остаётся единственным сигналом.
+        $this->assertEqualsWithDelta(40.0, $this->service->blendOzonAdsDemand(0.0, 40.0), 0.0001);
+    }
+
+    public function test_blend_ozon_ads_keeps_fact_when_ads_low_or_absent(): void
+    {
+        // ADS ниже факта или отсутствует → берём факт.
+        $this->assertEqualsWithDelta(8.0, $this->service->blendOzonAdsDemand(8.0, 3.0), 0.0001);
+        $this->assertEqualsWithDelta(8.0, $this->service->blendOzonAdsDemand(8.0, null), 0.0001);
+    }
+
     // === Динамический safety stock ===
 
     public function test_dynamic_safety_stock(): void
@@ -635,6 +748,24 @@ class AutoSupplyPlanCalculationTest extends TestCase
         // max(10, 50) = 50
         $result = $this->service->calculateDynamicSafetyStock(10.0, 0.0, 1, 5);
         $this->assertEqualsWithDelta(50.0, $result, 0.01);
+    }
+
+    public function test_safety_stock_sigma_lead_time_formula_when_enabled(): void
+    {
+        // Flag on, z=1.65: SS = z × σ × √LT, σ_daily = vol(CV) × demand.
+        // demand=10, vol=0.3, LT=16, minSafetyDays=0:
+        // σ_daily=3; σ_LT=3*√16=12; SS=1.65*12=19.8; min=0 → 19.8.
+        $on = $this->service->calculateDynamicSafetyStock(10.0, 0.3, 16, 0, true, 1.65);
+        $this->assertEqualsWithDelta(19.8, $on, 0.01);
+
+        // Старая формула (flag off) на тех же входах: 10*16*(1+0.3*1.5)=232.
+        $off = $this->service->calculateDynamicSafetyStock(10.0, 0.3, 16, 0, false, 1.65);
+        $this->assertEqualsWithDelta(232.0, $off, 0.01);
+
+        // Пол minSafetyDays соблюдается и в новом режиме.
+        $floored = $this->service->calculateDynamicSafetyStock(10.0, 0.3, 4, 3, true, 1.65);
+        // σ_LT=3*√4=6; SS=1.65*6=9.9; min=10*3=30 → 30.
+        $this->assertEqualsWithDelta(30.0, $floored, 0.01);
     }
 
     // === Needed с safety stock ===
@@ -691,5 +822,70 @@ class AutoSupplyPlanCalculationTest extends TestCase
         $resultWith = $this->service->calculatePriorityScoreV2('B', null, 10.0, 7, 'stable', 0, 15000);
         $resultWithout = $this->service->calculatePriorityScoreV2('B', null, 10.0, 7, 'stable', 0, 0);
         $this->assertGreaterThan($resultWithout['score'], $resultWith['score']);
+    }
+
+    // === Quality gate (доверие к плану) для всех площадок ===
+
+    public function test_quality_gate_wb_low_confidence_no_longer_falsely_good(): void
+    {
+        // Регрессия: раньше WB всегда получал 'good'. Теперь высокая доля длинного окна → 'bad'.
+        $gate = $this->service->classifyQualityGate('wildberries', [
+            'fallback_long_lines' => 8,
+            'fallback_long_share' => 60.0,
+        ]);
+        $this->assertSame('bad', $gate['status']);
+        $this->assertSame('wildberries', $gate['marketplace']);
+        $this->assertNotEmpty($gate['reasons']);
+    }
+
+    public function test_quality_gate_wb_clean_is_good(): void
+    {
+        $gate = $this->service->classifyQualityGate('wildberries', []);
+        $this->assertSame('good', $gate['status']);
+        $this->assertSame([], $gate['reasons']);
+    }
+
+    public function test_quality_gate_wb_missing_barcodes_warns(): void
+    {
+        $gate = $this->service->classifyQualityGate('wildberries', [
+            'wb_missing_barcode_lines' => 3,
+            'fallback_long_share' => 10.0,
+        ]);
+        $this->assertSame('warning', $gate['status']);
+        $this->assertStringContainsString('штрихкод', $gate['reasons'][0]);
+    }
+
+    public function test_quality_gate_ozon_without_trusted_demand_is_bad(): void
+    {
+        $gate = $this->service->classifyQualityGate('ozon', [
+            'has_trusted_ozon_demand' => false,
+            'has_ozon_stock_analytics' => true,
+            'has_ozon_delivery_summary' => true,
+        ]);
+        $this->assertSame('bad', $gate['status']);
+        $this->assertSame('нет автоматического спроса из заказов Ozon', $gate['reasons'][0]);
+    }
+
+    public function test_quality_gate_negative_profit_threshold_tightened(): void
+    {
+        // 25% убыточных ≥ 20 → 'bad'. Прежний порог 40 здесь бы не сработал.
+        $gate = $this->service->classifyQualityGate('ozon', [
+            'has_trusted_ozon_demand' => true,
+            'has_ozon_stock_analytics' => true,
+            'has_ozon_delivery_summary' => true,
+            'negative_profit_lines' => 5,
+            'negative_profit_share' => 25.0,
+        ]);
+        $this->assertSame('bad', $gate['status']);
+    }
+
+    public function test_quality_gate_ozon_full_data_is_good(): void
+    {
+        $gate = $this->service->classifyQualityGate('ozon', [
+            'has_trusted_ozon_demand' => true,
+            'has_ozon_stock_analytics' => true,
+            'has_ozon_delivery_summary' => true,
+        ]);
+        $this->assertSame('good', $gate['status']);
     }
 }

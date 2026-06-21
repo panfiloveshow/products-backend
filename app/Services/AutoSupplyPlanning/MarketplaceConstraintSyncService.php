@@ -275,19 +275,26 @@ class MarketplaceConstraintSyncService
      */
     private function normalizeWbWarehouse(string $warehouseId, ?string $name, array $slots): array
     {
-        $hasAvailable = false;
+        $hasUnloadable = false;
+        $minAcceptance = null;
         $minStorage = null;
         $minDelivery = null;
 
         foreach ($slots as $slot) {
-            if (! empty($slot['is_available'])) {
-                $hasAvailable = true;
+            // WB: coefficient -1 (<0) = приёмки нет; 0 = бесплатно; >0 = платный множитель.
+            // Слот пригоден, если разгрузка разрешена и коэффициент не отрицательный.
+            // Платное окно физически доступно — costScore учтёт его штрафом, а не блоком
+            // (slot['is_available'] из SuppliesApi помечает только бесплатные окна — не используем).
+            $coef = $this->numOrNull($slot['coefficient'] ?? null);
+            if (($slot['allow_unload'] ?? false) === true && $coef !== null && $coef >= 0) {
+                $hasUnloadable = true;
+                $minAcceptance = $this->minNullable($minAcceptance, $coef);
             }
             $minStorage = $this->minNullable($minStorage, $this->numOrNull($slot['storage_coefficient'] ?? null));
             $minDelivery = $this->minNullable($minDelivery, $this->numOrNull($slot['delivery_coefficient'] ?? null));
         }
 
-        [$acceptanceCoefficient, $reason] = $this->normalizeWbAcceptance($hasAvailable);
+        [$acceptanceCoefficient, $reason] = $this->normalizeWbAcceptance($hasUnloadable, $minAcceptance);
 
         return [
             'warehouse_id' => $warehouseId,
@@ -295,7 +302,7 @@ class MarketplaceConstraintSyncService
             'sku' => null,
             'max_qty' => null,   // WB API не отдаёт жёсткий лимит штук
             'need_qty' => null,  // потребность — вход продавца, не из API
-            'is_available' => $hasAvailable,
+            'is_available' => $hasUnloadable,
             'acceptance_coefficient' => $acceptanceCoefficient,
             'delivery_coefficient' => $minDelivery,
             'storage_coefficient' => $minStorage,
@@ -308,22 +315,28 @@ class MarketplaceConstraintSyncService
     /**
      * Маппинг доступности WB → acceptance_coefficient формата плана.
      *
-     * ВАЖНО (RESEARCH-1): должно быть согласовано с costScore в TerritorialPlanningService
-     * (costScore = 100 / max(1, max(storage, acceptance)), где 1.0 = нейтрально).
+     * ВАЖНО (RESEARCH-1): согласовано с costScore в TerritorialPlanningService
+     * (costScore = 100 / max(1.0, max(storage, acceptance)) — clamp до 1.0 делает 0/1
+     * нейтральными, а >1 штрафует стоимость направления).
      * WB: coefficient 0 = бесплатная приёмка, 1 = базовая, >1 = платный множитель,
-     * нет слота = недоступно. Текущая реализация: есть бесплатное окно в горизонте → 1.0
-     * (нейтрально); иначе is_available=false. Платные коэффициенты (>1) пока не повышают
-     * стоимость направления — отдельная задача калибровки (см. ТЗ §6).
+     * нет окна разгрузки = недоступно. Несём реальный минимальный коэффициент окна
+     * (0 для бесплатного, платный множитель для платного) — платные окна остаются
+     * доступными, но дорогими, а не блокируются.
      *
      * @return array{0: float|null, 1: string}
      */
-    private function normalizeWbAcceptance(bool $hasAvailable): array
+    private function normalizeWbAcceptance(bool $hasUnloadable, ?float $minAcceptance): array
     {
-        if ($hasAvailable) {
-            return [1.0, 'Есть бесплатные окна приёмки в горизонте'];
+        if (! $hasUnloadable) {
+            return [null, 'Нет окон приёмки (разгрузка запрещена) в ближайшие ' . self::HORIZON_DAYS . ' дн.'];
         }
 
-        return [null, 'Нет бесплатных окон приёмки в ближайшие ' . self::HORIZON_DAYS . ' дн.'];
+        $coef = $minAcceptance ?? 0.0;
+        if ($coef > 1.0) {
+            return [$coef, sprintf('Только платные окна приёмки (мин. ×%s) в горизонте', $coef)];
+        }
+
+        return [$coef, 'Есть бесплатные окна приёмки в горизонте'];
     }
 
     /**

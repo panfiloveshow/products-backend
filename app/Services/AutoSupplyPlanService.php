@@ -25,6 +25,19 @@ class AutoSupplyPlanService
     public const MIN_SALES_DAYS = 14;
     public const LEAD_TIME_DEFAULT = 7;
 
+    // ponytail: пороги «низкого доверия» — две константы, не плодим конфиг.
+    // Прежние 50/40 были почти недостижимы → план всегда был максимум «warning».
+    public const QUALITY_GATE_FALLBACK_LONG_BAD_SHARE = 35.0;
+    public const QUALITY_GATE_NEGATIVE_PROFIT_BAD_SHARE = 20.0;
+
+    // ponytail: при <2 ненулевых окон продаж CV недостоверен — для страхового запаса
+    // используем консервативный пол волатильности вместо нулевого.
+    public const VOLATILITY_FLOOR_LOW_HISTORY = 0.3;
+
+    // ponytail: ads_cluster Ozon не должен раздувать спрос более чем в N раз от факта продаж
+    // (защита от завышенного/накрученного ADS). Если факта нет — ADS берём как есть.
+    public const OZON_ADS_MAX_MULTIPLIER = 3.0;
+
     // ─── 3.1 EWMA Forecast ───────────────────────────────────────────
 
     /**
@@ -84,6 +97,10 @@ class AutoSupplyPlanService
     /**
      * Применить max_cover_days cap.
      *
+     * max_cover_days ограничивает ОБОРАЧИВАЕМЫЙ (рабочий) запас, но не страховой:
+     * safetyStock прибавляется поверх cap, иначе при maxCoverDays <= targetCoverDays
+     * весь страховой запас вычёркивался бы (систематический недозаказ A-товаров → OOS).
+     *
      * @return array{needed: float, caps_applied: string[]}
      */
     public function applyMaxCoverCap(
@@ -91,9 +108,10 @@ class AutoSupplyPlanService
         float $dailyDemand,
         int   $maxCoverDays,
         int   $currentStock,
-        int   $inTransit
+        int   $inTransit,
+        float $safetyStock = 0.0
     ): array {
-        $capStock  = $dailyDemand * $maxCoverDays;
+        $capStock  = $dailyDemand * $maxCoverDays + $safetyStock;
         $capNeeded = max(0, $capStock - ($currentStock + $inTransit));
         $needed    = min($neededBeforeCaps, $capNeeded);
 
@@ -156,32 +174,37 @@ class AutoSupplyPlanService
 
     /**
      * Построить симуляцию остатков по дням.
-     * in_transit приходит через LEAD_TIME_DEFAULT,
-     * рекомендованная поставка — через LEAD_TIME_DEFAULT + 3.
+     * in_transit приходит через настроенный lead time,
+     * рекомендованная поставка — через lead time + 3 (приёмка/обработка).
      */
     public function buildSimulation(
         int   $currentStock,
         int   $inTransit,
         float $dailyDemand,
         int   $supplyQty,
-        int   $horizonDays
+        int   $horizonDays,
+        int   $leadTimeDays = self::LEAD_TIME_DEFAULT
     ): array {
         $simulation    = [];
         $stock         = (float) $currentStock;
         $transitArrived = false;
         $supplyArrived  = false;
 
+        // ponytail: дни прихода берём из настроенного lead time, а не из зашитой константы 7.
+        $transitArrivalDay = max(1, $leadTimeDays);
+        $supplyArrivalDay  = $transitArrivalDay + 3;
+
         for ($day = 1; $day <= $horizonDays; $day++) {
             $transitToday = 0;
             $supplyToday  = 0;
 
-            if (!$transitArrived && $day === self::LEAD_TIME_DEFAULT && $inTransit > 0) {
+            if (!$transitArrived && $day === $transitArrivalDay && $inTransit > 0) {
                 $stock += $inTransit;
                 $transitToday = $inTransit;
                 $transitArrived = true;
             }
 
-            if (!$supplyArrived && $day === self::LEAD_TIME_DEFAULT + 3 && $supplyQty > 0) {
+            if (!$supplyArrived && $day === $supplyArrivalDay && $supplyQty > 0) {
                 $stock += $supplyQty;
                 $supplyToday = $supplyQty;
                 $supplyArrived = true;
@@ -337,6 +360,96 @@ class AutoSupplyPlanService
         ];
     }
 
+    /**
+     * Классификация доверия к плану (quality gate) — для ВСЕХ площадок, не только Ozon.
+     *
+     * Раньше статус считался только в Ozon-ветке, а WB/Yandex всегда получали 'good'
+     * (ложно-высокое доверие). Здесь общие сигналы (fallback, убыточные, ручная проверка)
+     * применяются ко всем, а маркетплейс-специфичные — под своей веткой.
+     *
+     * @param array{
+     *   fallback_long_lines?:int, fallback_long_share?:float,
+     *   negative_profit_lines?:int, negative_profit_share?:float,
+     *   skipped_negative_profit_lines?:int, manual_review_lines?:int,
+     *   has_trusted_ozon_demand?:bool, has_ozon_stock_analytics?:bool,
+     *   has_ozon_delivery_summary?:bool, advertising_driven_lines?:int,
+     *   advertising_high_drr_lines?:int, wb_missing_barcode_lines?:int
+     * } $signals
+     * @return array{status:string, reasons:array<int,string>, marketplace:string}
+     */
+    public function classifyQualityGate(string $marketplace, array $signals): array
+    {
+        $fallbackLongLines = (int) ($signals['fallback_long_lines'] ?? 0);
+        $fallbackLongShare = (float) ($signals['fallback_long_share'] ?? 0);
+        $negativeProfitLines = (int) ($signals['negative_profit_lines'] ?? 0);
+        $negativeProfitShare = (float) ($signals['negative_profit_share'] ?? 0);
+        $skippedNegativeProfitLines = (int) ($signals['skipped_negative_profit_lines'] ?? 0);
+        $manualReviewLines = (int) ($signals['manual_review_lines'] ?? 0);
+
+        $reasons = [];
+        $demandTrusted = true;
+
+        // Маркетплейс-специфичные блокеры спроса идут первыми — они важнее всего.
+        if ($marketplace === 'ozon') {
+            $demandTrusted = (bool) ($signals['has_trusted_ozon_demand'] ?? false);
+            if (! $demandTrusted) {
+                $reasons[] = 'нет автоматического спроса из заказов Ozon';
+            }
+            if (! ($signals['has_ozon_stock_analytics'] ?? false)) {
+                $reasons[] = 'нет аналитики остатков Ozon';
+            }
+            if (! ($signals['has_ozon_delivery_summary'] ?? false)) {
+                $reasons[] = 'нет сводки Ozon по скорости доставки';
+            }
+        } elseif ($marketplace === 'wildberries') {
+            $wbMissingBarcodeLines = (int) ($signals['wb_missing_barcode_lines'] ?? 0);
+            if ($wbMissingBarcodeLines > 0) {
+                $reasons[] = "{$wbMissingBarcodeLines} строк без сопоставления штрихкодов WB";
+            }
+        }
+
+        // Общие сигналы доверия к данным — для всех площадок.
+        if ($fallbackLongLines > 0) {
+            $reasons[] = "{$fallbackLongLines} строк рассчитаны только по длинному окну продаж: коротких данных недостаточно";
+        }
+        if ($negativeProfitLines > 0) {
+            $reasons[] = "{$negativeProfitLines} строк с отрицательной прибылью";
+        }
+        if ($skippedNegativeProfitLines > 0) {
+            $reasons[] = "{$skippedNegativeProfitLines} убыточных строк отсечены";
+        }
+        if ($manualReviewLines > 0) {
+            $reasons[] = "{$manualReviewLines} строк требуют проверки спроса";
+        }
+
+        // Реклама Ozon — менее критичные пометки, в конце.
+        if ($marketplace === 'ozon') {
+            $advertisingDrivenLines = (int) ($signals['advertising_driven_lines'] ?? 0);
+            if ($advertisingDrivenLines > 0) {
+                $reasons[] = "{$advertisingDrivenLines} строк со спросом, поддержанным рекламой";
+            }
+            $advertisingHighDrrLines = (int) ($signals['advertising_high_drr_lines'] ?? 0);
+            if ($advertisingHighDrrLines > 0) {
+                $reasons[] = "{$advertisingHighDrrLines} строк с высоким ДРР";
+            }
+        }
+
+        $status = 'good';
+        if (! $demandTrusted
+            || $fallbackLongShare >= self::QUALITY_GATE_FALLBACK_LONG_BAD_SHARE
+            || $negativeProfitShare >= self::QUALITY_GATE_NEGATIVE_PROFIT_BAD_SHARE) {
+            $status = 'bad';
+        } elseif ($reasons !== []) {
+            $status = 'warning';
+        }
+
+        return [
+            'status' => $status,
+            'reasons' => $reasons,
+            'marketplace' => $marketplace,
+        ];
+    }
+
     // ═══════════════════════════════════════════════════════════════════
     // v2: Улучшенный расчёт автопополнения
     // ═══════════════════════════════════════════════════════════════════
@@ -392,12 +505,13 @@ class AutoSupplyPlanService
         float  $sales30,
         float  $realAvgDailySales = 0,
         float  $effectiveDailySales = 0,
-        int    $daysInStock30 = 30,
+        ?int   $daysInStock30 = 30, // null = дни в наличии неизвестны
         float  $redemptionRate = 100,
         string $salesTrend = 'stable',
         float  $salesTrendPercent = 0,
         float  $avgDailySalesApi = 0,
-        string $realAvgSource = 'ozon_order_report'
+        string $realAvgSource = 'ozon_order_report',
+        bool   $oosAdjustWhenUnknownDays = false
     ): array {
         $source = 'ewma';
         $needsManualReview = false;
@@ -408,7 +522,7 @@ class AutoSupplyPlanService
             $source = $realAvgSource;
         }
         // Приоритет 2: effective_daily_sales (с учётом OOS-дней)
-        elseif ($effectiveDailySales > 0 && $daysInStock30 > 0 && $daysInStock30 < 28) {
+        elseif ($effectiveDailySales > 0 && $this->shouldUseOosAdjustedDemand($daysInStock30, $oosAdjustWhenUnknownDays)) {
             $baseDemand = $effectiveDailySales;
             $source = 'effective_oos_adjusted';
         }
@@ -464,6 +578,21 @@ class AutoSupplyPlanService
     }
 
     /**
+     * Стоит ли брать OOS-скорректированный спрос (effective_daily_sales).
+     * Известные дни в наличии: да, если товар был OOS заметную часть периода (<28 из 30).
+     * Неизвестные (null): только если $whenUnknown — иначе EWMA делит на полное окно и
+     * занижает спрос недавно стокнувшихся SKU. Флаг прокидывает job из config (off по умолч.).
+     */
+    private function shouldUseOosAdjustedDemand(?int $daysInStock30, bool $whenUnknown): bool
+    {
+        if ($daysInStock30 === null) {
+            return $whenUnknown;
+        }
+
+        return $daysInStock30 > 0 && $daysInStock30 < 28;
+    }
+
+    /**
      * Скорректировать спрос по тренду продаж.
      * Рост → увеличиваем прогноз (макс +20%).
      * Падение → уменьшаем (макс -15%).
@@ -504,22 +633,76 @@ class AutoSupplyPlanService
     }
 
     /**
+     * Волатильность для страхового запаса с консервативным полом при нехватке истории.
+     *
+     * calculateVolatility() возвращает 0 при <2 ненулевых окнах продаж (CV недостоверен).
+     * Для нового/редко продаваемого товара это обнуляло бы страховой запас сверх минимума,
+     * поэтому при бедной истории ставим пол VOLATILITY_FLOOR_LOW_HISTORY. При стабильных
+     * равных продажах (≥2 окна → реальный 0) пол не нужен.
+     */
+    public function volatilityForSafety(float $avg7d, float $avg14d, float $avg30d): float
+    {
+        $volatility = $this->calculateVolatility($avg7d, $avg14d, $avg30d);
+        $nonZeroWindows = count(array_filter([$avg7d, $avg14d, $avg30d], fn ($v) => $v > 0));
+
+        if ($nonZeroWindows < 2) {
+            return max($volatility, self::VOLATILITY_FLOOR_LOW_HISTORY);
+        }
+
+        return $volatility;
+    }
+
+    /**
+     * Смешать спрос с ads_cluster Ozon, ограничив завышение.
+     *
+     * Раньше брался max($avgDailySales, $ozonAds) без проверки — накрученный/завышенный
+     * ADS мог раздуть спрос (напр. факт 5/день, ADS 100/день → план на 100). Теперь ADS
+     * не поднимает спрос более чем в OZON_ADS_MAX_MULTIPLIER раз от факта. Если факта нет
+     * (новый товар, $avgDailySales <= 0) — ADS остаётся единственным сигналом.
+     */
+    public function blendOzonAdsDemand(float $avgDailySales, ?float $ozonAds): float
+    {
+        if ($ozonAds === null || $ozonAds <= 0) {
+            return $avgDailySales;
+        }
+        if ($avgDailySales <= 0) {
+            return $ozonAds;
+        }
+
+        $cappedAds = min($ozonAds, $avgDailySales * self::OZON_ADS_MAX_MULTIPLIER);
+
+        return max($avgDailySales, $cappedAds);
+    }
+
+    /**
      * Рассчитать динамический страховой запас.
      *
-     * Формула: SS = avg_sales × lead_time × (1 + volatility × k)
-     * где k = 1.5 (коэффициент запаса)
+     * По умолчанию ($sigmaLtEnabled=false): SS = avg_sales × lead_time × (1 + volatility × 1.5).
+     * При $sigmaLtEnabled: классическая формула SS = z × σ × √(lead_time), где σ_дневн ≈
+     * volatility(CV) × avg_sales, z — целевой уровень сервиса ($serviceLevelZ, 1.65 ≈ 95%).
+     * Флаг и z прокидывает job из config autoplanning.safety_stock (off по умолчанию).
      *
-     * Минимум: safetyStockDays × avg_sales (из настроек плана)
+     * Минимум в обоих режимах: minSafetyDays × avg_sales (из настроек плана).
      */
     public function calculateDynamicSafetyStock(
         float $dailyDemand,
         float $volatility,
         int   $leadTimeDays,
-        int   $minSafetyDays = 3
+        int   $minSafetyDays = 3,
+        bool  $sigmaLtEnabled = false,
+        float $serviceLevelZ = 1.65
     ): float {
+        $minSafety = $dailyDemand * $minSafetyDays;
+
+        if ($sigmaLtEnabled) {
+            $sigmaDaily = $volatility * $dailyDemand;
+            $sigmaLeadTime = $sigmaDaily * sqrt(max(1, $leadTimeDays));
+
+            return max($serviceLevelZ * $sigmaLeadTime, $minSafety);
+        }
+
         $safetyCoef = 1.5;
         $dynamicSafety = $dailyDemand * $leadTimeDays * (1 + $volatility * $safetyCoef);
-        $minSafety = $dailyDemand * $minSafetyDays;
 
         return max($dynamicSafety, $minSafety);
     }
@@ -608,9 +791,10 @@ class AutoSupplyPlanService
 
         $confidenceLevel = 'good';
         if ($orderedUnits > 0 && $orderedUnits < 5) {
+            // ponytail: не режем спрос произвольным ×0.4. Помечаем low — осторожность даёт
+            // applyProtectiveQuantityGuard (trial-покрытие по дням), а не искажение спроса.
             $confidenceLevel = 'low';
             $reasons[] = 'low_posting_volume';
-            $demand *= 0.4;
         } elseif ($suspectedSpike || $activeDays > 0 && $activeDays < 5) {
             $confidenceLevel = 'warning';
         }

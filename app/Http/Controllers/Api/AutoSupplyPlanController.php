@@ -38,6 +38,30 @@ class AutoSupplyPlanController extends Controller
     ) {}
 
     /**
+     * Загружает план по id и проверяет, что его интеграция принадлежит
+     * workspace текущего запроса (защита от IDOR/BOLA). При отказе бросает
+     * HttpException (403/404) — работает для любого типа ответа метода
+     * (JsonResponse и StreamedResponse). Используйте вместо прямого
+     * AutoSupplyPlan::findOrFail() во всех экшенах по {id}, чтобы проверку
+     * нельзя было забыть.
+     *
+     * @param  array<int, string>  $with  жадно загружаемые связи
+     */
+    private function authorizedPlan(Request $request, string $id, array $with = []): AutoSupplyPlan
+    {
+        $plan = AutoSupplyPlan::with($with)->findOrFail($id);
+
+        $access = $this->integrationAccessService
+            ->ensureAccessibleIntegration($request, (int) $plan->integration_id);
+
+        if (! ($access['success'] ?? false)) {
+            abort($access['status'] ?? 403, $access['message'] ?? 'Доступ запрещён');
+        }
+
+        return $plan;
+    }
+
+    /**
      * GET /api/auto-supply-plans
      */
     public function index(Request $request): JsonResponse
@@ -611,9 +635,9 @@ class AutoSupplyPlanController extends Controller
     /**
      * POST /api/auto-supply-plans/{id}/calculate
      */
-    public function calculate(string $id): JsonResponse
+    public function calculate(Request $request, string $id): JsonResponse
     {
-        $plan = AutoSupplyPlan::findOrFail($id);
+        $plan = $this->authorizedPlan($request, $id);
 
         // Удаляем старые строки
         $plan->lines()->delete();
@@ -638,9 +662,9 @@ class AutoSupplyPlanController extends Controller
      * GET /api/auto-supply-plans/{id}/accuracy
      * Точность план-факта (этап 2): агрегат по плану + пер-строчные оценки.
      */
-    public function accuracy(string $id): JsonResponse
+    public function accuracy(Request $request, string $id): JsonResponse
     {
-        $plan = AutoSupplyPlan::findOrFail($id);
+        $plan = $this->authorizedPlan($request, $id);
 
         $lines = PlanLineEvaluation::query()
             ->where('auto_supply_plan_id', $plan->id)
@@ -669,7 +693,7 @@ class AutoSupplyPlanController extends Controller
      */
     public function lines(Request $request, string $id): JsonResponse
     {
-        $plan = AutoSupplyPlan::findOrFail($id);
+        $plan = $this->authorizedPlan($request, $id);
 
         $query = $this->planLinesQueryForSelectedClusters($plan);
 
@@ -695,7 +719,7 @@ class AutoSupplyPlanController extends Controller
      */
     public function simulate(Request $request, string $id): JsonResponse
     {
-        $plan = AutoSupplyPlan::findOrFail($id);
+        $plan = $this->authorizedPlan($request, $id);
 
         $request->validate([
             'offer_id' => 'required|string',
@@ -1239,9 +1263,9 @@ class AutoSupplyPlanController extends Controller
      * GET /api/auto-supply-plans/{id}/clusters
      * Агрегация строк плана по кластерам доставки (гео-распределение)
      */
-    public function clusters(string $id): JsonResponse
+    public function clusters(Request $request, string $id): JsonResponse
     {
-        $plan = AutoSupplyPlan::findOrFail($id);
+        $plan = $this->authorizedPlan($request, $id);
 
         $lines = $this->planLinesQueryForSelectedClusters($plan)->get();
 
@@ -2720,9 +2744,9 @@ class AutoSupplyPlanController extends Controller
     /**
      * DELETE /api/auto-supply-plans/{id}
      */
-    public function destroy(string $id): JsonResponse
+    public function destroy(Request $request, string $id): JsonResponse
     {
-        $plan = AutoSupplyPlan::findOrFail($id);
+        $plan = $this->authorizedPlan($request, $id);
         $plan->lines()->delete();
         $plan->delete();
 
@@ -2735,7 +2759,7 @@ class AutoSupplyPlanController extends Controller
      */
     public function updateLine(Request $request, string $planId, int $lineId): JsonResponse
     {
-        $plan = AutoSupplyPlan::findOrFail($planId);
+        $plan = $this->authorizedPlan($request, $planId);
 
         if ($plan->status !== AutoSupplyPlan::STATUS_READY) {
             abort(422, 'План ещё не рассчитан');
@@ -2746,22 +2770,33 @@ class AutoSupplyPlanController extends Controller
         ]);
 
         $line = $this->planLinesQueryForSelectedClusters($plan)->findOrFail($lineId);
-        $oldQty = $line->qty_rounded;
-        $newQty = $request->input('qty_rounded');
+        $newQty = (int) $request->input('qty_rounded');
 
-        $line->update([
-            'qty_rounded' => $newQty,
-        ]);
+        // Показанная строка — это агрегат SUM(qty_rounded) по группе (sku[, cluster_id]),
+        // см. aggregatedPlanLinesQuery(). Правка только одной MIN(id)-строки оставила бы
+        // остальные строки группы без изменений → план и экспорт разошлись бы с введённым
+        // значением. Поэтому распределяем новое количество по всем строкам группы.
+        $siblings = $this->aggregatedSiblingLines($plan, $line);
+        $oldQty = (int) $siblings->sum('qty_rounded');
+
+        \DB::transaction(function () use ($siblings, $newQty) {
+            $this->redistributeQtyAcrossLines($siblings, $newQty);
+        });
 
         // Пересчитать total_qty плана
         $plan->update([
             'total_qty' => $plan->lines()->sum('qty_rounded'),
         ]);
 
+        // Возвращаем каноническую строку с агрегированным qty — именно его видит и вводит
+        // пользователь (реальное qty строки в БД — её доля после распределения).
+        $fresh = $line->fresh();
+        $fresh->setAttribute('qty_rounded', $newQty);
+
         return response()->json([
             'message' => 'Количество обновлено',
             'data' => [
-                'line' => $line->fresh(),
+                'line' => $fresh,
                 'old_qty' => $oldQty,
                 'new_qty' => $newQty,
                 'plan_total_qty' => $plan->fresh()->total_qty,
@@ -2770,14 +2805,105 @@ class AutoSupplyPlanController extends Controller
     }
 
     /**
+     * Строки, которые показанная (агрегированная) строка плана объединяет:
+     * Ozon группирует по (sku, cluster_id), остальные МП — по sku
+     * (см. aggregatedPlanLinesQuery). Учитывает scope выбранных кластеров.
+     */
+    private function aggregatedSiblingLines(AutoSupplyPlan $plan, AutoSupplyPlanLine $line): \Illuminate\Support\Collection
+    {
+        return $this->planLinesQueryForSelectedClusters($plan)
+            ->where('sku', $line->sku)
+            ->when(
+                $plan->marketplace === 'ozon',
+                fn ($q) => $line->cluster_id === null
+                    ? $q->whereNull('cluster_id')
+                    : $q->where('cluster_id', $line->cluster_id)
+            )
+            ->get();
+    }
+
+    /**
+     * Распределяет новое суммарное количество по подлежащим строкам агрегата
+     * пропорционально текущим. Метод наибольшего остатка гарантирует
+     * sum(qty_rounded) === $newTotal — план и все экспорты совпадут с введённым
+     * значением, а пер-складская разбивка сохраняется для matrix/by-warehouse экспортов.
+     * Кратность pack соблюдается, когда введённая сумма ей кратна; иначе приоритет —
+     * точное сохранение суммы (ручной ввод пользователя авторитетен).
+     */
+    private function redistributeQtyAcrossLines(\Illuminate\Support\Collection $lines, int $newTotal): void
+    {
+        $lines = $lines->values();
+        $count = $lines->count();
+
+        if ($count === 0) {
+            return;
+        }
+
+        if ($count === 1) {
+            $lines[0]->update(['qty_rounded' => $newTotal]);
+
+            return;
+        }
+
+        $pack = 1;
+        foreach ($lines as $l) {
+            $inputs = is_array($l->explain_json) ? ($l->explain_json['inputs'] ?? []) : [];
+            $p = (int) ($inputs['pack_multiple'] ?? 1);
+            if ($p > 1) {
+                $pack = $p;
+                break;
+            }
+        }
+
+        $unit = ($pack > 1 && $newTotal % $pack === 0) ? $pack : 1;
+        $totalUnits = intdiv($newTotal, $unit);
+
+        $oldSum = 0;
+        foreach ($lines as $l) {
+            $oldSum += (int) $l->qty_rounded;
+        }
+
+        // Веса = текущее распределение; если вся группа в нуле — кладём всё в первую
+        // (каноническую MIN(id)) строку, остальные оставляем нулевыми.
+        $weights = $oldSum > 0
+            ? $lines->map(fn ($l) => (int) $l->qty_rounded)->all()
+            : array_map(fn ($i) => $i === 0 ? 1 : 0, range(0, $count - 1));
+        $weightSum = array_sum($weights);
+
+        $floors = [];
+        $frac = [];
+        $assigned = 0;
+        foreach ($weights as $i => $w) {
+            $exact = $totalUnits * $w / $weightSum;
+            $floors[$i] = (int) floor($exact);
+            $frac[$i] = $exact - $floors[$i];
+            $assigned += $floors[$i];
+        }
+
+        // Остаток единиц раздаём строкам с наибольшей дробной частью.
+        $remainder = $totalUnits - $assigned;
+        if ($remainder > 0) {
+            $order = array_keys($frac);
+            usort($order, fn ($a, $b) => $frac[$b] <=> $frac[$a]);
+            foreach (array_slice($order, 0, $remainder) as $i) {
+                $floors[$i]++;
+            }
+        }
+
+        foreach ($lines as $i => $l) {
+            $l->update(['qty_rounded' => $floors[$i] * $unit]);
+        }
+    }
+
+    /**
      * GET /api/auto-supply-plans/{id}/export/ozon
      *
      * Колонки: "артикул", "имя (необязательно)", "количество"
      * Группировка: SUM(qty_rounded) по offer_id
      */
-    public function exportOzon(string $id): StreamedResponse
+    public function exportOzon(Request $request, string $id): StreamedResponse
     {
-        $plan = AutoSupplyPlan::findOrFail($id);
+        $plan = $this->authorizedPlan($request, $id);
 
         if ($plan->status !== AutoSupplyPlan::STATUS_READY) {
             abort(422, 'План ещё не рассчитан');
@@ -2834,9 +2960,9 @@ class AutoSupplyPlanController extends Controller
      * Группировка: SUM(qty_rounded) по barcode
      * Ошибка если barcode null или дубли
      */
-    public function exportWb(string $id): StreamedResponse|JsonResponse
+    public function exportWb(Request $request, string $id): StreamedResponse|JsonResponse
     {
-        $plan = AutoSupplyPlan::findOrFail($id);
+        $plan = $this->authorizedPlan($request, $id);
 
         if ($plan->status !== AutoSupplyPlan::STATUS_READY) {
             abort(422, 'План ещё не рассчитан');
@@ -2945,9 +3071,9 @@ class AutoSupplyPlanController extends Controller
      * Формат матрицы Ozon FBO: строки = артикулы, столбцы = склады
      * Шаблон для загрузки в ЛК Ozon (Поставки → Создать поставку)
      */
-    public function exportOzonMatrix(string $id): StreamedResponse
+    public function exportOzonMatrix(Request $request, string $id): StreamedResponse
     {
-        $plan = AutoSupplyPlan::findOrFail($id);
+        $plan = $this->authorizedPlan($request, $id);
 
         if ($plan->status !== AutoSupplyPlan::STATUS_READY) {
             abort(422, 'План ещё не рассчитан');
@@ -3051,9 +3177,9 @@ class AutoSupplyPlanController extends Controller
      * ZIP-архив с отдельными XLSX шаблонами по каждому складу (городу)
      * Каждый файл — шаблон Ozon FBO: "артикул", "имя (необязательно)", "количество"
      */
-    public function exportOzonByWarehouse(string $id): StreamedResponse|JsonResponse
+    public function exportOzonByWarehouse(Request $request, string $id): StreamedResponse|JsonResponse
     {
-        $plan = AutoSupplyPlan::findOrFail($id);
+        $plan = $this->authorizedPlan($request, $id);
 
         if ($plan->status !== AutoSupplyPlan::STATUS_READY) {
             abort(422, 'План ещё не рассчитан');

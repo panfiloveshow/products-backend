@@ -90,6 +90,58 @@ class LocalityEnrichmentServiceTest extends TestCase
         $this->assertSame('C', $result['children'][2]['cluster_name']);
     }
 
+    public function test_split_pack_multiple_conserves_total_and_does_not_inflate(): void
+    {
+        // Регресс: totalQty=25, pack=10, 4 равных кластера.
+        // Раньше ceil-округление раздувало первые кластеры до 10 каждый (сумма 30 > 25),
+        // 4-й спрос-кластер молча получал 0 и выкидывался. Теперь — апортация на сетке pack.
+        $line = ['sku' => 'X-1', 'warehouse_id' => 'W1', 'qty_rounded' => 25];
+        $recs = collect([
+            $this->buildRec(25, 'A', 'a', 1000, 10, rankScore: 100),
+            $this->buildRec(25, 'B', 'b', 1000, 10, rankScore: 90),
+            $this->buildRec(25, 'C', 'c', 1000, 10, rankScore: 80),
+            $this->buildRec(25, 'D', 'd', 1000, 10, rankScore: 70),
+        ]);
+
+        $result = $this->svc->applyClusterSplit(
+            $line, $recs, [], LocalityEnrichmentService::STRATEGY_RECOMMENDATIONS, 5, 10
+        );
+
+        $qtys = array_column($result['children'], 'qty_rounded');
+        $this->assertSame(25, array_sum($qtys), 'Сумма детей обязана == totalQty (не раздувать поставку)');
+        foreach ($result['children'] as $child) {
+            $this->assertSame(25, $child['aggregated_qty_rounded'], 'aggregated не должен расходиться с фактической суммой');
+        }
+        // 25 единиц при pack=10 покрывают максимум 3 кластера (2 пака + остаток 5); 4-й = 0 и опущен.
+        $this->assertCount(3, $result['children']);
+        sort($qtys);
+        $this->assertSame([5, 10, 10], $qtys, 'Паки кратны 10, единственный суб-пак остаток = 5');
+        // weight в split_json — реализованная доля qty/total, а не идеальные 25%
+        $weights = array_column($result['children'][0]['cluster_split_json'], 'weight');
+        $this->assertEqualsWithDelta(100.0, array_sum($weights), 0.01);
+    }
+
+    public function test_split_pack_multiple_one_no_regression(): void
+    {
+        $line = ['sku' => 'X-1', 'warehouse_id' => 'W1', 'qty_rounded' => 25];
+        $recs = collect([
+            $this->buildRec(25, 'A', 'a', 1000, 10, rankScore: 100),
+            $this->buildRec(25, 'B', 'b', 1000, 10, rankScore: 90),
+            $this->buildRec(25, 'C', 'c', 1000, 10, rankScore: 80),
+            $this->buildRec(25, 'D', 'd', 1000, 10, rankScore: 70),
+        ]);
+
+        $result = $this->svc->applyClusterSplit(
+            $line, $recs, [], LocalityEnrichmentService::STRATEGY_RECOMMENDATIONS, 5, 1
+        );
+
+        $qtys = array_column($result['children'], 'qty_rounded');
+        $this->assertSame(25, array_sum($qtys));
+        $this->assertCount(4, $result['children'], 'pack=1 — все 4 кластера покрыты, никто не теряется');
+        sort($qtys);
+        $this->assertSame([6, 6, 6, 7], $qtys);
+    }
+
     public function test_enrich_line_adds_metrics_fields(): void
     {
         $line = ['sku' => 'X-1', 'qty_rounded' => 50];
@@ -149,6 +201,55 @@ class LocalityEnrichmentServiceTest extends TestCase
         $this->assertStringContainsString('73.0%', $text);
         $this->assertStringContainsString('17.0', $text);
         $this->assertStringContainsString('430 000', $text);
+    }
+
+    public function test_split_proportional_distributes_evenly_across_clusters(): void
+    {
+        // «Равномерно по всем»: одинаковое кол-во в каждый кластер с потребностью,
+        // несмотря на разный recommended_supply (в отличие от demand_weighted).
+        $line = ['sku' => 'X-1', 'warehouse_id' => 'W1', 'qty_rounded' => 90];
+        $analytics = [
+            '10' => ['recommended_supply' => 100, 'cluster_name' => 'A'],
+            '20' => ['recommended_supply' => 50,  'cluster_name' => 'B'],
+            '30' => ['recommended_supply' => 10,  'cluster_name' => 'C'],
+        ];
+
+        $result = $this->svc->applyClusterSplit(
+            $line, collect([]), $analytics, LocalityEnrichmentService::STRATEGY_PROPORTIONAL, 5, 1
+        );
+
+        $this->assertTrue($result['is_split']);
+        $qtys = array_column($result['children'], 'qty_rounded');
+        $this->assertSame(90, array_sum($qtys));
+        sort($qtys);
+        $this->assertSame([30, 30, 30], $qtys, 'Равномерно: 90/3 = 30 в каждый');
+    }
+
+    public function test_split_filters_to_selected_clusters_without_losing_volume(): void
+    {
+        // Регресс R4: при выборе части кластеров объём невыбранного НЕ теряется —
+        // он перераспределяется на выбранные через нормировку весов.
+        $line = ['sku' => 'X-1', 'warehouse_id' => 'W1', 'qty_rounded' => 100];
+        $analytics = [
+            '10' => ['recommended_supply' => 50, 'cluster_name' => 'A'],
+            '20' => ['recommended_supply' => 50, 'cluster_name' => 'B'],
+            '30' => ['recommended_supply' => 50, 'cluster_name' => 'C'], // не выбран
+        ];
+
+        $result = $this->svc->applyClusterSplit(
+            $line, collect([]), $analytics,
+            LocalityEnrichmentService::STRATEGY_DEMAND_WEIGHTED, 5, 1, [10, 20]
+        );
+
+        $this->assertTrue($result['is_split']);
+        $clusterIds = array_map(fn ($c) => (string) $c['cluster_id'], $result['children']);
+        sort($clusterIds);
+        $this->assertSame(['10', '20'], $clusterIds, 'Только выбранные кластеры');
+
+        $qtys = array_column($result['children'], 'qty_rounded');
+        $this->assertSame(100, array_sum($qtys), 'Объём исключённого кластера ушёл выбранным, не потерян');
+        sort($qtys);
+        $this->assertSame([50, 50], $qtys);
     }
 
     /**

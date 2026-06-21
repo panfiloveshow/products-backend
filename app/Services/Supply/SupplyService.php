@@ -359,7 +359,10 @@ class SupplyService
             $result = $ozon->supplies()->createSupplyFromDraft(
                 (int) $supply->ozon_draft_id,
                 (int) $supply->warehouse_id,
-                $timeslotPayload
+                $timeslotPayload,
+                $supply->cluster_id ? (int) $supply->cluster_id : null,
+                $supply->warehouse_name,
+                $supply->supply_method ?? 'direct'
             );
 
             $duration = (int) ((microtime(true) - $startTime) * 1000);

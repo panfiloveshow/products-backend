@@ -136,9 +136,9 @@ class PlanFactReconciler
 
     private function forecastDemandQty(AutoSupplyPlanLine $line, int $horizon): float
     {
-        $daily = $line->demand_daily;
-        if (is_numeric($daily) && (float) $daily > 0) {
-            return round((float) $daily * $horizon, 2);
+        $daily = $this->forecastDailyDemand($line);
+        if ($daily > 0) {
+            return round($daily * $horizon, 2);
         }
 
         // Фолбэк: сумма прогноза по дням из simulation_json.
@@ -149,6 +149,28 @@ class PlanFactReconciler
         }
 
         return round($sum, 2);
+    }
+
+    /**
+     * Дневной прогноз для измерения точности. Если применялась калибровка (этап 4),
+     * берём спрос ДО неё (explain.inputs.daily_demand_pre_calibration): иначе план-факт
+     * меряет собственную поправку, bias всегда ≈0 и корректор перестаёт сходиться.
+     */
+    private function forecastDailyDemand(AutoSupplyPlanLine $line): float
+    {
+        $explain = is_array($line->explain_json) ? $line->explain_json : [];
+        $calibrationApplied = (bool) ($explain['inputs']['calibration']['applied'] ?? false);
+
+        if ($calibrationApplied) {
+            $raw = $explain['inputs']['daily_demand_pre_calibration'] ?? null;
+            if (is_numeric($raw) && (float) $raw > 0) {
+                return (float) $raw;
+            }
+        }
+
+        $daily = $line->demand_daily;
+
+        return is_numeric($daily) ? (float) $daily : 0.0;
     }
 
     /**
@@ -173,8 +195,13 @@ class PlanFactReconciler
                 }
             });
 
-        // Ozon: сузить до кластера строки (портируемый JSON-оператор Laravel `->`).
-        if ($plan->marketplace === 'ozon' && ! empty($line->cluster_name)) {
+        // Ozon: кластерную строку факт обязан быть сужен до её кластера. Без имени
+        // кластера надёжно сопоставить нельзя — НЕ подменяем суммой всех кластеров
+        // (это дало бы ложный under-forecast и отравило калибровку). Лучше «нет данных».
+        if ($plan->marketplace === 'ozon' && $line->cluster_id !== null) {
+            if (empty($line->cluster_name)) {
+                return 0;
+            }
             $query->where('p.financial_data->cluster_to', $line->cluster_name);
         }
 

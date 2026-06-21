@@ -180,6 +180,7 @@ class LocalityEnrichmentService
         string $strategy = self::STRATEGY_RECOMMENDATIONS,
         int $maxClusters = self::DEFAULT_MAX_CLUSTERS,
         int $packMultiple = 1,
+        array $selectedClusterIds = [],
     ): array {
         $totalQty = (int) ($line['qty_rounded'] ?? 0);
         $sku = (string) ($line['sku'] ?? '');
@@ -195,7 +196,7 @@ class LocalityEnrichmentService
             ]], 'is_split' => false];
         }
 
-        $splits = $this->resolveSplitWeights($strategy, $recommendations, $ozonClusterAnalytics, $maxClusters);
+        $splits = $this->resolveSplitWeights($strategy, $recommendations, $ozonClusterAnalytics, $maxClusters, $selectedClusterIds);
         if (empty($splits)) {
             return ['children' => [$line + [
                 'parent_line_key' => $parentKey,
@@ -214,21 +215,21 @@ class LocalityEnrichmentService
             ]], 'is_split' => false];
         }
 
+        // Апортация qty по весам методом наибольших остатков (Hamilton) НА СЕТКЕ pack_multiple.
+        // Целые паки раздаются по весам; неизбежный суб-пак остаток (если totalQty не кратен pack)
+        // уходит одному самому недообслуженному кластеру. Инвариант: sum(qty) == totalQty всегда.
+        $qtyByIndex = $this->apportionOnPackGrid($splits, $weightsSum, $totalQty, max(1, $packMultiple));
+
         $children = [];
         $distributedQty = 0;
         $splitJsonRows = [];
 
         foreach ($splits as $i => $split) {
-            $share = $split['weight'] / $weightsSum;
-            $rawQty = $totalQty * $share;
-            $isLast = ($i === array_key_last($splits));
-
-            // Последняя строка забирает остаток, чтобы сумма совпала с totalQty
-            $qty = $isLast
-                ? max(0, $totalQty - $distributedQty)
-                : $this->roundToPackMultiple((int) floor($rawQty), $packMultiple);
+            $qty = $qtyByIndex[$i] ?? 0;
 
             if ($qty <= 0) {
+                // Кластеров больше, чем покрывается на сетке pack — нулевой кластер опускаем.
+                // Это не молчаливая потеря: инвариант суммы ниже гарантирует, что qty не утерян.
                 continue;
             }
 
@@ -256,11 +257,23 @@ class LocalityEnrichmentService
                 'qty' => $qty,
                 'expected_savings_rub' => $expectedSavingsForChild,
                 'rec_id' => $split['rec_id'] ?? null,
-                'weight' => round($share * 100, 2),
+                'weight' => round($qty / $totalQty * 100, 2), // реализованная доля (qty/total), а не идеальная
             ];
 
             $child['cluster_split_json'] = null; // split_json пишется только на parent row (первой child), остальные — null
             $children[] = $child;
+        }
+
+        // Runtime-инвариант: сумма детей обязана совпасть с aggregated_qty_rounded (= totalQty).
+        // При апортации выше это всегда так; лог ловит будущие регрессии, а не молчит как раньше.
+        if ($distributedQty !== $totalQty) {
+            logger()->warning('LocalityEnrichmentService: cluster split sum mismatch', [
+                'sku' => $sku,
+                'parent_line_key' => $parentKey,
+                'total_qty' => $totalQty,
+                'distributed_qty' => $distributedQty,
+                'pack_multiple' => $packMultiple,
+            ]);
         }
 
         if (! empty($children)) {
@@ -426,13 +439,19 @@ class LocalityEnrichmentService
         Collection $recommendations,
         array $ozonClusterAnalytics,
         int $maxClusters,
+        array $selectedClusterIds = [],
     ): array {
+        // Равномерно по всем кластерам с потребностью (отфильтрованным по выбору пользователя).
+        if ($strategy === self::STRATEGY_PROPORTIONAL && ! empty($ozonClusterAnalytics)) {
+            return $this->weightsProportional($ozonClusterAnalytics, $maxClusters, $selectedClusterIds);
+        }
+
         if ($strategy === self::STRATEGY_RECOMMENDATIONS && $recommendations->isNotEmpty()) {
             return $this->weightsFromRecommendations($recommendations, $maxClusters);
         }
 
         if ($strategy === self::STRATEGY_DEMAND_WEIGHTED && ! empty($ozonClusterAnalytics)) {
-            return $this->weightsFromOzonAnalytics($ozonClusterAnalytics, $maxClusters);
+            return $this->weightsFromOzonAnalytics($ozonClusterAnalytics, $maxClusters, $selectedClusterIds);
         }
 
         // Fallback: если есть рекомендации — используем их, иначе Ozon analytics, иначе пусто (single row).
@@ -440,7 +459,7 @@ class LocalityEnrichmentService
             return $this->weightsFromRecommendations($recommendations, $maxClusters);
         }
         if (! empty($ozonClusterAnalytics)) {
-            return $this->weightsFromOzonAnalytics($ozonClusterAnalytics, $maxClusters);
+            return $this->weightsFromOzonAnalytics($ozonClusterAnalytics, $maxClusters, $selectedClusterIds);
         }
         return [];
     }
@@ -466,12 +485,16 @@ class LocalityEnrichmentService
     }
 
     /** @return list<array{cluster_id:?string, cluster_name:string, weight:float, rec_id:?int}> */
-    private function weightsFromOzonAnalytics(array $ozonClusterAnalytics, int $maxClusters): array
+    private function weightsFromOzonAnalytics(array $ozonClusterAnalytics, int $maxClusters, array $selectedClusterIds = []): array
     {
         // Формат из AutoSupplyPlanService::loadOzonDeliveryAnalytics:
         // $ozonClusterAnalytics = [cluster_id => ['recommended_supply' => int, 'cluster_name' => string, ...]]
+        $allow = $this->selectedClusterFilter($selectedClusterIds);
         $rows = [];
         foreach ($ozonClusterAnalytics as $clusterId => $data) {
+            if ($allow !== null && ! isset($allow[(string) $clusterId])) {
+                continue; // кластер не выбран — его объём уйдёт выбранным через нормировку весов, не теряется
+            }
             $supply = (int) ($data['recommended_supply'] ?? 0);
             if ($supply <= 0) {
                 continue;
@@ -487,12 +510,102 @@ class LocalityEnrichmentService
         return array_slice($rows, 0, $maxClusters);
     }
 
-    private function roundToPackMultiple(int $qty, int $packMultiple): int
+    /**
+     * Равномерное распределение: равный вес по всем кластерам с потребностью (отфильтрованным по выбору).
+     * @return list<array{cluster_id:?string, cluster_name:string, weight:float, rec_id:?int}>
+     */
+    private function weightsProportional(array $ozonClusterAnalytics, int $maxClusters, array $selectedClusterIds = []): array
     {
-        if ($packMultiple <= 1) {
-            return $qty;
+        $allow = $this->selectedClusterFilter($selectedClusterIds);
+        $rows = [];
+        foreach ($ozonClusterAnalytics as $clusterId => $data) {
+            if ($allow !== null && ! isset($allow[(string) $clusterId])) {
+                continue;
+            }
+            if ((int) ($data['recommended_supply'] ?? 0) <= 0) {
+                continue;
+            }
+            $rows[] = [
+                'cluster_id' => (string) $clusterId,
+                'cluster_name' => (string) ($data['cluster_name'] ?? ''),
+                'weight' => 1.0,
+                'rec_id' => null,
+            ];
         }
-        return (int) (ceil($qty / $packMultiple) * $packMultiple);
+        return array_slice($rows, 0, $maxClusters);
+    }
+
+    /**
+     * Карта разрешённых кластеров (по выбору пользователя). null = фильтр не нужен (выбраны все).
+     * @return array<string,true>|null
+     */
+    private function selectedClusterFilter(array $selectedClusterIds): ?array
+    {
+        if (empty($selectedClusterIds)) {
+            return null;
+        }
+        $map = [];
+        foreach ($selectedClusterIds as $id) {
+            $map[(string) $id] = true;
+        }
+        return $map;
+    }
+
+    /**
+     * Распределить $totalQty по сплитам пропорционально весам на сетке $pack
+     * методом наибольших остатков (Hamilton). Возвращает qty по индексу сплита.
+     *
+     * Инвариант: array_sum(результат) === $totalQty (единицы не теряются и не плодятся).
+     * Целые паки раздаются по весам; суб-пак остаток (totalQty mod pack) уходит
+     * самому недообслуженному кластеру.
+     *
+     * @param  list<array{weight:float}>  $splits
+     * @return array<int,int>  qty по индексу сплита
+     */
+    private function apportionOnPackGrid(array $splits, float $weightsSum, int $totalQty, int $pack): array
+    {
+        $wholePacks = intdiv($totalQty, $pack);
+        $residual = $totalQty - $wholePacks * $pack; // 0..pack-1 — нарушает кратность только здесь
+
+        $packCounts = [];
+        $remainders = [];
+        foreach ($splits as $i => $split) {
+            $idealPacks = $wholePacks * ($split['weight'] / $weightsSum);
+            $packCounts[$i] = (int) floor($idealPacks);
+            $remainders[$i] = $idealPacks - $packCounts[$i];
+        }
+
+        // Доразадаём оставшиеся целые паки кластерам с наибольшим дробным остатком.
+        $leftoverPacks = $wholePacks - array_sum($packCounts);
+        arsort($remainders); // по убыванию остатка; ключи (индексы сплитов) сохраняются
+        foreach (array_keys($remainders) as $i) {
+            if ($leftoverPacks <= 0) {
+                break;
+            }
+            $packCounts[$i]++;
+            $leftoverPacks--;
+        }
+
+        $qtyByIndex = [];
+        foreach ($packCounts as $i => $packs) {
+            $qtyByIndex[$i] = $packs * $pack;
+        }
+
+        // Суб-пак остаток — самому недообслуженному кластеру (макс. дефицит ideal - назначено).
+        if ($residual > 0) {
+            $bestI = array_key_first($qtyByIndex);
+            $bestDeficit = -INF;
+            foreach ($splits as $i => $split) {
+                $deficit = $totalQty * ($split['weight'] / $weightsSum) - $qtyByIndex[$i];
+                if ($deficit > $bestDeficit) {
+                    $bestDeficit = $deficit;
+                    $bestI = $i;
+                }
+            }
+            $qtyByIndex[$bestI] += $residual;
+        }
+
+        return $qtyByIndex;
     }
 
     /**

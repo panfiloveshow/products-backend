@@ -35,12 +35,13 @@ class ForecastCalibrationServiceTest extends TestCase
         Config::set('autoplanning.calibration.window', 5);
     }
 
-    private function seedEvaluations(int $integrationId, string $sku, array $biases, string $status = 'ok'): void
+    private function seedEvaluations(int $integrationId, string $sku, array $biases, string $status = 'ok', ?string $cluster = null): void
     {
         foreach ($biases as $i => $bias) {
             DB::table('plan_line_evaluations')->insert([
                 'integration_id' => $integrationId,
                 'sku' => $sku,
+                'cluster_id' => $cluster,
                 'status' => $status,
                 'bias_pct' => $bias,
                 'evaluated_at' => now()->subDays(count($biases) - $i),
@@ -100,6 +101,27 @@ class ForecastCalibrationServiceTest extends TestCase
         $result = (new ForecastCalibrationService())->correctorFor(700, 'ART1');
 
         $this->assertEquals(0.75, $result['multiplier']);
+    }
+
+    public function test_cluster_scoping_isolates_bias_per_cluster(): void
+    {
+        // Один SKU, два кластера с ПРОТИВОПОЛОЖНЫМ смещением — без передачи кластера
+        // они бы усреднились в ~0 и корректор ничего не исправил (баг G).
+        $this->seedEvaluations(700, 'ART1', [40, 40, 40], 'ok', '12');    // перепрогноз
+        $this->seedEvaluations(700, 'ART1', [-40, -40, -40], 'ok', '30'); // недопрогноз
+
+        $svc = new ForecastCalibrationService();
+
+        // Кластер 12: median +40 → multiplier = 1 - 0.40*0.5 = 0.80 (снижаем).
+        $c12 = $svc->correctorFor(700, 'ART1', '12');
+        $this->assertTrue($c12['applied']);
+        $this->assertEquals(40.0, $c12['median_bias_pct']);
+        $this->assertEquals(0.80, $c12['multiplier']);
+
+        // Кластер 30: median -40 → multiplier = 1 + 0.40*0.5 = 1.20 (повышаем).
+        $c30 = $svc->correctorFor(700, 'ART1', '30');
+        $this->assertEquals(-40.0, $c30['median_bias_pct']);
+        $this->assertEquals(1.20, $c30['multiplier']);
     }
 
     public function test_ignores_insufficient_status_rows(): void

@@ -158,6 +158,45 @@ class PlanFactReconcilerTest extends TestCase
         $this->assertSame('postings_fbo', $result['demand_fact_source']);
     }
 
+    public function test_forecast_measured_against_pre_calibration_demand(): void
+    {
+        // fix E: цикл не должен мерить собственную поправку. demand_daily=2.0 — это УЖЕ
+        // откалиброванное значение; модель прогнозировала 3.0/день до калибровки.
+        [$plan, $line] = $this->makePlanAndLine();
+        $line->explain_json = [
+            'inputs' => [
+                'calibration' => ['applied' => true, 'multiplier' => 0.667],
+                'daily_demand_pre_calibration' => 3.0,
+            ],
+        ];
+
+        // Факт = 42 = сырой прогноз 3.0 * 14: при правильном измерении bias=0.
+        $this->insertPosting('700', 'Москва', '2026-05-03 10:00:00', 42);
+
+        $result = (new PlanFactReconciler())->evaluateLine($line, $plan);
+
+        // Меряем против сырого 3.0*14=42, а не калиброванного 2.0*14=28.
+        $this->assertEquals(42.0, $result['forecast_demand_qty']);
+        $this->assertEquals(0.0, $result['bias_pct']);
+    }
+
+    public function test_clustered_line_without_name_is_insufficient_not_nationwide(): void
+    {
+        // fix F: кластерная строка (cluster_id=12) с потерянным именем не должна
+        // суммировать продажи всех кластеров — иначе ложный under-forecast.
+        [$plan, $line] = $this->makePlanAndLine();
+        $line->cluster_name = null;
+
+        $this->insertPosting('700', 'Москва', '2026-05-03 10:00:00', 50);
+        $this->insertPosting('700', 'Питер', '2026-05-04 10:00:00', 70);
+
+        $result = (new PlanFactReconciler())->evaluateLine($line, $plan);
+
+        $this->assertSame(PlanLineEvaluation::STATUS_INSUFFICIENT, $result['status']);
+        $this->assertEquals(0.0, $result['actual_sales_qty']);
+        $this->assertNull($result['bias_pct']);
+    }
+
     public function test_insufficient_data_when_no_sales_does_not_fake_accuracy(): void
     {
         [$plan, $line] = $this->makePlanAndLine();

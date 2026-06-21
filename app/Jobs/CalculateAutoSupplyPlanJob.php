@@ -76,8 +76,11 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
         $horizonDays = $plan->horizon_days ?: 30;
 
         // v3: horizon_days ограничивает max_cover_days и target_cover_days
-        $maxCoverDays = $plan->max_cover_days ?: min($horizonDays, 90);
+        $requestedMaxCoverDays = $plan->max_cover_days ? (int) $plan->max_cover_days : null;
+        $maxCoverDays = $requestedMaxCoverDays ?: min($horizonDays, 90);
         $maxCoverDays = min($maxCoverDays, $horizonDays);
+        // ponytail: фиксируем факт зажатия настройки горизонтом — чтобы не терялась молча.
+        $maxCoverDaysClamped = $requestedMaxCoverDays !== null && $requestedMaxCoverDays > $maxCoverDays;
 
         $integrationId = $plan->integration_id;
         $marketplace = $plan->marketplace;
@@ -326,10 +329,16 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
             $yandexFbsStockMap = array_map('intval', $fbsRows);
         }
 
-        // v2: Загружаем in-transit из активных заявок на поставку
+        // v2: Загружаем in-transit из активных заявок на поставку.
+        // ponytail: для Ozon делим заявки на до-отгрузочные и отгруженные — отгруженные уже
+        // отражены в transit_stock_count аналитики Ozon, поэтому их нельзя складывать с ним (задвоение).
         $supplyInTransit = $service->getInTransitFromSupplies($integrationId);
-        $supplyInTransitByCluster = ($marketplace === 'ozon' && ! empty($clusterMapping))
-            ? $this->getOzonInTransitFromSuppliesByCluster($integrationId, $clusterMapping)
+        $ozonClusterSupplies = ($marketplace === 'ozon' && ! empty($clusterMapping));
+        $supplyInTransitByClusterPending = $ozonClusterSupplies
+            ? $this->getOzonInTransitFromSuppliesByCluster($integrationId, $clusterMapping, ['draft_ozon', 'slot_booked', 'preparing', 'ready_to_ship'])
+            : [];
+        $supplyInTransitByClusterShipped = $ozonClusterSupplies
+            ? $this->getOzonInTransitFromSuppliesByCluster($integrationId, $clusterMapping, ['shipped', 'in_transit'])
             : [];
 
         // v3: Проверяем, загружен ли CSV-отчёт заказов для этой интеграции
@@ -402,6 +411,11 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
         $advertisingHighDrrLines = 0;
         $advertisingProfitAdjustedLines = 0;
 
+        // Деманд-математика gated (config autoplanning.*, off по умолчанию — читаем 1 раз).
+        $oosAdjustWhenUnknownDays = (bool) config('autoplanning.demand.oos_adjust_when_unknown_days', false);
+        $ssSigmaLtEnabled = (bool) config('autoplanning.safety_stock.sigma_lead_time_enabled', false);
+        $ssServiceLevelZ = (float) config('autoplanning.safety_stock.service_level_z', 1.65);
+
         foreach ($warehouses as $wh) {
             $product = $products->get($wh->sku);
             $ue = $unitEconomics->get($wh->sku);
@@ -470,11 +484,12 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
                 }
             }
 
-            // v3: Если Ozon даёт ads_cluster (ср. продажи/день по кластеру), используем как доп. источник
-            // ads_cluster > 0 означает что Ozon видит реальные продажи на этом складе
-            if ($ozonAdsCluster !== null && $ozonAdsCluster > 0) {
-                $avgDailySales = max($avgDailySales, $ozonAdsCluster);
-            }
+            // v3: ads_cluster Ozon (ср. продажи/день по кластеру) — доп. источник спроса,
+            // но с ограничением завышения относительно факта (см. blendOzonAdsDemand).
+            $avgDailySales = $service->blendOzonAdsDemand(
+                (float) $avgDailySales,
+                $ozonAdsCluster !== null ? (float) $ozonAdsCluster : null
+            );
 
             if ($marketplace === 'ozon' && $postingDemandData && (float) ($postingDemandData['avg_daily_sales'] ?? 0) > 0) {
                 $postingDemandShape = $service->shapeOzonPostingDemand(
@@ -494,22 +509,35 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
 
             // v2: In-transit = API + заявки на поставку
             $inTransitApi = $wh->in_transit ?? 0;
+            $ozonTransitFromAnalytics = false;
+            $ozonReturnFromCustomer = 0;
             if ($marketplace === 'ozon' && $wh->getAttribute('is_cluster_aggregate') && $ozonStockData) {
                 $apiValidStock = (int) ($ozonStockData['valid_stock_count'] ?? 0);
                 $apiAvailableStock = (int) ($ozonStockData['available_stock_count'] ?? 0);
                 $apiTransitStock = (int) ($ozonStockData['transit_stock_count'] ?? 0);
+                $ozonReturnFromCustomer = (int) ($ozonStockData['return_from_customer_stock_count'] ?? 0);
 
                 if ($apiValidStock > 0 || $apiAvailableStock > 0) {
                     $currentStock = max($apiValidStock, $apiAvailableStock);
                 }
                 if ($apiTransitStock > 0) {
                     $inTransitApi = $apiTransitStock;
+                    $ozonTransitFromAnalytics = true;
                 }
             }
             $clusterIdForTransit = $wh->getAttribute('cluster_id');
-            $inTransitSupplies = ($marketplace === 'ozon' && $clusterIdForTransit)
-                ? ($supplyInTransitByCluster[$wh->sku . '|' . $clusterIdForTransit] ?? 0)
-                : ($supplyInTransit[$wh->sku] ?? 0);
+            if ($marketplace === 'ozon' && $clusterIdForTransit) {
+                $transitKey = $wh->sku . '|' . $clusterIdForTransit;
+                $pendingSupplies = (int) ($supplyInTransitByClusterPending[$transitKey] ?? 0);
+                $shippedSupplies = (int) ($supplyInTransitByClusterShipped[$transitKey] ?? 0);
+                // Если «в пути» взят из аналитики Ozon (transit_stock_count), он уже включает
+                // отгруженные поставки → добавляем только до-отгрузочные заявки, иначе задвоение.
+                $inTransitSupplies = $ozonTransitFromAnalytics
+                    ? $pendingSupplies
+                    : ($pendingSupplies + $shippedSupplies);
+            } else {
+                $inTransitSupplies = (int) ($supplyInTransit[$wh->sku] ?? 0);
+            }
             $inTransit = $inTransitApi + $inTransitSupplies;
             if (! $includeInTransit) {
                 $inTransitApi = 0;
@@ -526,26 +554,22 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
                 $inTransit = $inTransit + (int) round($inWayFromClient * 0.8);
             }
 
-            // WB v5: FBS-остатки продавца — товары уже у продавца, можно отгрузить на WB
-            // Учитываем как дополнительный "виртуальный транзит" (товар уже есть, нужна только отгрузка)
-            $wbFbsStock = 0;
-            if ($marketplace === 'wildberries') {
-                $wbFbsStock = $wbFbsStockMap[$wh->sku] ?? 0;
-                if ($wbFbsStock > 0) {
-                    // FBS = уже на складе продавца, учитываем как in-transit с коэффициентом 1.0
-                    $inTransit = $inTransit + $wbFbsStock;
-                }
+            // Ozon: возвраты от покупателя (return_from_customer) едут обратно на склад —
+            // симметрично WB, тот же коэффициент 0.8 (часть уходит в брак).
+            if ($marketplace === 'ozon' && $includeInTransit && $ozonReturnFromCustomer > 0) {
+                $inTransit = $inTransit + (int) round($ozonReturnFromCustomer * 0.8);
             }
 
-            // Yandex: FBS-остатки продавца — аналогично WB
-            $yandexFbsStock = 0;
-            if (in_array($marketplace, ['yandex', 'yandex_market'], true)) {
-                $yandexFbsStock = $yandexFbsStockMap[$wh->sku] ?? 0;
-                if ($yandexFbsStock > 0) {
-                    // FBS = уже на складе продавца, учитываем как in-transit
-                    $inTransit = $inTransit + $yandexFbsStock;
-                }
-            }
+            // ponytail: FBS-остатки продавца НЕ учитываем в потребности. Автопланирование
+            // считает поставку на FBO/FBW (склады маркетплейса), а FBS — отдельная модель
+            // (продавец отгружает сам). Значения сохраняем только для отображения (fbs_stock).
+            $wbFbsStock = $marketplace === 'wildberries'
+                ? (int) ($wbFbsStockMap[$wh->sku] ?? 0)
+                : 0;
+
+            $yandexFbsStock = in_array($marketplace, ['yandex', 'yandex_market'], true)
+                ? (int) ($yandexFbsStockMap[$wh->sku] ?? 0)
+                : 0;
 
             // v2: Данные для улучшенного прогноза
             $realAvgDailySales = $wh->real_avg_daily_sales ?? 0;
@@ -558,7 +582,8 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
             if ($postingDemandApplied && $effectiveDailySales <= 0) {
                 $effectiveDailySales = (float) ($postingDemandShape['daily_demand'] ?? $postingDemandData['avg_daily_sales'] ?? 0);
             }
-            $daysInStock30 = $wh->days_in_stock_30 ?? 30;
+            $daysInStock30Raw = $wh->days_in_stock_30;       // null = неизвестно (передаём в V2)
+            $daysInStock30 = $daysInStock30Raw ?? 30;        // int для explain/avg30 как раньше
 
             // WB v4: % выкупа — вычисляем из реальных данных unit_economics если есть
             $redemptionRate = 100;
@@ -641,9 +666,9 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
             // --- v2: Улучшенный прогноз спроса (real > effective > EWMA > API avg > 7d fallback) ---
             $demandResult = $service->calculateDailyDemandV2(
                 $ewmaAlpha, $sales7, $sales14, $sales30,
-                $realAvgDailySales, $effectiveDailySales, $daysInStock30,
+                $realAvgDailySales, $effectiveDailySales, $daysInStock30Raw,
                 $redemptionRate, $salesTrend, $salesTrendPercent,
-                $avgDailySales, $realAvgDemandSource
+                $avgDailySales, $realAvgDemandSource, $oosAdjustWhenUnknownDays
             );
             $dailyDemand = $demandResult['daily_demand'];
             $demandSource = $demandResult['source'];
@@ -672,10 +697,20 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
 
             // Калибровка по план-факту (этап 4): корректор систематического bias.
             // Off по умолчанию (флаг autoplanning.calibration.enabled). Виден в explain.
+            // Спрос ДО калибровки фиксируем — план-факт меряет точность против него,
+            // иначе цикл оценивал бы собственную поправку (см. PlanFactReconciler).
+            $dailyDemandPreCalibration = $dailyDemand;
             $calibration = null;
             if ($dailyDemand > 0) {
+                // Кластер передаём, чтобы корректор брал bias именно этого кластера
+                // (для Ozon $wh — кластерный агрегат с cluster_id), а не усреднял по всем.
+                $calibrationCluster = $wh->getAttribute('cluster_id');
                 $corrector = app(ForecastCalibrationService::class)
-                    ->correctorFor((int) $plan->integration_id, (string) $wh->sku);
+                    ->correctorFor(
+                        (int) $plan->integration_id,
+                        (string) $wh->sku,
+                        $calibrationCluster !== null ? (string) $calibrationCluster : null
+                    );
                 if ($corrector['applied'] && $corrector['multiplier'] !== 1.0) {
                     $dailyDemand *= $corrector['multiplier'];
                     $demandSource .= '+calibrated';
@@ -729,8 +764,8 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
             }
 
             // --- v2: Динамический safety stock ---
-            $volatility = $service->calculateVolatility($avg7, $avg14, $avg30);
-            $safetyStock = $service->calculateDynamicSafetyStock($dailyDemand, $volatility, $leadTimeDays, $minSafetyDays);
+            $volatility = $service->volatilityForSafety($avg7, $avg14, $avg30);
+            $safetyStock = $service->calculateDynamicSafetyStock($dailyDemand, $volatility, $leadTimeDays, $minSafetyDays, $ssSigmaLtEnabled, $ssServiceLevelZ);
 
             // v3: Для нового склада — минимальный safety stock
             if ($supplyType === 'new_warehouse') {
@@ -751,7 +786,7 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
             $neededBeforeCaps = $baseResult['needed_before_caps'];
 
             // --- Max cover cap ---
-            $capResult = $service->applyMaxCoverCap($neededBeforeCaps, $dailyDemand, $maxCoverDays, $currentStock, $inTransit);
+            $capResult = $service->applyMaxCoverCap($neededBeforeCaps, $dailyDemand, $maxCoverDays, $currentStock, $inTransit, $safetyStock);
             $needed = $capResult['needed'];
             $capStock = $capResult['cap_stock'];
             $capNeeded = $capResult['cap_needed'];
@@ -893,7 +928,7 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
             }
 
             // --- Симуляция и риск ---
-            $simulation = $service->buildSimulation($currentStock, $inTransit, $dailyDemand, $qtyRounded, $horizonDays);
+            $simulation = $service->buildSimulation($currentStock, $inTransit, $dailyDemand, $qtyRounded, $horizonDays, $leadTimeDays);
             $oosDate = $service->findOosDate($simulation);
             $coverAfter = ($currentStock + $inTransit + $qtyRounded) / max($dailyDemand, AutoSupplyPlanService::EPS);
             $surplusDays = $coverAfter > $targetCoverDays ? (int) ($coverAfter - $targetCoverDays) : null;
@@ -1057,6 +1092,7 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
                     'demand_seasonality_multiplier' => $seasonalityMultiplier,
                     'demand_trend_multiplier' => $trendMultiplier,
                     'calibration' => $calibration,
+                    'daily_demand_pre_calibration' => round($dailyDemandPreCalibration, 4),
                     'promo_mode' => $promoMode,
                     'ewma_alpha' => $ewmaAlpha,
                     'sales_7d' => $sales7,
@@ -1293,7 +1329,10 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
                     : (bool) ($settings->locality_split_default ?? true);
                 $minConfidence = $plan->params['minimum_locality_confidence']
                     ?? ($settings->locality_min_confidence_default ?? \App\Domains\Locality\Integration\LocalityEnrichmentService::DEFAULT_MIN_CONFIDENCE);
-                $maxClusters = (int) ($settings->locality_max_split_clusters
+                // max_split_clusters: per-план через params > per-integration через SupplySettings > default.
+                // Позволяет фронту задать «все кластеры = реально все», подняв лимит выше зашитого 5.
+                $maxClusters = (int) ($plan->params['locality_max_split_clusters']
+                    ?? $settings->locality_max_split_clusters
                     ?? \App\Domains\Locality\Integration\LocalityEnrichmentService::DEFAULT_MAX_CLUSTERS);
                 $strategy = (string) ($plan->params['locality_distribution_strategy']
                     ?? \App\Domains\Locality\Integration\LocalityEnrichmentService::STRATEGY_RECOMMENDATIONS);
@@ -1325,7 +1364,8 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
                             $ozonClusterData,
                             (string) $strategy,
                             $maxClusters,
-                            max(1, $packMultiple)
+                            max(1, $packMultiple),
+                            $selectedOzonClusterIds
                         );
 
                         foreach ($split['children'] as $child) {
@@ -1569,46 +1609,24 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
         $negativeProfitShare = ($totalLines + $skippedNegativeProfitLines) > 0
             ? min(100.0, round(($remainingNegativeProfitLines / max($totalLines + $skippedNegativeProfitLines, 1)) * 100, 2))
             : 0.0;
-        $qualityGateStatus = 'good';
-        $qualityGateReasons = [];
-
-        if ($marketplace === 'ozon') {
-            $hasOzonPostingDemand = !empty($ozonPostingDemand['by_offer']);
-            $hasTrustedOzonDemand = $hasOzonReport || $hasOzonPostingDemand;
-            if (! $hasTrustedOzonDemand) {
-                $qualityGateReasons[] = 'нет автоматического спроса из заказов Ozon';
-            }
-            if (count($ozonStockAnalytics) === 0 && count($ozonStockAnalyticsCluster) === 0) {
-                $qualityGateReasons[] = 'нет аналитики остатков Ozon';
-            }
-            if (count($ozonAnalytics) === 0) {
-                $qualityGateReasons[] = 'нет сводки Ozon по скорости доставки';
-            }
-            if ($fallbackLongLines > 0) {
-                $qualityGateReasons[] = "{$fallbackLongLines} строк рассчитаны только по длинному окну продаж: коротких данных недостаточно";
-            }
-            if ($remainingNegativeProfitLines > 0) {
-                $qualityGateReasons[] = "{$remainingNegativeProfitLines} строк с отрицательной прибылью";
-            }
-            if ($skippedNegativeProfitLines > 0) {
-                $qualityGateReasons[] = "{$skippedNegativeProfitLines} убыточных строк отсечены";
-            }
-            if ($manualReviewLines > 0) {
-                $qualityGateReasons[] = "{$manualReviewLines} строк требуют проверки спроса";
-            }
-            if ($advertisingDrivenLines > 0) {
-                $qualityGateReasons[] = "{$advertisingDrivenLines} строк со спросом, поддержанным рекламой";
-            }
-            if ($advertisingHighDrrLines > 0) {
-                $qualityGateReasons[] = "{$advertisingHighDrrLines} строк с высоким ДРР";
-            }
-
-            if (! $hasTrustedOzonDemand || $fallbackLongShare >= 50 || $negativeProfitShare >= 40) {
-                $qualityGateStatus = 'bad';
-            } elseif ($qualityGateReasons !== []) {
-                $qualityGateStatus = 'warning';
-            }
-        }
+        // Доверие к плану (quality gate) считается для ВСЕХ площадок, не только Ozon.
+        // Раньше WB/Yandex всегда получали 'good' (ложно-высокое доверие).
+        $qualityGate = $service->classifyQualityGate($marketplace, [
+            'fallback_long_lines' => $fallbackLongLines,
+            'fallback_long_share' => $fallbackLongShare,
+            'negative_profit_lines' => $remainingNegativeProfitLines,
+            'negative_profit_share' => $negativeProfitShare,
+            'skipped_negative_profit_lines' => $skippedNegativeProfitLines,
+            'manual_review_lines' => $manualReviewLines,
+            'has_trusted_ozon_demand' => $hasOzonReport || !empty($ozonPostingDemand['by_offer']),
+            'has_ozon_stock_analytics' => count($ozonStockAnalytics) > 0 || count($ozonStockAnalyticsCluster) > 0,
+            'has_ozon_delivery_summary' => count($ozonAnalytics) > 0,
+            'advertising_driven_lines' => $advertisingDrivenLines,
+            'advertising_high_drr_lines' => $advertisingHighDrrLines,
+            'wb_missing_barcode_lines' => (int) ($missingSourceCounts['wb_barcode_map'] ?? 0),
+        ]);
+        $qualityGateStatus = $qualityGate['status'];
+        $qualityGateReasons = $qualityGate['reasons'];
 
         $planningFactSources = [
             'demand' => !empty($ozonPostingDemand['by_offer']) ? 'posting_fbo_v3' : ($hasOzonReport ? 'ozon_order_report' : null),
@@ -1625,6 +1643,7 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
         $qualityJson['meta'] = array_merge($qualityJson['meta'] ?? [], [
             'quality_gate_status' => $qualityGateStatus,
             'quality_gate_reasons' => $qualityGateReasons,
+            'quality_gate_marketplace' => $marketplace,
             'demand_source_counts' => $demandSourceCounts,
             'missing_source_counts' => $missingSourceCounts,
             'planning_fact_sources' => $planningFactSources,
@@ -1649,6 +1668,9 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
             'plan_quality_audit' => $planQualityAudit,
             'advanced_params_applied' => [
                 'analysis_period_days' => $analysisPeriodDays,
+                'max_cover_days_requested' => $requestedMaxCoverDays,
+                'max_cover_days_effective' => $maxCoverDays,
+                'max_cover_days_clamped' => $maxCoverDaysClamped,
                 'demand_seasonality_multiplier' => $seasonalityMultiplier,
                 'trend_multiplier' => $trendMultiplier,
                 'promo_mode' => $promoMode,
@@ -2012,20 +2034,13 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
     /**
      * @return array<string, int> keyed by "sku|cluster_id"
      */
-    private function getOzonInTransitFromSuppliesByCluster(int $integrationId, array $clusterMapping): array
+    private function getOzonInTransitFromSuppliesByCluster(int $integrationId, array $clusterMapping, array $statuses = ['draft_ozon', 'slot_booked', 'preparing', 'ready_to_ship', 'shipped', 'in_transit']): array
     {
         try {
             $rows = \Illuminate\Support\Facades\DB::table('supply_items')
                 ->join('supplies', 'supply_items.supply_id', '=', 'supplies.id')
                 ->where('supplies.integration_id', $integrationId)
-                ->whereIn('supplies.status', [
-                    'draft_ozon',
-                    'slot_booked',
-                    'preparing',
-                    'ready_to_ship',
-                    'shipped',
-                    'in_transit',
-                ])
+                ->whereIn('supplies.status', $statuses)
                 ->selectRaw('supply_items.sku, supplies.warehouse_name, SUM(supply_items.planned_qty) as qty')
                 ->groupBy('supply_items.sku', 'supplies.warehouse_name')
                 ->get();

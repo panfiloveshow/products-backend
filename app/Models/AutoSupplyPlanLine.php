@@ -191,6 +191,18 @@ class AutoSupplyPlanLine extends Model
         ));
     }
 
+    /**
+     * ВНИМАНИЕ (известная неточность на агрегированной строке).
+     * Для Ozon строка в lines/show — это агрегат группы (sku, cluster_id):
+     * current_stock/in_transit суммируются (SUM), а explain_json берётся как
+     * MIN(explain_json) одной складской строки кластера (см. aggregatedPlanLinesQuery).
+     * Поэтому quantity_explanation / deficit_qty / surplus_qty ниже считают спрос
+     * (daily_demand, min/target_cover_days) по ОДНОЙ строке, но остаток — по всему
+     * кластеру → разбивка противоречит qty_rounded. Для одиночной строки (один склад
+     * в кластере, WB) всё согласовано. Корректный фикс требует агрегировать входы
+     * спроса на уровне группы в aggregatedPlanLinesQuery (см. заметку проекта
+     * autosupply_aggregated_line_explain_mismatch).
+     */
     public function getQuantityExplanationAttribute(): array
     {
         return [

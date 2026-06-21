@@ -86,14 +86,14 @@ class MarketplaceConstraintSyncServiceTest extends TestCase
         ];
     }
 
-    public function test_maps_available_and_blocked_warehouses_with_coefficients(): void
+    public function test_maps_free_and_paid_warehouses_with_coefficients(): void
     {
         Http::fake([
             self::ACCEPTANCE_URL => Http::response([
-                // Коледино: бесплатное (0) и базовое (1) окно → доступен; берём лучшие коэф.
+                // Коледино: бесплатное (0) и базовое (1) окно → доступен; несём min коэф = 0.
                 $this->acceptanceItem('507', 'Коледино', '2026-06-12', 0, true, 1.0, 1.2),
                 $this->acceptanceItem('507', 'Коледино', '2026-06-14', 1, true, 0.9, 1.1),
-                // Подольск: только платный коэффициент 2 → недоступен (нет бесплатных окон).
+                // Подольск: только платный коэффициент 2 → доступен, но дорогой (штраф costScore).
                 $this->acceptanceItem('117501', 'Подольск', '2026-06-13', 2, true, 1.5, 1.4),
             ], 200),
         ]);
@@ -110,7 +110,7 @@ class MarketplaceConstraintSyncServiceTest extends TestCase
         $this->assertNotNull($koledino);
         $this->assertTrue($koledino['is_available']);
         // assertEquals (не assertSame): целые float теряют .0 через JSON-сериализацию в БД.
-        $this->assertEquals(1.0, $koledino['acceptance_coefficient']);
+        $this->assertEquals(0.0, $koledino['acceptance_coefficient']); // min(0,1) = бесплатно
         $this->assertEquals(0.9, $koledino['storage_coefficient']);   // min по горизонту
         $this->assertEquals(1.1, $koledino['delivery_coefficient']);  // min по горизонту
         $this->assertNull($koledino['max_qty']);                    // WB API не отдаёт лимит штук
@@ -118,16 +118,37 @@ class MarketplaceConstraintSyncServiceTest extends TestCase
         $this->assertSame('marketplace_constraint', $koledino['source_type']);
         $this->assertSame('Коледино', $koledino['warehouse_name']);
 
+        // Платное окно: доступно, коэффициент несётся как штраф (>1), не блок.
         $podolsk = $records->firstWhere('warehouse_id', '117501');
         $this->assertNotNull($podolsk);
-        $this->assertFalse($podolsk['is_available']);
-        $this->assertNull($podolsk['acceptance_coefficient']);
+        $this->assertTrue($podolsk['is_available']);
+        $this->assertEquals(2.0, $podolsk['acceptance_coefficient']);
 
         $summary = $snapshot->summary_json;
         $this->assertSame(2, $summary['warehouses_total']);
-        $this->assertSame(1, $summary['warehouses_available']);
-        $this->assertSame(1, $summary['warehouses_blocked']);
+        $this->assertSame(2, $summary['warehouses_available']);
+        $this->assertSame(0, $summary['warehouses_blocked']);
         $this->assertSame(14, $summary['horizon_days']);
+    }
+
+    public function test_blocks_warehouse_only_when_no_unloadable_slot(): void
+    {
+        Http::fake([
+            self::ACCEPTANCE_URL => Http::response([
+                // Разгрузка запрещена (allowUnload=false) и коэффициент -1 (приёмки нет) → реально недоступен.
+                $this->acceptanceItem('999', 'Закрытый', '2026-06-12', -1, false, 1.0, 1.0),
+                $this->acceptanceItem('999', 'Закрытый', '2026-06-13', 3, false, 1.0, 1.0),
+            ], 200),
+        ]);
+
+        $snapshot = (new MarketplaceConstraintSyncService())->syncIntegration($this->makeWbIntegration());
+
+        $records = collect($snapshot->warehouse_constraints_json);
+        $blocked = $records->firstWhere('warehouse_id', '999');
+        $this->assertNotNull($blocked);
+        $this->assertFalse($blocked['is_available']);
+        $this->assertNull($blocked['acceptance_coefficient']);
+        $this->assertSame(1, $snapshot->summary_json['warehouses_blocked']);
     }
 
     public function test_filters_slots_outside_horizon(): void
