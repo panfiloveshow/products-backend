@@ -346,6 +346,9 @@ class InventoryController extends Controller
         $marketplace = $marketplaceFilter ?: (clone $query)->value('marketplace');
         $marketplace = $this->normalizeMarketplace($marketplace);
 
+        // Карта склад→кластер (только Ozon; кэш 24ч). Для WB кластеров нет.
+        $clusterMapping = $marketplace === 'ozon' ? \App\Models\OzonWarehouseCluster::getAllMapping() : [];
+
         // Получаем ВСЕ склады (включая пустые) — сначала с остатком, потом пустые
         $warehouses = (clone $query)
             ->select('warehouse_id', 'warehouse_name', 'marketplace', 'fulfillment_type', 'region')
@@ -353,14 +356,22 @@ class InventoryController extends Controller
             ->groupBy('warehouse_id', 'warehouse_name', 'marketplace', 'fulfillment_type', 'region')
             ->orderByDesc(DB::raw('SUM(quantity)'))
             ->get()
-            ->map(fn($w) => [
-                'warehouse_id'      => $w->warehouse_id,
-                'warehouse_name'    => $w->warehouse_name,
-                'marketplace'       => $w->marketplace,
-                'fulfillment_type'  => $w->fulfillment_type,
-                'region'            => $w->region,
-                'total_qty'         => (int) $w->total_qty,
-            ]);
+            ->map(function ($w) use ($clusterMapping) {
+                $cluster = $clusterMapping === []
+                    ? null
+                    : ($clusterMapping[\App\Models\OzonWarehouseCluster::normalizeWarehouseName((string) $w->warehouse_name)] ?? null);
+
+                return [
+                    'warehouse_id'      => $w->warehouse_id,
+                    'warehouse_name'    => $w->warehouse_name,
+                    'marketplace'       => $w->marketplace,
+                    'fulfillment_type'  => $w->fulfillment_type,
+                    'region'            => $w->region,
+                    'total_qty'         => (int) $w->total_qty,
+                    'cluster_id'        => $cluster['cluster_id'] ?? null,
+                    'cluster_name'      => $cluster['cluster_name'] ?? null,
+                ];
+            });
 
         // Агрегируем по SKU с учётом фильтра по fulfillment_type
         // WB / синк остатков: одинаковые sales и avg на каждой строке склада → берём MAX (SUM раздует в N раз).
