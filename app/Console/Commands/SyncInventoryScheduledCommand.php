@@ -67,10 +67,11 @@ class SyncInventoryScheduledCommand extends Command
 
         foreach ($integrations as $integration) {
             try {
-                // Пустые credentials: фабрика возьмёт ключи из самой интеграции (как в UI-синке).
+                // Ключи берём из самой интеграции (как OzonMarketplace::fromIntegration).
+                // Пустой массив НЕЛЬЗЯ: фабрика отдаёт их клиенту как есть → 401 Client-Id empty.
                 $syncLog = $service->startSync(
                     $integration->marketplace,
-                    [],
+                    $integration->getDecryptedCredentials(),
                     $integration->id,
                     $stagger > 0 ? $i * $stagger : null
                 );
