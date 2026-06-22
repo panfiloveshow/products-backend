@@ -804,6 +804,8 @@ class InventoryController extends Controller
             'out_of_stock_count'=> $outOfStockCount,
             'critical_count'    => $criticalCount,
             'low_count'         => $lowCount,
+            // Когда данные по складам последний раз обновлялись синком (индикатор свежести).
+            'last_synced_at'    => (clone $summaryQuery)->max('last_updated'),
             'storage_totals'    => [
                 'current_month' => [
                     'total' => round($storageFeeTotal, 2),
