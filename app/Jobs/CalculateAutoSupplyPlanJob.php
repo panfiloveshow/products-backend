@@ -367,6 +367,19 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
             }
         }
 
+        // TEMP DEBUG (убрать после): реальное состояние posting-спроса в пересчёте.
+        if ($marketplace === 'ozon') {
+            $dbgBc = $ozonPostingDemand['by_cluster'] ?? [];
+            $dbg3866 = $dbgBc['3-02/3866'] ?? [];
+            \Illuminate\Support\Facades\Log::warning('DBG_POSTING recalc state', [
+                'by_offer' => count($ozonPostingDemand['by_offer'] ?? []),
+                'by_cluster' => count($dbgBc),
+                'analysis_days' => $analysisPeriodDays,
+                'sku3866_clusters' => array_keys($dbg3866),
+                'sku3866_m154' => $dbg3866['154']['avg_daily_sales'] ?? 'MISSING',
+            ]);
+        }
+
         // v2: Предварительный расчёт выручки за 30д для ABC-приоритета
         $revenueBySkuMap = [];
         foreach ($warehouses as $wh) {
