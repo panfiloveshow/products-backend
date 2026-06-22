@@ -468,6 +468,19 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
                 }
             }
 
+            // TEMP DEBUG (убрать)
+            if ($wh->sku === '3-02/3866') {
+                \Illuminate\Support\Facades\Log::warning('DBG_LINE 3866', [
+                    'cluster_id' => $clusterIdForAnalytics,
+                    'is_agg' => $wh->getAttribute('is_cluster_aggregate'),
+                    'has_bycluster' => !empty($ozonPostingDemand['by_cluster'][$wh->sku][(string) $clusterIdForAnalytics]),
+                    'has_byoffer' => !empty($ozonPostingDemand['by_offer'][$wh->sku]),
+                    'pd_set' => $postingDemandData !== null,
+                    'pd_avg' => $postingDemandData['avg_daily_sales'] ?? null,
+                    'stock' => $currentStock,
+                ]);
+            }
+
             // v3: Получаем аналитику Ozon для этого SKU × склад
             $ozonStockData = null;
             $ozonTurnoverData = $ozonTurnover[$wh->sku] ?? null;
