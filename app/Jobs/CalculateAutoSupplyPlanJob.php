@@ -367,19 +367,6 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
             }
         }
 
-        // TEMP DEBUG (убрать после): реальное состояние posting-спроса в пересчёте.
-        if ($marketplace === 'ozon') {
-            $dbgBc = $ozonPostingDemand['by_cluster'] ?? [];
-            $dbg3866 = $dbgBc['3-02/3866'] ?? [];
-            \Illuminate\Support\Facades\Log::warning('DBG_POSTING recalc state', [
-                'by_offer' => count($ozonPostingDemand['by_offer'] ?? []),
-                'by_cluster' => count($dbgBc),
-                'analysis_days' => $analysisPeriodDays,
-                'sku3866_clusters' => array_keys($dbg3866),
-                'sku3866_m154' => $dbg3866['154']['avg_daily_sales'] ?? 'MISSING',
-            ]);
-        }
-
         // v2: Предварительный расчёт выручки за 30д для ABC-приоритета
         $revenueBySkuMap = [];
         foreach ($warehouses as $wh) {
@@ -466,19 +453,6 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
                     // это главный источник завышения после промо-всплесков.
                     $postingDemandWeakOfferOnly = true;
                 }
-            }
-
-            // TEMP DEBUG (убрать)
-            if ($wh->sku === '3-02/3866') {
-                \Illuminate\Support\Facades\Log::warning('DBG_LINE 3866', [
-                    'cluster_id' => $clusterIdForAnalytics,
-                    'is_agg' => $wh->getAttribute('is_cluster_aggregate'),
-                    'has_bycluster' => !empty($ozonPostingDemand['by_cluster'][$wh->sku][(string) $clusterIdForAnalytics]),
-                    'has_byoffer' => !empty($ozonPostingDemand['by_offer'][$wh->sku]),
-                    'pd_set' => $postingDemandData !== null,
-                    'pd_avg' => $postingDemandData['avg_daily_sales'] ?? null,
-                    'stock' => $currentStock,
-                ]);
             }
 
             // v3: Получаем аналитику Ozon для этого SKU × склад
@@ -1282,23 +1256,6 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
                 if ($marketplace === 'wildberries' && !empty($barcode)) $qBarcode++;
             }
 
-            // TEMP DEBUG (убрать)
-            if ($wh->sku === '3-02/3866') {
-                \Illuminate\Support\Facades\Log::warning('DBG_QTY 3866', [
-                    'cl' => $wh->getAttribute('cluster_id'),
-                    'dailyDemand' => round((float) $dailyDemand, 2),
-                    'demandSource' => $demandSource,
-                    'targetCoverDays' => $targetCoverDays,
-                    'safety' => round((float) $safetyStock, 1),
-                    'stock' => $currentStock,
-                    'inTransit' => $inTransit,
-                    'isLowTrial' => $isLowDemandTrial,
-                    'needed' => round((float) $needed, 1),
-                    'qtyRounded' => $qtyRounded,
-                    'guardApplied' => !empty($quantityGuardResult['applied']),
-                ]);
-            }
-
             // Пропускаем строки с нулевым количеством
             if ($qtyRounded <= 0) {
                 continue;
@@ -1360,18 +1317,6 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
             $totalQty += $qtyRounded;
             $totalLines++;
         }
-
-        // TEMP DEBUG (убрать)
-        $dbgStage = function (string $tag) use (&$lines) {
-            $f = array_filter($lines, fn ($l) => ($l['sku'] ?? '') === '3-02/3866');
-            \Illuminate\Support\Facades\Log::warning('DBG_STAGE ' . $tag, [
-                'total' => count($lines),
-                'n3866' => count($f),
-                'qty3866' => array_sum(array_map(fn ($l) => (int) ($l['qty_rounded'] ?? 0), $f)),
-                'cl3866' => array_map(fn ($l) => (int) ($l['cluster_id'] ?? 0), array_values($f)),
-            ]);
-        };
-        $dbgStage('after_loop');
 
         // --- Locality enrichment + cluster split (Ozon only) ---
         if ($marketplace === 'ozon' && ! empty($lines)) {
@@ -1460,8 +1405,6 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
             }
         }
 
-        $dbgStage('after_enrich');
-
         if ($marketplace === 'ozon' && $selectedOzonClusterIds !== []) {
             $lines = array_values(array_filter($lines, function (array $line) use ($selectedOzonClusterIds): bool {
                 $clusterId = (int) ($line['cluster_id'] ?? 0);
@@ -1471,7 +1414,6 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
             $totalLines = count($lines);
             $totalQty = array_sum(array_map(fn (array $line) => (int) ($line['qty_rounded'] ?? 0), $lines));
         }
-        $dbgStage('after_clusterfilter');
 
         $lines = $constraintService->appendMarketplaceNeedCandidates($lines, $plan, $marketplace, $products, $unitEconomics);
         $candidateLinesBeforeConstraints = count($lines);
@@ -1479,10 +1421,8 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
         $constraintResult = $constraintService->apply($lines, $plan, $marketplace);
         $lines = $constraintResult['lines'];
         $constraintsSummary = $constraintResult['summary'];
-        $dbgStage('after_constraint');
 
         $lines = app(TerritorialPlanningService::class)->enrichLines($lines, $plan);
-        $dbgStage('after_territorial');
 
         $budgetLimit = (float) ($plan->budget_limit ?? 0);
         $optimization = app(PlanLineOptimizer::class)->optimize($lines, $plan, [
@@ -1493,7 +1433,6 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
             'constraints_summary' => $constraintsSummary,
         ]);
         $lines = $optimization['lines'];
-        $dbgStage('after_optimize');
         $selectionSummary = $optimization['summary'];
         $skippedNegativeProfitLines = (int) ($selectionSummary['negative_profit_skipped_lines'] ?? 0);
         $budgetSkippedLines = (int) ($selectionSummary['budget_skipped_lines'] ?? 0);
