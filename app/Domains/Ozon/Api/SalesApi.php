@@ -109,8 +109,10 @@ class SalesApi
         try {
             $since  = now()->subDays($days)->setTime(0, 0, 0)->toIso8601String();
             $to     = now()->toIso8601String();
-            $offset = 0;
-            $limit  = 100; // Ozon: posting/fbo/list требует limit в (0, 100]; раньше 1000 → 400, спрос плана падал в trial
+            $cursor  = '';
+            $limit   = 100; // Ozon: posting/fbo/list требует limit в (0, 100]
+            $hasNext = false;
+            $pages   = 0;
 
             $now = now();
 
@@ -118,22 +120,31 @@ class SalesApi
             $rawUnits = [];
 
             do {
-                $response = $this->client->post('/v3/posting/fbo/list', [
-                    'dir'    => 'ASC',
-                    'filter' => [
-                        'since'  => $since,
-                        'to'     => $to,
-                        'status' => 'delivered',
+                // Новый формат v3 (старый давал 0): filter.statuses[] вместо status,
+                // sort_dir вместо dir, курсорная пагинация вместо offset,
+                // postings на верхнем уровне ответа вместо result.postings.
+                $body = [
+                    'filter'   => [
+                        'since'    => $since,
+                        'to'       => $to,
+                        'statuses' => ['delivered'],
                     ],
-                    'limit'  => $limit,
-                    'offset' => $offset,
-                    'with'   => [
+                    'limit'    => $limit,
+                    'sort_dir' => 'ASC',
+                    'with'     => [
                         'analytics_data' => true,
                         'financial_data' => false,
                     ],
-                ]);
+                ];
+                if ($cursor !== '') {
+                    $body['cursor'] = $cursor;
+                }
 
-                $postings = $response['result']['postings'] ?? $response['result'] ?? [];
+                $response = $this->client->post('/v3/posting/fbo/list', $body);
+
+                $postings = $response['postings'] ?? $response['result']['postings'] ?? [];
+                $cursor   = (string) ($response['cursor'] ?? '');
+                $hasNext  = (bool) ($response['has_next'] ?? false);
 
                 foreach ($postings as $posting) {
                     $warehouseId = (string)($posting['analytics_data']['warehouse_id'] ?? '');
@@ -192,8 +203,7 @@ class SalesApi
                     }
                 }
 
-                $offset += $limit;
-            } while (count($postings) === $limit);
+            } while ($hasNext && $cursor !== '' && ++$pages < 500);
 
             // Преобразуем в финальный формат с продажами за периоды
             $result = [];
@@ -311,27 +321,36 @@ class SalesApi
         try {
             $since = now()->subDays($days)->setTime(0, 0, 0)->toIso8601String();
             $to = now()->toIso8601String();
-            $offset = 0;
-            $limit = 100; // Ozon: posting/fbs/list требует limit в (0, 100]
+            $cursor  = '';
+            $limit   = 100; // Ozon: posting/fbs/list требует limit в (0, 100]
+            $hasNext = false;
+            $pages   = 0;
             $rawUnits = [];
 
             do {
-                $response = $this->client->post('/v3/posting/fbs/list', [
-                    'dir' => 'ASC',
-                    'filter' => [
-                        'since' => $since,
-                        'to' => $to,
-                        'status' => 'delivered',
+                // Новый формат v3: statuses[]/sort_dir/cursor, postings на верхнем уровне.
+                $body = [
+                    'filter'   => [
+                        'since'    => $since,
+                        'to'       => $to,
+                        'statuses' => ['delivered'],
                     ],
-                    'limit' => $limit,
-                    'offset' => $offset,
-                    'with' => [
+                    'limit'    => $limit,
+                    'sort_dir' => 'ASC',
+                    'with'     => [
                         'analytics_data' => true,
                         'financial_data' => false,
                     ],
-                ]);
+                ];
+                if ($cursor !== '') {
+                    $body['cursor'] = $cursor;
+                }
 
-                $postings = $response['result']['postings'] ?? [];
+                $response = $this->client->post('/v3/posting/fbs/list', $body);
+
+                $postings = $response['postings'] ?? $response['result']['postings'] ?? [];
+                $cursor   = (string) ($response['cursor'] ?? '');
+                $hasNext  = (bool) ($response['has_next'] ?? false);
 
                 foreach ($postings as $posting) {
                     $analytics = $posting['analytics_data'] ?? [];
@@ -364,8 +383,7 @@ class SalesApi
                     }
                 }
 
-                $offset += $limit;
-            } while (count($postings) === $limit);
+            } while ($hasNext && $cursor !== '' && ++$pages < 500);
 
             $result = [];
             foreach ($rawUnits as $offerId => $warehouses) {
