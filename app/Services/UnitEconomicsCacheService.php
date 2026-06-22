@@ -721,7 +721,7 @@ class UnitEconomicsCacheService
             $tariffSource = $tariffBreakdown['source'] ?? $tariffSource;
             $tariffEffectiveFrom = $tariffBreakdown['effective_date'] ?? $tariffEffectiveFrom;
             $sppPercent = (float) ($settings?->spp_percent ?? $marketplaceData['spp_percent'] ?? $existingUE?->spp_percent ?? 0);
-            $warehouseCoefficient = $this->getAverageWarehouseCoefficient($product->integration_id, $product->sku, $marketplace);
+            $warehouseCoefficient = $this->getAverageWarehouseCoefficient($product->integration_id, $product->sku, $marketplace, (string) $fulfillmentType);
 
             // Делаем средневзвешенный по складам КС авторитетным: записываем его в box-тариф,
             // чтобы калькулятор не перетирал его коэффициентом одного склада/фолбэка «Цифровой склад».
@@ -1605,17 +1605,22 @@ class UnitEconomicsCacheService
     }
 
     /**
-     * Получает средний взвешенный КС (коэффициент склада) по всем складам товара
-     * 
+     * Получает средний взвешенный КС (коэффициент склада) по складам товара
+     *
      * КС влияет на всю логистику WB: логистика = базовая × КС
-     * 
+     *
+     * КС зависит от схемы: на FBW/FBO считаем по складам WB, на схемах продавца
+     * (FBS/DBW/DBS/EDBS) — по складам продавца. Иначе у FBW-товара в КС подмешивались
+     * бы FBS-склады (и наоборот) — пользователь видел бы чужой коэффициент.
+     *
      * @param string $sku SKU товара
      * @param string $marketplace Маркетплейс
+     * @param string $scheme Схема работы (FBW/FBS/DBW/...) — для фильтра складов
      * @return float Средний КС (1.0 = 100%, 1.4 = 140%)
      */
-    private function getAverageWarehouseCoefficient(int $integrationId, string $sku, string $marketplace): float
+    private function getAverageWarehouseCoefficient(int $integrationId, string $sku, string $marketplace, string $scheme = ''): float
     {
-        $cacheKey = $integrationId . '|' . $marketplace . '|' . $sku;
+        $cacheKey = $integrationId . '|' . $marketplace . '|' . $sku . '|' . strtoupper($scheme);
         if (array_key_exists($cacheKey, $this->warehouseCoefficientCache)) {
             return $this->warehouseCoefficientCache[$cacheKey];
         }
@@ -1623,8 +1628,18 @@ class UnitEconomicsCacheService
         $warehouses = InventoryWarehouse::where('sku', $sku)
             ->where('integration_id', $integrationId)
             ->where('marketplace', $marketplace)
-            ->get(['warehouse_coefficient', 'quantity']);
-        
+            ->get(['warehouse_coefficient', 'quantity', 'fulfillment_type']);
+
+        $schemeUpper = strtoupper($scheme);
+        if ($schemeUpper !== '') {
+            $wantsMarketplaceStock = in_array($schemeUpper, ['FBS', 'DBW', 'DBS', 'EDBS'], true);
+            $warehouses = $warehouses->filter(function ($w) use ($wantsMarketplaceStock) {
+                $isMarketplace = in_array(strtoupper((string) ($w->fulfillment_type ?? '')), ['FBS', 'DBW', 'DBS', 'EDBS'], true);
+
+                return $wantsMarketplaceStock ? $isMarketplace : ! $isMarketplace;
+            });
+        }
+
         if ($warehouses->isEmpty()) {
             $this->warehouseCoefficientCache[$cacheKey] = 1.0;
             return 1.0; // По умолчанию 100%
@@ -1958,7 +1973,7 @@ class UnitEconomicsCacheService
         }
 
         $snapshots = WildberriesTariffSnapshot::where('integration_id', $integrationId)
-            ->whereIn('tariff_type', ['box', 'return'])
+            ->whereIn('tariff_type', ['box', 'return', 'acceptance'])
             ->orderByDesc('effective_date')
             ->orderByDesc('fetched_at')
             ->get();
@@ -1967,10 +1982,29 @@ class UnitEconomicsCacheService
         $boxFallback = null;
         $boxFallbackHasFboBase = false;
         $returnPayload = [];
+        // КС склада WB (FBW/FBO) берём из коэффициентов приёмки (deliveryCoef со
+        // снапшота acceptance), а не из box-тарифа: deliveryCoef — это «то, что на
+        // экране ВБ». На уровне склада он одинаков по типам короба/датам — берём
+        // первое валидное значение (снапшоты идут по дате desc). Marketplace-коэф
+        // (FBS) не трогаем: у приёмки его нет.
+        $acceptanceDeliveryByWarehouse = [];
 
         foreach ($snapshots as $snapshot) {
             if ($snapshot->tariff_type === 'return' && $returnPayload === []) {
                 $returnPayload = is_array($snapshot->payload) ? $snapshot->payload : [];
+                continue;
+            }
+
+            if ($snapshot->tariff_type === 'acceptance') {
+                $name = $snapshot->warehouse_name ? $this->normalizeWildberriesWarehouseName((string) $snapshot->warehouse_name) : null;
+                if ($name && ! isset($acceptanceDeliveryByWarehouse[$name])) {
+                    $payload = is_array($snapshot->payload) ? $snapshot->payload : [];
+                    $raw = $payload['deliveryCoef'] ?? null;
+                    $raw = is_string($raw) ? str_replace(',', '.', $raw) : $raw;
+                    if (is_numeric($raw) && (float) $raw > 0) {
+                        $acceptanceDeliveryByWarehouse[$name] = (float) $raw;
+                    }
+                }
                 continue;
             }
 
@@ -1993,6 +2027,28 @@ class UnitEconomicsCacheService
                 $boxByWarehouse[$warehouseName] = $snapshot;
             }
         }
+
+        // Накладываем deliveryCoef приёмки на FBW/FBO-коэффициент box-снапшота.
+        // Базу логистики (delivery_base/liter) не трогаем — в сумме логистики КС
+        // сокращается, меняется только показ КС и его ₽-надбавка.
+        $applyAcceptanceCoef = function (?WildberriesTariffSnapshot $snapshot) use ($acceptanceDeliveryByWarehouse) {
+            if (! $snapshot || ! $snapshot->warehouse_name) {
+                return;
+            }
+            $name = $this->normalizeWildberriesWarehouseName((string) $snapshot->warehouse_name);
+            $coefPercent = $acceptanceDeliveryByWarehouse[$name] ?? null;
+            if ($coefPercent === null) {
+                return;
+            }
+            $payload = is_array($snapshot->payload) ? $snapshot->payload : [];
+            $payload['boxDeliveryCoefExpr'] = $coefPercent;
+            $payload['delivery_coef_percent'] = $coefPercent;
+            $snapshot->payload = $payload;
+        };
+        foreach ($boxByWarehouse as $snapshot) {
+            $applyAcceptanceCoef($snapshot);
+        }
+        $applyAcceptanceCoef($boxFallback);
 
         $this->wildberriesTariffSnapshotCache[$integrationId] = [
             'box_by_warehouse' => $boxByWarehouse,

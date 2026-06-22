@@ -343,7 +343,13 @@ class StorageApi
             $acceptance = $this->client->commonGet('/api/tariffs/v1/acceptance/coefficients', [
                 'date' => $date,
             ]) ?? [];
-            foreach (($acceptance['coefficients'] ?? $acceptance['response']['data'] ?? $acceptance['data'] ?? []) as $key => $row) {
+            // Эндпоинт отдаёт плоский массив строк (склад × дата × тип короба) —
+            // берём его как фолбэк, если ответ не завёрнут в coefficients/data.
+            $acceptanceRows = $acceptance['coefficients']
+                ?? $acceptance['response']['data']
+                ?? $acceptance['data']
+                ?? (is_array($acceptance) && array_is_list($acceptance) ? $acceptance : []);
+            foreach ($acceptanceRows as $key => $row) {
                 $snapshots[] = [
                     'tariff_type' => 'acceptance',
                     'effective_date' => $date,

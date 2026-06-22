@@ -1044,29 +1044,46 @@ class WildberriesService implements MarketplaceInterface
     public function getWarehouseCoefficients(): array
     {
         try {
-            $response = $this->wbGet("{$this->commonApiUrl}/api/v1/tariffs/box", [
-                'date' => now()->format('Y-m-d'),
-            ]);
+            // КС склада (FBW) берём из коэффициентов приёмки — поле deliveryCoef
+            // ("180" = 1.8), а не из box-тарифа boxDeliveryCoefExpr. Это значение,
+            // которое ВБ показывает по складу. Ответ — плоский массив строк
+            // (склад × дата × тип короба); deliveryCoef на уровне склада один,
+            // берём первое валидное на склад.
+            $response = $this->wbGet("{$this->commonApiUrl}/api/tariffs/v1/acceptance/coefficients");
 
             if (! $response->successful()) {
                 return [];
             }
 
-            $warehouseList = $response->json()['response']['data']['warehouseList'] ?? [];
-            $result = [];
+            $rows = $response->json();
+            if (! is_array($rows)) {
+                return [];
+            }
 
-            foreach ($warehouseList as $warehouse) {
-                $name = (string) ($warehouse['warehouseName'] ?? '');
+            $result = [];
+            foreach ($rows as $row) {
+                if (! is_array($row)) {
+                    continue;
+                }
+                $name = (string) ($row['warehouseName'] ?? '');
                 if ($name === '') {
                     continue;
                 }
 
                 $normalizedName = $this->normalizeWarehouseName($name);
-                $coefPercent = (float) ($warehouse['boxDeliveryCoefExpr'] ?? 100);
+                if (isset($result[$normalizedName])) {
+                    continue;
+                }
+
+                $raw = $row['deliveryCoef'] ?? null;
+                $raw = is_string($raw) ? str_replace(',', '.', $raw) : $raw;
+                if (! is_numeric($raw) || (float) $raw <= 0) {
+                    continue;
+                }
 
                 $result[$normalizedName] = [
                     'warehouse_name' => $name,
-                    'warehouse_coefficient' => $coefPercent / 100,
+                    'warehouse_coefficient' => (float) $raw / 100,
                 ];
             }
 
