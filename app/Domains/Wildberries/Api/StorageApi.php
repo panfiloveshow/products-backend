@@ -349,17 +349,37 @@ class StorageApi
                 ?? $acceptance['response']['data']
                 ?? $acceptance['data']
                 ?? (is_array($acceptance) && array_is_list($acceptance) ? $acceptance : []);
+            // Дедуп по складу: эндпоинт отдаёт строку на (склад × дата × тип короба),
+            // а deliveryCoef/storageCoef — на уровне склада (одинаков по типам/датам).
+            // Отдаём ОДНУ строку на склад, иначе ключ конфликта снапшота
+            // (integration, tariff_type, effective_date, warehouse_id, …) совпадает у
+            // всех коробов склада → upsert падает Cardinality violation. Приоритет —
+            // строка с валидным deliveryCoef.
+            $acceptanceByWarehouse = [];
             foreach ($acceptanceRows as $key => $row) {
-                $snapshots[] = [
+                if (! is_array($row)) {
+                    continue;
+                }
+                $warehouseId = isset($row['warehouseID'])
+                    ? (string) $row['warehouseID']
+                    : (isset($row['warehouseId']) ? (string) $row['warehouseId'] : 'row:'.(string) $key);
+
+                $existing = $acceptanceByWarehouse[$warehouseId] ?? null;
+                $hasCoef = isset($row['deliveryCoef']) && is_numeric(str_replace(',', '.', (string) $row['deliveryCoef']));
+                if ($existing !== null && ! $hasCoef) {
+                    continue; // уже есть строка склада — не перетираем строкой без коэффициента
+                }
+                $acceptanceByWarehouse[$warehouseId] = [
                     'tariff_type' => 'acceptance',
                     'effective_date' => $date,
-                    'warehouse_id' => isset($row['warehouseID'])
-                        ? (string) $row['warehouseID']
-                        : (isset($row['warehouseId']) ? (string) $row['warehouseId'] : 'row:'.(string) $key),
+                    'warehouse_id' => $warehouseId,
                     'warehouse_name' => $row['warehouseName'] ?? null,
-                    'payload' => is_array($row) ? $row : ['value' => $row],
+                    'payload' => $row,
                     'fetched_at' => $fetchedAt,
                 ];
+            }
+            foreach ($acceptanceByWarehouse as $snapshot) {
+                $snapshots[] = $snapshot;
             }
         } catch (\Throwable $e) {
             Log::warning('WB getTariffSnapshots: acceptance block failed', ['error' => $e->getMessage()]);
