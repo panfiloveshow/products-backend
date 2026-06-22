@@ -668,8 +668,12 @@ class StorageApi
 
         $host = strtolower($parts['host']);
 
+        // Ozon отдаёт файлы отчётов как с ozon.ru, так и с ozone.ru (напр. ir.ozone.ru) —
+        // оба легитимные домены Ozon. Без ozone.ru скачивание отчёта хранения блокировалось.
         return $host === 'ozon.ru'
             || str_ends_with($host, '.ozon.ru')
+            || $host === 'ozone.ru'
+            || str_ends_with($host, '.ozone.ru')
             || str_ends_with($host, '.ozon.cloud');
     }
 }
