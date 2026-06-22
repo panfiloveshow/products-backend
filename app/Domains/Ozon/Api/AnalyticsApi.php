@@ -97,6 +97,18 @@ class AnalyticsApi
         $maxPages = 50; // hard-cap: 50 000 SKU — страхует от зависания при кривом ответе API
         $page = 0;
 
+        // Premium-метрики (delivered_units/returns/cancellations) доступны только Premium-продавцам;
+        // у не-Premium Ozon отклоняет весь запрос («deprecated metrics used») → пагинация спамила 400.
+        // Не дёргаем analytics-выкуп для не-Premium — он возьмётся из другого источника (postings/финансы).
+        $premium = $this->checkPremiumStatus();
+        if (($premium['is_premium'] ?? false) !== true) {
+            Log::info('Ozon getRedemptionRateFromAnalytics: не-Premium — analytics-выкуп пропущен (fallback на другой источник)', [
+                'reason' => $premium['reason'] ?? null,
+            ]);
+
+            return [];
+        }
+
         try {
             while ($page < $maxPages) {
                 $response = $this->client->post('/v1/analytics/data', [
