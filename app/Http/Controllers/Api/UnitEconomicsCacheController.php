@@ -2920,12 +2920,15 @@ class UnitEconomicsCacheController extends Controller
                 ]];
             }
 
-            $data['warehouse_coef_percent'] = round((float) ($marketplaceData['warehouse_coef_percent'] ?? $warehouseCoefPercent), 0);
-            $data['warehouse_coefficient'] = round((float) ($marketplaceData['warehouse_coefficient'] ?? $avgWarehouseCoef), 3);
+            // Источник КС — живая разбивка по складам (снапшоты приёмки + остатки),
+            // а не marketplace_data: туда КС никто не пишет, там оседали устаревшие
+            // значения от старых синков (напр. 100%), перетиравшие верный КС.
+            $data['warehouse_coef_percent'] = round($warehouseCoefPercent, 0);
+            $data['warehouse_coefficient'] = round($avgWarehouseCoef, 3);
             $data['warehouse_details'] = $warehouseDetails; // Детализация по складам для tooltip
             $baseLogistics = (float) $cache->base_logistics_cost;
             // Сумма надбавки КС = базовая логистика × (коэффициент - 1)
-            $data['warehouse_coef_amount'] = round((float) ($marketplaceData['warehouse_coef_amount'] ?? ($baseLogistics * ($avgWarehouseCoef - 1))), 2);
+            $data['warehouse_coef_amount'] = round($baseLogistics * ($avgWarehouseCoef - 1), 2);
 
             // ИЛ (индекс локализации) — из интеграции (настройка магазина)
             if ($pageContext !== null && isset($pageContext['integrations_by_id'])) {
