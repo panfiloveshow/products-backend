@@ -21,7 +21,6 @@ use App\Http\Controllers\Api\SellerStockController;
 use App\Http\Controllers\Api\WbBarcodeCostController;
 use App\Http\Controllers\Api\WbWebhookController;
 use App\Http\Controllers\Api\SupplierController;
-use App\Http\Controllers\Api\OzonOrderReportController;
 use App\Http\Controllers\Api\Locality\LocalityOverviewController;
 use App\Http\Controllers\Api\Locality\LocalitySkuController;
 use App\Http\Controllers\Api\Locality\LocalityClusterController;
@@ -480,19 +479,6 @@ Route::prefix('wb-barcode-costs')->middleware('sellico.permission')->group(funct
     Route::get('/', [WbBarcodeCostController::class, 'index'])->name('wb-barcode-costs.index');
     Route::post('/bulk', [WbBarcodeCostController::class, 'bulkUpsert'])->name('wb-barcode-costs.bulkUpsert');
     Route::delete('/', [WbBarcodeCostController::class, 'destroy'])->name('wb-barcode-costs.destroy');
-});
-
-/*
-|--------------------------------------------------------------------------
-| Ozon Order Reports Module
-|--------------------------------------------------------------------------
-*/
-Route::prefix('ozon-reports')->middleware('sellico.permission')->group(function () {
-    Route::get('/', [OzonOrderReportController::class, 'index'])->name('ozon-reports.index');
-    Route::post('/upload', [OzonOrderReportController::class, 'upload'])->name('ozon-reports.upload');
-    Route::get('/summary', [OzonOrderReportController::class, 'reportSummary'])->name('ozon-reports.summary');
-    Route::get('/warehouse-sales', [OzonOrderReportController::class, 'warehouseSales'])->name('ozon-reports.warehouseSales');
-    Route::delete('/{id}', [OzonOrderReportController::class, 'destroy'])->name('ozon-reports.destroy');
 });
 
 /*
