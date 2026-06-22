@@ -399,7 +399,7 @@ class AutoSupplyPlanService
                 $reasons[] = 'нет аналитики остатков Ozon';
             }
             if (! ($signals['has_ozon_delivery_summary'] ?? false)) {
-                $reasons[] = 'нет сводки Ozon по скорости доставки';
+                $reasons[] = 'нет данных локальности по кластерам';
             }
         } elseif ($marketplace === 'wildberries') {
             $wbMissingBarcodeLines = (int) ($signals['wb_missing_barcode_lines'] ?? 0);
@@ -1330,20 +1330,33 @@ class AutoSupplyPlanService
             return [];
         }
 
+        // Источник скорости доставки / локальности — собственный Locality-движок
+        // (locality_metrics_cluster_daily). Ozon-эндпоинт /v1/analytics/average-delivery-time/*
+        // удалён (404) — больше его не дёргаем.
         try {
-            $client = OzonClient::fromIntegration($integration);
-            $summary = $client->post('/v1/analytics/average-delivery-time/summary', [], true);
+            $clusters = \App\Models\LocalityMetricClusterDaily::where('integration_id', $integration->id)
+                ->distinct('destination_cluster_id')
+                ->count('destination_cluster_id');
 
-            \Illuminate\Support\Facades\Log::info('AutoSupplyPlanService: Ozon delivery analytics loaded', [
+            if ($clusters === 0) {
+                return [];
+            }
+
+            $overpayment = (float) \App\Models\LocalityMetricDaily::where('integration_id', $integration->id)
+                ->sum('overpayment_amount');
+
+            \Illuminate\Support\Facades\Log::info('AutoSupplyPlanService: Ozon delivery analytics (locality engine)', [
                 'integration_id' => $integration->id,
-                'has_summary' => ! empty($summary) && empty($summary['_error']),
+                'clusters' => $clusters,
             ]);
 
-            return empty($summary) || ! empty($summary['_error'])
-                ? []
-                : ['__summary' => $summary];
-        } catch (\Exception $e) {
-            \Illuminate\Support\Facades\Log::warning('AutoSupplyPlanService: Ozon delivery analytics failed', [
+            return ['__summary' => [
+                'source' => 'locality_engine',
+                'clusters' => $clusters,
+                'overpayment_amount' => round($overpayment, 2),
+            ]];
+        } catch (\Throwable $e) {
+            \Illuminate\Support\Facades\Log::warning('AutoSupplyPlanService: Ozon delivery analytics (locality) failed', [
                 'integration_id' => $integration->id,
                 'error' => $e->getMessage(),
             ]);
