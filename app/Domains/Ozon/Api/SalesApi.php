@@ -110,7 +110,7 @@ class SalesApi
             $since  = now()->subDays($days)->setTime(0, 0, 0)->toIso8601String();
             $to     = now()->toIso8601String();
             $offset = 0;
-            $limit  = 1000;
+            $limit  = 100; // Ozon: posting/fbo/list требует limit в (0, 100]; раньше 1000 → 400, спрос плана падал в trial
 
             $now = now();
 
@@ -312,7 +312,7 @@ class SalesApi
             $since = now()->subDays($days)->setTime(0, 0, 0)->toIso8601String();
             $to = now()->toIso8601String();
             $offset = 0;
-            $limit = 1000;
+            $limit = 100; // Ozon: posting/fbs/list требует limit в (0, 100]
             $rawUnits = [];
 
             do {
