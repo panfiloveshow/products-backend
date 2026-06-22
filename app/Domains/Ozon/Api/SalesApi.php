@@ -140,7 +140,25 @@ class SalesApi
                     $body['cursor'] = $cursor;
                 }
 
-                $response = $this->client->post('/v3/posting/fbo/list', $body);
+                // Устойчивость к rate-limit: пересчёт плана делает много вызовов Ozon (2 req/сек) →
+                // постинг-пагинация ловит 429/ошибки. Повторяем ту же страницу с backoff, иначе
+                // цикл молча обрывается → частичный спрос → топовые SKU уходят в trial → крошечный план.
+                $attempt = 0;
+                while (true) {
+                    $response = $this->client->post('/v3/posting/fbo/list', $body);
+                    if ((empty($response) || ! empty($response['_error'])) && $attempt < 5) {
+                        usleep((int) (500000 * (2 ** $attempt)));
+                        $attempt++;
+                        continue;
+                    }
+                    break;
+                }
+                if (! empty($response['_error'])) {
+                    Log::warning('Ozon getSalesBySkuAndWarehouse: страница не загрузилась после ретраев — спрос частичный', [
+                        'pages_done' => $pages,
+                        'error' => $response['message'] ?? $response['error'] ?? 'unknown',
+                    ]);
+                }
 
                 $postings = $response['postings'] ?? $response['result']['postings'] ?? [];
                 $cursor   = (string) ($response['cursor'] ?? '');
@@ -346,7 +364,17 @@ class SalesApi
                     $body['cursor'] = $cursor;
                 }
 
-                $response = $this->client->post('/v3/posting/fbs/list', $body);
+                // Устойчивость к rate-limit — повтор страницы с backoff (см. FBO-вариант выше).
+                $attempt = 0;
+                while (true) {
+                    $response = $this->client->post('/v3/posting/fbs/list', $body);
+                    if ((empty($response) || ! empty($response['_error'])) && $attempt < 5) {
+                        usleep((int) (500000 * (2 ** $attempt)));
+                        $attempt++;
+                        continue;
+                    }
+                    break;
+                }
 
                 $postings = $response['postings'] ?? $response['result']['postings'] ?? [];
                 $cursor   = (string) ($response['cursor'] ?? '');
