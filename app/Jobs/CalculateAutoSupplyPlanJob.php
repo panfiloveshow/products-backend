@@ -1282,6 +1282,23 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
                 if ($marketplace === 'wildberries' && !empty($barcode)) $qBarcode++;
             }
 
+            // TEMP DEBUG (убрать)
+            if ($wh->sku === '3-02/3866') {
+                \Illuminate\Support\Facades\Log::warning('DBG_QTY 3866', [
+                    'cl' => $wh->getAttribute('cluster_id'),
+                    'dailyDemand' => round((float) $dailyDemand, 2),
+                    'demandSource' => $demandSource,
+                    'targetCoverDays' => $targetCoverDays,
+                    'safety' => round((float) $safetyStock, 1),
+                    'stock' => $currentStock,
+                    'inTransit' => $inTransit,
+                    'isLowTrial' => $isLowDemandTrial,
+                    'needed' => round((float) $needed, 1),
+                    'qtyRounded' => $qtyRounded,
+                    'guardApplied' => !empty($quantityGuardResult['applied']),
+                ]);
+            }
+
             // Пропускаем строки с нулевым количеством
             if ($qtyRounded <= 0) {
                 continue;
