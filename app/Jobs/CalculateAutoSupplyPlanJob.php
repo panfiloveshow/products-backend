@@ -1361,6 +1361,18 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
             $totalLines++;
         }
 
+        // TEMP DEBUG (убрать)
+        $dbgStage = function (string $tag) use (&$lines) {
+            $f = array_filter($lines, fn ($l) => ($l['sku'] ?? '') === '3-02/3866');
+            \Illuminate\Support\Facades\Log::warning('DBG_STAGE ' . $tag, [
+                'total' => count($lines),
+                'n3866' => count($f),
+                'qty3866' => array_sum(array_map(fn ($l) => (int) ($l['qty_rounded'] ?? 0), $f)),
+                'cl3866' => array_map(fn ($l) => (int) ($l['cluster_id'] ?? 0), array_values($f)),
+            ]);
+        };
+        $dbgStage('after_loop');
+
         // --- Locality enrichment + cluster split (Ozon only) ---
         if ($marketplace === 'ozon' && ! empty($lines)) {
             try {
@@ -1448,6 +1460,8 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
             }
         }
 
+        $dbgStage('after_enrich');
+
         if ($marketplace === 'ozon' && $selectedOzonClusterIds !== []) {
             $lines = array_values(array_filter($lines, function (array $line) use ($selectedOzonClusterIds): bool {
                 $clusterId = (int) ($line['cluster_id'] ?? 0);
@@ -1457,6 +1471,7 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
             $totalLines = count($lines);
             $totalQty = array_sum(array_map(fn (array $line) => (int) ($line['qty_rounded'] ?? 0), $lines));
         }
+        $dbgStage('after_clusterfilter');
 
         $lines = $constraintService->appendMarketplaceNeedCandidates($lines, $plan, $marketplace, $products, $unitEconomics);
         $candidateLinesBeforeConstraints = count($lines);
@@ -1464,8 +1479,10 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
         $constraintResult = $constraintService->apply($lines, $plan, $marketplace);
         $lines = $constraintResult['lines'];
         $constraintsSummary = $constraintResult['summary'];
+        $dbgStage('after_constraint');
 
         $lines = app(TerritorialPlanningService::class)->enrichLines($lines, $plan);
+        $dbgStage('after_territorial');
 
         $budgetLimit = (float) ($plan->budget_limit ?? 0);
         $optimization = app(PlanLineOptimizer::class)->optimize($lines, $plan, [
@@ -1476,6 +1493,7 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
             'constraints_summary' => $constraintsSummary,
         ]);
         $lines = $optimization['lines'];
+        $dbgStage('after_optimize');
         $selectionSummary = $optimization['summary'];
         $skippedNegativeProfitLines = (int) ($selectionSummary['negative_profit_skipped_lines'] ?? 0);
         $budgetSkippedLines = (int) ($selectionSummary['budget_skipped_lines'] ?? 0);

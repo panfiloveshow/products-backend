@@ -793,6 +793,25 @@ class UnitEconomicsCacheService
         $acceptanceCost = (float) ($marketplaceData['acceptance_cost'] ?? 0);
         $penaltyCost = (float) ($marketplaceData['penalty_cost'] ?? 0);
 
+        // Uzum: числа лежат плоско в uzum_data (SkuForTable), а не в commissions/redemption.
+        if ($marketplace === 'uzum') {
+            $commissionPercent = (float) ($marketplaceData['commission'] ?? $commissionPercent);
+            if ($costPrice <= 0 && ($marketplaceData['purchase_price'] ?? 0) > 0) {
+                $costPrice = (float) $marketplaceData['purchase_price'];
+            }
+            if ($settings?->redemption_rate_override === null
+                && ($marketplaceData['returned_percentage'] ?? null) !== null
+            ) {
+                $redemptionRate = max(0.0, min(100.0, 100 - (float) $marketplaceData['returned_percentage']));
+                $redemptionSource = 'api';
+            }
+            // Хранение учитываем только для FBO (склад Uzum).
+            $storageCost = strtoupper($fulfillmentType) === 'FBO'
+                ? (float) ($marketplaceData['paid_storage_amount'] ?? 0)
+                : 0.0;
+            $acquiringPercent = (float) config('services.uzum.acquiring_percent', 0);
+        }
+
         // (volume_weight / chargeable_volume_liters вычисляются позже — в
         // convertResultToCacheData по результатам калькулятора; здесь этот блок
         // был вставлен по ошибке и падал на `Undefined variable $result`.)
@@ -1389,6 +1408,7 @@ class UnitEconomicsCacheService
             'ozon' => ['FBO', 'FBS', 'RFBS', 'EXPRESS'],
             'wildberries' => ['FBO', 'FBS', 'DBS', 'EDBS', 'DBW'],
             'yandex', 'yandex_market' => ['FBY', 'FBS', 'DBS', 'EXPRESS'],
+            'uzum' => ['FBS', 'FBO', 'DBS'],
             default => ['FBO'],
         };
     }

@@ -1014,6 +1014,7 @@ class SyncUnitEconomicsCommand extends Command
             'ozon' => ['FBO', 'FBS', 'RFBS', 'EXPRESS'],
             'wildberries' => ['FBO', 'FBS', 'DBS', 'EDBS', 'DBW'],
             'yandex', 'yandex_market' => ['FBY', 'FBS', 'DBS', 'EXPRESS'],
+            'uzum' => ['FBS', 'FBO', 'DBS'],
             default => [null],
         };
 
@@ -1050,6 +1051,7 @@ class SyncUnitEconomicsCommand extends Command
                 // Определяем фактическую схему работы товара (из остатков API)
                 $defaultFulfillmentType = match ($marketplace) {
                     'yandex', 'yandex_market' => 'FBY',
+                    'uzum' => 'FBS',
                     default => 'FBO',
                 };
                 $actualFulfillmentType = strtoupper($inventory?->fulfillment_type ?? $defaultFulfillmentType);
@@ -2109,6 +2111,43 @@ class SyncUnitEconomicsCommand extends Command
                     ? round((((float) ($normalizedTariffs['AGENCY_COMMISSION'] ?? 0) + (float) ($normalizedTariffs['PAYMENT_TRANSFER'] ?? 0)) / $data['price']) * 100, 2)
                     : 0;
                 break;
+
+            case 'uzum':
+                // Все числа лежат в uzum_data (SkuForTable), записанные при синке товаров.
+                $uzumData = $product->uzum_data ?? [];
+
+                $fulfillmentType = $forceFulfillmentType
+                    ? strtoupper($forceFulfillmentType)
+                    : strtoupper($inventory?->fulfillment_type ?? $product->fulfillment_type ?? 'FBS');
+                $data['fulfillment_type'] = $fulfillmentType;
+
+                // Себестоимость: ручная (UnitEconomicsSettings/inventory) → purchasePrice из API.
+                if (($data['cost_price'] ?? 0) <= 0 && ($uzumData['purchase_price'] ?? 0) > 0) {
+                    $data['cost_price'] = (float) $uzumData['purchase_price'];
+                }
+
+                $data['commission_percent'] = (float) ($uzumData['commission'] ?? 0);
+
+                // Продажи: quantitySold за весь период (Phase 1; нет окна 30д в продуктовом эндпоинте).
+                $data['sales_count'] = (int) ($uzumData['quantity_sold'] ?? $data['sales_count'] ?? 0);
+
+                // Хранение из API (FBO); калькулятор сам обнуляет для FBS/DBS.
+                $data['storage_cost'] = (float) ($uzumData['paid_storage_amount'] ?? 0);
+
+                // % выкупа: ручной → (100 − returnedPercentage) → дефолт.
+                if ($manualRedemptionRate !== null) {
+                    $data['redemption_rate'] = $manualRedemptionRate;
+                    $data['redemption_source'] = 'manual';
+                } elseif (($uzumData['returned_percentage'] ?? null) !== null) {
+                    $data['redemption_rate'] = max(0, min(100, 100 - (float) $uzumData['returned_percentage']));
+                    $data['redemption_source'] = 'api';
+                } else {
+                    $data['redemption_rate'] = 100;
+                    $data['redemption_source'] = 'default';
+                }
+
+                $data['acquiring_percent'] = (float) config('services.uzum.acquiring_percent', 0);
+                break;
         }
 
         return $data;
@@ -2368,6 +2407,41 @@ class SyncUnitEconomicsCommand extends Command
 
                 // === НА РС ===
                 'advertising_cost' => $calculated['advertising_cost'] ?? $data['advertising_cost'] ?? 0,
+                'to_settlement_account' => $calculated['to_settlement_account'] ?? null,
+
+                // === НАЛОГИ ===
+                'tax_amount' => $calculated['tax_amount'] ?? null,
+                'vat_amount' => $calculated['vat_amount'] ?? null,
+                'drr_amount' => $calculated['drr_amount'] ?? null,
+                'our_share_amount' => $calculated['our_share_amount'] ?? null,
+            ];
+        } elseif ($marketplace === 'uzum') {
+            $detailed = [
+                'fulfillment_type' => $calculated['fulfillment_type'] ?? $data['fulfillment_type'] ?? 'FBS',
+
+                // === КОМИССИЯ / ЭКВАЙРИНГ ===
+                'commission_percent' => $calculated['commission_percent'] ?? $data['commission_percent'] ?? null,
+                'commission_amount' => $calculated['commission_amount'] ?? null,
+                'acquiring_percent' => $calculated['acquiring_percent'] ?? $data['acquiring_percent'] ?? 0,
+                'acquiring_amount' => $calculated['acquiring_amount'] ?? null,
+
+                // === ЛОГИСТИКА ===
+                'logistics_cost' => $calculated['logistics_cost'] ?? null,
+                'delivery_cost' => $calculated['delivery_cost'] ?? null,
+
+                // === % ВЫКУПА ===
+                'redemption_rate' => $calculated['redemption_rate'] ?? $data['redemption_rate'] ?? 100,
+                'redemption_source' => $data['redemption_source'] ?? 'default',
+
+                // === ХРАНЕНИЕ ===
+                'storage_cost' => $calculated['storage_cost'] ?? null,
+
+                // === ВОЗВРАТЫ ===
+                'return_logistics_cost' => $calculated['return_logistics_cost'] ?? null,
+                'expected_return_cost' => $calculated['expected_return_cost'] ?? null,
+                'effective_logistics' => $calculated['effective_logistics'] ?? null,
+
+                // === НА РС ===
                 'to_settlement_account' => $calculated['to_settlement_account'] ?? null,
 
                 // === НАЛОГИ ===

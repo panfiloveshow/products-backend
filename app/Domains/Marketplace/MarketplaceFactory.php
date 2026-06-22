@@ -6,6 +6,7 @@ use App\Domains\Marketplace\Contracts\MarketplaceInterface;
 use App\Domains\Wildberries\WildberriesMarketplace;
 use App\Domains\Ozon\OzonMarketplace;
 use App\Domains\YandexMarket\YandexMarketMarketplace;
+use App\Domains\Uzum\UzumMarketplace;
 use App\Models\Integration;
 use InvalidArgumentException;
 
@@ -25,6 +26,7 @@ class MarketplaceFactory
             'wildberries' => new WildberriesMarketplace($credentials, $integration),
             'ozon' => new OzonMarketplace($credentials, $integration),
             'yandex', 'yandex_market' => new YandexMarketMarketplace($credentials),
+            'uzum' => new UzumMarketplace($credentials, $integration),
             default => throw new InvalidArgumentException("Unknown marketplace: {$marketplace}"),
         };
     }
@@ -34,6 +36,6 @@ class MarketplaceFactory
      */
     public static function getSupportedMarketplaces(): array
     {
-        return ['wildberries', 'ozon', 'yandex', 'yandex_market'];
+        return ['wildberries', 'ozon', 'yandex', 'yandex_market', 'uzum'];
     }
 }

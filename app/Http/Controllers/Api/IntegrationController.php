@@ -803,7 +803,7 @@ class IntegrationController extends Controller
     public function testConnection(Request $request): JsonResponse
     {
         $validator = Validator::make($request->all(), [
-            'marketplace' => 'required|string|in:wildberries,ozon,yandex_market',
+            'marketplace' => 'required|string|in:wildberries,ozon,yandex_market,uzum',
             'credentials' => 'required|array',
         ]);
 

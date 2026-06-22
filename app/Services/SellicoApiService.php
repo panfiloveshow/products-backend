@@ -176,6 +176,7 @@ class SellicoApiService
                 'wildberries' => 'wildberries',
                 'ozon'        => 'ozon',
                 'yandexmarket' => 'yandex_market',
+                'uzum'        => 'uzum',
                 default       => $type,
             };
             

@@ -44,6 +44,7 @@ class Product extends Model
         'wb_data',
         'ozon_data',
         'yandex_data',
+        'uzum_data',
     ];
 
     protected $casts = [
@@ -57,6 +58,7 @@ class Product extends Model
         'wb_data' => 'array',
         'ozon_data' => 'array',
         'yandex_data' => 'array',
+        'uzum_data' => 'array',
     ];
 
     public function inventoryWarehouses(): HasMany

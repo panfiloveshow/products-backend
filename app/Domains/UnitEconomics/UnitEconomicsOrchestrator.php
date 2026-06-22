@@ -8,6 +8,7 @@ use App\Domains\UnitEconomics\DTO\UnitEconomicsResult;
 use App\Domains\Wildberries\UnitEconomics\WildberriesUnitEconomicsCalculator;
 use App\Domains\Ozon\UnitEconomics\OzonUnitEconomicsCalculator;
 use App\Domains\YandexMarket\UnitEconomics\YandexMarketUnitEconomicsCalculator;
+use App\Domains\Uzum\UnitEconomics\UzumUnitEconomicsCalculator;
 
 /**
  * Оркестратор юнит-экономики
@@ -27,6 +28,7 @@ class UnitEconomicsOrchestrator
         $this->registerCalculator(new WildberriesUnitEconomicsCalculator());
         $this->registerCalculator(new OzonUnitEconomicsCalculator());
         $this->registerCalculator(new YandexMarketUnitEconomicsCalculator());
+        $this->registerCalculator(new UzumUnitEconomicsCalculator());
     }
 
     /**

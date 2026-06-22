@@ -61,6 +61,16 @@ return [
         'base_url' => env('YANDEX_MARKET_BASE_URL', 'https://api.partner.market.yandex.ru'),
     ],
 
+    'uzum' => [
+        'base_url' => env('UZUM_API_URL', 'https://api-seller.uzum.uz/api/seller-openapi'),
+        // ponytail: Phase-1 константы — продуктовый эндпоинт не отдаёт логистику/эквайринг per-SKU.
+        // Апгрейд-путь: считать из /v1/finance/expenses + /v1/finance/orders (Phase 2).
+        'acquiring_percent' => env('UZUM_ACQUIRING_PERCENT', 0),
+        'logistics_fbs' => env('UZUM_LOGISTICS_FBS', 0),
+        'logistics_fbo' => env('UZUM_LOGISTICS_FBO', 0),
+        'logistics_dbs' => env('UZUM_LOGISTICS_DBS', 0),
+    ],
+
     'sellico' => [
         'base_url' => env('SELLICO_API_URL', 'https://sellico.ru/api'),
         'email' => env('SELLICO_EMAIL'),

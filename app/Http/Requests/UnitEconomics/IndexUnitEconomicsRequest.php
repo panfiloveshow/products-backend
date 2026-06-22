@@ -15,7 +15,7 @@ class IndexUnitEconomicsRequest extends FormRequest
     {
         return [
             'search' => 'nullable|string|max:255',
-            'marketplace' => 'nullable|in:ozon,wildberries,yandex_market',
+            'marketplace' => 'nullable|in:ozon,wildberries,yandex_market,uzum',
             'integration_id' => 'nullable|array',
             'integration_id.*' => 'integer',
             'profitability' => 'nullable|in:all,profitable,unprofitable',

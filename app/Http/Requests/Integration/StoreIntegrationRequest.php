@@ -19,7 +19,7 @@ class StoreIntegrationRequest extends FormRequest
         
         $rules = [
             'name' => 'required|string|max:255',
-            'marketplace' => 'required|string|in:wildberries,ozon,yandex_market',
+            'marketplace' => 'required|string|in:wildberries,ozon,yandex_market,uzum',
             'credentials' => 'required|array',
             'is_active' => 'boolean',
             'auto_sync_enabled' => 'boolean',
@@ -40,6 +40,9 @@ class StoreIntegrationRequest extends FormRequest
                 'credentials.campaign_id' => 'required|string',
                 'credentials.business_id' => 'nullable|string',
                 'credentials.scheme' => 'nullable|string|in:FBY,FBS,DBS,EXPRESS',
+            ],
+            'uzum' => [
+                'credentials.api_key' => 'required|string',
             ],
             default => ['credentials' => 'required|array'],
         };
