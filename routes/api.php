@@ -334,13 +334,13 @@ Route::prefix('unit-economics')->middleware('sellico.permission')->group(functio
         ->name('unit-economics.stats');
 
     Route::get('/commissions/{marketplace}', [UnitEconomicsCacheController::class, 'commissions'])
-        ->whereIn('marketplace', ['wildberries', 'ozon', 'yandex_market'])
+        ->whereIn('marketplace', ['wildberries', 'ozon', 'yandex_market', 'uzum'])
         ->name('unit-economics.commissions');
     Route::get('/tariffs/{marketplace}', [UnitEconomicsCacheController::class, 'tariffs'])
-        ->whereIn('marketplace', ['wildberries', 'ozon', 'yandex_market'])
+        ->whereIn('marketplace', ['wildberries', 'ozon', 'yandex_market', 'uzum'])
         ->name('unit-economics.tariffs');
     Route::get('/stats/{marketplace}', [UnitEconomicsCacheController::class, 'statsByMarketplace'])
-        ->whereIn('marketplace', ['wildberries', 'ozon', 'yandex_market'])
+        ->whereIn('marketplace', ['wildberries', 'ozon', 'yandex_market', 'uzum'])
         ->name('unit-economics.stats.marketplace');
 
     // Settings (PUT) — должны быть до /{marketplace} чтобы не конфликтовать
@@ -362,20 +362,20 @@ Route::prefix('unit-economics')->middleware('sellico.permission')->group(functio
 
     // Calculate
     Route::post('/calculate/{marketplace}', [UnitEconomicsCacheController::class, 'calculate'])
-        ->whereIn('marketplace', ['wildberries', 'ozon', 'yandex_market'])
+        ->whereIn('marketplace', ['wildberries', 'ozon', 'yandex_market', 'uzum'])
         ->name('unit-economics.calculate');
 
     // Export
     Route::get('/{marketplace}/export/excel', [UnitEconomicsCacheController::class, 'exportExcel'])
-        ->whereIn('marketplace', ['wildberries', 'ozon', 'yandex_market'])
+        ->whereIn('marketplace', ['wildberries', 'ozon', 'yandex_market', 'uzum'])
         ->name('unit-economics.export.excel');
 
     // By marketplace (main listing — использует кеш)
     Route::get('/{marketplace}', [UnitEconomicsCacheController::class, 'index'])
-        ->whereIn('marketplace', ['wildberries', 'ozon', 'yandex_market'])
+        ->whereIn('marketplace', ['wildberries', 'ozon', 'yandex_market', 'uzum'])
         ->name('unit-economics.marketplace');
     Route::get('/{marketplace}/{sku}', [UnitEconomicsCacheController::class, 'show'])
-        ->whereIn('marketplace', ['wildberries', 'ozon', 'yandex_market'])
+        ->whereIn('marketplace', ['wildberries', 'ozon', 'yandex_market', 'uzum'])
         ->name('unit-economics.details');
 });
 
