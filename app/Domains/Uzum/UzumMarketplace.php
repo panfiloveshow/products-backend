@@ -56,6 +56,18 @@ class UzumMarketplace implements MarketplaceInterface
     }
 
     /**
+     * Остатки по складам. Phase 1: per-warehouse инвентаризация Uzum не тянется
+     * (остаток уже есть в товаре как quantityActive+quantityFbs). Возвращаем пусто,
+     * чтобы авто-чейн SyncInventoryJob не падал. ponytail: наполнить из API при необходимости.
+     *
+     * @return array<int, array<string, mixed>>
+     */
+    public function getInventory(): array
+    {
+        return [];
+    }
+
+    /**
      * Получить товары: разворачиваем карточки в строки по каждому SKU.
      *
      * @return array<int, array<string, mixed>>
@@ -149,7 +161,8 @@ class UzumMarketplace implements MarketplaceInterface
             'barcode' => isset($sku['barcode']) ? (string) $sku['barcode'] : null,
             'price' => (float) ($sku['price'] ?? 0),
             'old_price' => null,
-            'cost_price' => isset($sku['purchasePrice']) ? (float) $sku['purchasePrice'] : null,
+            // products.cost_price NOT NULL (default 0) — null нельзя; purchasePrice у Uzum часто пуст.
+            'cost_price' => isset($sku['purchasePrice']) ? (float) $sku['purchasePrice'] : 0.0,
             'stock' => $quantityActive + $quantityFbs,
             'category' => $card['category'] ?? null,
             'brand' => null,
