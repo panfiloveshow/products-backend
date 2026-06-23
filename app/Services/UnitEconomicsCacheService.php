@@ -334,6 +334,7 @@ class UnitEconomicsCacheService
         $marketplaceData = match ($marketplace) {
             'wildberries' => ($product->wb_data ?? []),
             'yandex_market' => ($product->yandex_data ?? []),
+            'uzum' => ($product->uzum_data ?? []),
             default => ($product->ozon_data ?? []),
         };
         $commissions = $marketplaceData['commissions_by_scheme'] ?? $marketplaceData['commissions'] ?? [];
