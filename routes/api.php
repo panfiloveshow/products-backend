@@ -56,10 +56,18 @@ Route::prefix('integrations')->middleware('sellico.permission')->group(function 
     Route::get('/{id}/status', [IntegrationController::class, 'checkStatus'])->name('integrations.status');
 });
 
-// Integration sync - outside sellico.permission middleware, т.к. метод
-// сам проверяет доступ через IntegrationAccessService::ensureAccessibleIntegration.
+// Integration sync — это ЗАПУСК синхронизации маркетплейса (расход лимитов API/CRM),
+// поэтому требуем аутентификацию вызывающего: sellico.permission проверяет
+// token+workspace+право products.sync.execute через CRM.
+// Без него sync был открыт: контроллерный ensureAccessibleIntegration при ПУСТОМ
+// workspace (нет X-Sellico-Workspace) пускал локально-закэшированную интеграцию
+// (validateWorkspaceAccess возвращает null = «доступ разрешён»), а присутствие
+// токена на строке 280 контроллера проверяется без валидации — любой мусор проходил.
+// sellico.permission делает workspace обязательным, после чего внутренняя
+// IDOR-проверка по work_space_id начинает реально работать. Аналогично ingest-роуту.
 // Ограничиваем методы POST/GET чтобы запретить CSRF-like трюки через PUT/DELETE.
 Route::match(['GET', 'POST'], 'integrations/{id}/sync', [IntegrationController::class, 'sync'])
+    ->middleware('sellico.permission')
     ->name('integrations.sync.direct');
 
 /*
