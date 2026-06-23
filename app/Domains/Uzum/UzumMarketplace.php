@@ -184,7 +184,9 @@ class UzumMarketplace implements MarketplaceInterface
             'sku' => (string) $code,
             'vendor_code' => isset($sku['article']) ? (string) $sku['article'] : null,
             'marketplace_id' => $skuId !== null ? (string) $skuId : null,
-            'name' => $sku['skuFullTitle'] ?? $sku['skuTitle'] ?? $card['title'] ?? $sku['productTitle'] ?? null,
+            // Реальное название товара: productTitle/card.title (описательное),
+            // фолбэк на skuFullTitle (код «НБК-…»). sku остаётся артикулом (sellerItemCode).
+            'name' => $sku['productTitle'] ?? $card['title'] ?? $sku['skuFullTitle'] ?? $sku['skuTitle'] ?? null,
             'barcode' => isset($sku['barcode']) ? (string) $sku['barcode'] : null,
             'price' => (float) ($sku['price'] ?? 0),
             'old_price' => null,
