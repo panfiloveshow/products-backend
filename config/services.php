@@ -69,6 +69,9 @@ return [
         'logistics_fbs' => env('UZUM_LOGISTICS_FBS', 0),
         'logistics_fbo' => env('UZUM_LOGISTICS_FBO', 0),
         'logistics_dbs' => env('UZUM_LOGISTICS_DBS', 0),
+        // Бесплатное размещение на складе Uzum: первые N дней не тарифицируются,
+        // платное хранение считается только за дни сверх лимита.
+        'free_storage_days' => env('UZUM_FREE_STORAGE_DAYS', 30),
     ],
 
     'sellico' => [

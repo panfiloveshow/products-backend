@@ -812,8 +812,11 @@ class UnitEconomicsCacheService
             $uzumPstorage = (bool) ($marketplaceData['pstorage'] ?? false);
             $uzumPricePerDay = (float) ($marketplaceData['paid_storage_price_item'] ?? 0);
             $uzumTurnover = (float) ($marketplaceData['turnover'] ?? 0);
+            $uzumFreeDays = (float) config('services.uzum.free_storage_days', 30);
+            // Первые N дней хранения бесплатны → платим только за дни сверх лимита.
+            $uzumPaidDays = max(0.0, $uzumTurnover - $uzumFreeDays);
             $storageCost = (strtoupper($fulfillmentType) === 'FBO' && $uzumPstorage)
-                ? $uzumPricePerDay * $uzumTurnover
+                ? $uzumPricePerDay * $uzumPaidDays
                 : 0.0;
             // Логистический сбор Uzum (per unit, из finance API) — калькулятор читает его
             // как ownDeliveryCost. Эквайринг отдельной статьёй у Uzum нет.
