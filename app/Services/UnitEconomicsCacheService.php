@@ -806,9 +806,11 @@ class UnitEconomicsCacheService
                 $redemptionRate = max(0.0, min(100.0, 100 - (float) $marketplaceData['returned_percentage']));
                 $redemptionSource = 'api';
             }
-            // Хранение учитываем только для FBO (склад Uzum).
+            // Хранение только для FBO (склад Uzum). paidStorageAmount — СУММА за период,
+            // нормируем на единицу (делим на проданное кол-во), т.к. таблица per-unit.
+            $uzumUnits = max(1, (int) ($marketplaceData['quantity_sold'] ?? 0));
             $storageCost = strtoupper($fulfillmentType) === 'FBO'
-                ? (float) ($marketplaceData['paid_storage_amount'] ?? 0)
+                ? (float) ($marketplaceData['paid_storage_amount'] ?? 0) / $uzumUnits
                 : 0.0;
             // Логистический сбор Uzum (per unit, из finance API) — калькулятор читает его
             // как ownDeliveryCost. Эквайринг отдельной статьёй у Uzum нет.
