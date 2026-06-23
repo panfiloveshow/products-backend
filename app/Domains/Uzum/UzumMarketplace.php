@@ -208,6 +208,8 @@ class UzumMarketplace implements MarketplaceInterface
                 'commission' => isset($sku['commission']) ? (float) $sku['commission'] : ($card['commission'] ?? null),
                 'purchase_price' => isset($sku['purchasePrice']) ? (float) $sku['purchasePrice'] : null,
                 'paid_storage_amount' => isset($sku['paidStorageAmount']) ? (float) $sku['paidStorageAmount'] : null,
+                'paid_storage_price_item' => isset($sku['paidStoragePriceItem']) ? (float) $sku['paidStoragePriceItem'] : null,
+                'pstorage' => (bool) ($sku['pstorage'] ?? false),
                 'returned_percentage' => isset($sku['returnedPercentage']) ? (float) $sku['returnedPercentage'] : null,
                 'quantity_sold' => isset($sku['quantitySold']) ? (int) $sku['quantitySold'] : null,
                 'quantity_returned' => isset($sku['quantityReturned']) ? (int) $sku['quantityReturned'] : null,

@@ -2164,10 +2164,11 @@ class SyncUnitEconomicsCommand extends Command
                 // Продажи: quantitySold за весь период (Phase 1; нет окна 30д в продуктовом эндпоинте).
                 $data['sales_count'] = (int) ($uzumData['quantity_sold'] ?? $data['sales_count'] ?? 0);
 
-                // Хранение из API (FBO): paidStorageAmount — СУММА за период, нормируем на
-                // единицу (per-unit таблица). Калькулятор обнуляет для FBS/DBS.
-                $data['storage_cost'] = (float) ($uzumData['paid_storage_amount'] ?? 0)
-                    / max(1, (int) ($uzumData['quantity_sold'] ?? 1));
+                // Хранение Uzum: суточная ставка за единицу (paidStoragePriceItem) ×
+                // оборачиваемость (turnover, дней лежит до продажи). Только FBO + платное.
+                $data['storage_cost'] = ((bool) ($uzumData['pstorage'] ?? false))
+                    ? (float) ($uzumData['paid_storage_price_item'] ?? 0) * (float) ($uzumData['turnover'] ?? 0)
+                    : 0.0;
 
                 // Логистический сбор Uzum (per unit) — из finance API (обогащено выше).
                 $data['logistics_fee_per_unit'] = (float) ($uzumData['logistics_fee_per_unit'] ?? 0);
