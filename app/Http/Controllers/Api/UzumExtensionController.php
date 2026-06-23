@@ -1,0 +1,132 @@
+<?php
+
+namespace App\Http\Controllers\Api;
+
+use App\Http\Controllers\Controller;
+use App\Http\Requests\Uzum\IngestExtensionRequest;
+use App\Models\Integration;
+use App\Models\UzumExtensionSnapshot;
+use Illuminate\Http\JsonResponse;
+use Illuminate\Http\Request;
+
+/**
+ * Приём данных из браузерного расширения Sellico для кабинета Uzum (ТЗ §17.1).
+ *
+ * Доступ закрыт middleware 'integration.access' (EnsureIntegrationAccess):
+ * интеграция проверяется на принадлежность workspace до входа в метод —
+ * IDOR-защита бесплатно (ср. memory autosupply_idor_bola, паттерн роута sync).
+ *
+ * MVP read-only: только сохраняем снапшот, никаких действий в кабинете Uzum.
+ */
+class UzumExtensionController extends Controller
+{
+    /**
+     * GET /integrations/uzum/extension/status (ТЗ §17.2).
+     * Возвращает статус подключения для попапа расширения.
+     */
+    public function status(Request $request): JsonResponse
+    {
+        $workspace = (int) (
+            $request->header('X-Sellico-Workspace')
+            ?? $request->header('X-Workspace-Id')
+            ?? $request->input('workspace')
+            ?? 0
+        );
+
+        if (! $workspace) {
+            return response()->json(['success' => false, 'message' => 'workspace_id обязателен'], 422);
+        }
+
+        $integrations = Integration::query()
+            ->forWorkspace($workspace)
+            ->where('marketplace', 'uzum')
+            ->where('is_active', true)
+            ->get();
+
+        $lastSnapshot = $integrations->isNotEmpty()
+            ? UzumExtensionSnapshot::query()
+                ->whereIn('integration_id', $integrations->pluck('id'))
+                ->latest('collected_at')
+                ->first()
+            : null;
+
+        return response()->json([
+            'connected' => $integrations->isNotEmpty(),
+            'userId' => (string) ($request->user()?->id ?? ''),
+            'shopId' => $integrations->first()?->settings['uzum_shop_id'] ?? null,
+            'lastSyncAt' => $lastSnapshot?->collected_at?->toIso8601String(),
+            'availableModules' => ['products', 'moderation'],
+        ]);
+    }
+
+    public function ingest(IngestExtensionRequest $request, int $id): JsonResponse
+    {
+        /** @var Integration $integration */
+        $integration = $request->attributes->get('authorized_integration');
+
+        if ($integration->marketplace !== 'uzum') {
+            return response()->json([
+                'success' => false,
+                'message' => 'Интеграция не принадлежит маркетплейсу Uzum',
+            ], 404);
+        }
+
+        $data = $request->validated();
+        [$accepted, $rejected, $errors] = self::partitionItems($data['items']);
+
+        $status = $rejected === 0 ? 'ok' : ($accepted === 0 ? 'error' : 'partial');
+
+        UzumExtensionSnapshot::create([
+            'integration_id' => $integration->id,
+            'shop_id' => $data['shop_id'] ?? ($integration->settings['uzum_shop_id'] ?? null),
+            'payload_type' => $data['payload_type'],
+            'raw_payload' => $data['items'],
+            'items_count' => count($data['items']),
+            'accepted_count' => $accepted,
+            'rejected_count' => $rejected,
+            'status' => $status,
+            'extension_version' => $data['extension']['version'] ?? null,
+            'extractor_version' => $data['extractor_version'] ?? null,
+            'collected_at' => $data['collected_at'] ?? now(),
+        ]);
+
+        $integration->updateSyncStatus($status === 'error' ? 'failed' : 'completed');
+
+        return response()->json([
+            'success' => $accepted > 0,
+            'accepted' => $accepted,
+            'rejected' => $rejected,
+            'errors' => $errors,
+        ]);
+    }
+
+    /**
+     * Делит items на принятые/отклонённые. Принимаем непустой объект (ассоц. массив);
+     * отклоняем скаляры и пустые — на MVP это вся валидация уровня item.
+     *
+     * @param  array<int,mixed>  $items
+     * @return array{0:int,1:int,2:array<int,array{index:int,code:string,message:string}>}
+     */
+    public static function partitionItems(array $items): array
+    {
+        $accepted = 0;
+        $rejected = 0;
+        $errors = [];
+
+        foreach ($items as $index => $item) {
+            if (is_array($item) && $item !== []) {
+                $accepted++;
+                continue;
+            }
+
+            $rejected++;
+            $errors[] = [
+                'index' => $index,
+                'code' => 'invalid_item',
+                'message' => 'Элемент должен быть непустым объектом',
+            ];
+        }
+
+        return [$accepted, $rejected, $errors];
+    }
+}

@@ -16,6 +16,7 @@ use App\Http\Controllers\Api\SupplyRecommendationController;
 use App\Http\Controllers\Api\PostingController;
 use App\Http\Controllers\Api\PlaceholderController;
 use App\Http\Controllers\Api\UnitEconomicsController;
+use App\Http\Controllers\Api\UzumExtensionController;
 use App\Http\Controllers\Api\UnitEconomicsCacheController;
 use App\Http\Controllers\Api\SellerStockController;
 use App\Http\Controllers\Api\WbBarcodeCostController;
@@ -69,6 +70,20 @@ Route::prefix('integrations')->middleware('sellico.permission')->group(function 
 Route::match(['GET', 'POST'], 'integrations/{id}/sync', [IntegrationController::class, 'sync'])
     ->middleware('sellico.permission')
     ->name('integrations.sync.direct');
+
+// Приём данных из браузерного расширения Uzum (ТЗ §17.1). Это ЗАПИСЬ данных продавца,
+// поэтому требуем аутентификацию вызывающего: sellico.permission (token+workspace+право
+// products.sync.execute через CRM) И integration.access (IDOR-защита интеграции).
+// Без sellico.permission ingest открыт: EnsureIntegrationAccess пускает локально-закэшированную
+// интеграцию без токена при пустом workspace (validateWorkspaceAccess возвращает null).
+// Discovery integration_id для расширения = существующий GET /integrations?marketplace=uzum.
+Route::post('integrations/{id}/uzum/extension/ingest', [UzumExtensionController::class, 'ingest'])
+    ->middleware(['sellico.permission', 'integration.access'])
+    ->name('integrations.uzum.extension.ingest');
+
+Route::get('integrations/uzum/extension/status', [UzumExtensionController::class, 'status'])
+    ->middleware('sellico.permission')
+    ->name('integrations.uzum.extension.status');
 
 /*
 |--------------------------------------------------------------------------

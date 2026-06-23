@@ -126,6 +126,8 @@ class CheckSellicoPermission
         'integrations.performanceAdvertisingImpact' => 'unit_economics.view',
         'integrations.sync'          => 'products.sync.execute',
         'integrations.sync.direct'   => 'products.sync.execute',
+        'integrations.uzum.extension.ingest'  => 'products.sync.execute',
+        'integrations.uzum.extension.status'  => 'products.view',
         'integrations.manualRedemptionRate' => 'products.edit',
         'integrations.syncStatus'    => 'products.sync.status',
         'integrations.status'        => 'products.view',
