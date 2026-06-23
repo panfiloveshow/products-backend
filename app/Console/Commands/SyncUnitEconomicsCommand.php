@@ -279,6 +279,39 @@ class SyncUnitEconomicsCommand extends Command
         $previewFixationMap = [];
         $orderEconomicsPreview = [];
         $manualRedemptionRate = null; // Инициализируем для всех маркетплейсов
+
+        // Uzum: тянем фактическую логистику (logisticDeliveryFee) и эталонную прибыль
+        // (sellerProfit) из finance API один раз и кладём в uzum_data каждого товара —
+        // дальше оба движка расчёта читают это из uzum_data без доп. запросов.
+        if ($marketplace === 'uzum') {
+            try {
+                $creds = $integration?->resolveCredentials() ?? [];
+                $uzumMp = \App\Domains\Marketplace\MarketplaceFactory::create('uzum', $creds, $integration);
+                $financeByProduct = $uzumMp->getFinanceByProduct(30);
+                foreach ($products as $product) {
+                    $ud = is_array($product->uzum_data ?? null) ? $product->uzum_data : [];
+                    $pid = (int) ($ud['product_id'] ?? 0);
+                    $fin = $financeByProduct[$pid] ?? null;
+                    if (! $fin) {
+                        continue;
+                    }
+                    $ud['logistics_fee_per_unit'] = (float) ($fin['logistics_per_unit'] ?? 0);
+                    $ud['seller_profit'] = $fin['seller_profit'] ?? null;
+                    if ((float) ($ud['purchase_price'] ?? 0) <= 0 && (float) ($fin['cost_per_unit'] ?? 0) > 0) {
+                        $ud['purchase_price'] = (float) $fin['cost_per_unit'];
+                    }
+                    $product->forceFill(['uzum_data' => $ud])->saveQuietly();
+                    $product->setAttribute('uzum_data', $ud);
+                }
+                $this->info('  Uzum finance: обогащено товаров из '.count($financeByProduct).' productId');
+            } catch (\Throwable $e) {
+                \Illuminate\Support\Facades\Log::warning('Uzum finance enrich failed', [
+                    'integration_id' => $integrationId,
+                    'error' => $e->getMessage(),
+                ]);
+            }
+        }
+
         if ($marketplace === 'ozon') {
             try {
                 // Приоритет: 1) локальная интеграция, 2) Sellico API, 3) глобальные из config/env
@@ -2134,6 +2167,11 @@ class SyncUnitEconomicsCommand extends Command
                 // Хранение из API (FBO); калькулятор сам обнуляет для FBS/DBS.
                 $data['storage_cost'] = (float) ($uzumData['paid_storage_amount'] ?? 0);
 
+                // Логистический сбор Uzum (per unit) — из finance API (обогащено выше).
+                $data['logistics_fee_per_unit'] = (float) ($uzumData['logistics_fee_per_unit'] ?? 0);
+                // Эталонная прибыль Uzum (sellerProfit) — для сверки, кладём в marketplace_data.
+                $data['seller_profit'] = $uzumData['seller_profit'] ?? null;
+
                 // % выкупа: ручной → (100 − returnedPercentage) → дефолт.
                 if ($manualRedemptionRate !== null) {
                     $data['redemption_rate'] = $manualRedemptionRate;
@@ -2146,7 +2184,8 @@ class SyncUnitEconomicsCommand extends Command
                     $data['redemption_source'] = 'default';
                 }
 
-                $data['acquiring_percent'] = (float) config('services.uzum.acquiring_percent', 0);
+                // Эквайринг у Uzum отдельной статьёй НЕ считается (включён в комиссию/логистику).
+                $data['acquiring_percent'] = 0;
                 break;
         }
 
@@ -2416,39 +2455,30 @@ class SyncUnitEconomicsCommand extends Command
                 'our_share_amount' => $calculated['our_share_amount'] ?? null,
             ];
         } elseif ($marketplace === 'uzum') {
+            // Индивидуальная модель Uzum: комиссия + логистика + хранение(FBO) + налог.
+            // Эквайринг и возвраты отдельными статьями НЕ выводим — их у Uzum нет.
             $detailed = [
                 'fulfillment_type' => $calculated['fulfillment_type'] ?? $data['fulfillment_type'] ?? 'FBS',
 
-                // === КОМИССИЯ / ЭКВАЙРИНГ ===
+                // === КОМИССИЯ ===
                 'commission_percent' => $calculated['commission_percent'] ?? $data['commission_percent'] ?? null,
                 'commission_amount' => $calculated['commission_amount'] ?? null,
-                'acquiring_percent' => $calculated['acquiring_percent'] ?? $data['acquiring_percent'] ?? 0,
-                'acquiring_amount' => $calculated['acquiring_amount'] ?? null,
 
-                // === ЛОГИСТИКА ===
-                'logistics_cost' => $calculated['logistics_cost'] ?? null,
-                'delivery_cost' => $calculated['delivery_cost'] ?? null,
+                // === ЛОГИСТИЧЕСКИЙ СБОР ===
+                'logistics_cost' => $calculated['logistics_fee'] ?? $calculated['logistics_cost'] ?? null,
+
+                // === ХРАНЕНИЕ (FBO) ===
+                'storage_cost' => $calculated['storage_cost'] ?? null,
 
                 // === % ВЫКУПА ===
                 'redemption_rate' => $calculated['redemption_rate'] ?? $data['redemption_rate'] ?? 100,
                 'redemption_source' => $data['redemption_source'] ?? 'default',
 
-                // === ХРАНЕНИЕ ===
-                'storage_cost' => $calculated['storage_cost'] ?? null,
-
-                // === ВОЗВРАТЫ ===
-                'return_logistics_cost' => $calculated['return_logistics_cost'] ?? null,
-                'expected_return_cost' => $calculated['expected_return_cost'] ?? null,
-                'effective_logistics' => $calculated['effective_logistics'] ?? null,
-
-                // === НА РС ===
-                'to_settlement_account' => $calculated['to_settlement_account'] ?? null,
-
-                // === НАЛОГИ ===
+                // === НАЛОГ ===
                 'tax_amount' => $calculated['tax_amount'] ?? null,
-                'vat_amount' => $calculated['vat_amount'] ?? null,
-                'drr_amount' => $calculated['drr_amount'] ?? null,
-                'our_share_amount' => $calculated['our_share_amount'] ?? null,
+
+                // === НА РС (что перечисляет Uzum) ===
+                'to_settlement_account' => $calculated['to_settlement_account'] ?? null,
             ];
         }
 

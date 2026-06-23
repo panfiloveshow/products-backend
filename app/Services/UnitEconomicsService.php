@@ -529,8 +529,13 @@ class UnitEconomicsService
     }
 
     /**
-     * Uzum: все ключевые числа приходят готовыми из API (commission, purchasePrice,
-     * paidStorageAmount, %выкупа). Логистика/эквайринг — Phase-1 константы из конфига.
+     * Uzum — индивидуальная модель (НЕ копия Ozon).
+     *
+     * Удержаний два: комиссия (% по категории) + логистический сбор (из finance API,
+     * per-unit). Эквайринг, доставка, обработка возвратов уже ВКЛЮЧЕНЫ в них —
+     * отдельных статей нет; лог. сбор при возврате возвращается.
+     *
+     * Прибыль = Цена − Комиссия − Логистика − Себестоимость − Хранение(FBO) − Налог.
      */
     private function calculateUzum(array $data): array
     {
@@ -541,26 +546,16 @@ class UnitEconomicsService
         $commissionPercent = (float) ($data['commission_percent'] ?? 0);
         $commissionAmount = ($price * $commissionPercent / 100) * $salesCount;
 
-        $acquiringPercent = (float) ($data['acquiring_percent'] ?? config('services.uzum.acquiring_percent', 0));
-        $acquiringAmount = ($price * $acquiringPercent / 100) * $salesCount;
-
-        // Логистика — Phase-1 константа по схеме (см. config services.uzum).
-        $logisticsPerUnit = (float) ($data['logistics_cost_per_unit'] ?? match ($fulfillmentType) {
-            'FBO' => config('services.uzum.logistics_fbo', 0),
-            'DBS' => config('services.uzum.logistics_dbs', 0),
-            default => config('services.uzum.logistics_fbs', 0),
-        });
+        // Логистический сбор Uzum, per unit (из finance API logisticDeliveryFee)
+        $logisticsPerUnit = (float) ($data['logistics_fee_per_unit'] ?? 0);
         $logisticsTotal = $logisticsPerUnit * $salesCount;
 
-        // Хранение только для FBO (склад Uzum).
+        // Хранение только для FBO (склад Uzum). paidStorageAmount — сумма за период.
         $storageCost = $fulfillmentType === 'FBO' ? (float) ($data['storage_cost'] ?? 0) : 0.0;
 
-        $redemptionRate = (float) ($data['redemption_rate'] ?? 100);
-        $returnRate = $redemptionRate >= 100 ? 0.0 : (100 - $redemptionRate) / 100;
-        $expectedReturnCost = $logisticsTotal * $returnRate;
-
-        $totalFees = $commissionAmount + $acquiringAmount + $logisticsTotal + $storageCost + $expectedReturnCost;
-        $toSettlementAccount = ($price * $salesCount) - $totalFees;
+        // Эквайринг и возвраты у Uzum отдельно НЕ считаются (внутри комиссии/логистики).
+        $totalFees = $commissionAmount + $logisticsTotal + $storageCost;
+        $toSettlementAccount = ($price * $salesCount) - $commissionAmount - $logisticsTotal;
 
         return [
             'total_fees' => $totalFees,
@@ -568,17 +563,13 @@ class UnitEconomicsService
                 'fulfillment_type' => $fulfillmentType,
                 'commission_percent' => round($commissionPercent, 2),
                 'commission_amount' => round($commissionAmount, 2),
-                'acquiring_percent' => round($acquiringPercent, 2),
-                'acquiring_amount' => round($acquiringAmount, 2),
+                'logistics_fee' => round($logisticsTotal, 2),
                 'logistics_cost' => round($logisticsTotal, 2),
-                'delivery_cost' => round($logisticsTotal, 2),
                 'storage_cost' => round($storageCost, 2),
-                'redemption_rate' => round($redemptionRate, 2),
-                'return_logistics_cost' => round($logisticsTotal, 2),
-                'expected_return_cost' => round($expectedReturnCost, 2),
-                'effective_logistics' => round($logisticsTotal + $expectedReturnCost, 2),
-                'packaging_cost' => round((float) ($data['packaging_cost'] ?? 0), 2),
+                'redemption_rate' => round((float) ($data['redemption_rate'] ?? 100), 2),
+                'seller_profit_api' => isset($data['seller_profit']) ? round((float) $data['seller_profit'], 2) : null,
                 'to_settlement_account' => round($toSettlementAccount, 2),
+                'currency' => 'UZS',
             ],
         ];
     }

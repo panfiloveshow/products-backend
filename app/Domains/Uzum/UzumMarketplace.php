@@ -3,6 +3,7 @@
 namespace App\Domains\Uzum;
 
 use App\Domains\Marketplace\Contracts\MarketplaceInterface;
+use App\Domains\Uzum\Api\FinanceApi;
 use App\Domains\Uzum\Api\ProductsApi;
 use App\Domains\Uzum\Api\UzumClient;
 use App\Models\Integration;
@@ -20,6 +21,7 @@ class UzumMarketplace implements MarketplaceInterface
 {
     private UzumClient $client;
     private ProductsApi $products;
+    private FinanceApi $finance;
     private ?Integration $integration;
 
     public function __construct(array $credentials = [], ?Integration $integration = null)
@@ -27,6 +29,7 @@ class UzumMarketplace implements MarketplaceInterface
         $apiKey = $credentials['api_key'] ?? config('services.uzum.api_key');
         $this->client = new UzumClient($apiKey);
         $this->products = new ProductsApi($this->client);
+        $this->finance = new FinanceApi($this->client);
         $this->integration = $integration;
     }
 
@@ -104,6 +107,30 @@ class UzumMarketplace implements MarketplaceInterface
         } while ($fetched >= 1 && $fetched >= $size && $guard < 200);
 
         return $result;
+    }
+
+    /**
+     * Фактический финансовый разбор по productId за последние $days дней
+     * (commission, logisticDeliveryFee, purchasePrice, sellerProfit).
+     * Источник логистики для юнит-экономики. Пусто, если у магазина нет финданных.
+     *
+     * @return array<int, array<string, float|int>>  ключ — productId
+     */
+    public function getFinanceByProduct(int $days = 30): array
+    {
+        $shopId = $this->resolveShopId();
+        if (! $shopId) {
+            return [];
+        }
+        $toMs = (int) (now()->timestamp * 1000);
+        $fromMs = (int) (now()->subDays($days)->timestamp * 1000);
+
+        try {
+            return $this->finance->aggregateOrdersByProduct($shopId, $fromMs, $toMs);
+        } catch (\Throwable $e) {
+            Log::warning('Uzum getFinanceByProduct failed', ['error' => $e->getMessage()]);
+            return [];
+        }
     }
 
     /**

@@ -809,7 +809,10 @@ class UnitEconomicsCacheService
             $storageCost = strtoupper($fulfillmentType) === 'FBO'
                 ? (float) ($marketplaceData['paid_storage_amount'] ?? 0)
                 : 0.0;
-            $acquiringPercent = (float) config('services.uzum.acquiring_percent', 0);
+            // Логистический сбор Uzum (per unit, из finance API) — калькулятор читает его
+            // как ownDeliveryCost. Эквайринг отдельной статьёй у Uzum нет.
+            $ownDeliveryCost = (float) ($marketplaceData['logistics_fee_per_unit'] ?? 0);
+            $acquiringPercent = 0.0;
         }
 
         // (volume_weight / chargeable_volume_liters вычисляются позже — в

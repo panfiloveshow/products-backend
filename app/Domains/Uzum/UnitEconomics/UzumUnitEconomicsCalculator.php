@@ -8,13 +8,17 @@ use App\Domains\UnitEconomics\DTO\CostBreakdown;
 use App\Domains\UnitEconomics\DTO\UnitEconomicsResult;
 
 /**
- * Калькулятор юнит-экономики Uzum Market.
+ * Калькулятор юнит-экономики Uzum Market (индивидуальная модель, НЕ копия Ozon).
  *
- * Phase 1: комиссия, себестоимость, хранение и %выкупа приходят готовыми из
- * Uzum API (SkuForTable) и кладутся в CalculationInput. Логистика и эквайринг —
- * настраиваемые константы (config services.uzum), пока их нет per-SKU в API.
+ * По тарифам Uzum удержаний всего ДВА: комиссия (% по категории) + логистический
+ * сбор (по объёму). Эквайринг, доставка и обработка возвратов УЖЕ включены в них —
+ * отдельных статей нет; лог. сбор при возврате возвращается.
  *
- * Схемы: FBS, FBO, DBS. Хранение учитываем только для FBO.
+ * Прибыль = Цена − Комиссия − Логистический сбор − Себестоимость − Хранение(FBO) − Налог.
+ *
+ * Источник логистики — finance API (`logisticDeliveryFee`), прокидывается per-unit
+ * через CalculationInput::ownDeliveryCost. sellerProfit (эталон Uzum) хранится
+ * в строке отдельно (marketplace_data), здесь не пересчитывается.
  */
 class UzumUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
 {
@@ -33,50 +37,47 @@ class UzumUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
         $price = $input->price;
         $scheme = strtoupper($input->fulfillmentType ?: 'FBS');
 
+        // Комиссия (% по категории, per-SKU из API)
         $commissionRate = $input->commissionRate ?? 0.0;
         $commission = $price * ($commissionRate / 100);
 
-        $acquiringRate = $input->acquiringPercent ?? (float) config('services.uzum.acquiring_percent', 0);
-        $acquiring = $price * ($acquiringRate / 100);
+        // Логистический сбор Uzum, per unit (из finance API через ownDeliveryCost)
+        $logistics = (float) ($input->ownDeliveryCost ?? 0);
 
-        // Логистика — Phase-1 константа из конфига по схеме.
-        // ponytail: апгрейд-путь — реальная логистика из /v1/finance/expenses (Phase 2).
-        $logistics = $input->ownDeliveryCost ?? $this->logisticsForScheme($scheme);
+        // Платное хранение — только FBO (склад Uzum)
+        $storage = $scheme === 'FBO' ? (float) ($input->storageCost ?? 0) : 0.0;
 
-        // Хранение учитываем только для FBO (склад Uzum); для FBS/DBS хранит продавец.
-        $storageCost = $scheme === 'FBO' ? (float) ($input->storageCost ?? 0) : 0.0;
+        // Себестоимость / упаковка / прочее
+        $costPrice = (float) ($input->costPrice ?? 0);
+        $packaging = (float) ($input->packagingCost ?? 0);
 
-        // Возвраты: %выкупа из API (100 − returnedPercentage).
-        $redemptionRate = $input->redemptionRate ?? 100;
-        $returnRate = $redemptionRate >= 100 ? 0.0 : (100 - $redemptionRate) / 100;
-        $expectedReturnCost = $logistics * $returnRate;
+        // Налог (UZ: оборотный/НДС) — ручной %
+        $taxPercent = (float) ($input->taxPercent ?? 0);
+        $taxAmount = $price * ($taxPercent / 100);
+        $additional = (float) ($input->additionalCosts ?? 0) + $taxAmount;
 
-        $costPrice = $input->costPrice ?? 0.0;
-        $packagingCost = $input->packagingCost ?? 0.0;
-        $additionalCosts = $input->additionalCosts ?? 0.0;
-
-        $deliveryCost = $logistics;
-
+        // Эквайринг и возвраты отдельно НЕ считаем — у Uzum они внутри комиссии/логистики.
         $costs = new CostBreakdown(
             commission: $commission,
-            acquiring: $acquiring,
+            acquiring: 0,
             logistics: $logistics,
             lastMile: 0,
             processingFee: 0,
-            deliveryCost: $deliveryCost,
-            storageCost: $storageCost,
-            returnLogistics: $logistics,
+            deliveryCost: $logistics,
+            storageCost: $storage,
+            returnLogistics: 0,
             returnProcessing: 0,
-            expectedReturnCost: $expectedReturnCost,
+            expectedReturnCost: 0,
             costPrice: $costPrice,
-            packagingCost: $packagingCost,
-            additionalCosts: $additionalCosts,
+            packagingCost: $packaging,
+            additionalCosts: $additional,
         );
 
         $totalCosts = $costs->getTotalCosts();
         $netProfit = $price - $totalCosts;
         $marginPercent = $price > 0 ? ($netProfit / $price) * 100 : 0;
-        $toSettlementAccount = $price - $costs->getMarketplaceCosts();
+        // К выплате от Uzum = цена − комиссия − лог. сбор (то, что удерживает МП)
+        $toSettlementAccount = $price - $commission - $logistics;
 
         $result = new UnitEconomicsResult(
             sku: $input->sku,
@@ -90,7 +91,7 @@ class UzumUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
             marginPercent: $marginPercent,
             marginAbsolute: $netProfit,
             commissionPercent: $commissionRate,
-            acquiringPercent: $acquiringRate,
+            acquiringPercent: 0,
             isProfitable: $netProfit > 0,
             hasCostPrice: $costPrice > 0,
             oldPrice: $input->oldPrice,
@@ -100,26 +101,15 @@ class UzumUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
         );
 
         $result->metadata = [
-            'commission' => round($commission, 2),
-            'acquiring' => round($acquiring, 2),
-            'logistics_cost' => round($logistics, 2),
-            'storage_cost' => round($storageCost, 2),
-            'redemption_rate' => round($redemptionRate, 2),
-            'return_logistics_cost' => round($logistics, 2),
-            'expected_return_cost' => round($expectedReturnCost, 2),
-            'effective_logistics' => round($deliveryCost + $expectedReturnCost, 2),
+            'commission_amount' => round($commission, 2),
+            'logistics_fee' => round($logistics, 2),
+            'storage_cost' => round($storage, 2),
+            'tax_amount' => round($taxAmount, 2),
+            'redemption_rate' => round((float) ($input->redemptionRate ?? 100), 2),
             'to_settlement_account' => round($toSettlementAccount, 2),
+            'currency' => 'UZS',
         ];
 
         return $result;
-    }
-
-    private function logisticsForScheme(string $scheme): float
-    {
-        return (float) match ($scheme) {
-            'FBO' => config('services.uzum.logistics_fbo', 0),
-            'DBS' => config('services.uzum.logistics_dbs', 0),
-            default => config('services.uzum.logistics_fbs', 0),
-        };
     }
 }
