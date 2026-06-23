@@ -2401,6 +2401,18 @@ class UnitEconomicsCacheController extends Controller
         $data['vendor_code'] = $vendorCode;
         $data['article'] = ($vendorCode !== null && $vendorCode !== '') ? $vendorCode : $cache->sku;
 
+        // Картинка товара (для таблиц UE). Берём первую из products.images.
+        $productImages = is_array($product?->images ?? null) ? $product->images : [];
+        $data['image'] = $productImages[0]
+            ?? ($product?->uzum_data['preview_image'] ?? null)
+            ?? null;
+
+        // Uzum: габаритная группа (KGT/малогабарит...). Числовых габаритов посылки
+        // Uzum seller API не отдаёт — только эту группу; логистику считает у себя.
+        if ($cache->marketplace === 'uzum') {
+            $data['dimensional_group'] = $product?->uzum_data['dimensional_group'] ?? null;
+        }
+
         // Добавляем поля для совместимости с v1
         $data['actual_weight'] = $product ? (float) ($product->weight ?? 0) / 1000 : 0;
         $data['turnover_days'] = $product?->turnover_days ?? 30;
