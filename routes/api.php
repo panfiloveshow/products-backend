@@ -85,6 +85,17 @@ Route::get('integrations/uzum/extension/status', [UzumExtensionController::class
     ->middleware('sellico.permission')
     ->name('integrations.uzum.extension.status');
 
+// Мост: командный канал «Sellico тянет любой эндпоинт кабинета Uzum».
+Route::get('integrations/{id}/uzum/extension/commands', [UzumExtensionController::class, 'commands'])
+    ->middleware(['sellico.permission', 'integration.access'])
+    ->name('integrations.uzum.extension.commands');
+Route::post('integrations/{id}/uzum/extension/commands', [UzumExtensionController::class, 'enqueueCommand'])
+    ->middleware(['sellico.permission', 'integration.access'])
+    ->name('integrations.uzum.extension.commands.enqueue');
+Route::post('integrations/{id}/uzum/extension/commands/{commandId}/result', [UzumExtensionController::class, 'commandResult'])
+    ->middleware(['sellico.permission', 'integration.access'])
+    ->name('integrations.uzum.extension.commands.result');
+
 /*
 |--------------------------------------------------------------------------
 | Auth & Integrations (Sellico API)
