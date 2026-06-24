@@ -91,6 +91,13 @@ class UzumExtensionController extends Controller
             'collected_at' => $data['collected_at'] ?? now(),
         ]);
 
+        // Габариты из кабинета (skuDimension) → в products.uzum_data['dimensions'],
+        // откуда юнит-экономика берёт объём (UnitEconomicsCacheService строки 686-693, 1045).
+        if ($data['payload_type'] === 'dimensions') {
+            $accepted = $this->applyDimensions($integration->id, $data['items']);
+            $rejected = count($data['items']) - $accepted;
+        }
+
         $integration->updateSyncStatus($status === 'error' ? 'failed' : 'completed');
 
         return response()->json([
@@ -99,6 +106,54 @@ class UzumExtensionController extends Controller
             'rejected' => $rejected,
             'errors' => $errors,
         ]);
+    }
+
+    /**
+     * Мерджит габариты в products.uzum_data['dimensions'] по product_id.
+     * Формат item: {product_id, sku_id?, length, width, height, weight, dimensional_group?}.
+     * Маппинг под существующий расчёт: length→depth (см. UnitEconomicsCacheService::686).
+     *
+     * @param  array<int,mixed>  $items
+     */
+    private function applyDimensions(int $integrationId, array $items): int
+    {
+        $applied = 0;
+
+        foreach ($items as $item) {
+            if (! is_array($item) || (empty($item['sku_id']) && empty($item['product_id']))) {
+                continue;
+            }
+
+            // Матчим по sku_id (точно, per-SKU), фолбэк — product_id.
+            $query = \App\Models\Product::query()->where('integration_id', $integrationId);
+            if (! empty($item['sku_id'])) {
+                $query->whereJsonContains('uzum_data->sku_id', (int) $item['sku_id']);
+            } else {
+                $query->whereJsonContains('uzum_data->product_id', (int) $item['product_id']);
+            }
+            $product = $query->first();
+
+            if (! $product) {
+                continue;
+            }
+
+            $uzum = is_array($product->uzum_data) ? $product->uzum_data : [];
+            $uzum['dimensions'] = array_filter([
+                'depth' => isset($item['length']) ? (float) $item['length'] : null,  // длина → depth
+                'width' => isset($item['width']) ? (float) $item['width'] : null,
+                'height' => isset($item['height']) ? (float) $item['height'] : null,
+                'weight' => isset($item['weight']) ? (float) $item['weight'] : null,
+            ], fn ($v) => $v !== null);
+
+            if (! empty($item['dimensional_group'])) {
+                $uzum['dimensional_group'] = $item['dimensional_group'];
+            }
+
+            $product->forceFill(['uzum_data' => $uzum])->saveQuietly();
+            $applied++;
+        }
+
+        return $applied;
     }
 
     /**

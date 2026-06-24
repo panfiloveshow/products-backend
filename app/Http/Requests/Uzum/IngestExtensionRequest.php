@@ -15,7 +15,7 @@ class IngestExtensionRequest extends BaseFormRequest
         return [
             'marketplace' => 'sometimes|in:uzum',
             'shop_id' => 'nullable|string|max:100',
-            'payload_type' => 'required|in:products,moderation,stocks,orders,finance,ads',
+            'payload_type' => 'required|in:products,moderation,stocks,orders,finance,ads,dimensions',
             'collected_at' => 'nullable|date',
             'items' => 'required|array',
             'extension' => 'nullable|array',
