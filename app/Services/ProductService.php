@@ -296,7 +296,7 @@ class ProductService
 
     public function getSyncStatuses(?int $integrationId = null): array
     {
-        $marketplaces = ['wildberries', 'ozon', 'yandex_market'];
+        $marketplaces = ['wildberries', 'ozon', 'yandex_market', 'uzum'];
         $statuses = [];
 
         foreach ($marketplaces as $marketplace) {
