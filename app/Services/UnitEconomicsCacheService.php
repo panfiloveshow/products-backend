@@ -809,17 +809,17 @@ class UnitEconomicsCacheService
                 $redemptionRate = max(0.0, min(100.0, 100 - (float) $marketplaceData['returned_percentage']));
                 $redemptionSource = 'api';
             }
-            // Хранение Uzum: paidStoragePriceItem — суточная ставка хранения ЗА ЕДИНИЦУ,
-            // умножаем на оборачиваемость (turnover, дней в обороте) = сколько единица лежит
-            // на складе до продажи. Только для FBO и только если хранение платное (pstorage).
+            // Хранение Uzum на 1 ПРОДАННУЮ единицу: суточное хранение всего остатка
+            // (ставка за шт × остаток) делим на среднесуточные продажи (шт/день).
+            // (ставка × остаток) / продажи_в_день = ставка × дней, за которые распродаётся остаток
+            // = средняя стоимость хранения, приходящаяся на одну проданную единицу.
+            // Только FBO и только если хранение платное (pstorage).
             $uzumPstorage = (bool) ($marketplaceData['pstorage'] ?? false);
-            $uzumPricePerDay = (float) ($marketplaceData['paid_storage_price_item'] ?? 0);
-            $uzumTurnover = (float) ($marketplaceData['turnover'] ?? 0);
-            $uzumFreeDays = (float) config('services.uzum.free_storage_days', 30);
-            // Первые N дней хранения бесплатны → платим только за дни сверх лимита.
-            $uzumPaidDays = max(0.0, $uzumTurnover - $uzumFreeDays);
-            $storageCost = (strtoupper($fulfillmentType) === 'FBO' && $uzumPstorage)
-                ? $uzumPricePerDay * $uzumPaidDays
+            $uzumPricePerDay = (float) ($marketplaceData['paid_storage_price_item'] ?? 0); // суточная ставка за 1 шт
+            $uzumStock = (float) ($marketplaceData['quantity_active'] ?? 0);               // остаток на складе
+            $uzumAvgDailySales = (float) ($marketplaceData['avgd_sales'] ?? 0);            // среднесуточные продажи, шт/день
+            $storageCost = (strtoupper($fulfillmentType) === 'FBO' && $uzumPstorage && $uzumAvgDailySales > 0)
+                ? ($uzumPricePerDay * $uzumStock) / $uzumAvgDailySales
                 : 0.0;
             // Логистический сбор Uzum. Приоритет — факт из finance API (logisticDeliveryFee);
             // если его нет (нет продаж) — считаем по тарифу от объёма (документация Uzum):
