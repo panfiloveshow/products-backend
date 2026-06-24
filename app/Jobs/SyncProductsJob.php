@@ -484,6 +484,9 @@ class SyncProductsJob implements ShouldBeUnique, ShouldQueue
             if ($marketplace === 'wildberries') {
                 $updateData = $this->preserveWbFboWarehouses($existingProduct, $updateData);
             }
+            if ($marketplace === 'uzum') {
+                $updateData = $this->preserveUzumDimensions($existingProduct, $updateData);
+            }
             $existingProduct->update($updateData);
 
             return 'updated';
@@ -500,6 +503,22 @@ class SyncProductsJob implements ShouldBeUnique, ShouldQueue
      * Если в новых данных нет ни одного FBO-склада, а в старых были — сохраняем
      * старые FBO-строки (FBS-строки берём свежие).
      */
+    /**
+     * Габариты Uzum (skuDimension) собирает расширение и кладёт в uzum_data['dimensions'].
+     * Openapi-синк их не отдаёт → при обычном update перетёр бы. Переносим из старых данных.
+     */
+    private function preserveUzumDimensions(Product $existing, array $updateData): array
+    {
+        if (! isset($updateData['uzum_data']) || ! is_array($updateData['uzum_data'])) {
+            return $updateData;
+        }
+        $oldDims = $existing->uzum_data['dimensions'] ?? null;
+        if (is_array($oldDims) && empty($updateData['uzum_data']['dimensions'])) {
+            $updateData['uzum_data']['dimensions'] = $oldDims;
+        }
+        return $updateData;
+    }
+
     private function preserveWbFboWarehouses(Product $existing, array $updateData): array
     {
         if (! isset($updateData['wb_data']) || ! is_array($updateData['wb_data'])) {
