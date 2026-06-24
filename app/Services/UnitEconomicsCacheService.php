@@ -818,9 +818,21 @@ class UnitEconomicsCacheService
             $storageCost = (strtoupper($fulfillmentType) === 'FBO' && $uzumPstorage)
                 ? $uzumPricePerDay * $uzumPaidDays
                 : 0.0;
-            // Логистический сбор Uzum (per unit, из finance API) — калькулятор читает его
-            // как ownDeliveryCost. Эквайринг отдельной статьёй у Uzum нет.
-            $ownDeliveryCost = (float) ($marketplaceData['logistics_fee_per_unit'] ?? 0);
+            // Логистический сбор Uzum. Приоритет — факт из finance API (logisticDeliveryFee);
+            // если его нет (нет продаж) — считаем по тарифу от объёма (документация Uzum):
+            // 1-й литр 5250 сум, каждый следующий +250 сум. FBS/FBO одинаково; DBS/EDBS — без сбора
+            // (продавец везёт сам). Объём = Д×Ш×В (см) / 1000 = литры.
+            $financeLogistics = (float) ($marketplaceData['logistics_fee_per_unit'] ?? 0);
+            $uzumScheme = strtoupper($fulfillmentType);
+            $volumeL = ($lengthCm > 0 && $widthCm > 0 && $heightCm > 0)
+                ? ($lengthCm * $widthCm * $heightCm) / 1000
+                : 0.0;
+            $firstLiter = (float) config('services.uzum.logistics_first_liter', 5250);
+            $nextLiter = (float) config('services.uzum.logistics_next_liter', 250);
+            $logisticsByVolume = ($volumeL > 0 && ! in_array($uzumScheme, ['DBS', 'EDBS'], true))
+                ? $firstLiter + max(0, (int) ceil($volumeL) - 1) * $nextLiter
+                : 0.0;
+            $ownDeliveryCost = $financeLogistics > 0 ? $financeLogistics : $logisticsByVolume;
             $acquiringPercent = 0.0;
         }
 

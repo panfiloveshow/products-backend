@@ -546,8 +546,23 @@ class UnitEconomicsService
         $commissionPercent = (float) ($data['commission_percent'] ?? 0);
         $commissionAmount = ($price * $commissionPercent / 100) * $salesCount;
 
-        // Логистический сбор Uzum, per unit (из finance API logisticDeliveryFee)
+        // Логистический сбор Uzum, per unit. Факт из finance (logisticDeliveryFee) в приоритете;
+        // если нет (нет продаж) — по тарифу от объёма: 1-й литр 5250 сум, каждый следующий +250.
+        // FBS/FBO одинаково; DBS/EDBS — без сбора (продавец везёт сам).
         $logisticsPerUnit = (float) ($data['logistics_fee_per_unit'] ?? 0);
+        if ($logisticsPerUnit <= 0 && ! in_array($fulfillmentType, ['DBS', 'EDBS'], true)) {
+            $volumeL = (float) ($data['volume_liters'] ?? 0);
+            if ($volumeL <= 0) {
+                $l = (float) ($data['length'] ?? 0);
+                $w = (float) ($data['width'] ?? 0);
+                $h = (float) ($data['height'] ?? 0);
+                $volumeL = ($l > 0 && $w > 0 && $h > 0) ? ($l * $w * $h) / 1000 : 0.0;
+            }
+            if ($volumeL > 0) {
+                $logisticsPerUnit = (float) config('services.uzum.logistics_first_liter', 5250)
+                    + max(0, (int) ceil($volumeL) - 1) * (float) config('services.uzum.logistics_next_liter', 250);
+            }
+        }
         $logisticsTotal = $logisticsPerUnit * $salesCount;
 
         // Хранение только для FBO (склад Uzum). paidStorageAmount — сумма за период.

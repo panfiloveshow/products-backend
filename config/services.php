@@ -72,6 +72,10 @@ return [
         // Бесплатное размещение на складе Uzum: первые N дней не тарифицируются,
         // платное хранение считается только за дни сверх лимита.
         'free_storage_days' => env('UZUM_FREE_STORAGE_DAYS', 30),
+        // Тариф логистики по объёму (документация Uzum): 1-й литр + каждый следующий.
+        // Применяется к FBS/FBO когда нет факта из finance; DBS/EDBS — без сбора.
+        'logistics_first_liter' => env('UZUM_LOGISTICS_FIRST_LITER', 5250),
+        'logistics_next_liter' => env('UZUM_LOGISTICS_NEXT_LITER', 250),
     ],
 
     'sellico' => [
