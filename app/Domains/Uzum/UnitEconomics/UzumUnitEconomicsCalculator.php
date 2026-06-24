@@ -76,8 +76,9 @@ class UzumUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
         $totalCosts = $costs->getTotalCosts();
         $netProfit = $price - $totalCosts;
         $marginPercent = $price > 0 ? ($netProfit / $price) * 100 : 0;
-        // К выплате от Uzum = цена − комиссия − лог. сбор (то, что удерживает МП)
-        $toSettlementAccount = $price - $commission - $logistics;
+        // На расчётный счёт = цена − всё, что удерживает Uzum (комиссия + лог. сбор +
+        // платное хранение FBO). БЕЗ себестоимости и налога — это деньги, которые упадут на счёт.
+        $toSettlementAccount = $price - $commission - $logistics - $storage;
 
         $result = new UnitEconomicsResult(
             sku: $input->sku,

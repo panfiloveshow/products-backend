@@ -76,6 +76,8 @@ return [
         // Применяется к FBS/FBO когда нет факта из finance; DBS/EDBS — без сбора.
         'logistics_first_liter' => env('UZUM_LOGISTICS_FIRST_LITER', 5250),
         'logistics_next_liter' => env('UZUM_LOGISTICS_NEXT_LITER', 250),
+        // Налог с оборота Узбекистана (ИП/самозанятые, оборот до 1 млрд сум) — 1% с 2026.
+        'tax_percent' => env('UZUM_TAX_PERCENT', 1),
     ],
 
     'sellico' => [

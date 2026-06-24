@@ -834,6 +834,12 @@ class UnitEconomicsCacheService
                 : 0.0;
             $ownDeliveryCost = $financeLogistics > 0 ? $financeLogistics : $logisticsByVolume;
             $acquiringPercent = 0.0;
+
+            // Налог Узбекистана: налог с оборота для ИП/самозанятых = 1% (с 2026, оборот до 1 млрд сум).
+            // Дефолт применяем, только если пользователь явно не задал ставку.
+            if ($settings?->tax_percent === null && $existingUE?->tax_percent === null) {
+                $taxPercent = (float) config('services.uzum.tax_percent', 1);
+            }
         }
 
         // (volume_weight / chargeable_volume_liters вычисляются позже — в
