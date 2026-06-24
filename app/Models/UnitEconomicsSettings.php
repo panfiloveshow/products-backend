@@ -25,6 +25,7 @@ class UnitEconomicsSettings extends Model
         'integration_id',
         'sku',
         'cost_price',
+        'return_fee',
         'drr_percent',
         'our_share_percent',
         'tax_percent',
@@ -40,6 +41,7 @@ class UnitEconomicsSettings extends Model
 
     protected $casts = [
         'cost_price' => 'decimal:2',
+        'return_fee' => 'decimal:2',
         'drr_percent' => 'decimal:2',
         'our_share_percent' => 'decimal:2',
         'tax_percent' => 'decimal:2',

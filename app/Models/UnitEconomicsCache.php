@@ -79,6 +79,7 @@ class UnitEconomicsCache extends Model
         'acquiring_amount',
         // Настройки пользователя
         'cost_price',
+        'return_fee',
         'drr_percent',
         'drr_amount',
         'our_share_percent',
@@ -137,6 +138,7 @@ class UnitEconomicsCache extends Model
         'acquiring_percent' => 'decimal:2',
         'acquiring_amount' => 'decimal:2',
         'cost_price' => 'decimal:2',
+        'return_fee' => 'decimal:2',
         'drr_percent' => 'decimal:2',
         'drr_amount' => 'decimal:2',
         'our_share_percent' => 'decimal:2',

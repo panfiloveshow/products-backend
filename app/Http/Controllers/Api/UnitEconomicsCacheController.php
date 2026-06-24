@@ -509,6 +509,7 @@ class UnitEconomicsCacheController extends Controller
         $validated = Validator::make($request->all(), [
             'integration_id' => 'required|integer',
             'cost_price' => 'nullable|numeric|min:0',
+            'return_fee' => 'nullable|numeric|min:0',
             'drr_percent' => 'nullable|numeric|min:0|max:100',
             'our_share_percent' => 'nullable|numeric|min:0|max:100',
             'tax_percent' => 'nullable|numeric|min:0|max:100',

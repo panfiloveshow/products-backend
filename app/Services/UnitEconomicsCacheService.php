@@ -795,6 +795,7 @@ class UnitEconomicsCacheService
         );
         $acceptanceCost = (float) ($marketplaceData['acceptance_cost'] ?? 0);
         $penaltyCost = (float) ($marketplaceData['penalty_cost'] ?? 0);
+        $uzumReturnCost = 0.0; // эффективный сбор за возврат FBO (заполняется в Uzum-блоке)
 
         // Uzum: числа лежат плоско в uzum_data (SkuForTable), а не в commissions/redemption.
         if ($marketplace === 'uzum') {
@@ -842,6 +843,14 @@ class UnitEconomicsCacheService
             if ($settings?->tax_percent === null && $existingUE?->tax_percent === null) {
                 $taxPercent = (float) config('services.uzum.tax_percent', 1);
             }
+
+            // Сбор за обработку возврата (FBO): ручная ставка за 1 возврат × доля возвратов на
+            // проданную единицу = (100 − %выкупа)/%выкупа. Так % выкупа влияет на прибыль FBO.
+            // FBS/DBS — сборка возврата бесплатна, сбор не применяется.
+            $returnFee = (float) ($settings?->return_fee ?? 0);
+            if ($returnFee > 0 && $uzumScheme === 'FBO' && $redemptionRate > 0 && $redemptionRate < 100) {
+                $uzumReturnCost = $returnFee * (100 - $redemptionRate) / $redemptionRate;
+            }
         }
 
         // (volume_weight / chargeable_volume_liters вычисляются позже — в
@@ -865,7 +874,9 @@ class UnitEconomicsCacheService
             'weight_g' => $weightG,
             'cost_price' => (float) $costPrice,
             'packaging_cost' => 0,
-            'additional_costs' => 0,
+            // Uzum: сюда кладём эффективный сбор за возврат FBO (уменьшает прибыль).
+            'additional_costs' => $uzumReturnCost,
+            'return_fee' => $returnFee ?? 0,
             'category_id' => $product->category ?? 'default',
             'commission_rate' => (float) $commissionPercent,
             'redemption_rate' => (float) $redemptionRate,
@@ -1193,6 +1204,7 @@ class UnitEconomicsCacheService
             'acquiring_amount' => $costs->acquiring,
             // Себестоимость и настройки
             'cost_price' => $costs->costPrice,
+            'return_fee' => (float) ($inputData['return_fee'] ?? 0),
             'drr_percent' => $drrPercent,
             'drr_amount' => $effectiveDrrAmount,
             'our_share_percent' => $ourSharePercent,
