@@ -252,8 +252,10 @@ class UnitEconomicsCacheService
             $this->forgetStatsCache($integrationId, $integration->marketplace, $this->getSchemesForMarketplace($integration->marketplace));
         }
 
-        RecalculateUnitEconomicsForSkuJob::dispatch($integrationId, $sku)
-            ->onQueue('unit-economics');
+        // Один SKU × схемы — пересчёт лёгкий и без внешних API. Считаем СИНХРОННО,
+        // чтобы ответ PUT /settings и перезагрузка фронта сразу показали свежую прибыль
+        // (раньше job уходил в очередь → фронт видел старые числа до обработки воркером).
+        RecalculateUnitEconomicsForSkuJob::dispatchSync($integrationId, $sku);
     }
 
     /**
