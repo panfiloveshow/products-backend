@@ -809,14 +809,21 @@ class UnitEconomicsCacheService
                 $redemptionRate = max(0.0, min(100.0, 100 - (float) $marketplaceData['returned_percentage']));
                 $redemptionSource = 'api';
             }
-            // Хранение Uzum на 1 проданную единицу = суточная ставка за штуку ÷ среднесуточные
-            // продажи (шт/день). Чем быстрее продаётся товар, тем меньше хранение на единицу.
+            // Хранение Uzum на 1 проданную единицу = СУТОЧНОЕ хранение всего остатка ÷
+            // среднесуточные продажи. Суточное хранение остатка = paidStorageAmount (если есть)
+            // либо ставка_за_шт × остаток. Делим на продажи в день: чем медленнее продаётся
+            // и больше остаток — тем дороже хранение на проданную единицу (= ставка × оборачиваемость).
             // Только FBO и только если хранение платное (pstorage).
             $uzumPstorage = (bool) ($marketplaceData['pstorage'] ?? false);
             $uzumPricePerDay = (float) ($marketplaceData['paid_storage_price_item'] ?? 0); // суточная ставка за 1 шт
+            $uzumStock = (float) ($marketplaceData['quantity_active'] ?? 0);               // остаток на складе
             $uzumAvgDailySales = (float) ($marketplaceData['avgd_sales'] ?? 0);            // среднесуточные продажи, шт/день
+            $uzumDailyStorage = (float) ($marketplaceData['paid_storage_amount'] ?? 0);    // суточное хранение всего остатка
+            if ($uzumDailyStorage <= 0) {
+                $uzumDailyStorage = $uzumPricePerDay * $uzumStock; // фолбэк, если paidStorageAmount пуст
+            }
             $storageCost = (strtoupper($fulfillmentType) === 'FBO' && $uzumPstorage && $uzumAvgDailySales > 0)
-                ? $uzumPricePerDay / $uzumAvgDailySales
+                ? $uzumDailyStorage / $uzumAvgDailySales
                 : 0.0;
             // Логистический сбор Uzum. Приоритет — факт из finance API (logisticDeliveryFee);
             // если его нет (нет продаж) — считаем по тарифу от объёма (документация Uzum):
