@@ -78,6 +78,12 @@ return [
         'logistics_next_liter' => env('UZUM_LOGISTICS_NEXT_LITER', 250),
         // Налог с оборота Узбекистана (ИП/самозанятые, оборот до 1 млрд сум) — 1% с 2026.
         'tax_percent' => env('UZUM_TAX_PERCENT', 1),
+        // Сбор за обработку возврата FBO по классу габаритов (с учётом скидки 50% до 31.03.2026).
+        // Авто-применяется по классу (Ш+В+Д): МГТ ≤60см, СГТ 60–170см, КГТ >170см.
+        // 0 = тариф не задан (заполнить из кабинета). Ручная ставка в настройках товара переопределяет.
+        'return_fee_mgt' => env('UZUM_RETURN_FEE_MGT', 0),
+        'return_fee_sgt' => env('UZUM_RETURN_FEE_SGT', 0),
+        'return_fee_kgt' => env('UZUM_RETURN_FEE_KGT', 0),
     ],
 
     'sellico' => [
