@@ -12,6 +12,8 @@ return [
     'allowed_origins_patterns' => [
         '#^https?://localhost(:\d+)?$#',
         '#^https?://127\.0\.0\.1(:\d+)?$#',
+        // Браузерное расширение Sellico для Uzum (origin = chrome-extension://<id>, 32 буквы).
+        '#^chrome-extension://[a-p]{32}$#',
     ],
     'allowed_headers' => ['*'],
     'exposed_headers' => [

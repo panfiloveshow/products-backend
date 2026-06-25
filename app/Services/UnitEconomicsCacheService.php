@@ -848,18 +848,10 @@ class UnitEconomicsCacheService
                 $taxPercent = (float) config('services.uzum.tax_percent', 1);
             }
 
-            // Сбор за обработку возврата (FBO). Ставка за 1 возврат берётся АВТО по классу габаритов
-            // (Ш+В+Д: МГТ ≤60см / СГТ 60–170см / КГТ >170см → тариф из конфига); ручная ставка
-            // в настройках товара переопределяет авто. Эффективно на проданную единицу:
-            // ставка × доля возвратов = ставка × (100−%выкупа)/%выкупа. Только FBO.
-            $uzumDimSumCm = ($lengthMm + $widthMm + $heightMm) / 10;
-            $uzumClass = $uzumDimSumCm <= 0 ? null
-                : ($uzumDimSumCm <= 60 ? 'mgt' : ($uzumDimSumCm <= 170 ? 'sgt' : 'kgt'));
-            $autoReturnFee = $uzumClass ? (float) config("services.uzum.return_fee_{$uzumClass}", 0) : 0.0;
-            $returnFee = $settings?->return_fee !== null ? (float) $settings->return_fee : $autoReturnFee;
-            if ($returnFee > 0 && $uzumScheme === 'FBO' && $redemptionRate > 0 && $redemptionRate < 100) {
-                $uzumReturnCost = $returnFee * (100 - $redemptionRate) / $redemptionRate;
-            }
+            // Возврат покупателя у Uzum нейтрален для продавца: комиссия и логистический сбор
+            // возвращаются, товар уходит обратно в продажу. Поэтому % выкупа — индикатор, отдельной
+            // статьи расхода нет (сбор за «сборку возврата» FBO — это вывоз остатков продавцом,
+            // не возврат покупателя, и к % выкупа не относится). $uzumReturnCost остаётся 0.
         }
 
         // (volume_weight / chargeable_volume_liters вычисляются позже — в
@@ -883,9 +875,7 @@ class UnitEconomicsCacheService
             'weight_g' => $weightG,
             'cost_price' => (float) $costPrice,
             'packaging_cost' => 0,
-            // Uzum: сюда кладём эффективный сбор за возврат FBO (уменьшает прибыль).
             'additional_costs' => $uzumReturnCost,
-            'return_fee' => $returnFee ?? 0,
             'category_id' => $product->category ?? 'default',
             'commission_rate' => (float) $commissionPercent,
             'redemption_rate' => (float) $redemptionRate,

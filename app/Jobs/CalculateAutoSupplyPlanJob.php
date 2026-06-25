@@ -1002,9 +1002,17 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
             $totalLogisticsCost = $logisticsCost * $qtyRounded;
             $expectedProfit = $expectedRevenue - $supplyCostEstimate - $commissionCost - $totalLogisticsCost - ($storageCostDaily * $targetCoverDays);
             $expectedProfitBeforeAds = $expectedProfit;
-            $advertisingSpendPerOrder = $advertisingImpact ? (float) ($advertisingImpact['ad_spend_per_order'] ?? 0) : 0.0;
-            $expectedAdvertisingCost = $advertisingSpendPerOrder > 0
-                ? $advertisingSpendPerOrder * $dailyDemand * $targetCoverDays
+            // Рекламные затраты плана = доля рекламы от ПРОГНОЗНОЙ выручки.
+            // НЕЛЬЗЯ брать ad_spend_per_order (= расход ÷ заказы-ИЗ-рекламы) и умножать на
+            // ВЕСЬ спрос: для дешёвых высокооборотных SKU расход-на-заказ кратно превышает
+            // цену, и прибыль уходила в ложный минус. Берём ad_total_drr_percent (= расход ÷
+            // «Заказано на сумму»), как на странице юнит-экономики, — сумма рекламы плана
+            // никогда не превышает реальную долю рекламного расхода в выручке.
+            $adTotalDrrPercent = $advertisingImpact ? (float) ($advertisingImpact['ad_total_drr_percent'] ?? 0) : 0.0;
+            // ponytail: нет общего ДРР (нет выручки за период) → реклама 0; высокий ДРР всё
+            // равно помечается сигналом high_ad_cost ниже, на прибыль больше не давит ложно.
+            $expectedAdvertisingCost = $adTotalDrrPercent > 0 && $expectedRevenue > 0
+                ? $expectedRevenue * ($adTotalDrrPercent / 100)
                 : 0.0;
             if ($expectedAdvertisingCost > 0) {
                 $expectedProfit -= $expectedAdvertisingCost;
@@ -1216,6 +1224,7 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
                     'ad_revenue' => $advertisingImpact['ad_revenue'] ?? null,
                     'ad_orders' => $advertisingImpact['ad_orders'] ?? null,
                     'ad_drr_percent' => $advertisingImpact['ad_drr_percent'] ?? null,
+                    'ad_total_drr_percent' => $advertisingImpact['ad_total_drr_percent'] ?? null,
                     'ad_spend_per_order' => $advertisingImpact['ad_spend_per_order'] ?? null,
                     'signals' => $advertisingImpact['signals'] ?? [],
                     'signals_ru' => $advertisingImpact['signals_ru'] ?? [],
