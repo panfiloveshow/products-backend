@@ -18,9 +18,11 @@ class IngestExtensionRequest extends BaseFormRequest
             'payload_type' => 'required|in:products,moderation,stocks,orders,finance,ads,dimensions',
             'collected_at' => 'nullable|date',
             'items' => 'required|array',
+            'items.*' => 'required|array',
             'extension' => 'nullable|array',
             'extension.version' => 'nullable|string|max:30',
             'extractor_version' => 'nullable|string|max:30',
+            'payload_hash' => 'nullable|string|size:64',
         ];
     }
 }

@@ -13,12 +13,13 @@ class UzumExtensionCommand extends Model
     use HasUuids;
 
     protected $fillable = [
-        'integration_id', 'method', 'path', 'body',
-        'status', 'http_status', 'response', 'error',
+        'integration_id', 'command_key', 'method', 'path', 'body',
+        'status', 'expires_at', 'http_status', 'response', 'error',
     ];
 
     protected $casts = [
         'body' => 'array',
         'response' => 'array',
+        'expires_at' => 'datetime',
     ];
 }

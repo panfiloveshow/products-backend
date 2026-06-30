@@ -3,13 +3,15 @@
 namespace App\Services;
 
 use App\Models\Integration;
-use Illuminate\Support\Facades\Http;
+use Illuminate\Http\Client\Response;
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 
 class SellicoApiService
 {
     private string $baseUrl;
+
     private ?string $accessToken = null;
 
     public function __construct()
@@ -31,7 +33,7 @@ class SellicoApiService
             if ($response->successful()) {
                 $data = $response->json();
                 $this->accessToken = $data['access_token'] ?? null;
-                
+
                 // Кэшируем токен пользователя (отдельный ключ, не пересекается с сервис-аккаунтом)
                 if ($this->accessToken) {
                     Cache::put('sellico_user_access_token', $this->accessToken, now()->addHours(23));
@@ -50,7 +52,8 @@ class SellicoApiService
                 'error' => $response->json('message', 'Ошибка авторизации'),
             ];
         } catch (\Exception $e) {
-            Log::error('Sellico login error: ' . $e->getMessage());
+            Log::error('Sellico login error: '.$e->getMessage());
+
             return [
                 'success' => false,
                 'error' => $e->getMessage(),
@@ -64,8 +67,8 @@ class SellicoApiService
     public function getWorkspaces(): array
     {
         $token = $this->getAccessToken();
-        
-        if (!$token) {
+
+        if (! $token) {
             return [
                 'success' => false,
                 'error' => 'Не авторизован в Sellico API',
@@ -88,7 +91,8 @@ class SellicoApiService
                 'error' => $response->json('message', 'Ошибка получения workspaces'),
             ];
         } catch (\Exception $e) {
-            Log::error('Sellico get workspaces error: ' . $e->getMessage());
+            Log::error('Sellico get workspaces error: '.$e->getMessage());
+
             return [
                 'success' => false,
                 'error' => $e->getMessage(),
@@ -101,7 +105,7 @@ class SellicoApiService
      */
     public function getIntegrations(int $workspaceId): array
     {
-        if (!$workspaceId) {
+        if (! $workspaceId) {
             return [
                 'success' => false,
                 'error' => 'workspace_id обязателен для получения интеграций',
@@ -109,8 +113,8 @@ class SellicoApiService
         }
 
         $token = $this->getAccessToken();
-        
-        if (!$token) {
+
+        if (! $token) {
             return [
                 'success' => false,
                 'error' => 'Не авторизован в Sellico API',
@@ -133,7 +137,8 @@ class SellicoApiService
                 'error' => $response->json('message', 'Ошибка получения интеграций'),
             ];
         } catch (\Exception $e) {
-            Log::error('Sellico get integrations error: ' . $e->getMessage());
+            Log::error('Sellico get integrations error: '.$e->getMessage());
+
             return [
                 'success' => false,
                 'error' => $e->getMessage(),
@@ -147,40 +152,40 @@ class SellicoApiService
     public function getMarketplaceCredentials(int $workspaceId): array
     {
         $result = $this->getIntegrations($workspaceId);
-        
-        if (!$result['success']) {
+
+        if (! $result['success']) {
             return $result;
         }
 
         $integrations = [];
-        
+
         foreach ($result['integrations'] as $integration) {
             $type = strtolower($integration['type'] ?? '');
-            
+
             $item = [
-                'id'             => $integration['id'],
-                'work_space_id'  => $integration['work_space_id'] ?? $integration['workspace_id'] ?? $integration['workSpaceId'] ?? $integration['workspaceId'] ?? null,
-                'name'           => $integration['name'],
-                'type'           => $integration['type'],
-                'description'    => $integration['description'] ?? null,
+                'id' => $integration['id'],
+                'work_space_id' => $integration['work_space_id'] ?? $integration['workspace_id'] ?? $integration['workSpaceId'] ?? $integration['workspaceId'] ?? null,
+                'name' => $integration['name'],
+                'type' => $integration['type'],
+                'description' => $integration['description'] ?? null,
                 'account_status' => $integration['account_status'] ?? null,
-                'is_premium'     => $integration['is_premium'] ?? false,
-                'api_key'        => $integration['api_key'] ?? null,
-                'client_id'      => $integration['client_id'] ?? null,
-                'created_at'     => $integration['created_at'] ?? null,
-                'updated_at'     => $integration['updated_at'] ?? null,
+                'is_premium' => $integration['is_premium'] ?? false,
+                'api_key' => $integration['api_key'] ?? null,
+                'client_id' => $integration['client_id'] ?? null,
+                'created_at' => $integration['created_at'] ?? null,
+                'updated_at' => $integration['updated_at'] ?? null,
             ];
-            
+
             // Группируем по типу маркетплейса
             $marketplaceType = match ($type) {
                 'wildberries' => 'wildberries',
-                'ozon'        => 'ozon',
+                'ozon' => 'ozon',
                 'yandexmarket' => 'yandex_market',
-                'uzum'        => 'uzum',
-                default       => $type,
+                'uzum' => 'uzum',
+                default => $type,
             };
-            
-            if (!isset($integrations[$marketplaceType])) {
+
+            if (! isset($integrations[$marketplaceType])) {
                 $integrations[$marketplaceType] = [];
             }
             $integrations[$marketplaceType][] = $item;
@@ -199,8 +204,8 @@ class SellicoApiService
     public function saveMarketplaceCredentials(string $marketplace, array $credentials): array
     {
         $token = $this->getAccessToken();
-        
-        if (!$token) {
+
+        if (! $token) {
             return [
                 'success' => false,
                 'error' => 'Не авторизован в Sellico API',
@@ -223,7 +228,8 @@ class SellicoApiService
                 'error' => $response->json('message', 'Ошибка сохранения интеграции'),
             ];
         } catch (\Exception $e) {
-            Log::error("Sellico save {$marketplace} credentials error: " . $e->getMessage());
+            Log::error("Sellico save {$marketplace} credentials error: ".$e->getMessage());
+
             return [
                 'success' => false,
                 'error' => $e->getMessage(),
@@ -237,8 +243,8 @@ class SellicoApiService
     public function deleteIntegration(string $marketplace): array
     {
         $token = $this->getAccessToken();
-        
-        if (!$token) {
+
+        if (! $token) {
             return [
                 'success' => false,
                 'error' => 'Не авторизован в Sellico API',
@@ -258,7 +264,8 @@ class SellicoApiService
                 'error' => $response->json('message', 'Ошибка удаления интеграции'),
             ];
         } catch (\Exception $e) {
-            Log::error("Sellico delete {$marketplace} integration error: " . $e->getMessage());
+            Log::error("Sellico delete {$marketplace} integration error: ".$e->getMessage());
+
             return [
                 'success' => false,
                 'error' => $e->getMessage(),
@@ -272,8 +279,8 @@ class SellicoApiService
     public function testConnection(string $marketplace): array
     {
         $token = $this->getAccessToken();
-        
-        if (!$token) {
+
+        if (! $token) {
             return [
                 'success' => false,
                 'error' => 'Не авторизован в Sellico API',
@@ -297,7 +304,8 @@ class SellicoApiService
                 'error' => $response->json('message', 'Ошибка проверки подключения'),
             ];
         } catch (\Exception $e) {
-            Log::error("Sellico test {$marketplace} connection error: " . $e->getMessage());
+            Log::error("Sellico test {$marketplace} connection error: ".$e->getMessage());
+
             return [
                 'success' => false,
                 'error' => $e->getMessage(),
@@ -317,6 +325,7 @@ class SellicoApiService
         $cached = Cache::get('sellico_user_access_token');
         if ($cached) {
             $this->accessToken = $cached;
+
             return $cached;
         }
 
@@ -341,10 +350,10 @@ class SellicoApiService
             return $cached;
         }
 
-        $email    = config('services.sellico.email')    ?? env('SELLICO_EMAIL');
+        $email = config('services.sellico.email') ?? env('SELLICO_EMAIL');
         $password = config('services.sellico.password') ?? env('SELLICO_PASSWORD');
 
-        if (!$email || !$password) {
+        if (! $email || ! $password) {
             return null;
         }
 
@@ -359,6 +368,7 @@ class SellicoApiService
                 if ($token) {
                     Cache::put('sellico_service_access_token', $token, now()->addHours(23));
                     Log::info('Sellico service login successful');
+
                     return $token;
                 }
             }
@@ -382,7 +392,7 @@ class SellicoApiService
      * логинимся заново и повторяем запрос один раз. Возвращает null, только
      * если сервисный токен вообще не удалось получить.
      */
-    private function withServiceTokenRetry(\Closure $perform): ?\Illuminate\Http\Client\Response
+    private function withServiceTokenRetry(\Closure $perform): ?Response
     {
         $token = $this->getServiceToken();
         if (! $token) {
@@ -415,8 +425,8 @@ class SellicoApiService
     public function getProfile(): array
     {
         $token = $this->getAccessToken();
-        
-        if (!$token) {
+
+        if (! $token) {
             return [
                 'success' => false,
                 'error' => 'Не авторизован в Sellico API',
@@ -425,12 +435,19 @@ class SellicoApiService
 
         try {
             $response = Http::withToken($token)
-                ->get("{$this->baseUrl}/me");
+                ->get("{$this->baseUrl}/user");
+
+            if ($response->status() === 404 || $response->status() === 405) {
+                $response = Http::withToken($token)
+                    ->get("{$this->baseUrl}/me");
+            }
 
             if ($response->successful()) {
+                $payload = $response->json();
+
                 return [
                     'success' => true,
-                    'user' => $response->json('data'),
+                    'user' => $payload['data'] ?? $payload,
                 ];
             }
 
@@ -439,7 +456,8 @@ class SellicoApiService
                 'error' => $response->json('message', 'Ошибка получения профиля'),
             ];
         } catch (\Exception $e) {
-            Log::error('Sellico get profile error: ' . $e->getMessage());
+            Log::error('Sellico get profile error: '.$e->getMessage());
+
             return [
                 'success' => false,
                 'error' => $e->getMessage(),
@@ -493,6 +511,7 @@ class SellicoApiService
 
         if (empty($tokens)) {
             Log::error('getIntegrationById: не удалось получить сервисный токен Sellico');
+
             return [
                 'success' => false,
                 'error' => 'Не удалось авторизоваться в Sellico API (сервисный аккаунт)',
@@ -511,6 +530,7 @@ class SellicoApiService
                         'token_type' => $tokenType,
                         'status' => $response->status(),
                     ]);
+
                     continue;
                 }
 
@@ -544,6 +564,7 @@ class SellicoApiService
                             'token_type' => $tokenType,
                             'status' => $response->status(),
                         ]);
+
                         continue;
                     }
 
@@ -583,6 +604,7 @@ class SellicoApiService
                 'integration_id' => $integrationId,
                 'error' => $e->getMessage(),
             ]);
+
             return [
                 'success' => false,
                 'error' => $e->getMessage(),
@@ -591,7 +613,7 @@ class SellicoApiService
     }
 
     /**
-     * @param array<string, string> $tokens
+     * @param  array<string, string>  $tokens
      * @return array<int, int>
      */
     private function getCandidateWorkspaceIds(int $integrationId, ?int $workspaceId, array $tokens): array
@@ -615,6 +637,7 @@ class SellicoApiService
                     'token_type' => $tokenType,
                     'status' => $response->status(),
                 ]);
+
                 continue;
             }
 
@@ -659,14 +682,14 @@ class SellicoApiService
      * Service token не используется как fallback: лучше не отправить activity,
      * чем отправить её от имени service-account и исказить аудит в CRM.
      *
-     * @param  int                 $workspaceId  ID рабочего пространства PlaceSales.
-     * @param  string              $action       Machine-readable ключ события (`products_sync_started`, `integration_created`, ...).
-     * @param  string              $title        Человекочитаемый заголовок.
-     * @param  string|null         $description  Доп. описание.
-     * @param  array<string,mixed> $meta         Произвольные метаданные (entity_type, entity_id, counters).
-     * @param  string|null         $token        Пользовательский токен. Если null — берётся из текущей сессии
-     *                                           ($this->accessToken или cache 'sellico_user_access_token').
-     *                                           Если user-токен не найден — activity НЕ отправляется.
+     * @param  int  $workspaceId  ID рабочего пространства PlaceSales.
+     * @param  string  $action  Machine-readable ключ события (`products_sync_started`, `integration_created`, ...).
+     * @param  string  $title  Человекочитаемый заголовок.
+     * @param  string|null  $description  Доп. описание.
+     * @param  array<string,mixed>  $meta  Произвольные метаданные (entity_type, entity_id, counters).
+     * @param  string|null  $token  Пользовательский токен. Если null — берётся из текущей сессии
+     *                              ($this->accessToken или cache 'sellico_user_access_token').
+     *                              Если user-токен не найден — activity НЕ отправляется.
      */
     public function sendActivity(
         int $workspaceId,
@@ -755,7 +778,6 @@ class SellicoApiService
      *
      * GET /workspaces/{workspace}/limits-external
      *
-     * @param  int $workspaceId
      * @return array<string,mixed>
      */
     public function getWorkspaceLimitsExternal(int $workspaceId, ?string $type = null): array
@@ -822,8 +844,7 @@ class SellicoApiService
      *
      * POST /workspaces/{workspace}/limits-external
      *
-     * @param  int                 $workspaceId
-     * @param  array<string,mixed> $payload Accepts current_value internally, sends value to PlaceSales.
+     * @param  array<string,mixed>  $payload  Accepts current_value internally, sends value to PlaceSales.
      * @return array<string,mixed>
      */
     public function storeWorkspaceLimitExternal(int $workspaceId, array $payload): array
@@ -889,8 +910,7 @@ class SellicoApiService
      *
      * PUT /workspaces/{workspace}/limits-external/sync
      *
-     * @param  int                 $workspaceId
-     * @param  array<string,mixed> $payload
+     * @param  array<string,mixed>  $payload
      * @return array<string,mixed>
      */
     public function syncWorkspaceLimitExternal(int $workspaceId, array $payload): array
@@ -966,8 +986,8 @@ class SellicoApiService
     public function getIntegrationProducts(int $integrationId): array
     {
         $token = $this->getAccessToken();
-        
-        if (!$token) {
+
+        if (! $token) {
             return [
                 'success' => false,
                 'error' => 'Не авторизован в Sellico API',
@@ -981,7 +1001,7 @@ class SellicoApiService
             if ($response->successful()) {
                 $products = $response->json('data', []);
                 $skus = array_column($products, 'sku');
-                
+
                 return [
                     'success' => true,
                     'skus' => array_filter($skus),
@@ -994,7 +1014,8 @@ class SellicoApiService
                 'error' => $response->json('message', 'Ошибка получения товаров интеграции'),
             ];
         } catch (\Exception $e) {
-            Log::error('Sellico get integration products error: ' . $e->getMessage());
+            Log::error('Sellico get integration products error: '.$e->getMessage());
+
             return [
                 'success' => false,
                 'error' => $e->getMessage(),

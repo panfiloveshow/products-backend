@@ -2,7 +2,10 @@
 
 $allowedOrigins = array_values(array_filter(array_map(
     static fn (string $origin): string => trim($origin),
-    explode(',', (string) env('CORS_ALLOWED_ORIGINS', 'https://sellico.ru,https://www.sellico.ru'))
+    explode(',', (string) env(
+        'CORS_ALLOWED_ORIGINS',
+        'https://sellico.ru,https://www.sellico.ru,chrome-extension://ilibiidnfllbmngliofcjmekjobpogpm'
+    ))
 )));
 
 return [
@@ -12,8 +15,6 @@ return [
     'allowed_origins_patterns' => [
         '#^https?://localhost(:\d+)?$#',
         '#^https?://127\.0\.0\.1(:\d+)?$#',
-        // Браузерное расширение Sellico для Uzum (origin = chrome-extension://<id>, 32 буквы).
-        '#^chrome-extension://[a-p]{32}$#',
     ],
     'allowed_headers' => ['*'],
     'exposed_headers' => [

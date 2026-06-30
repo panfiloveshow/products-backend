@@ -11,6 +11,7 @@ class UzumExtensionSnapshot extends Model
         'integration_id',
         'shop_id',
         'payload_type',
+        'payload_hash',
         'raw_payload',
         'items_count',
         'accepted_count',

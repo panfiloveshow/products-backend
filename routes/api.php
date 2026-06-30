@@ -1,34 +1,34 @@
 <?php
 
 use App\Http\Controllers\Api\AuthController;
-use App\Http\Controllers\Api\IntegrationController;
-use App\Http\Controllers\Api\WorkSpaceController;
 use App\Http\Controllers\Api\AutoSupplyPlanController;
 use App\Http\Controllers\Api\CostPriceController;
-use App\Http\Controllers\Api\ProductController;
+use App\Http\Controllers\Api\IntegrationController;
 use App\Http\Controllers\Api\InventoryController;
+use App\Http\Controllers\Api\Locality\LocalityClusterController;
+use App\Http\Controllers\Api\Locality\LocalityExplainController;
+use App\Http\Controllers\Api\Locality\LocalityOverviewController;
+use App\Http\Controllers\Api\Locality\LocalityRecommendationController;
+use App\Http\Controllers\Api\Locality\LocalityRecomputeController;
+use App\Http\Controllers\Api\Locality\LocalityReconciliationController;
+use App\Http\Controllers\Api\Locality\LocalitySkuController;
+use App\Http\Controllers\Api\PlaceholderController;
+use App\Http\Controllers\Api\PostingController;
+use App\Http\Controllers\Api\ProductController;
+use App\Http\Controllers\Api\SellerStockController;
 use App\Http\Controllers\Api\ShipmentController;
+use App\Http\Controllers\Api\SupplierController;
 use App\Http\Controllers\Api\SupplyController;
 use App\Http\Controllers\Api\SupplyDocumentController;
 use App\Http\Controllers\Api\SupplyPackageController;
 use App\Http\Controllers\Api\SupplyPlanController;
 use App\Http\Controllers\Api\SupplyRecommendationController;
-use App\Http\Controllers\Api\PostingController;
-use App\Http\Controllers\Api\PlaceholderController;
+use App\Http\Controllers\Api\UnitEconomicsCacheController;
 use App\Http\Controllers\Api\UnitEconomicsController;
 use App\Http\Controllers\Api\UzumExtensionController;
-use App\Http\Controllers\Api\UnitEconomicsCacheController;
-use App\Http\Controllers\Api\SellerStockController;
 use App\Http\Controllers\Api\WbBarcodeCostController;
 use App\Http\Controllers\Api\WbWebhookController;
-use App\Http\Controllers\Api\SupplierController;
-use App\Http\Controllers\Api\Locality\LocalityOverviewController;
-use App\Http\Controllers\Api\Locality\LocalitySkuController;
-use App\Http\Controllers\Api\Locality\LocalityClusterController;
-use App\Http\Controllers\Api\Locality\LocalityExplainController;
-use App\Http\Controllers\Api\Locality\LocalityReconciliationController;
-use App\Http\Controllers\Api\Locality\LocalityRecommendationController;
-use App\Http\Controllers\Api\Locality\LocalityRecomputeController;
+use App\Http\Controllers\Api\WorkSpaceController;
 use Illuminate\Support\Facades\Route;
 
 /*
@@ -78,7 +78,7 @@ Route::match(['GET', 'POST'], 'integrations/{id}/sync', [IntegrationController::
 // интеграцию без токена при пустом workspace (validateWorkspaceAccess возвращает null).
 // Discovery integration_id для расширения = существующий GET /integrations?marketplace=uzum.
 Route::post('integrations/{id}/uzum/extension/ingest', [UzumExtensionController::class, 'ingest'])
-    ->middleware(['sellico.permission', 'integration.access'])
+    ->middleware(['throttle:30,1', 'sellico.permission', 'integration.access'])
     ->name('integrations.uzum.extension.ingest');
 
 Route::get('integrations/uzum/extension/status', [UzumExtensionController::class, 'status'])
@@ -87,13 +87,13 @@ Route::get('integrations/uzum/extension/status', [UzumExtensionController::class
 
 // Мост: командный канал «Sellico тянет любой эндпоинт кабинета Uzum».
 Route::get('integrations/{id}/uzum/extension/commands', [UzumExtensionController::class, 'commands'])
-    ->middleware(['sellico.permission', 'integration.access'])
+    ->middleware(['throttle:60,1', 'sellico.permission', 'integration.access'])
     ->name('integrations.uzum.extension.commands');
 Route::post('integrations/{id}/uzum/extension/commands', [UzumExtensionController::class, 'enqueueCommand'])
-    ->middleware(['sellico.permission', 'integration.access'])
+    ->middleware(['throttle:30,1', 'sellico.permission', 'integration.access'])
     ->name('integrations.uzum.extension.commands.enqueue');
 Route::post('integrations/{id}/uzum/extension/commands/{commandId}/result', [UzumExtensionController::class, 'commandResult'])
-    ->middleware(['sellico.permission', 'integration.access'])
+    ->middleware(['throttle:60,1', 'sellico.permission', 'integration.access'])
     ->name('integrations.uzum.extension.commands.result');
 
 /*
@@ -195,27 +195,27 @@ Route::prefix('shipments')->middleware('sellico.permission')->group(function () 
     Route::get('/recommendations', [ShipmentController::class, 'recommendations'])->name('shipments.recommendations');
     Route::get('/stats', [ShipmentController::class, 'stats'])->name('shipments.stats');
     Route::post('/from-recommendation/{recommendationId}', [ShipmentController::class, 'createFromRecommendation'])->name('shipments.createFromRecommendation');
-    
+
     Route::get('/{id}', [ShipmentController::class, 'show'])->name('shipments.show');
     Route::post('/', [ShipmentController::class, 'store'])->name('shipments.store');
     Route::put('/{id}', [ShipmentController::class, 'update'])->name('shipments.update');
     Route::delete('/{id}', [ShipmentController::class, 'destroy'])->name('shipments.destroy');
-    
+
     // Items management
     Route::post('/{id}/items', [ShipmentController::class, 'addItem'])->name('shipments.addItem');
     Route::put('/{id}/items/{itemId}', [ShipmentController::class, 'updateItem'])->name('shipments.updateItem');
     Route::delete('/{id}/items/{itemId}', [ShipmentController::class, 'removeItem'])->name('shipments.removeItem');
-    
+
     // Workflow
     Route::post('/{id}/submit', [ShipmentController::class, 'submit'])->name('shipments.submit');
     Route::post('/{id}/approve', [ShipmentController::class, 'approve'])->name('shipments.approve');
     Route::post('/{id}/reject', [ShipmentController::class, 'reject'])->name('shipments.reject');
     Route::post('/{id}/send', [ShipmentController::class, 'send'])->name('shipments.send');
     Route::post('/{id}/deliver', [ShipmentController::class, 'deliver'])->name('shipments.deliver');
-    
+
     // Slots
     Route::post('/{id}/book-slot', [ShipmentController::class, 'bookSlot'])->name('shipments.bookSlot');
-    
+
     // Export
     Route::get('/{id}/export/pdf', [ShipmentController::class, 'exportPdf'])->name('shipments.export');
     Route::get('/{id}/export/csv', [ShipmentController::class, 'exportCsv'])->name('shipments.export.csv');
