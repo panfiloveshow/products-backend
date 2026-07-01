@@ -342,6 +342,16 @@ class CheckSellicoPermission
             ?? $request->header('X-User-Email')
             ?? 0;
 
+        // Расширение может не прислать id пользователя (X-Sellico-User) — тогда CRM делает
+        // User::findOrFail(0) → 404 → блок. Резолвим id из токена через GET /api/user (кэш 1ч),
+        // чтобы проверка прав работала по реальному пользователю. Веб-путь остаётся как есть.
+        if ($token && (empty($user) || $user === '0' || $user === 0)) {
+            $resolved = $this->resolveUserIdFromToken($token);
+            if ($resolved) {
+                $user = $resolved;
+            }
+        }
+
         $workspace = $request->header('X-Sellico-Workspace')
             ?? $request->header('X-Workspace-Id')
             ?? $request->input('workspace');
@@ -600,6 +610,43 @@ class CheckSellicoPermission
             // Fail-closed: null → middleware решит через grace-кэш, иначе 503.
             return null;
         }
+    }
+
+    /**
+     * Резолвит id пользователя Sellico по его токену (GET /api/user), с кэшем на 1 час.
+     * Нужно для расширения, которое может не прислать X-Sellico-User → иначе user=0 → CRM 404.
+     */
+    protected function resolveUserIdFromToken(string $token): ?string
+    {
+        $cacheKey = 'sellico_user_id:'.md5($token);
+        $cached = Cache::get($cacheKey);
+        if ($cached !== null) {
+            return $cached !== '' ? (string) $cached : null;
+        }
+
+        $crmUrl = 'https://sellico.ru';
+        $plainToken = str_contains($token, '|') ? explode('|', $token, 2)[1] : $token;
+
+        try {
+            $response = Http::timeout(5)
+                ->accept('application/json')
+                ->withToken($plainToken)
+                ->get("{$crmUrl}/api/user");
+
+            if ($response->successful()) {
+                $id = $response->json('id');
+                $val = $id !== null ? (string) $id : '';
+                Cache::put($cacheKey, $val, now()->addHour());
+
+                return $val !== '' ? $val : null;
+            }
+        } catch (\Exception $e) {
+            Log::warning('CheckSellicoPermission: не удалось резолвить user id из токена', [
+                'error' => $e->getMessage(),
+            ]);
+        }
+
+        return null;
     }
 
     /**
