@@ -3083,12 +3083,47 @@ class UnitEconomicsCacheController extends Controller
         $data['tax_percent'] = (float) ($settings?->tax_percent ?? $cache->tax_percent ?? 0);
         $data['vat_percent'] = (float) ($settings?->vat_percent ?? $cache->vat_percent ?? 0);
 
-        // Суммы на основе процентов
+        // Суммы ручных процентов должны соответствовать актуальным settings сразу,
+        // даже если асинхронный пересчёт кэша ещё не успел обновить *_amount.
         $price = (float) $cache->price;
-        $data['drr_amount'] = round((float) ($cache->drr_amount ?? ($price * $data['drr_percent'] / 100)), 2);
-        $data['our_share_amount'] = round((float) ($cache->our_share_amount ?? ($price * $data['our_share_percent'] / 100)), 2);
-        $data['tax_amount'] = round((float) ($cache->tax_amount ?? ($price * $data['tax_percent'] / 100)), 2);
-        $data['vat_amount'] = round((float) ($cache->vat_amount ?? ($price * $data['vat_percent'] / 100)), 2);
+        $cachedDrrAmount = (float) ($cache->drr_amount ?? 0);
+        $cachedOurShareAmount = (float) ($cache->our_share_amount ?? 0);
+        $cachedTaxAmount = (float) ($cache->tax_amount ?? 0);
+        $cachedVatAmount = (float) ($cache->vat_amount ?? 0);
+
+        $data['drr_amount'] = round($price * $data['drr_percent'] / 100, 2);
+        $data['our_share_amount'] = round($price * $data['our_share_percent'] / 100, 2);
+        $data['tax_amount'] = round($price * $data['tax_percent'] / 100, 2);
+        $data['vat_amount'] = round($price * $data['vat_percent'] / 100, 2);
+
+        $manualCostsDelta = (
+            (float) $data['drr_amount']
+            + (float) $data['our_share_amount']
+            + (float) $data['tax_amount']
+            + (float) $data['vat_amount']
+        ) - (
+            $cachedDrrAmount
+            + $cachedOurShareAmount
+            + $cachedTaxAmount
+            + $cachedVatAmount
+        );
+
+        if (abs($manualCostsDelta) >= 0.005) {
+            $data['total_costs'] = round((float) $cache->total_costs + $manualCostsDelta, 2);
+            $data['net_profit'] = round((float) $cache->net_profit - $manualCostsDelta, 2);
+            $data['margin_percent'] = $price > 0 ? round(((float) $data['net_profit'] / $price) * 100, 2) : 0.0;
+
+            $costPrice = (float) ($data['cost_price'] ?? $cache->cost_price ?? 0);
+            $data['roi_percent'] = $costPrice > 0 ? round(((float) $data['net_profit'] / $costPrice) * 100, 2) : 0.0;
+            $data['total_costs_per_unit'] = round((float) $data['total_costs'] / $salesCount, 2);
+
+            if (array_key_exists('to_settlement_account', $data)) {
+                $data['to_settlement_account'] = round(
+                    (float) $data['to_settlement_account'] - ((float) $data['drr_amount'] - $cachedDrrAmount),
+                    2
+                );
+            }
+        }
 
         return $data;
     }

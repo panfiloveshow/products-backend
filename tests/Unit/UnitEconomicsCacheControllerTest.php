@@ -8,6 +8,7 @@ use App\Models\Integration;
 use App\Models\LocalityMetricDaily;
 use App\Models\Product;
 use App\Models\UnitEconomicsCache;
+use App\Models\UnitEconomicsSettings;
 use App\Services\IntegrationAccessService;
 use App\Services\UnitEconomicsCacheService;
 use App\Services\UnitEconomicsService;
@@ -116,6 +117,79 @@ class UnitEconomicsCacheControllerTest extends TestCase
         $this->assertSame(410, $response->getStatusCode());
         $this->assertTrue($data['data']['deprecated']);
         $this->assertSame('wildberries', $data['data']['marketplace']);
+    }
+
+    public function test_enrich_cache_item_recalculates_vat_amount_from_manual_settings_immediately(): void
+    {
+        $controller = new UnitEconomicsCacheController(
+            $this->createMock(UnitEconomicsCacheService::class),
+            $this->createMock(UnitEconomicsService::class),
+            $this->createMock(UnitEconomicsOrchestrator::class),
+            $this->createMock(IntegrationAccessService::class),
+        );
+
+        $product = new Product([
+            'id' => 10,
+            'integration_id' => 77,
+            'marketplace' => 'ozon',
+            'sku' => 'ozon-vat-22',
+            'name' => 'Ozon VAT product',
+        ]);
+        $product->fulfillment_type = 'FBO';
+
+        $cache = new UnitEconomicsCache([
+            'integration_id' => 77,
+            'product_id' => 10,
+            'sku' => 'ozon-vat-22',
+            'marketplace' => 'ozon',
+            'fulfillment_type' => 'FBO',
+            'sales_count' => 1,
+            'price' => 1000,
+            'cost_price' => 300,
+            'commission_amount' => 100,
+            'acquiring_amount' => 15,
+            'logistics_cost' => 50,
+            'storage_cost' => 0,
+            'drr_percent' => 0,
+            'drr_amount' => 0,
+            'our_share_percent' => 0,
+            'our_share_amount' => 0,
+            'tax_percent' => 0,
+            'tax_amount' => 0,
+            'vat_percent' => 0,
+            'vat_amount' => 0,
+            'total_costs' => 465,
+            'net_profit' => 535,
+            'to_settlement_account' => 835,
+            'marketplace_data' => [],
+        ]);
+        $cache->setRelation('product', $product);
+
+        $settings = new UnitEconomicsSettings([
+            'integration_id' => 77,
+            'sku' => 'ozon-vat-22',
+            'drr_percent' => 0,
+            'our_share_percent' => 0,
+            'tax_percent' => 0,
+            'vat_percent' => 22,
+        ]);
+
+        $method = new \ReflectionMethod(UnitEconomicsCacheController::class, 'enrichCacheItem');
+        $method->setAccessible(true);
+
+        $result = $method->invoke($controller, $cache, 'FBO', $settings, [
+            'inventory_by_product_key' => collect([
+                '10|77' => collect(),
+            ]),
+            'actual_schemes_by_product_key' => collect([
+                '10|77' => 'FBO',
+            ]),
+        ]);
+
+        $this->assertSame(22.0, $result['vat_percent']);
+        $this->assertSame(220.0, $result['vat_amount']);
+        $this->assertSame(685.0, $result['total_costs']);
+        $this->assertSame(315.0, $result['net_profit']);
     }
 
     public function test_normalize_ozon_cluster_markup_data_enriches_summary_and_sales_profile(): void
