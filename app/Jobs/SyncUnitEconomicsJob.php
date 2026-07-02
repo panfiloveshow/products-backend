@@ -7,13 +7,14 @@ use App\Services\Wildberries\WildberriesTariffRefresher;
 use App\Services\UnitEconomicsService;
 use App\Domains\Marketplace\MarketplaceFactory;
 use Illuminate\Bus\Queueable;
+use Illuminate\Contracts\Queue\ShouldBeUnique;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
 use Illuminate\Support\Facades\Log;
 
-class SyncUnitEconomicsJob implements ShouldQueue
+class SyncUnitEconomicsJob implements ShouldQueue, ShouldBeUnique
 {
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
 
@@ -21,6 +22,15 @@ class SyncUnitEconomicsJob implements ShouldQueue
     // Крупные магазины (сотни товаров) не укладывались в 600с → таймаут до диспатча кэша,
     // из-за чего товары не появлялись в юнит-экономике. Поднимаем лимит.
     public int $timeout = 1800;
+
+    // Джоб диспатчится из трёх мест (кнопка синка, после синка остатков, после хранения) —
+    // без uniqueness дубли стакались и по 20+ минут блокировали очередь unit-economics.
+    public int $uniqueFor = 3600;
+
+    public function uniqueId(): string
+    {
+        return (string) $this->integrationId;
+    }
 
     public function __construct(
         public int $integrationId,
@@ -102,17 +112,19 @@ class SyncUnitEconomicsJob implements ShouldQueue
                 $this->syncWildberriesTariffSnapshots($integration);
             }
             
+            $syncStartedAt = microtime(true);
             $result = $unitEconomicsService->syncFromRealData(
                 $integration,
                 $this->periodStart,
                 $this->periodEnd,
                 $localizationIndex
             );
-            
+
             Log::info('SyncUnitEconomicsJob completed', [
                 'integration_id' => $this->integrationId,
                 'synced' => $result['synced'],
                 'errors' => $result['errors'],
+                'duration_s' => round(microtime(true) - $syncStartedAt, 1),
             ]);
             
             // Запускаем пересчёт кэша ПОСЛЕ завершения синхронизации UnitEconomics

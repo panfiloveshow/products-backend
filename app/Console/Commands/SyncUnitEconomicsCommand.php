@@ -180,6 +180,7 @@ class SyncUnitEconomicsCommand extends Command
     ): array
     {
         $marketplaceAliases = $this->marketplaceAliases($marketplace);
+        $phaseStart = microtime(true); // тайминг фаз: видно, что именно жрёт минуты (API vs расчёт)
 
         $products = Product::where('integration_id', $integrationId)
             ->whereIn('marketplace', $marketplaceAliases)
@@ -1051,6 +1052,9 @@ class SyncUnitEconomicsCommand extends Command
             default => [null],
         };
 
+        $apiPhaseSeconds = round(microtime(true) - $phaseStart, 1);
+        $loopStart = microtime(true);
+
         foreach ($products as $product) {
             try {
                 $inventory = $inventoryData->get($product->sku);
@@ -1289,6 +1293,16 @@ class SyncUnitEconomicsCommand extends Command
                 }
             }
         }
+
+        \Illuminate\Support\Facades\Log::info('SyncUnitEconomicsCommand phases', [
+            'integration_id' => $integrationId,
+            'marketplace' => $marketplace,
+            'products' => $products->count(),
+            'api_phase_s' => $apiPhaseSeconds,
+            'calc_loop_s' => round(microtime(true) - $loopStart, 1),
+            'synced' => $synced,
+            'errors' => $errors,
+        ]);
 
         // Пересчитываем кэш юнит-экономики после синхронизации
         if ($synced > 0 && ! $this->option('skip-cache-dispatch')) {

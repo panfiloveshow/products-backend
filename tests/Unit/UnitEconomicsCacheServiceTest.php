@@ -650,4 +650,52 @@ class UnitEconomicsCacheServiceTest extends TestCase
 
         $this->assertSame(1.2, $cacheData['logistics_coefficient']);
     }
+
+    public function test_delivery_profile_cache_precedence_scheme_then_all(): void
+    {
+        $service = new UnitEconomicsCacheService(
+            $this->createMock(UnitEconomicsOrchestrator::class)
+        );
+
+        $schemeProfile = new \App\Models\OzonSkuDeliveryProfile(['scheme' => 'FBO']);
+        $allProfile = new \App\Models\OzonSkuDeliveryProfile(['scheme' => 'ALL']);
+
+        $ref = new \ReflectionProperty(UnitEconomicsCacheService::class, 'deliveryProfileCache');
+        $ref->setAccessible(true);
+        // Прогреты и точная схема, и ALL — точная схема должна победить; для SKU2 только ALL.
+        $ref->setValue($service, [
+            '5|SKU1|FBO' => $schemeProfile,
+            '5|SKU1|ALL' => $allProfile,
+            '5|SKU2|FBO' => null,
+            '5|SKU2|ALL' => $allProfile,
+        ]);
+
+        $method = new \ReflectionMethod(UnitEconomicsCacheService::class, 'getDeliveryProfileCached');
+        $method->setAccessible(true);
+
+        $p1 = new Product(['integration_id' => 5, 'sku' => 'SKU1']);
+        $p2 = new Product(['integration_id' => 5, 'sku' => 'SKU2']);
+
+        $this->assertSame($schemeProfile, $method->invoke($service, $p1, 'FBO'));
+        $this->assertSame($allProfile, $method->invoke($service, $p2, 'FBO'));
+    }
+
+    public function test_supply_fixation_cache_returns_warmed_value(): void
+    {
+        $service = new UnitEconomicsCacheService(
+            $this->createMock(UnitEconomicsOrchestrator::class)
+        );
+
+        $fixation = new \App\Models\OzonSupplyFixation(['sku' => 'SKU1']);
+        $ref = new \ReflectionProperty(UnitEconomicsCacheService::class, 'supplyFixationCache');
+        $ref->setAccessible(true);
+        $ref->setValue($service, ['5|SKU1' => $fixation, '5|SKU2' => null]);
+
+        $method = new \ReflectionMethod(UnitEconomicsCacheService::class, 'getSupplyFixationCached');
+        $method->setAccessible(true);
+
+        // Прогретые ключи (в т.ч. закэшированный null) возвращаются без обращения к БД.
+        $this->assertSame($fixation, $method->invoke($service, 5, 'SKU1'));
+        $this->assertNull($method->invoke($service, 5, 'SKU2'));
+    }
 }

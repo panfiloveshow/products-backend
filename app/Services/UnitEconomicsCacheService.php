@@ -49,6 +49,12 @@ class UnitEconomicsCacheService
     private array $integrationStockWeightedCoefCache = [];
     /** @var array<string, array>|null Per-SKU locality data from real orders (batch-loaded) */
     private ?array $localityCache = null;
+    /** @var array<string, ?OzonSkuDeliveryProfile> ключ integration|sku|SCHEME — прогревается чанком (убирает N+1) */
+    private array $deliveryProfileCache = [];
+    /** @var array<int, ?OzonSkuDeliveryProfile> fallback-профиль интеграции (любой с cluster_profile) */
+    private array $integrationFallbackProfileCache = [];
+    /** @var array<string, ?OzonSupplyFixation> ключ integration|sku — активная фиксация, прогревается чанком */
+    private array $supplyFixationCache = [];
     /** @var int|null Seller-level FBO orders in last 7 days (cached per integration) */
     private ?int $sellerFboOrders7DaysCache = null;
 
@@ -163,6 +169,9 @@ class UnitEconomicsCacheService
         $this->settingsCache = [];
         $this->localityCache = null;
         $this->sellerFboOrders7DaysCache = null;
+        $this->deliveryProfileCache = [];
+        $this->integrationFallbackProfileCache = [];
+        $this->supplyFixationCache = [];
         $integration = $this->getIntegrationCached($integrationId);
         if (!$integration) {
             return ['error' => 'Integration not found'];
@@ -227,6 +236,7 @@ class UnitEconomicsCacheService
             'integration_id' => $integrationId,
             'stats' => $stats,
             'stale_pruned' => $stalePruned,
+            'duration_s' => round(now()->diffInMilliseconds($startedAt, true) / 1000, 1),
         ]);
 
         $this->forgetStatsCache($integrationId, $integration->marketplace, $schemes);
@@ -467,12 +477,7 @@ class UnitEconomicsCacheService
                 ? $marketplaceData['active_fixation']
                 : [];
             if ($activeFixation === []) {
-                $fixation = OzonSupplyFixation::query()
-                    ->where('integration_id', $product->integration_id)
-                    ->where('sku', $product->sku)
-                    ->activeWindow()
-                    ->orderByDesc('fixation_base_date')
-                    ->first();
+                $fixation = $this->getSupplyFixationCached((int) $product->integration_id, (string) $product->sku);
                 if ($fixation) {
                     $activeFixation = [
                         'fixation_applied' => true,
@@ -487,21 +492,7 @@ class UnitEconomicsCacheService
                     ];
                 }
             }
-            $deliveryProfile = OzonSkuDeliveryProfile::findForProduct(
-                $product->integration_id,
-                $product->sku,
-                strtoupper($fulfillmentType)
-            ) ?? OzonSkuDeliveryProfile::findForProduct(
-                $product->integration_id,
-                $product->sku,
-                'ALL'
-            );
-            // Fallback: если для конкретного SKU нет профиля, берём любой профиль интеграции
-            if (! $deliveryProfile && $product->integration_id) {
-                $deliveryProfile = OzonSkuDeliveryProfile::where('integration_id', $product->integration_id)
-                    ->whereNotNull('cluster_profile')
-                    ->first();
-            }
+            $deliveryProfile = $this->getDeliveryProfileCached($product, strtoupper($fulfillmentType));
             $profileStock = is_array($deliveryProfile?->stock_profile ?? null) ? $deliveryProfile->stock_profile : [];
             $profileSales = is_array($deliveryProfile?->sales_profile ?? null) ? $deliveryProfile->sales_profile : [];
             $profileCluster = is_array($deliveryProfile?->cluster_profile ?? null) ? $deliveryProfile->cluster_profile : [];
@@ -1951,6 +1942,40 @@ class UnitEconomicsCacheService
             }
         }
 
+        if ($integration->marketplace === 'ozon') {
+            // Профили доставки и активные фиксации — раньше дёргались per-товар × per-схему
+            // (2000-6000 запросов на магазин), теперь два SELECT на чанк.
+            $schemesWithAll = collect($normalizedSchemes)->push('ALL')->unique()->values()->all();
+
+            OzonSkuDeliveryProfile::where('integration_id', $integration->id)
+                ->whereIn('sku', $skus)
+                ->whereIn('scheme', $schemesWithAll)
+                ->orderByDesc('calculated_at')
+                ->get()
+                ->each(function (OzonSkuDeliveryProfile $profile) use ($integration) {
+                    $key = $integration->id.'|'.$profile->sku.'|'.strtoupper((string) $profile->scheme);
+                    $this->deliveryProfileCache[$key] ??= $profile; // первый = свежайший (orderByDesc)
+                });
+            foreach ($skus as $sku) {
+                foreach ($schemesWithAll as $scheme) {
+                    $this->deliveryProfileCache[$integration->id.'|'.$sku.'|'.$scheme] ??= null;
+                }
+            }
+
+            OzonSupplyFixation::query()
+                ->where('integration_id', $integration->id)
+                ->whereIn('sku', $skus)
+                ->activeWindow()
+                ->orderByDesc('fixation_base_date')
+                ->get()
+                ->each(function (OzonSupplyFixation $fixation) use ($integration) {
+                    $this->supplyFixationCache[$integration->id.'|'.$fixation->sku] ??= $fixation;
+                });
+            foreach ($skus as $sku) {
+                $this->supplyFixationCache[$integration->id.'|'.$sku] ??= null;
+            }
+        }
+
         if ($integration->marketplace !== 'wildberries') {
             return;
         }
@@ -2027,6 +2052,54 @@ class UnitEconomicsCacheService
                 ? round($weightedSum / $totalQuantity, 4)
                 : round($noStockDefaultCoef, 4);
         }
+    }
+
+    /**
+     * Профиль доставки с семантикой прежнего кода (scheme → ALL → любой профиль интеграции),
+     * но через чанковый прогрев: в recalculateIntegration — ноль запросов, при одиночном
+     * вызове — прямой запрос с мемоизацией.
+     */
+    private function getDeliveryProfileCached(Product $product, string $scheme): ?OzonSkuDeliveryProfile
+    {
+        $integrationId = (int) $product->integration_id;
+        $sku = (string) $product->sku;
+
+        foreach ([strtoupper($scheme), 'ALL'] as $candidate) {
+            $key = $integrationId.'|'.$sku.'|'.$candidate;
+            if (! array_key_exists($key, $this->deliveryProfileCache)) {
+                $this->deliveryProfileCache[$key] = OzonSkuDeliveryProfile::findForProduct($integrationId, $sku, $candidate);
+            }
+            if ($this->deliveryProfileCache[$key]) {
+                return $this->deliveryProfileCache[$key];
+            }
+        }
+
+        if (! $integrationId) {
+            return null;
+        }
+        if (! array_key_exists($integrationId, $this->integrationFallbackProfileCache)) {
+            $this->integrationFallbackProfileCache[$integrationId] = OzonSkuDeliveryProfile::where('integration_id', $integrationId)
+                ->whereNotNull('cluster_profile')
+                ->first();
+        }
+
+        return $this->integrationFallbackProfileCache[$integrationId];
+    }
+
+    /** Активная фиксация поставки: из чанкового прогрева либо прямой запрос с мемоизацией. */
+    private function getSupplyFixationCached(int $integrationId, string $sku): ?OzonSupplyFixation
+    {
+        $key = $integrationId.'|'.$sku;
+        if (! array_key_exists($key, $this->supplyFixationCache)) {
+            $this->supplyFixationCache[$key] = OzonSupplyFixation::query()
+                ->where('integration_id', $integrationId)
+                ->where('sku', $sku)
+                ->activeWindow()
+                ->orderByDesc('fixation_base_date')
+                ->first();
+        }
+
+        return $this->supplyFixationCache[$key];
     }
 
     private function warmWildberriesTariffSnapshotCache(int $integrationId): void
