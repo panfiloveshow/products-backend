@@ -64,6 +64,10 @@ return [
     'uzum' => [
         'base_url' => env('UZUM_API_URL', 'https://api-seller.uzum.uz/api/seller-openapi'),
         'extension_allow_raw_commands' => env('UZUM_EXTENSION_ALLOW_RAW_COMMANDS', false),
+        // Version-handshake расширения: min — ниже неё расширение показывает «обновите»,
+        // latest — информационная. Пустой min = проверка выключена.
+        'extension_min_version' => env('UZUM_EXTENSION_MIN_VERSION', ''),
+        'extension_latest_version' => env('UZUM_EXTENSION_LATEST_VERSION', ''),
         // ponytail: Phase-1 константы — продуктовый эндпоинт не отдаёт логистику/эквайринг per-SKU.
         // Апгрейд-путь: считать из /v1/finance/expenses + /v1/finance/orders (Phase 2).
         'acquiring_percent' => env('UZUM_ACQUIRING_PERCENT', 0),

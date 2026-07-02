@@ -14,6 +14,14 @@ Artisan::command('inspire', function () {
 // non-local переплат и рекомендаций поставок. Включи через ENV LOCALITY_SCHEDULE=true,
 // запусти `php artisan schedule:work` (или systemd cron по артизану).
 
+// Гигиена моста Uzum-расширения: команды живут 10 минут (expires_at), но DELETE их
+// никто не делал — таблица росла бесконечно. Локальный DELETE, API маркетплейсов не трогает.
+\Illuminate\Support\Facades\Schedule::call(function () {
+    \App\Models\UzumExtensionCommand::query()
+        ->where('expires_at', '<', now()->subHour())
+        ->delete();
+})->hourly()->name('uzum.extension-commands-cleanup');
+
 // NB: читаем через config(), а не env() — чтобы флаг работал после config:cache.
 if (config('locality.schedule_enabled', false)) {
     \Illuminate\Support\Facades\Schedule::job(new \App\Domains\Locality\Jobs\SyncClusterMapJob())

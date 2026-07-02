@@ -10,6 +10,7 @@ use App\Models\UzumExtensionCommand;
 use App\Models\UzumExtensionSnapshot;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Log;
 
 /**
  * Приём данных из браузерного расширения Sellico для кабинета Uzum (ТЗ §17.1).
@@ -27,6 +28,14 @@ class UzumExtensionController extends Controller
     private const COMMAND_TTL_MINUTES = 10;
 
     private const MAX_COMMAND_RESPONSE_BYTES = 1_000_000;
+
+    private const MAX_PENDING_COMMANDS = 50;
+
+    /** Потолок валидного габарита (см/кг): защита от мусора вроде отрицательных значений. */
+    private const MAX_DIMENSION_VALUE = 10_000;
+
+    /** Ошибки сохранения товаров в рамках текущего ingest — попадают в error_message снапшота. */
+    private array $saveErrors = [];
 
     /**
      * GET /integrations/uzum/extension/status (ТЗ §17.2).
@@ -113,7 +122,7 @@ class UzumExtensionController extends Controller
             ]);
         }
 
-        UzumExtensionSnapshot::create([
+        $snapshot = UzumExtensionSnapshot::create([
             'integration_id' => $integration->id,
             'shop_id' => $data['shop_id'] ?? ($integration->settings['uzum_shop_id'] ?? null),
             'payload_type' => $data['payload_type'],
@@ -138,6 +147,22 @@ class UzumExtensionController extends Controller
             $rejected = count($data['items']) - $accepted;
         }
 
+        // Снапшот дописываем фактом применения: счётчики после apply* и причины отказов —
+        // иначе error_message пуст и разбирать неудачный ingest не по чему.
+        $status = $rejected === 0 ? 'ok' : ($accepted === 0 ? 'error' : 'partial');
+        $errorMessage = $errors !== [] || $this->saveErrors !== []
+            ? mb_substr(implode('; ', array_merge(
+                array_map(fn ($e) => "#{$e['index']} {$e['code']}", array_slice($errors, 0, 20)),
+                array_slice($this->saveErrors, 0, 20),
+            )), 0, 2000)
+            : null;
+        $snapshot->update([
+            'accepted_count' => $accepted,
+            'rejected_count' => $rejected,
+            'status' => $status,
+            'error_message' => $errorMessage,
+        ]);
+
         $integration->updateSyncStatus($status === 'error' ? 'failed' : 'completed');
 
         return response()->json([
@@ -159,19 +184,18 @@ class UzumExtensionController extends Controller
     {
         $applied = 0;
 
+        // Один SELECT на весь батч вместо запроса на каждый item (раньше 1000 items ≈ 2000 запросов).
+        [$bySkuId, $byProductId] = $this->loadProductMaps($integrationId);
+
         foreach ($items as $item) {
             if (! is_array($item) || (empty($item['sku_id']) && empty($item['product_id']))) {
                 continue;
             }
 
             // Матчим по sku_id (точно, per-SKU), фолбэк — product_id.
-            $query = Product::query()->where('integration_id', $integrationId);
-            if (! empty($item['sku_id'])) {
-                $query->whereJsonContains('uzum_data->sku_id', (int) $item['sku_id']);
-            } else {
-                $query->whereJsonContains('uzum_data->product_id', (int) $item['product_id']);
-            }
-            $product = $query->first();
+            $product = ! empty($item['sku_id'])
+                ? ($bySkuId[(int) $item['sku_id']] ?? null)
+                : ($byProductId[(string) (int) $item['product_id']] ?? null);
 
             if (! $product) {
                 continue;
@@ -179,21 +203,76 @@ class UzumExtensionController extends Controller
 
             $uzum = is_array($product->uzum_data) ? $product->uzum_data : [];
             $uzum['dimensions'] = array_filter([
-                'depth' => isset($item['length']) ? (float) $item['length'] : null,  // длина → depth
-                'width' => isset($item['width']) ? (float) $item['width'] : null,
-                'height' => isset($item['height']) ? (float) $item['height'] : null,
-                'weight' => isset($item['weight']) ? (float) $item['weight'] : null,
+                'depth' => $this->dimensionValue($item['length'] ?? null),  // длина → depth
+                'width' => $this->dimensionValue($item['width'] ?? null),
+                'height' => $this->dimensionValue($item['height'] ?? null),
+                'weight' => $this->dimensionValue($item['weight'] ?? null),
             ], fn ($v) => $v !== null);
 
             if (! empty($item['dimensional_group'])) {
                 $uzum['dimensional_group'] = $item['dimensional_group'];
             }
 
-            $product->forceFill(['uzum_data' => $uzum])->saveQuietly();
-            $applied++;
+            if ($this->saveProduct($product->forceFill(['uzum_data' => $uzum]))) {
+                $applied++;
+            }
         }
 
         return $applied;
+    }
+
+    /** Габарит валиден, если это число в (0, MAX_DIMENSION_VALUE]; иначе не пишем. */
+    private function dimensionValue(mixed $value): ?float
+    {
+        if (! is_numeric($value)) {
+            return null;
+        }
+        $float = (float) $value;
+
+        return $float > 0 && $float <= self::MAX_DIMENSION_VALUE ? $float : null;
+    }
+
+    /**
+     * Карты товаров интеграции для матчинга без per-item запросов:
+     * sku_id → Product и product_id → Product (первый по id — как раньше first()).
+     *
+     * @return array{0:array<int,Product>,1:array<string,Product>}
+     */
+    private function loadProductMaps(int $integrationId): array
+    {
+        $bySkuId = [];
+        $byProductId = [];
+
+        foreach (Product::query()->where('integration_id', $integrationId)->orderBy('id')->get() as $product) {
+            $uzum = is_array($product->uzum_data) ? $product->uzum_data : [];
+            if (isset($uzum['sku_id']) && ! isset($bySkuId[(int) $uzum['sku_id']])) {
+                $bySkuId[(int) $uzum['sku_id']] = $product;
+            }
+            if (isset($uzum['product_id']) && ! isset($byProductId[(string) $uzum['product_id']])) {
+                $byProductId[(string) $uzum['product_id']] = $product;
+            }
+        }
+
+        return [$bySkuId, $byProductId];
+    }
+
+    /** Сохранение без событий, но С логом: saveQuietly глотал ошибки БД молча. */
+    private function saveProduct(Product $product): bool
+    {
+        try {
+            $product->saveQuietly();
+
+            return true;
+        } catch (\Throwable $e) {
+            $this->saveErrors[] = "product {$product->sku}: {$e->getMessage()}";
+            Log::warning('uzum extension: не удалось сохранить товар', [
+                'product_sku' => $product->sku,
+                'integration_id' => $product->integration_id,
+                'error' => $e->getMessage(),
+            ]);
+
+            return false;
+        }
     }
 
     /**
@@ -206,39 +285,63 @@ class UzumExtensionController extends Controller
     {
         $applied = 0;
 
+        // Один SELECT на весь батч: product_id → все per-SKU строки, sku_id → строка,
+        // sku → строка (для firstOrCreate).
+        $byProductId = [];
+        $bySkuId = [];
+        $bySku = [];
+        $query = Product::query()
+            ->where('integration_id', $integrationId)
+            ->where('marketplace', 'uzum')
+            ->orderBy('id');
+        foreach ($query->get() as $product) {
+            $uzum = is_array($product->uzum_data) ? $product->uzum_data : [];
+            if (isset($uzum['product_id'])) {
+                $byProductId[(string) $uzum['product_id']][] = $product;
+            }
+            if (isset($uzum['sku_id']) && ! isset($bySkuId[(int) $uzum['sku_id']])) {
+                $bySkuId[(int) $uzum['sku_id']] = $product;
+            }
+            $bySku[(string) $product->sku] = $product;
+        }
+
         foreach ($items as $item) {
             if (! is_array($item) || empty($item['productId']) || empty($item['title'])) {
                 continue;
             }
 
             $productId = (string) $item['productId'];
-            $query = Product::query()
-                ->where('integration_id', $integrationId)
-                ->where('marketplace', 'uzum')
-                ->whereJsonContains('uzum_data->product_id', is_numeric($productId) ? (int) $productId : $productId);
-
-            $existing = $query->get();
+            // Per-SKU (extractor 0.2.0): если item несёт skuId и есть точная строка — обновляем её,
+            // а не все строки товара.
+            $skuId = isset($item['skuId']) && is_numeric($item['skuId']) ? (int) $item['skuId'] : null;
+            $existing = $skuId !== null && isset($bySkuId[$skuId])
+                ? collect([$bySkuId[$skuId]])
+                : collect($byProductId[$productId] ?? []);
             if ($existing->isEmpty()) {
-                $existing = collect([
-                    Product::firstOrCreate(
-                        [
-                            'integration_id' => $integrationId,
-                            'marketplace' => 'uzum',
-                            'sku' => 'uzum-product-'.$productId,
-                        ],
-                        [
-                            'name' => (string) $item['title'],
-                            'marketplace_id' => $productId,
-                            'price' => isset($item['price']) ? (float) $item['price'] : null,
-                            'old_price' => isset($item['oldPrice']) ? (float) $item['oldPrice'] : null,
-                            'stock' => isset($item['stock']) ? (int) $item['stock'] : 0,
-                            'category' => $item['category'] ?? null,
-                            'uzum_data' => [],
-                        ]
-                    ),
-                ]);
+                $sku = 'uzum-product-'.$productId;
+                $product = $bySku[$sku] ?? Product::firstOrCreate(
+                    [
+                        'integration_id' => $integrationId,
+                        'marketplace' => 'uzum',
+                        'sku' => $sku,
+                    ],
+                    [
+                        'name' => (string) $item['title'],
+                        'marketplace_id' => $productId,
+                        'price' => isset($item['price']) ? (float) $item['price'] : null,
+                        'old_price' => isset($item['oldPrice']) ? (float) $item['oldPrice'] : null,
+                        'stock' => isset($item['stock']) ? (int) $item['stock'] : 0,
+                        'category' => $item['category'] ?? null,
+                        'uzum_data' => [],
+                    ]
+                );
+                $bySku[$sku] = $product;
+                $existing = collect([$product]);
             }
 
+            // Item засчитываем один раз, сколько бы строк он ни обновил: иначе per-SKU
+            // items одного товара накручивают accepted выше items_count (rejected уходит в минус).
+            $savedAny = false;
             foreach ($existing as $product) {
                 $uzum = is_array($product->uzum_data) ? $product->uzum_data : [];
                 $uzum['shop_id'] = $shopId ?? ($uzum['shop_id'] ?? null);
@@ -262,7 +365,11 @@ class UzumExtensionController extends Controller
                     $update['vendor_code'] = (string) $item['sku'];
                 }
 
-                $product->forceFill($update)->saveQuietly();
+                if ($this->saveProduct($product->forceFill($update))) {
+                    $savedAny = true;
+                }
+            }
+            if ($savedAny) {
                 $applied++;
             }
         }
@@ -314,6 +421,22 @@ class UzumExtensionController extends Controller
             $built = $this->buildCommandPath($integration, $data);
         } catch (\InvalidArgumentException $e) {
             return response()->json(['success' => false, 'message' => $e->getMessage()], 422);
+        }
+
+        // Потолок живой очереди: без него можно бесконечно копить pending-команды (DoS).
+        $pending = UzumExtensionCommand::query()
+            ->where('integration_id', $integration->id)
+            ->where('status', 'pending')
+            ->where(function ($query) {
+                $query->whereNull('expires_at')->orWhere('expires_at', '>', now());
+            })
+            ->count();
+        if ($pending >= self::MAX_PENDING_COMMANDS) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Очередь команд переполнена — дождитесь выполнения',
+                'limit' => self::MAX_PENDING_COMMANDS,
+            ], 429);
         }
 
         $command = UzumExtensionCommand::create([

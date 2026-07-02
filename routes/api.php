@@ -85,6 +85,13 @@ Route::get('integrations/uzum/extension/status', [UzumExtensionController::class
     ->middleware('sellico.permission')
     ->name('integrations.uzum.extension.status');
 
+// Version-handshake расширения: публичный (проверка версии нужна ДО авторизации),
+// отдаёт только конфиг-константы — утечки нет.
+Route::get('extension/version', fn () => response()->json([
+    'min_version' => (string) config('services.uzum.extension_min_version', ''),
+    'latest_version' => (string) config('services.uzum.extension_latest_version', ''),
+]))->middleware('throttle:60,1')->name('extension.version');
+
 // Мост: командный канал «Sellico тянет любой эндпоинт кабинета Uzum».
 Route::get('integrations/{id}/uzum/extension/commands', [UzumExtensionController::class, 'commands'])
     ->middleware(['throttle:60,1', 'sellico.permission', 'integration.access'])

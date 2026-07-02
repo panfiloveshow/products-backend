@@ -493,6 +493,9 @@ class IntegrationController extends Controller
         $credentials = $resolved['credentials'];
         $check = $performanceApi->checkCredentials(is_array($credentials) ? $credentials : []);
 
+        // Всегда 200: «Performance не подключён» — штатное состояние, а не ошибка запроса.
+        // Реклама лишь дообогащает юнит-экономику; фронт читает success/has_* из тела
+        // и сам решает, запрашивать ли отчёт. 422 здесь давал красный шум в консоли.
         return response()->json([
             'success' => (bool) ($check['success'] ?? false),
             'data' => [
@@ -504,7 +507,7 @@ class IntegrationController extends Controller
                 'has_performance_client_secret' => (bool) ($credentials['performance_client_secret'] ?? false),
                 'performance_api' => $check,
             ],
-        ], ($check['success'] ?? false) ? 200 : 422);
+        ]);
     }
 
     public function performanceSummary(
