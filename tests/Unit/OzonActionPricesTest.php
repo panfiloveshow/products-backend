@@ -23,7 +23,7 @@ class OzonActionPricesTest extends TestCase
         return new ProductsApi($client);
     }
 
-    public function test_get_action_prices_collects_participating_actions_and_hotsales(): void
+    public function test_get_action_prices_collects_participating_actions(): void
     {
         $api = $this->makeApi([
             'get' => [
@@ -40,23 +40,12 @@ class OzonActionPricesTest extends TestCase
                     ],
                     'total' => 2,
                 ]],
-                '/v1/actions/hotsales/list' => ['result' => [
-                    ['hotsale_id' => 5, 'is_participating' => true],
-                ]],
-                '/v1/actions/hotsales/products' => ['result' => [
-                    'products' => [
-                        ['id' => 111, 'action_price' => 199.0, 'is_active' => true],
-                        ['id' => 333, 'action_price' => 50.0, 'is_active' => false], // неактивный — пропускаем
-                    ],
-                    'total' => 2,
-                ]],
             ],
         ]);
 
         $prices = $api->getActionPrices();
 
-        // Для 111 берётся минимальная цена из обычной акции и Hot Sale
-        $this->assertSame([111 => 199.0, 222 => 90.0], $prices);
+        $this->assertSame([111 => 250.0, 222 => 90.0], $prices);
     }
 
     public function test_get_prices_uses_action_price_as_actual_price(): void
@@ -72,7 +61,6 @@ class OzonActionPricesTest extends TestCase
                     'products' => [['id' => 111, 'action_price' => 300.0]],
                     'total' => 1,
                 ]],
-                '/v1/actions/hotsales/list' => ['result' => []],
                 '/v5/product/info/prices' => [
                     'items' => [[
                         'offer_id' => '3-02/3516',
@@ -98,7 +86,6 @@ class OzonActionPricesTest extends TestCase
         $api = $this->makeApi([
             'get' => ['/v1/actions' => ['result' => []]],
             'post' => [
-                '/v1/actions/hotsales/list' => ['result' => []],
                 '/v5/product/info/prices' => [
                     'items' => [[
                         'offer_id' => 'SKU-1',

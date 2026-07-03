@@ -342,7 +342,8 @@ class ProductsApi implements ProductsApiInterface
     /**
      * Акционные цены товаров из API акций.
      * GET /v1/actions — доступные акции; POST /v1/actions/products — товары,
-     * уже участвующие в акции; POST /v1/actions/hotsales/* — Hot Sale.
+     * уже участвующие в акции. Hot Sale эндпоинты (/v1/actions/hotsales/*)
+     * Ozon удалил — возвращают 404, их не запрашиваем.
      *
      * @return array<int, float> product_id => минимальная акционная цена
      */
@@ -364,23 +365,6 @@ class ProductsApi implements ProductsApiInterface
 
                 $this->collectActionProducts($prices, '/v1/actions/products', ['action_id' => $actionId]);
             }
-
-            $hotsales = ($this->client->post('/v1/actions/hotsales/list', []) ?? [])['result'] ?? [];
-
-            foreach ($hotsales as $hotsale) {
-                $hotsaleId = $hotsale['hotsale_id'] ?? null;
-
-                if (! $hotsaleId || empty($hotsale['is_participating'])) {
-                    continue;
-                }
-
-                $this->collectActionProducts(
-                    $prices,
-                    '/v1/actions/hotsales/products',
-                    ['hotsale_id' => $hotsaleId],
-                    onlyActive: true
-                );
-            }
         } catch (\Throwable $e) {
             \Illuminate\Support\Facades\Log::warning('Ozon getActionPrices failed', [
                 'error' => $e->getMessage(),
@@ -393,7 +377,7 @@ class ProductsApi implements ProductsApiInterface
     /**
      * @param  array<int, float>  $prices  аккумулятор product_id => цена
      */
-    private function collectActionProducts(array &$prices, string $endpoint, array $params, bool $onlyActive = false): void
+    private function collectActionProducts(array &$prices, string $endpoint, array $params): void
     {
         $offset = 0;
 
@@ -406,10 +390,6 @@ class ProductsApi implements ProductsApiInterface
             $products = $response['result']['products'] ?? [];
 
             foreach ($products as $product) {
-                if ($onlyActive && empty($product['is_active'])) {
-                    continue;
-                }
-
                 $productId = (int) ($product['id'] ?? 0);
                 $actionPrice = (float) ($product['action_price'] ?? 0);
 
