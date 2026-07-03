@@ -262,6 +262,11 @@ class ProductsApi implements ProductsApiInterface
         $allPrices = [];
         $cursor = '';
 
+        // С 12.11.2025 Ozon отключил marketing_price, и участие в акции больше
+        // не отражается в /v5/product/info/prices — акционные цены доступны
+        // только через API акций (/v1/actions*). product_id => акционная цена.
+        $actionPrices = $this->getActionPrices();
+
         do {
             $response = $this->client->post('/v5/product/info/prices', [
                 'filter' => [
@@ -293,16 +298,19 @@ class ProductsApi implements ProductsApiInterface
                 $marketingSellerPrice = (float) ($priceData['marketing_seller_price'] ?? 0);
                 $priceIndexes = $this->normalizePriceIndexes($item['price_indexes'] ?? []);
                 
-                // Актуальная цена = marketing_seller_price если есть акция, иначе price
-                // marketing_seller_price — это цена с учётом всех скидок и акций
-                $actualPrice = ($marketingSellerPrice > 0 && $marketingSellerPrice < $price) 
-                    ? $marketingSellerPrice 
-                    : $price;
-                
+                // Актуальная цена: минимум из marketing_seller_price (легаси, Ozon
+                // перестал заполнять) и акционной цены из API акций.
+                $actionPrice = (float) ($actionPrices[(int) ($item['product_id'] ?? 0)] ?? 0);
+                $promoCandidates = array_filter(
+                    [$marketingSellerPrice, $actionPrice],
+                    fn (float $p): bool => $p > 0 && $p < $price
+                );
+                $actualPrice = $promoCandidates !== [] ? min($promoCandidates) : $price;
+
                 // Определяем, участвует ли товар в акции
-                $isInPromotion = $marketingSellerPrice > 0 && $marketingSellerPrice < $price;
-                $promotionDiscount = $isInPromotion 
-                    ? round((1 - $marketingSellerPrice / $price) * 100, 1) 
+                $isInPromotion = $actualPrice < $price;
+                $promotionDiscount = $isInPromotion && $price > 0
+                    ? round((1 - $actualPrice / $price) * 100, 1)
                     : 0;
                 
                 $allPrices[$sku] = [
@@ -329,6 +337,92 @@ class ProductsApi implements ProductsApiInterface
         } while (!empty($items) && !empty($cursor));
 
         return $allPrices;
+    }
+
+    /**
+     * Акционные цены товаров из API акций.
+     * GET /v1/actions — доступные акции; POST /v1/actions/products — товары,
+     * уже участвующие в акции; POST /v1/actions/hotsales/* — Hot Sale.
+     *
+     * @return array<int, float> product_id => минимальная акционная цена
+     */
+    public function getActionPrices(): array
+    {
+        $prices = [];
+
+        try {
+            $actions = ($this->client->get('/v1/actions') ?? [])['result'] ?? [];
+
+            foreach ($actions as $action) {
+                $actionId = $action['id'] ?? null;
+                $participating = (int) ($action['participating_products_count'] ?? 0) > 0
+                    || ! empty($action['is_participating']);
+
+                if (! $actionId || ! $participating) {
+                    continue;
+                }
+
+                $this->collectActionProducts($prices, '/v1/actions/products', ['action_id' => $actionId]);
+            }
+
+            $hotsales = ($this->client->post('/v1/actions/hotsales/list', []) ?? [])['result'] ?? [];
+
+            foreach ($hotsales as $hotsale) {
+                $hotsaleId = $hotsale['hotsale_id'] ?? null;
+
+                if (! $hotsaleId || empty($hotsale['is_participating'])) {
+                    continue;
+                }
+
+                $this->collectActionProducts(
+                    $prices,
+                    '/v1/actions/hotsales/products',
+                    ['hotsale_id' => $hotsaleId],
+                    onlyActive: true
+                );
+            }
+        } catch (\Throwable $e) {
+            \Illuminate\Support\Facades\Log::warning('Ozon getActionPrices failed', [
+                'error' => $e->getMessage(),
+            ]);
+        }
+
+        return $prices;
+    }
+
+    /**
+     * @param  array<int, float>  $prices  аккумулятор product_id => цена
+     */
+    private function collectActionProducts(array &$prices, string $endpoint, array $params, bool $onlyActive = false): void
+    {
+        $offset = 0;
+
+        do {
+            $response = $this->client->post($endpoint, $params + [
+                'limit' => 100,
+                'offset' => $offset,
+            ]) ?? [];
+
+            $products = $response['result']['products'] ?? [];
+
+            foreach ($products as $product) {
+                if ($onlyActive && empty($product['is_active'])) {
+                    continue;
+                }
+
+                $productId = (int) ($product['id'] ?? 0);
+                $actionPrice = (float) ($product['action_price'] ?? 0);
+
+                if ($productId && $actionPrice > 0) {
+                    $prices[$productId] = isset($prices[$productId])
+                        ? min($prices[$productId], $actionPrice)
+                        : $actionPrice;
+                }
+            }
+
+            $offset += count($products);
+            $total = (int) ($response['result']['total'] ?? 0);
+        } while (count($products) === 100 && $offset < $total);
     }
 
     private function normalizePriceIndexes(mixed $priceIndexes): array

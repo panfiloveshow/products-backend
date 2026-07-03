@@ -89,6 +89,7 @@ class CostPriceController extends Controller
             'items.*.sku' => 'required|string',
             'items.*.cost_price' => 'required|numeric|min:0',
             'integration_id' => 'nullable|integer',
+            'marketplace_id' => 'nullable|integer',
         ]);
 
         $items = collect($request->input('items'))
@@ -97,7 +98,8 @@ class CostPriceController extends Controller
 
                 return $sku === '' ? [] : [$sku => (float) $item['cost_price']];
             });
-        $integrationId = $request->integer('integration_id') ?: null;
+        // Фронт исторически шлёт marketplace_id (это id интеграции) — принимаем оба.
+        $integrationId = $request->integer('integration_id') ?: $request->integer('marketplace_id') ?: null;
 
         $updated = 0;
         $notFound = [];

@@ -1,0 +1,118 @@
+<?php
+
+namespace Tests\Unit;
+
+use App\Domains\Ozon\Api\OzonClient;
+use App\Domains\Ozon\Api\ProductsApi;
+use Mockery;
+use Tests\TestCase;
+
+class OzonActionPricesTest extends TestCase
+{
+    private function makeApi(array $clientReturns): ProductsApi
+    {
+        $client = Mockery::mock(OzonClient::class);
+
+        $client->shouldReceive('get')->andReturnUsing(
+            fn (string $endpoint, array $params = []) => $clientReturns['get'][$endpoint] ?? null
+        );
+        $client->shouldReceive('post')->andReturnUsing(
+            fn (string $endpoint, array $data = []) => $clientReturns['post'][$endpoint] ?? null
+        );
+
+        return new ProductsApi($client);
+    }
+
+    public function test_get_action_prices_collects_participating_actions_and_hotsales(): void
+    {
+        $api = $this->makeApi([
+            'get' => [
+                '/v1/actions' => ['result' => [
+                    ['id' => 10, 'participating_products_count' => 2],
+                    ['id' => 20, 'participating_products_count' => 0], // не участвует — пропускаем
+                ]],
+            ],
+            'post' => [
+                '/v1/actions/products' => ['result' => [
+                    'products' => [
+                        ['id' => 111, 'action_price' => 250.0],
+                        ['id' => 222, 'action_price' => 90.0],
+                    ],
+                    'total' => 2,
+                ]],
+                '/v1/actions/hotsales/list' => ['result' => [
+                    ['hotsale_id' => 5, 'is_participating' => true],
+                ]],
+                '/v1/actions/hotsales/products' => ['result' => [
+                    'products' => [
+                        ['id' => 111, 'action_price' => 199.0, 'is_active' => true],
+                        ['id' => 333, 'action_price' => 50.0, 'is_active' => false], // неактивный — пропускаем
+                    ],
+                    'total' => 2,
+                ]],
+            ],
+        ]);
+
+        $prices = $api->getActionPrices();
+
+        // Для 111 берётся минимальная цена из обычной акции и Hot Sale
+        $this->assertSame([111 => 199.0, 222 => 90.0], $prices);
+    }
+
+    public function test_get_prices_uses_action_price_as_actual_price(): void
+    {
+        $api = $this->makeApi([
+            'get' => [
+                '/v1/actions' => ['result' => [
+                    ['id' => 10, 'participating_products_count' => 1],
+                ]],
+            ],
+            'post' => [
+                '/v1/actions/products' => ['result' => [
+                    'products' => [['id' => 111, 'action_price' => 300.0]],
+                    'total' => 1,
+                ]],
+                '/v1/actions/hotsales/list' => ['result' => []],
+                '/v5/product/info/prices' => [
+                    'items' => [[
+                        'offer_id' => '3-02/3516',
+                        'product_id' => 111,
+                        // marketing_seller_price Ozon больше не заполняет
+                        'price' => ['price' => 600.0, 'old_price' => 900.0, 'marketing_seller_price' => 0],
+                    ]],
+                    'cursor' => '',
+                ],
+            ],
+        ]);
+
+        $prices = $api->getPrices();
+
+        $this->assertSame(300.0, $prices['3-02/3516']['actual_price']);
+        $this->assertTrue($prices['3-02/3516']['is_in_promotion']);
+        $this->assertSame(50.0, $prices['3-02/3516']['promotion_discount']);
+        $this->assertSame(600.0, $prices['3-02/3516']['price']);
+    }
+
+    public function test_get_prices_falls_back_to_base_price_without_actions(): void
+    {
+        $api = $this->makeApi([
+            'get' => ['/v1/actions' => ['result' => []]],
+            'post' => [
+                '/v1/actions/hotsales/list' => ['result' => []],
+                '/v5/product/info/prices' => [
+                    'items' => [[
+                        'offer_id' => 'SKU-1',
+                        'product_id' => 999,
+                        'price' => ['price' => 500.0, 'marketing_seller_price' => 0],
+                    ]],
+                    'cursor' => '',
+                ],
+            ],
+        ]);
+
+        $prices = $api->getPrices();
+
+        $this->assertSame(500.0, $prices['SKU-1']['actual_price']);
+        $this->assertFalse($prices['SKU-1']['is_in_promotion']);
+    }
+}

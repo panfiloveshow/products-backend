@@ -115,4 +115,39 @@ class CostPriceControllerTest extends TestCase
         ]);
         $this->assertSame(321.55, (float) UnitEconomicsCache::where('product_id', $product->id)->value('cost_price'));
     }
+
+    public function test_bulk_accepts_marketplace_id_as_integration_alias(): void
+    {
+        $integration = Integration::factory()->wildberries()->create(['id' => 61003]);
+        $other = Integration::factory()->wildberries()->create(['id' => 61004]);
+        $product = Product::factory()->wildberries()->create([
+            'integration_id' => $integration->id,
+            'sku' => 'ALIAS-1',
+            'vendor_code' => 'ALIAS-1',
+            'cost_price' => 0,
+        ]);
+
+        $controller = new CostPriceController(new CostPriceParserService());
+        $response = $controller->bulk(Request::create('/api/products/cost-price/bulk', 'POST', [
+            'marketplace_id' => $integration->id,
+            'items' => [
+                ['sku' => 'ALIAS-1', 'cost_price' => 111.11],
+            ],
+        ]));
+
+        $this->assertTrue($response->getData(true)['success']);
+        $this->assertSame(1, $response->getData(true)['data']['updated']);
+        $this->assertSame(111.11, (float) $product->refresh()->cost_price);
+
+        // marketplace_id должен работать как фильтр интеграции: в чужом магазине товар не ищем
+        $foreignResponse = $controller->bulk(Request::create('/api/products/cost-price/bulk', 'POST', [
+            'marketplace_id' => $other->id,
+            'items' => [
+                ['sku' => 'ALIAS-1', 'cost_price' => 222.22],
+            ],
+        ]));
+
+        $this->assertSame(['ALIAS-1'], $foreignResponse->getData(true)['data']['not_found']);
+        $this->assertSame(111.11, (float) $product->refresh()->cost_price);
+    }
 }
