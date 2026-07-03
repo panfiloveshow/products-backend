@@ -881,14 +881,10 @@ class UnitEconomicsCacheController extends Controller
         string $marketplace,
         string $fulfillmentType
     ): Spreadsheet {
-        // Финансовые поля считаем по той же формуле, что фронт
-        // (UnitEconomicsPage.tsx mapOzonItemsToRows): амуны процентов = % × price,
-        // toSettlement = price - все_аммы - effectiveLogistics, profit = toSettlement - costPrice.
-        // Иначе Excel показывает cache.net_profit (со своими корректировками типа
-        // marketplace_compensation), а UI — локально пересчитанное значение,
-        // и менеджеры видят разные цифры по одному и тому же SKU.
-        $items = $this->recalculateFinanceFieldsForExport($items, $marketplace);
-
+        // Финансовые поля (net_profit / to_settlement_account / margin / *_amount) уже
+        // посчитаны единым источником истины в enrichCacheItem::applyCanonicalProfitBreakdown —
+        // теми же числами, что видит менеджер в карточке. Локального пересчёта здесь больше
+        // нет, поэтому Excel и UI по определению совпадают.
         $spreadsheet = new Spreadsheet();
         $sheet = $spreadsheet->getActiveSheet();
         $sheet->setTitle('Юнит-экономика');
@@ -1477,74 +1473,6 @@ class UnitEconomicsCacheController extends Controller
         $sheet = $spreadsheet->getSheet(0);
         $sheet->setCellValue(self::EXPORT_TEMPLATE_MARKER_CELL, self::EXPORT_TEMPLATE_VERSION);
         $sheet->getColumnDimension('AZ')->setVisible(false);
-    }
-
-    /**
-     * Пересчёт финансовых полей под фронт-формулы.
-     *
-     * Ozon считает проценты как % × price и вычитает effective_logistics один раз.
-     * WB дополнительно вычитает СПП и хранение, как WBProductsTable при ручной правке.
-     *
-     * @param  array<int, array<string, mixed>>  $items
-     * @return array<int, array<string, mixed>>
-     */
-    private function recalculateFinanceFieldsForExport(array $items, string $marketplace): array
-    {
-        $isWildberriesExport = $marketplace === 'wildberries';
-
-        foreach ($items as &$item) {
-            $price = (float) ($item['price'] ?? 0);
-            $costPrice = (float) ($item['cost_price'] ?? 0);
-            $commissionPercent = (float) ($item['commission_percent'] ?? 0);
-            $acquiringPercent = (float) ($item['acquiring_percent'] ?? 0);
-            $taxPercent = (float) ($item['tax_percent'] ?? 0);
-            $vatPercent = (float) ($item['vat_percent'] ?? 0);
-            $drrPercent = (float) ($item['drr_percent'] ?? 0);
-            $ourSharePercent = (float) ($item['our_share_percent'] ?? 0);
-            $effectiveLogistics = (float) ($item['effective_logistics'] ?? 0);
-            $storageCost = $isWildberriesExport ? (float) ($item['storage_cost'] ?? 0) : 0.0;
-            $sppPercent = (float) ($item['spp_percent'] ?? 0);
-
-            $commissionAmount = $price * $commissionPercent / 100;
-            $acquiringAmount = $price * $acquiringPercent / 100;
-            $taxAmount = $price * $taxPercent / 100;
-            $vatAmount = $isWildberriesExport ? 0.0 : $price * $vatPercent / 100;
-            $drrAmount = $price * $drrPercent / 100;
-            $ourShareAmount = $isWildberriesExport ? 0.0 : $price * $ourSharePercent / 100;
-            // СПП на WB финансирует маркетплейс — он информационный и НЕ входит в прибыль.
-            // СПП ₽ = действующая цена − цена покупателя (СПП считается от действующей цены).
-            $sppAmountDisplay = $isWildberriesExport
-                ? (float) ($item['spp_amount']
-                    ?? max(0.0, $price - (float) ($item['customer_price'] ?? $price)))
-                : 0.0;
-
-            // «На РС» = деньги, которые перечисляет маркетплейс: цена − удержания Ozon
-            // (комиссия/эфф. логистика/эквайринг/хранение) − реклама (ДРР).
-            // Налог, НДС и «наша часть» — выплаты продавца, в «На РС» не входят.
-            $toSettlement = $price - $commissionAmount - $effectiveLogistics
-                - $acquiringAmount - $drrAmount - $storageCost;
-            // Прибыль = На РС − себестоимость − налог − НДС − наша часть.
-            $netProfit = $toSettlement - $costPrice - $taxAmount - $vatAmount - $ourShareAmount;
-            $totalCosts = $costPrice + $commissionAmount + $effectiveLogistics
-                + $acquiringAmount + $taxAmount + $vatAmount
-                + $ourShareAmount + $drrAmount + $storageCost;
-
-            $item['commission_amount'] = round($commissionAmount, 2);
-            $item['acquiring_amount'] = round($acquiringAmount, 2);
-            $item['tax_amount'] = round($taxAmount, 2);
-            $item['vat_amount'] = round($vatAmount, 2);
-            $item['drr_amount'] = round($drrAmount, 2);
-            $item['our_share_amount'] = round($ourShareAmount, 2);
-            $item['spp_amount'] = round($sppAmountDisplay, 2);
-            $item['total_costs'] = round($totalCosts, 2);
-            $item['to_settlement_account'] = round($toSettlement, 2);
-            $item['net_profit'] = round($netProfit, 2);
-            $item['margin_percent'] = $price > 0 ? round(($netProfit / $price) * 100, 2) : 0.0;
-            $item['roi_percent'] = $costPrice > 0 ? round(($netProfit / $costPrice) * 100, 2) : 0.0;
-        }
-        unset($item);
-
-        return $items;
     }
 
     /**
@@ -3083,9 +3011,19 @@ class UnitEconomicsCacheController extends Controller
         $data['tax_percent'] = (float) ($settings?->tax_percent ?? $cache->tax_percent ?? 0);
         $data['vat_percent'] = (float) ($settings?->vat_percent ?? $cache->vat_percent ?? 0);
 
-        // Суммы ручных процентов должны соответствовать актуальным settings сразу,
-        // даже если асинхронный пересчёт кэша ещё не успел обновить *_amount.
         $price = (float) $cache->price;
+
+        // Единый источник истины для прибыли Ozon/WB. «На РС», прибыль, маржа, ROI и суммы
+        // компонентов считаются здесь один раз (на единицу, % × цена) — ровно то, что
+        // показывает карточка «из чего состоит прибыль» и что уходит в Excel. Раньше фронт
+        // и экспорт пересчитывали это независимо и расходились (разные дефолты/округление/
+        // состав «На РС»). Теперь оба читают эти поля дословно.
+        if (in_array($cache->marketplace, ['ozon', 'wildberries'], true)) {
+            return $this->applyCanonicalProfitBreakdown($data, $cache->marketplace, $salesCount);
+        }
+
+        // Yandex/Uzum: суммы ручных процентов должны соответствовать актуальным settings
+        // сразу, даже если асинхронный пересчёт кэша ещё не успел обновить *_amount.
         $cachedDrrAmount = (float) ($cache->drr_amount ?? 0);
         $cachedOurShareAmount = (float) ($cache->our_share_amount ?? 0);
         $cachedTaxAmount = (float) ($cache->tax_amount ?? 0);
@@ -3122,6 +3060,90 @@ class UnitEconomicsCacheController extends Controller
                     (float) $data['to_settlement_account'] - ((float) $data['drr_amount'] - $cachedDrrAmount),
                     2
                 );
+            }
+        }
+
+        return $data;
+    }
+
+    /**
+     * Единый источник истины для юнит-экономики Ozon/WB (значения на единицу товара).
+     *
+     * И карточка «из чего состоит прибыль» на фронте, и Excel-экспорт читают эти поля
+     * дословно — никакого повторного пересчёта. Все компоненты = % × действующая цена;
+     * «На РС» = выплата маркетплейса (цена − комиссия − эфф.логистика − эквайринг −
+     * хранение − реклама), а налог/НДС/«наша часть» — расходы продавца, вычитаются уже
+     * в прибыли (в «На РС» не входят). storage учитывается только для WB.
+     */
+    private function applyCanonicalProfitBreakdown(array $data, string $marketplace, int $salesCount): array
+    {
+        $isWb = $marketplace === 'wildberries';
+        $salesCount = max(1, $salesCount);
+
+        $price = (float) ($data['price'] ?? 0);
+        $costPrice = (float) ($data['cost_price'] ?? 0);
+
+        $commissionAmount = round($price * (float) ($data['commission_percent'] ?? 0) / 100, 2);
+        $effectiveLogistics = round((float) ($data['effective_logistics'] ?? 0), 2);
+        // Эквайринг: как на фронте (item.acquiring_percent || DEFAULT), дефолт 1.5% при отсутствии.
+        $acquiringPercent = (float) ($data['acquiring_percent'] ?? 0);
+        if ($acquiringPercent <= 0) {
+            $acquiringPercent = 1.5;
+        }
+        $data['acquiring_percent'] = $acquiringPercent;
+        $acquiringAmount = round($price * $acquiringPercent / 100, 2);
+        $storageCost = $isWb ? round((float) ($data['storage_cost'] ?? 0), 2) : 0.0;
+        $drrAmount = round($price * (float) ($data['drr_percent'] ?? 0) / 100, 2);
+        $taxAmount = round($price * (float) ($data['tax_percent'] ?? 0) / 100, 2);
+        // НДС и «наша часть» — только Ozon; у WB их нет.
+        $vatAmount = $isWb ? 0.0 : round($price * (float) ($data['vat_percent'] ?? 0) / 100, 2);
+        $ourShareAmount = $isWb ? 0.0 : round($price * (float) ($data['our_share_percent'] ?? 0) / 100, 2);
+
+        $toSettlement = round(
+            $price - $commissionAmount - $effectiveLogistics - $acquiringAmount - $storageCost - $drrAmount,
+            2
+        );
+        $netProfit = round($toSettlement - $costPrice - $taxAmount - $vatAmount - $ourShareAmount, 2);
+        $totalCosts = round(
+            $costPrice + $commissionAmount + $effectiveLogistics + $acquiringAmount
+            + $storageCost + $drrAmount + $taxAmount + $vatAmount + $ourShareAmount,
+            2
+        );
+
+        $data['commission_amount'] = $commissionAmount;
+        $data['commission_per_unit'] = $commissionAmount;
+        $data['effective_logistics'] = $effectiveLogistics;
+        $data['acquiring_amount'] = $acquiringAmount;
+        $data['acquiring_per_unit'] = $acquiringAmount;
+        $data['storage_cost'] = $storageCost;
+        $data['storage_per_unit'] = $storageCost;
+        $data['drr_amount'] = $drrAmount;
+        $data['tax_amount'] = $taxAmount;
+        $data['vat_amount'] = $vatAmount;
+        $data['our_share_amount'] = $ourShareAmount;
+
+        $data['to_settlement_account'] = $toSettlement;
+        $data['net_profit'] = $netProfit;
+        $data['margin_percent'] = $price > 0 ? round($netProfit / $price * 100, 2) : 0.0;
+        $data['roi_percent'] = $costPrice > 0 ? round($netProfit / $costPrice * 100, 2) : 0.0;
+        $data['total_costs'] = $totalCosts;
+        // Все компоненты — на единицу, поэтому per_unit == сумма.
+        $data['total_costs_per_unit'] = $totalCosts;
+
+        // Диапазон прибыли (Ozon) — сдвигаем к каноничной прибыли, сохраняя ширину «вилки».
+        if (isset($data['profit_base'])) {
+            $delta = $netProfit - (float) $data['profit_base'];
+            if (isset($data['profit_min'])) {
+                $data['profit_min'] = round((float) $data['profit_min'] + $delta, 2);
+            }
+            if (isset($data['profit_max'])) {
+                $data['profit_max'] = round((float) $data['profit_max'] + $delta, 2);
+            }
+            $data['profit_base'] = $netProfit;
+            if (isset($data['marketplace_data']) && is_array($data['marketplace_data'])) {
+                $data['marketplace_data']['profit_min'] = $data['profit_min'] ?? $netProfit;
+                $data['marketplace_data']['profit_base'] = $netProfit;
+                $data['marketplace_data']['profit_max'] = $data['profit_max'] ?? $netProfit;
             }
         }
 

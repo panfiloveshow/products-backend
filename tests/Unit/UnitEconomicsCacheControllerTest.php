@@ -146,9 +146,12 @@ class UnitEconomicsCacheControllerTest extends TestCase
             'sales_count' => 1,
             'price' => 1000,
             'cost_price' => 300,
+            'commission_percent' => 10,
             'commission_amount' => 100,
+            'acquiring_percent' => 1.5,
             'acquiring_amount' => 15,
             'logistics_cost' => 50,
+            'effective_logistics' => 50,
             'storage_cost' => 0,
             'drr_percent' => 0,
             'drr_amount' => 0,
@@ -188,6 +191,9 @@ class UnitEconomicsCacheControllerTest extends TestCase
 
         $this->assertSame(22.0, $result['vat_percent']);
         $this->assertSame(220.0, $result['vat_amount']);
+        // Единый источник истины (applyCanonicalProfitBreakdown): «На РС» не включает НДС,
+        // он вычитается в прибыли. Числа совпадают с карточкой и Excel.
+        $this->assertSame(835.0, $result['to_settlement_account']);
         $this->assertSame(685.0, $result['total_costs']);
         $this->assertSame(315.0, $result['net_profit']);
     }
