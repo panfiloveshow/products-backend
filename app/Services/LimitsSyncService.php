@@ -262,10 +262,17 @@ class LimitsSyncService
 
     private function isMissingExternalLimit(array $result): bool
     {
+        // 404 на этом эндпоинте у Sellico бывает двух видов: "Limit not found." (лимит
+        // ещё не заведён) и "No query results for model [...WorkSpace] N" (сам workspace
+        // уже удалён у них, а локальная integration.work_space_id на него ещё ссылается).
+        // Оба случая для нас одинаково не ошибка синка. Матчим по конкретным строкам
+        // (не по любому 404), чтобы не замаскировать другие проблемы вроде сломанного
+        // роута на стороне Sellico.
         $error = mb_strtolower((string) ($result['error'] ?? ''));
 
         return str_contains($error, 'limit not found')
-            || str_contains($error, 'лимит не найден');
+            || str_contains($error, 'лимит не найден')
+            || str_contains($error, 'no query results for model');
     }
 
     /**

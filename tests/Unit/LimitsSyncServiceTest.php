@@ -46,6 +46,24 @@ class LimitsSyncServiceTest extends TestCase
         $this->assertTrue($result['missing_limit']);
     }
 
+    public function test_sync_treats_deleted_workspace_no_query_results_as_success_not_failure(): void
+    {
+        // Регрессия #2: у Sellico 404 на этот эндпоинт бывает и в другой формулировке —
+        // "No query results for model [...WorkSpace] N", когда сам workspace уже удалён
+        // (не просто лимит не заведён). Первый фикс матчил только "Limit not found" и
+        // не покрывал этот случай — крон продолжал падать на workspace 23.
+        $service = new LimitsSyncService($this->sellicoApi([], syncResponse: [
+            'success' => false,
+            'status' => 404,
+            'error' => 'No query results for model [App\\Models\\WorkSpace] 23',
+        ]));
+
+        $result = $service->syncWorkspaceProductsLimit(0);
+
+        $this->assertTrue($result['success']);
+        $this->assertTrue($result['missing_limit']);
+    }
+
     public function test_limit_check_failures_are_not_reported_as_exceeded(): void
     {
         $service = new LimitsSyncService($this->sellicoApi([]));
