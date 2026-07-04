@@ -23,6 +23,29 @@ class LimitsSyncServiceTest extends TestCase
         $this->assertTrue($result['missing_limit']);
     }
 
+    public function test_sync_treats_missing_external_limit_as_success_not_failure(): void
+    {
+        // Регрессия: limits:sync-products падал каждый прогон (exit 1) для workspace,
+        // уже удалённого на стороне Sellico — 404 "Limit not found" считался провалом
+        // синка, хотя для getWorkspaceLimit() этот же 404 давно трактуется как норма.
+        $service = new LimitsSyncService($this->sellicoApi([
+            'success' => false,
+            'status' => 404,
+            'error' => 'Limit not found.',
+        ], syncResponse: [
+            'success' => false,
+            'status' => 404,
+            'error' => 'Limit not found.',
+        ]));
+
+        // workspaceId <= 0 коротит countWorkspaceProducts() без обращения к БД —
+        // тесту важен только путь через syncWorkspaceLimit(), не подсчёт товаров.
+        $result = $service->syncWorkspaceProductsLimit(0);
+
+        $this->assertTrue($result['success']);
+        $this->assertTrue($result['missing_limit']);
+    }
+
     public function test_limit_check_failures_are_not_reported_as_exceeded(): void
     {
         $service = new LimitsSyncService($this->sellicoApi([]));
@@ -53,16 +76,21 @@ class LimitsSyncServiceTest extends TestCase
         $this->assertSame(5, $result['limit']['limit']);
     }
 
-    private function sellicoApi(array $response): SellicoApiService
+    private function sellicoApi(array $response, ?array $syncResponse = null): SellicoApiService
     {
-        return new class($response) extends SellicoApiService {
-            public function __construct(private array $response)
+        return new class($response, $syncResponse) extends SellicoApiService {
+            public function __construct(private array $response, private ?array $syncResponse = null)
             {
             }
 
             public function getWorkspaceLimitsExternal(int $workspaceId, ?string $type = null): array
             {
                 return $this->response;
+            }
+
+            public function syncWorkspaceLimitExternal(int $workspaceId, array $payload): array
+            {
+                return $this->syncResponse ?? $this->response;
             }
         };
     }

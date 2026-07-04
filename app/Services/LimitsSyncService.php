@@ -178,11 +178,20 @@ class LimitsSyncService
             'current_value' => $currentValue,
         ]);
 
+        // Как и в getWorkspaceLimit(): отсутствие лимита на стороне Sellico (workspace
+        // ещё не заведён/уже удалён у них) — не ошибка синка, а нормальное состояние.
+        // Раньше это не проверялось здесь, и крон limits:sync-products падал каждый
+        // прогон на локальных integrations с уже несуществующим у Sellico work_space_id.
+        if (! ($result['success'] ?? false) && $this->isMissingExternalLimit($result)) {
+            $result = array_merge($result, ['success' => true, 'missing_limit' => true]);
+        }
+
         if ($result['success'] ?? false) {
             Log::info('Workspace external limit synced', [
                 'workspace_id' => $workspaceId,
                 'type' => $type,
                 'current_value' => $currentValue,
+                'missing_limit' => $result['missing_limit'] ?? false,
             ]);
         } else {
             Log::warning('Workspace external limit sync failed', [
