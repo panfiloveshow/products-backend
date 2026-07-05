@@ -2,6 +2,11 @@
 
 return [
 
+    // Shared secret for the ads-intelligence repricer's unit-economics pull.
+    'repricer' => [
+        'token' => env('REPRICER_SERVICE_TOKEN', ''),
+    ],
+
     /*
     |--------------------------------------------------------------------------
     | Third Party Services

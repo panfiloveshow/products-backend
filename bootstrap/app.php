@@ -15,6 +15,7 @@ return Application::configure(basePath: dirname(__DIR__))
         $middleware->alias([
             'sellico.permission' => \App\Http\Middleware\CheckSellicoPermission::class,
             'integration.access' => \App\Http\Middleware\EnsureIntegrationAccess::class,
+            'repricer.service' => \App\Http\Middleware\CheckRepricerServiceToken::class,
         ]);
     })
     ->withExceptions(function (Exceptions $exceptions): void {

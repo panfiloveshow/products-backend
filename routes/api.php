@@ -138,6 +138,11 @@ Route::middleware('throttle:60,1')->group(function () {
 | Products Module
 |--------------------------------------------------------------------------
 */
+// Backend-to-backend: repricer pulls unit-economics cost by nmID. Guarded by a
+// shared service secret, NOT the per-user sellico.permission flow.
+Route::get('products/unit-economics/export', [CostPriceController::class, 'unitEconomicsExport'])
+    ->middleware('repricer.service')->name('products.unit-economics.export');
+
 Route::prefix('products')->middleware('sellico.permission')->group(function () {
     Route::get('/', [ProductController::class, 'index'])->name('products.index');
     Route::get('/sync/status', [ProductController::class, 'syncStatus'])->name('products.syncStatus');
@@ -155,7 +160,6 @@ Route::prefix('products')->middleware('sellico.permission')->group(function () {
     Route::get('/export/{exportId}/download', [ProductController::class, 'downloadExport'])
         ->name('products.export.download');
     Route::get('/cost-price', [CostPriceController::class, 'index'])->name('products.cost-price.index');
-    Route::get('/unit-economics/export', [CostPriceController::class, 'unitEconomicsExport'])->name('products.unit-economics.export');
     Route::post('/cost-price/upload', [CostPriceController::class, 'upload'])->name('products.cost-price.upload');
     Route::post('/cost-price/bulk', [CostPriceController::class, 'bulk'])->name('products.cost-price.bulk');
     Route::get('/cost-price/template', [CostPriceController::class, 'template'])->name('products.cost-price.template');
