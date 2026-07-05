@@ -155,6 +155,7 @@ Route::prefix('products')->middleware('sellico.permission')->group(function () {
     Route::get('/export/{exportId}/download', [ProductController::class, 'downloadExport'])
         ->name('products.export.download');
     Route::get('/cost-price', [CostPriceController::class, 'index'])->name('products.cost-price.index');
+    Route::get('/unit-economics/export', [CostPriceController::class, 'unitEconomicsExport'])->name('products.unit-economics.export');
     Route::post('/cost-price/upload', [CostPriceController::class, 'upload'])->name('products.cost-price.upload');
     Route::post('/cost-price/bulk', [CostPriceController::class, 'bulk'])->name('products.cost-price.bulk');
     Route::get('/cost-price/template', [CostPriceController::class, 'template'])->name('products.cost-price.template');

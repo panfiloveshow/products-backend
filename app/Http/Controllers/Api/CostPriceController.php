@@ -79,6 +79,58 @@ class CostPriceController extends Controller
     }
 
     /**
+     * Экспорт юнит-экономики по nmID для внешних сервисов (репрайсер).
+     * Джойнит себестоимость (unit_economics_settings по sku=баркод) с товаром WB,
+     * чтобы отдать себестоимость + комиссию + налог с ключом nmID, а не баркодом.
+     * GET /api/products/unit-economics/export?integration_id=X
+     */
+    public function unitEconomicsExport(Request $request): JsonResponse
+    {
+        $integrationId = $request->query('integration_id');
+        if (!$integrationId) {
+            return response()->json(['items' => []]);
+        }
+
+        $rows = Product::query()
+            ->where('products.integration_id', $integrationId)
+            ->where('products.marketplace', 'wildberries')
+            ->join('unit_economics_settings as ue', function ($j) {
+                $j->on('ue.integration_id', '=', 'products.integration_id')
+                    ->on('ue.sku', '=', 'products.sku');
+            })
+            ->where('ue.cost_price', '>', 0)
+            ->get([
+                'products.marketplace_id',
+                'products.wb_data',
+                'products.commission',
+                'ue.cost_price',
+                'ue.tax_percent',
+            ]);
+
+        $items = [];
+        foreach ($rows as $row) {
+            $wbData = is_array($row->wb_data) ? $row->wb_data : (json_decode((string) $row->wb_data, true) ?: []);
+            // nmID: из карточки, иначе префикс marketplace_id ("nmID:barcode").
+            $nmId = $wbData['nmID'] ?? $wbData['nmId'] ?? null;
+            if (!$nmId && $row->marketplace_id) {
+                $nmId = strtok((string) $row->marketplace_id, ':');
+            }
+            $nmId = (int) $nmId;
+            if ($nmId <= 0) {
+                continue;
+            }
+            $items[$nmId] = [
+                'nm_id' => $nmId,
+                'cost_price' => (float) $row->cost_price,
+                'commission_percent' => $row->commission !== null ? (float) $row->commission : null,
+                'tax_percent' => $row->tax_percent !== null ? (float) $row->tax_percent : null,
+            ];
+        }
+
+        return response()->json(['items' => array_values($items)]);
+    }
+
+    /**
      * Массовое обновление себестоимости по SKU
      * POST /api/products/cost-price/bulk
      */
