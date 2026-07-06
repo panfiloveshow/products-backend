@@ -200,7 +200,12 @@ class UnitEconomicsSanityCheck extends Command
                 ->selectRaw("integration_id,
                     count(*) as total,
                     count(*) filter (where (marketplace_data->>'current_price_index') is null) as null_idx,
-                    count(*) filter (where commission_percent in (15, 20, 21)) as default_comm")
+                    count(*) filter (where commission_percent in (15, 20, 21)) as default_comm,
+                    count(*) filter (
+                        where (marketplace_data->>'marketing_seller_price') ~ '^[0-9.]+$'
+                          and (marketplace_data->>'marketing_seller_price')::numeric > 0
+                          and price < (marketplace_data->>'marketing_seller_price')::numeric
+                    ) as underpriced")
                 ->groupBy('integration_id')
                 ->havingRaw('count(*) >= 20')
                 ->get();
@@ -213,6 +218,18 @@ class UnitEconomicsSanityCheck extends Command
                         'type' => 'ozon_enrichment',
                         'integration_id' => $g->integration_id,
                         'detail' => "индекс NULL {$nullPct}% + дефолт-комиссия {$defPct}% из {$g->total} SKU → фетч цен/комиссий не долил",
+                    ];
+                }
+
+                // Инвариант цены: действующая цена не может быть НИЖЕ витрины Ozon
+                // (marketing_seller_price). Если ниже — подхватили заниженную action-цену
+                // из /v1/actions вместо витринной (баг A65, 2026-07-06). Ноль ложных
+                // срабатываний: витринная цена — потолок для нашей действующей.
+                if ((int) $g->underpriced > 0) {
+                    $issues[] = [
+                        'type' => 'price_below_showcase',
+                        'integration_id' => $g->integration_id,
+                        'detail' => "{$g->underpriced} SKU: действующая цена ниже витрины Ozon (marketing_seller_price) → занижена action-ценой",
                     ];
                 }
             }
