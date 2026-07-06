@@ -315,6 +315,10 @@ class SyncUnitEconomicsCommand extends Command
         }
 
         if ($marketplace === 'ozon') {
+            // Момент старта Ozon-цикла: постинги, подтянутые/освежённые ниже, получают
+            // synced_at >= этой метки. Передаём её в order-economics, чтобы он пересчитал
+            // ТОЛЬКО изменившиеся заказы, а не всю историю (десятки тысяч, ~9.5 мин).
+            $ozonSyncStartedAt = now();
             try {
                 // Приоритет: 1) локальная интеграция, 2) Sellico API, 3) глобальные из config/env
                 $clientId = null;
@@ -763,7 +767,7 @@ class SyncUnitEconomicsCommand extends Command
             }
 
             try {
-                $orderUnitEconomicsService->syncForIntegration($integrationId);
+                $orderUnitEconomicsService->syncForIntegration($integrationId, $ozonSyncStartedAt);
                 $orderEconomicsPreview = $orderUnitEconomicsService->summarizeForPreview($integrationId);
             } catch (\Throwable $orderEconomicsException) {
                 $this->warn('  Не удалось синхронизировать order-economics: '.$orderEconomicsException->getMessage());

@@ -22,7 +22,15 @@ class OzonOrderUnitEconomicsService
     ) {
     }
 
-    public function syncForIntegration(int $integrationId): Collection
+    /**
+     * @param  Carbon|null  $since  Пересчитывать только постинги, обновлённые (synced_at)
+     *   с этого момента. PostingService бампает synced_at лишь у подтянутых в этом
+     *   цикле постингов (~сотни), поэтому order-economics перестаёт перебирать всю
+     *   историю (десятки тысяч строк, ~9.5 мин) — считает только изменившиеся заказы.
+     *   Строки OzonOrderUnitEconomics по неизменным постингам сохраняются (updateOrCreate),
+     *   summarizeForPreview агрегирует по всей таблице. null → полный пересчёт (бэкфилл).
+     */
+    public function syncForIntegration(int $integrationId, ?Carbon $since = null): Collection
     {
         $rows = collect();
 
@@ -36,6 +44,7 @@ class OzonOrderUnitEconomicsService
             ->with(['items', 'items.product'])
             ->where('integration_id', $integrationId)
             ->where('marketplace', 'ozon')
+            ->when($since !== null, fn ($q) => $q->where('synced_at', '>=', $since))
             ->chunk(100, function ($postings) use (&$rows): void {
                 \DB::transaction(function () use ($postings, &$rows): void {
                     foreach ($postings as $posting) {
