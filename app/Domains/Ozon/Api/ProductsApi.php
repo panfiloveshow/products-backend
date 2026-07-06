@@ -418,11 +418,20 @@ class ProductsApi implements ProductsApiInterface
             'self_marketplaces_index_data' => $this->normalizePriceIndexData($priceIndexes['self_marketplaces_index_data'] ?? $priceIndexes['self_marketplaces'] ?? []),
         ];
 
+        // Ozon «индекс цены» = ваша цена ÷ МИНИМАЛЬНАЯ цена на тот же товар среди
+        // всех источников (Ozon / внешние площадки / другие МП). Биндинговый —
+        // источник с самым дешёвым конкурентом, т.е. с НАИБОЛЬШИМ price_index_value;
+        // он же определяет color_index в кабинете. Раньше брали первый ненулевой
+        // (всегда ozon_index_data) → число расходилось с цветом и с кабинетом.
         foreach (['ozon_index_data', 'external_index_data', 'self_marketplaces_index_data'] as $source) {
-            if (($normalized[$source]['min_price'] ?? 0) > 0 || ($normalized[$source]['price_index_value'] ?? 0) > 0) {
+            $candidate = $normalized[$source];
+            if (($candidate['price_index_value'] ?? 0) <= 0 && ($candidate['min_price'] ?? 0) <= 0) {
+                continue;
+            }
+            if (! isset($normalized['selected_index_data'])
+                || ($candidate['price_index_value'] ?? 0) > ($normalized['selected_index_data']['price_index_value'] ?? 0)) {
                 $normalized['selected_index_source'] = $source;
-                $normalized['selected_index_data'] = $normalized[$source];
-                break;
+                $normalized['selected_index_data'] = $candidate;
             }
         }
 

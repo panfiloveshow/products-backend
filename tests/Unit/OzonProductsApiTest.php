@@ -55,9 +55,11 @@ class OzonProductsApiTest extends TestCase
         $this->assertSame(1600.0, $result['3-02/4011']['actual_price']);
         $this->assertSame('RED', $result['3-02/4011']['price_index_color']);
         $this->assertSame('Невыгодный', $result['3-02/4011']['price_index_label']);
-        $this->assertSame(1.35, $result['3-02/4011']['price_index_value']);
-        $this->assertSame(689.0, $result['3-02/4011']['competitor_price']);
-        $this->assertSame('ozon_index_data', $result['3-02/4011']['competitor_price_source']);
+        // Биндинговый индекс = сравнение с самым дешёвым конкурентом (external, 652 ₽ →
+        // индекс 1.39), а не первый попавшийся ozon_index_data. Совпадает с color_index=RED.
+        $this->assertSame(1.39, $result['3-02/4011']['price_index_value']);
+        $this->assertSame(652.0, $result['3-02/4011']['competitor_price']);
+        $this->assertSame('external_index_data', $result['3-02/4011']['competitor_price_source']);
         $this->assertSame(652.0, $result['3-02/4011']['price_indexes']['external_index_data']['min_price']);
     }
 
