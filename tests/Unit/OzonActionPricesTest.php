@@ -81,6 +81,38 @@ class OzonActionPricesTest extends TestCase
         $this->assertSame(600.0, $prices['3-02/3516']['price']);
     }
 
+    public function test_get_prices_prefers_marketing_seller_price_over_lower_action_price(): void
+    {
+        // Кейс A65: витрина 668 (marketing_seller_price), а /v1/actions отдаёт 420
+        // (цена участия в неактивной акции). Актуальная цена = 668, НЕ min(668, 420).
+        $api = $this->makeApi([
+            'get' => [
+                '/v1/actions' => ['result' => [
+                    ['id' => 10, 'participating_products_count' => 1],
+                ]],
+            ],
+            'post' => [
+                '/v1/actions/products' => ['result' => [
+                    'products' => [['id' => 111, 'action_price' => 420.0]],
+                    'total' => 1,
+                ]],
+                '/v5/product/info/prices' => [
+                    'items' => [[
+                        'offer_id' => 'A65',
+                        'product_id' => 111,
+                        'price' => ['price' => 693.0, 'old_price' => 1050.0, 'marketing_seller_price' => 668.0],
+                    ]],
+                    'cursor' => '',
+                ],
+            ],
+        ]);
+
+        $prices = $api->getPrices();
+
+        $this->assertSame(668.0, $prices['A65']['actual_price']);
+        $this->assertTrue($prices['A65']['is_in_promotion']);
+    }
+
     public function test_get_prices_falls_back_to_base_price_without_actions(): void
     {
         $api = $this->makeApi([

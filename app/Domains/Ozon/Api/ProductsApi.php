@@ -298,14 +298,18 @@ class ProductsApi implements ProductsApiInterface
                 $marketingSellerPrice = (float) ($priceData['marketing_seller_price'] ?? 0);
                 $priceIndexes = $this->normalizePriceIndexes($item['price_indexes'] ?? []);
                 
-                // Актуальная цена: минимум из marketing_seller_price (легаси, Ozon
-                // перестал заполнять) и акционной цены из API акций.
+                // Актуальная цена на витрине: приоритет marketing_seller_price — если
+                // Ozon его заполнил, это фактическая цена продажи (совпадает с «Ваша
+                // цена» в кабинете). Цена из API акций (/v1/actions) — ТОЛЬКО фолбэк,
+                // когда marketing_seller_price = 0: она отражает цену УЧАСТИЯ в акции,
+                // а не обязательно текущую витринную (будущая/неактивная акция). Раньше
+                // брали min(marketing, action) и занижали цену (напр. A65: витрина 668,
+                // action 420 → показывали 420, экономика уходила в ложный минус).
                 $actionPrice = (float) ($actionPrices[(int) ($item['product_id'] ?? 0)] ?? 0);
-                $promoCandidates = array_filter(
-                    [$marketingSellerPrice, $actionPrice],
-                    fn (float $p): bool => $p > 0 && $p < $price
-                );
-                $actualPrice = $promoCandidates !== [] ? min($promoCandidates) : $price;
+                $promoPrice = ($marketingSellerPrice > 0 && $marketingSellerPrice < $price)
+                    ? $marketingSellerPrice
+                    : (($actionPrice > 0 && $actionPrice < $price) ? $actionPrice : 0.0);
+                $actualPrice = $promoPrice > 0 ? $promoPrice : $price;
 
                 // Определяем, участвует ли товар в акции
                 $isInPromotion = $actualPrice < $price;
