@@ -27,8 +27,9 @@ class UnitEconomicsSanityCheck extends Command
         {--marketplace= : Ограничить маркетплейсом (ozon, wildberries, yandex_market)}
         {--tolerance=0.02 : Допуск округлений в рублях}
         {--limit=5000 : Сколько строк проверить}
-        {--fail-on-drift : Вернуть exit-код 1 если найдены рассинхроны (для CI/cron)}
-        {--log : Писать найденные рассинхроны в storage/logs/laravel.log через Log::error}';
+        {--max-age-days=3 : Порог протухания источника unit_economics.updated_at (дни)}
+        {--fail-on-drift : Вернуть exit-код 1 если найдены рассинхроны/аномалии (для CI/cron)}
+        {--log : Писать найденные проблемы в storage/logs/laravel.log через Log::error}';
 
     protected $description = 'Проверяет математическую согласованность полей в unit_economics_cache (effective_logistics, expected_return_cost)';
 
@@ -87,36 +88,56 @@ class UnitEconomicsSanityCheck extends Command
         $this->newLine();
         $this->info("Проверено: {$checked}. Найдено рассинхронов: " . count($drifts));
 
-        if (empty($drifts)) {
-            $this->info('✅ Все поля математически согласованы.');
+        // Проверка «синк не долил данные»: протухание источника + дефолтные комиссии/
+        // пустой индекс у Ozon. Ловит именно тот класс проблем, из-за которого юнитка
+        // молча показывала комиссию 15% и «Нет данных» по индексу (провалившийся/
+        // недоехавший синк), — матпроверка выше его не видит.
+        $anomalies = $this->checkSyncHealth(
+            $this->option('integration'),
+            $this->option('marketplace'),
+            (int) $this->option('max-age-days')
+        );
+
+        if ($drifts !== []) {
+            $this->warn('⚠️  Найдены рассинхроны:');
+            $this->table(
+                ['integration', 'sku', 'scheme', 'eff (факт)', 'eff (ожид)', 'Δeff', 'ret (факт)', 'ret (ожид)', 'Δret', 'calc_at'],
+                array_map(fn ($d) => [
+                    $d['integration_id'],
+                    $d['sku'],
+                    $d['scheme'],
+                    $d['effective_actual'],
+                    $d['effective_expected'],
+                    $d['effective_drift'],
+                    $d['return_actual'],
+                    $d['return_expected'],
+                    $d['return_drift'],
+                    $d['calc_at'],
+                ], array_slice($drifts, 0, 30))
+            );
+            if (count($drifts) > 30) {
+                $this->line('... и ещё ' . (count($drifts) - 30) . ' строк (показаны первые 30)');
+            }
+        }
+
+        if ($anomalies !== []) {
+            $this->warn('⚠️  Аномалии синка (протухание/дефолты):');
+            $this->table(
+                ['type', 'integration', 'detail'],
+                array_map(fn ($a) => [$a['type'], $a['integration_id'], $a['detail']], $anomalies)
+            );
+        }
+
+        if ($drifts === [] && $anomalies === []) {
+            $this->info('✅ Поля согласованы, синк свежий, дефолтов-массово нет.');
             return self::SUCCESS;
         }
 
-        $this->warn('⚠️  Найдены рассинхроны:');
-        $this->table(
-            ['integration', 'sku', 'scheme', 'eff (факт)', 'eff (ожид)', 'Δeff', 'ret (факт)', 'ret (ожид)', 'Δret', 'calc_at'],
-            array_map(fn ($d) => [
-                $d['integration_id'],
-                $d['sku'],
-                $d['scheme'],
-                $d['effective_actual'],
-                $d['effective_expected'],
-                $d['effective_drift'],
-                $d['return_actual'],
-                $d['return_expected'],
-                $d['return_drift'],
-                $d['calc_at'],
-            ], array_slice($drifts, 0, 30))
-        );
-
-        if (count($drifts) > 30) {
-            $this->line('... и ещё ' . (count($drifts) - 30) . ' строк (показаны первые 30)');
-        }
-
         if ($this->option('log')) {
-            Log::error('ue:sanity-check — найдены рассинхроны в unit_economics_cache', [
+            Log::error('ue:sanity-check — найдены проблемы в юнит-экономике', [
                 'total_drifts' => count($drifts),
-                'sample' => array_slice($drifts, 0, 10),
+                'drift_sample' => array_slice($drifts, 0, 10),
+                'anomalies' => $anomalies,
             ]);
         }
 
@@ -125,5 +146,78 @@ class UnitEconomicsSanityCheck extends Command
         }
 
         return self::SUCCESS;
+    }
+
+    /**
+     * Здоровье синка: (1) протухание — источник unit_economics.updated_at старше
+     * порога у активной интеграции; (2) Ozon-enrichment не долит — почти у всех SKU
+     * индекс цены NULL И комиссия дефолтная (15/20/21). Это признак провалившегося
+     * фетча цен/комиссий, который матпроверка не видит.
+     *
+     * @return array<int, array{type:string, integration_id:int|string, detail:string}>
+     */
+    private function checkSyncHealth(?string $integrationId, ?string $marketplace, int $maxAgeDays): array
+    {
+        $issues = [];
+
+        // Только активные интеграции — не шумим по спящим/отключённым.
+        $activeIds = \App\Models\Integration::query()
+            ->where('is_active', true)
+            ->when($integrationId, fn ($q) => $q->where('id', $integrationId))
+            ->pluck('id')
+            ->all();
+
+        if ($activeIds === []) {
+            return [];
+        }
+
+        // (1) Протухание источника
+        $freshness = \App\Models\UnitEconomics::query()
+            ->whereIn('integration_id', $activeIds)
+            ->when($marketplace, fn ($q) => $q->where('marketplace', $marketplace))
+            ->selectRaw('integration_id, marketplace, max(updated_at) as last_updated, count(*) as rows')
+            ->groupBy('integration_id', 'marketplace')
+            ->get();
+
+        foreach ($freshness as $g) {
+            $ageDays = $g->last_updated
+                ? (int) \Illuminate\Support\Carbon::parse($g->last_updated)->diffInDays(now())
+                : 99999;
+            if ($ageDays > $maxAgeDays) {
+                $issues[] = [
+                    'type' => 'stale',
+                    'integration_id' => $g->integration_id,
+                    'detail' => "{$g->marketplace}: источник не обновлялся {$ageDays}д (порог {$maxAgeDays}д), строк {$g->rows}",
+                ];
+            }
+        }
+
+        // (2) Ozon: массовые дефолты (индекс NULL + комиссия 15/20/21) у активной интеграции
+        if ($marketplace === null || $marketplace === 'ozon') {
+            $ozon = UnitEconomicsCache::query()
+                ->where('marketplace', 'ozon')
+                ->whereIn('integration_id', $activeIds)
+                ->selectRaw("integration_id,
+                    count(*) as total,
+                    count(*) filter (where (marketplace_data->>'current_price_index') is null) as null_idx,
+                    count(*) filter (where commission_percent in (15, 20, 21)) as default_comm")
+                ->groupBy('integration_id')
+                ->havingRaw('count(*) >= 20')
+                ->get();
+
+            foreach ($ozon as $g) {
+                $nullPct = round($g->null_idx / $g->total * 100);
+                $defPct = round($g->default_comm / $g->total * 100);
+                if ($nullPct > 90 && $defPct > 90) {
+                    $issues[] = [
+                        'type' => 'ozon_enrichment',
+                        'integration_id' => $g->integration_id,
+                        'detail' => "индекс NULL {$nullPct}% + дефолт-комиссия {$defPct}% из {$g->total} SKU → фетч цен/комиссий не долил",
+                    ];
+                }
+            }
+        }
+
+        return $issues;
     }
 }
