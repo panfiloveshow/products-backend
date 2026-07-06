@@ -143,7 +143,8 @@ class UnitEconomicsCacheController extends Controller
             ->salesRange($validated['sales_min'] ?? null, $validated['sales_max'] ?? null)
             ->nonLocalMarkupRange($validated['non_local_markup_min'] ?? null, $validated['non_local_markup_max'] ?? null)
             ->confidence($validated['confidence'] ?? null)
-            ->localityState($validated['locality_state'] ?? null);
+            ->localityState($validated['locality_state'] ?? null)
+            ->wbPrimaryBarcode($marketplace, (int) $validated['integration_id']);
         $statsQuery = clone $query;
 
         // Сортировка
@@ -786,6 +787,7 @@ class UnitEconomicsCacheController extends Controller
             ->nonLocalMarkupRange($validated['non_local_markup_min'] ?? null, $validated['non_local_markup_max'] ?? null)
             ->confidence($validated['confidence'] ?? null)
             ->localityState($validated['locality_state'] ?? null)
+            ->wbPrimaryBarcode($marketplace, $integrationId)
             ->with('product')
             ->orderBy('sku')
             ->orderBy('id');
@@ -1930,6 +1932,7 @@ class UnitEconomicsCacheController extends Controller
         return Cache::remember($cacheKey, 60, function () use ($integrationId, $marketplace) {
             $counts = UnitEconomicsCache::where('integration_id', $integrationId)
                 ->where('marketplace', $marketplace)
+                ->wbPrimaryBarcode($marketplace, $integrationId)
                 ->selectRaw('fulfillment_type, COUNT(*) as count')
                 ->groupBy('fulfillment_type')
                 ->pluck('count', 'fulfillment_type')
@@ -2071,6 +2074,7 @@ class UnitEconomicsCacheController extends Controller
             $stats = UnitEconomicsCache::where('integration_id', $integrationId)
                 ->where('marketplace', $marketplace)
                 ->where('fulfillment_type', strtoupper($fulfillmentType))
+                ->wbPrimaryBarcode($marketplace, $integrationId)
                 ->selectRaw('
                     COUNT(*) as total_count,
                     SUM(CASE WHEN net_profit > 0 THEN 1 ELSE 0 END) as profitable_count,

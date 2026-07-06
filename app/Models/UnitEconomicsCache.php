@@ -202,6 +202,55 @@ class UnitEconomicsCache extends Model
     }
 
     /**
+     * WB: одна строка на артикул (nmID), а не на баркод.
+     *
+     * WB-карточка (nmID) может прийти с несколькими баркодами (size.skus) → синк
+     * заводит по товару на каждый баркод (WildberriesMarketplace::mapCardToProducts),
+     * и в кэше получается несколько строк на один артикул. Здесь оставляем ровно один
+     * «канонический» баркод на nmID — тот, у которого есть продажи. На проде проверено:
+     * из нескольких баркодов одного nmID продажи всегда только у одного, остальные —
+     * пустышки (переклейка штрихкода на стороне WB), поэтому суммировать не нужно,
+     * достаточно выбрать живой баркод.
+     *
+     * Тай-брейк: sales_28_days и products.stock хранятся на уровне nmID и скопированы
+     * во все баркоды одинаково (различить не могут), поэтому ведущий признак «живого»
+     * баркода — сумма остатков по складам из wb_data.stock_warehouses (она per-barcode:
+     * у реального баркода реальные склады, у дубля — пусто). Дальше продажи и id для
+     * детерминизма.
+     *
+     * Реализация — Postgres DISTINCT ON. На других драйверах (sqlite в тестах) —
+     * no-op: фильтр косметический, целостность расчёта от него не зависит.
+     */
+    public function scopeWbPrimaryBarcode(Builder $query, string $marketplace, ?int $integrationId): Builder
+    {
+        if ($marketplace !== 'wildberries' || $integrationId === null) {
+            return $query;
+        }
+        if ($query->getConnection()->getDriverName() !== 'pgsql') {
+            return $query;
+        }
+
+        $table = $this->getTable();
+        // Сумма остатков по складам из wb_data (per-barcode) — тот же источник, что бейдж
+        // «в продаже» и разбивка КС в листинге.
+        $warehouseQtyExpr = "COALESCE((SELECT SUM((elem->>'quantity')::numeric) "
+            ."FROM json_array_elements("
+            ."CASE WHEN json_typeof(wb_data->'stock_warehouses') = 'array' "
+            ."THEN wb_data->'stock_warehouses' ELSE '[]'::json END) AS elem), 0)";
+
+        return $query->where(function (Builder $outer) use ($table, $integrationId, $warehouseQtyExpr) {
+            $outer->whereNull("{$table}.product_id")
+                ->orWhereIn("{$table}.product_id", function ($sub) use ($integrationId, $warehouseQtyExpr) {
+                    $sub->from('products')
+                        ->selectRaw("DISTINCT ON (COALESCE(wb_data->>'nmID', sku)) id")
+                        ->where('marketplace', 'wildberries')
+                        ->where('integration_id', $integrationId)
+                        ->orderByRaw("COALESCE(wb_data->>'nmID', sku), {$warehouseQtyExpr} DESC, sales_28_days DESC NULLS LAST, id");
+                });
+        });
+    }
+
+    /**
      * Поиск по SKU или названию
      */
     public function scopeSearch(Builder $query, ?string $search): Builder

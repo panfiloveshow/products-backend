@@ -146,6 +146,33 @@ class Integration extends Model
         return $this->credentials ?? [];
     }
 
+    /**
+     * Стабильный отпечаток учётной записи маркетплейса (по ключевым полям credentials).
+     *
+     * Две интеграции с одинаковым отпечатком = один и тот же кабинет продавца,
+     * подключённый дважды (типовая причина «зомби»-интеграций: старый Sellico-id
+     * удалён во фронте, но локальная запись осталась и продолжает синкать тот же
+     * кабинет параллельно с новой). Используется санитаром integrations:dedup-credentials.
+     *
+     * Возвращает null, если ключевых полей нет (сравнивать нечего — не трогаем).
+     */
+    public function credentialFingerprint(): ?string
+    {
+        $c = $this->credentials ?? [];
+        $parts = match ($this->marketplace) {
+            'wildberries', 'uzum' => [$c['api_key'] ?? null],
+            'ozon' => [$c['client_id'] ?? null, $c['api_key'] ?? null],
+            'yandex_market', 'yandex' => [$c['token'] ?? null, $c['campaign_id'] ?? null],
+            default => [$c['api_key'] ?? $c['token'] ?? null],
+        };
+        $parts = array_values(array_filter($parts, static fn ($p) => $p !== null && $p !== ''));
+        if ($parts === []) {
+            return null;
+        }
+
+        return hash('sha256', $this->marketplace.'|'.implode('|', $parts));
+    }
+
     /** @var array<string,mixed>|null Мемоизация резолва креды (в т.ч. Sellico-фолбэк) */
     private ?array $resolvedCredentialsMemo = null;
 

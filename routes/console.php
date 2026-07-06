@@ -168,6 +168,20 @@ if (filter_var(env('INTEGRATIONS_RECONCILE_SCHEDULE', false), FILTER_VALIDATE_BO
         ->name('integrations.reconcile');
 }
 
+// Санитар «зомби»-интеграций по ОТПЕЧАТКУ credentials (в отличие от reconcile выше —
+// сигнал чисто локальный, Sellico не требуется). Ловит один кабинет, подключённый
+// дважды: деактивирует старые дубликаты, оставляя самую свежую. Безопасно (только
+// is_active=false, данные не трогаются). Прод использует /etc/cron.d, а не schedule:run,
+// поэтому там задача заводится отдельной cron-строкой:
+//   */30 * * * * www-data cd /var/www/products-backend && php artisan integrations:dedup-credentials --apply >> storage/logs/integrations-dedup.log 2>&1
+if (filter_var(env('INTEGRATIONS_DEDUP_SCHEDULE', false), FILTER_VALIDATE_BOOLEAN)) {
+    \Illuminate\Support\Facades\Schedule::command('integrations:dedup-credentials --apply')
+        ->everyThirtyMinutes()
+        ->withoutOverlapping()
+        ->appendOutputTo(storage_path('logs/integrations-dedup.log'))
+        ->name('integrations.dedup-credentials');
+}
+
 // Авто-обновление остатков и продаж ПО СКЛАДАМ из API → inventory_warehouses.
 // Заменяет ручную загрузку CSV-отчёта Ozon в разделе автопланирования: матрица
 // предпочитает свежий average_daily_sales из синка (см. resolveInventoryMatrixDailyDemand).
