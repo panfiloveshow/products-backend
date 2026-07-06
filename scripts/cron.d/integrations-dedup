@@ -1,0 +1,25 @@
+# Санитар «зомби»-интеграций: один кабинет продавца, подключённый дважды.
+#
+# Ловит дубли по ОТПЕЧАТКУ credentials (Integration::credentialFingerprint):
+# две активные интеграции одного workspace+маркетплейса с одним api_key. Такое
+# возникает, когда старую интеграцию удалили во фронте Sellico, но локальная
+# запись products-backend осталась и продолжает синкать тот же кабинет параллельно
+# с новой (реальные случаи: id=80 «Свежее Поле», id=16 «Titan_2» — задваивали
+# юнит-экономику и жгли квоту API месяцами).
+#
+# Почему не integrations:reconcile: тот сверяется с живым списком Sellico, а
+# сервисный аккаунт доступа к нему не имеет → пропускает всё. Здесь сигнал чисто
+# локальный, Sellico не нужен. Действие консервативное: только деактивация
+# (is_active=false, auto_sync_enabled=false), данные не трогаются — откат тривиален.
+#
+# Установка на сервере (один раз):
+#   sudo cp /var/www/products-backend/scripts/cron.d/integrations-dedup /etc/cron.d/integrations-dedup
+#   sudo chown root:root /etc/cron.d/integrations-dedup
+#   sudo chmod 644 /etc/cron.d/integrations-dedup
+
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+MAILTO=""
+
+# Каждые 30 минут — деактивировать дубликаты кабинетов, если появились.
+*/30 * * * * www-data cd /var/www/products-backend && /usr/bin/php artisan integrations:dedup-credentials --apply >> /var/www/products-backend/storage/logs/integrations-dedup.log 2>&1
