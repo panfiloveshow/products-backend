@@ -32,6 +32,7 @@ class Integration extends Model
         'manual_redemption_rate',
         'localization_index',
         'localization_checked_at',
+        'ozon_postings_synced_until',
         'redemption_checked_at',
         'last_validation_at',
         'last_validation_status',
@@ -50,6 +51,7 @@ class Integration extends Model
         'manual_redemption_rate' => 'decimal:2',
         'localization_index' => 'decimal:2',
         'localization_checked_at' => 'datetime',
+        'ozon_postings_synced_until' => 'datetime',
         'redemption_checked_at' => 'datetime',
         'last_validation_at' => 'datetime',
     ];

@@ -8,6 +8,7 @@ use App\Models\Integration;
 use App\Models\Posting;
 use App\Models\PostingItem;
 use App\Models\Product;
+use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 
@@ -51,17 +52,47 @@ class PostingService
     /**
      * Синхронизация отправлений Ozon FBS
      */
+    // Overlap-окно к водяному знаку: перекрываем последние дни, чтобы поймать
+    // поздние апдейты/смены статуса постингов, созданных до прошлого синка.
+    private const OZON_POSTINGS_OVERLAP_DAYS = 5;
+
+    // Бэкфилл при первом прогоне (нет водяного знака), если явный dateFrom не задан.
+    private const OZON_POSTINGS_BACKFILL_DAYS = 90;
+
     private function syncOzonPostings(Integration $integration, ?string $status, ?string $dateFrom): array
     {
         $marketplace = OzonMarketplace::fromIntegration($integration);
-        $since = $dateFrom ? date('c', strtotime($dateFrom)) : date('c', strtotime('-60 days'));
-        $to = date('c');
+
+        // Инкрементальный синк: тянем только постинги свежее водяного знака (минус
+        // overlap), а не всё окно каждый раз. Первый прогон / сброс знака → полный
+        // бэкфилл ($dateFrom или BACKFILL_DAYS). Статусы старых постингов догоняет
+        // refreshInFlightOzonPostings отдельно. Это срезает ~21000 постингов до
+        // сотен и снимает риск MAX_OFFSET_EXCEEDED offset-пагинации.
+        // ponytail: per-row upsert оставлен — при инкрементальном окне это сотни
+        // строк (~секунды); bulk Posting::upsert() имеет смысл, только если батчи
+        // снова вырастут (крупный бэкфилл).
+        $hadWatermark = $integration->ozon_postings_synced_until !== null;
+        $sinceDate = $this->ozonPostingsSince($integration->ozon_postings_synced_until, $dateFrom);
+
+        // Момент старта фиксируем ДО фетча — станет новым знаком, чтобы не пропустить
+        // постинги, созданные во время самого синка.
+        $syncStartedAt = now();
+        $since = $sinceDate->format('c');
+        $to = $syncStartedAt->format('c');
 
         $fbs = $this->syncOzonFbsPostings($integration, $marketplace, $status, $since, $to);
         $fbo = $this->syncOzonFboPostings($integration, $marketplace, $since, $to);
 
+        // Продвигаем знак ТОЛЬКО после успеха обоих потоков (исключение выше не даст
+        // сюда дойти → следующий прогон переберёт то же окно, upsert идемпотентен).
+        // Отдельная колонка, а не settings JSON: команда перезаписывает settings
+        // (localization/premium) и затёрла бы знак.
+        $integration->forceFill(['ozon_postings_synced_until' => $syncStartedAt])->save();
+
         Log::info('Ozon postings synced', [
             'integration_id' => $integration->id,
+            'incremental' => $hadWatermark,
+            'since' => $since,
             'total' => $fbs['total'] + $fbo['total'],
             'created' => $fbs['created'] + $fbo['created'],
             'updated' => $fbs['updated'] + $fbo['updated'],
@@ -74,6 +105,22 @@ class PostingService
             'created' => $fbs['created'] + $fbo['created'],
             'updated' => $fbs['updated'] + $fbo['updated'],
         ];
+    }
+
+    /**
+     * Нижняя граница окна синка постингов Ozon.
+     * Есть водяной знак → знак − overlap (инкрементально, ловим поздние апдейты).
+     * Нет знака → полный бэкфилл ($dateFrom или BACKFILL_DAYS).
+     */
+    private function ozonPostingsSince(?Carbon $watermark, ?string $dateFrom): Carbon
+    {
+        if ($watermark !== null) {
+            return $watermark->copy()->subDays(self::OZON_POSTINGS_OVERLAP_DAYS);
+        }
+
+        return $dateFrom
+            ? Carbon::parse($dateFrom)
+            : now()->subDays(self::OZON_POSTINGS_BACKFILL_DAYS);
     }
 
     private function syncOzonFbsPostings(Integration $integration, OzonMarketplace $marketplace, ?string $status, string $since, string $to): array

@@ -277,6 +277,7 @@ class SyncUnitEconomicsCommand extends Command
         $ozonPricingStrategyBySku = [];
         $deliveryProfiles = [];
         $ozonDirectSalesProfiles = [];
+        $ozonStockProfiles = [];
         $previewFixationMap = [];
         $orderEconomicsPreview = [];
         $manualRedemptionRate = null; // Инициализируем для всех маркетплейсов
@@ -353,7 +354,9 @@ class SyncUnitEconomicsCommand extends Command
 
                 if (! empty($clientId) && ! empty($apiKey)) {
                     $ozonService = new \App\Domains\Ozon\OzonMarketplace(['client_id' => $clientId, 'api_key' => $apiKey]);
-                    $operationalSince = now()->subDays(120)->format('Y-m-d');
+                    // Потолок бэкфилла постингов при первом синке (нет водяного знака).
+                    // Дальше PostingService идёт инкрементально от ozon_postings_synced_until.
+                    $operationalSince = now()->subDays(90)->format('Y-m-d');
 
                     try {
                         $suppliesSyncResult = $supplySyncService->syncForIntegration($integrationId);
@@ -744,14 +747,27 @@ class SyncUnitEconomicsCommand extends Command
                 } else {
                     $this->warn('  Нет credentials для Ozon API');
                 }
-            } catch (\Exception $e) {
+            } catch (\Throwable $e) {
                 $this->warn("  Не удалось получить данные из API: {$e->getMessage()}");
             }
 
-            $fixationService->syncForIntegration($integrationId);
-            $previewFixationMap = $fixationService->getPreviewFixationMap($integrationId, $ozonStockProfiles);
-            $orderUnitEconomicsService->syncForIntegration($integrationId);
-            $orderEconomicsPreview = $orderUnitEconomicsService->summarizeForPreview($integrationId);
+            // Фиксация тарифов и order-economics — тяжёлые локальные фазы (читают все
+            // постинги, ловили дедлок кэша). Обёрнуты, чтобы их падение НЕ роняло
+            // прогон до цикла записи: комиссия/цена/индекс уже готовы и должны
+            // записаться независимо. При провале остаются дефолты [] (см. инициализацию).
+            try {
+                $fixationService->syncForIntegration($integrationId);
+                $previewFixationMap = $fixationService->getPreviewFixationMap($integrationId, $ozonStockProfiles);
+            } catch (\Throwable $fixationException) {
+                $this->warn('  Не удалось синхронизировать фиксацию тарифов: '.$fixationException->getMessage());
+            }
+
+            try {
+                $orderUnitEconomicsService->syncForIntegration($integrationId);
+                $orderEconomicsPreview = $orderUnitEconomicsService->summarizeForPreview($integrationId);
+            } catch (\Throwable $orderEconomicsException) {
+                $this->warn('  Не удалось синхронизировать order-economics: '.$orderEconomicsException->getMessage());
+            }
         }
 
         // === WILDBERRIES API ===
