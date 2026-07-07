@@ -77,6 +77,12 @@ return [
             'level' => env('LOG_LEVEL', 'debug'),
             'replace_placeholders' => true,
             'processors' => [SensitiveDataProcessor::class],
+            // Лог-файл создают то root (schedule:run в root-кроне), то www-data
+            // (php-fpm/воркеры), то danya_user (личный крон unit-economics:sync).
+            // Без явного permission первый создатель дня закрывает файл для
+            // остальных — Log::warning внутри catch-блока сам бросает
+            // исключение, и цепочка получения актуальных цен Ozon обрывается.
+            'permission' => 0664,
         ],
 
         'daily' => [
@@ -86,6 +92,7 @@ return [
             'days' => env('LOG_DAILY_DAYS', 14),
             'replace_placeholders' => true,
             'processors' => [SensitiveDataProcessor::class],
+            'permission' => 0664,
         ],
 
         'slack' => [
@@ -149,6 +156,7 @@ return [
             'days' => 30,
             'replace_placeholders' => true,
             'processors' => [SensitiveDataProcessor::class],
+            'permission' => 0664,
         ],
 
     ],
