@@ -205,7 +205,13 @@ class UnitEconomicsSanityCheck extends Command
                         where (marketplace_data->>'marketing_seller_price') ~ '^[0-9.]+$'
                           and (marketplace_data->>'marketing_seller_price')::numeric > 0
                           and price < (marketplace_data->>'marketing_seller_price')::numeric
-                    ) as underpriced")
+                    ) as underpriced,
+                    count(*) filter (
+                        where (marketplace_data->>'is_in_promotion')::boolean is true
+                          and (marketplace_data->>'seller_price') ~ '^[0-9.]+$'
+                          and (marketplace_data->>'seller_price')::numeric > 0
+                          and price >= (marketplace_data->>'seller_price')::numeric
+                    ) as promo_not_applied")
                 ->groupBy('integration_id')
                 ->havingRaw('count(*) >= 20')
                 ->get();
@@ -230,6 +236,21 @@ class UnitEconomicsSanityCheck extends Command
                         'type' => 'price_below_showcase',
                         'integration_id' => $g->integration_id,
                         'detail' => "{$g->underpriced} SKU: действующая цена ниже витрины Ozon (marketing_seller_price) → занижена action-ценой",
+                    ];
+                }
+
+                // Обратный инвариант: SKU помечен «в акции» (is_in_promotion), но действующая
+                // цена не ниже базовой (seller_price) — акция не применилась. Возникает, когда
+                // getPrices()/getActionPrices() падает на середине синка (см. incident
+                // 2026-07-07: permission denied при логировании обрывал фетч цен ДО расчёта
+                // акции), а is_in_promotion подтягивается из старого ozon_data-фолбэка и
+                // остаётся true, хотя price откатился на seller_price. Ноль ложных срабатываний:
+                // если is_in_promotion истинен, seller_price — потолок для действующей цены.
+                if ((int) $g->promo_not_applied > 0) {
+                    $issues[] = [
+                        'type' => 'promo_not_applied',
+                        'integration_id' => $g->integration_id,
+                        'detail' => "{$g->promo_not_applied} SKU: помечены «в акции», но действующая цена не ниже базовой (seller_price) → акция не подтянулась при синке",
                     ];
                 }
             }
