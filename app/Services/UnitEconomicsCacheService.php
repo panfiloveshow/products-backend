@@ -380,6 +380,20 @@ class UnitEconomicsCacheService
             ?? $existingUE?->commission_percent
             ?? $defaultCommissionPercent;
 
+        // WB: комиссия из живого снапшота приоритетнее замороженной в wb_data
+        // (см. loadWildberriesCommissionBySubject). Так повышение комиссий WB
+        // применяется по ежедневному refresh тарифов, без полного синка товаров.
+        if ($marketplace === 'wildberries') {
+            $snapshotCommission = $this->resolveWildberriesCommissionPercentFromSnapshot(
+                (int) $product->integration_id,
+                $marketplaceData,
+                $schemeKey
+            );
+            if ($snapshotCommission !== null) {
+                $commissionPercent = $snapshotCommission;
+            }
+        }
+
         // Дефолты по маркетплейсам — среднерыночные показатели, используются
         // только если нет данных ни из API, ни из ручного override. Раньше для Ozon
         // стоял 100% — это завышало маржу у новых интеграций и для товаров,
@@ -2190,7 +2204,93 @@ class UnitEconomicsCacheService
             'box_by_warehouse' => $boxByWarehouse,
             'box_fallback' => $boxFallback,
             'return' => $returnPayload,
+            'commission_by_subject' => $this->loadWildberriesCommissionBySubject($integrationId),
         ];
+    }
+
+    /**
+     * Живые комиссии WB по subject_id из commission-снапшотов.
+     *
+     * Комиссия в расчёте раньше бралась из wb_data (заморожена на момент синка
+     * ТОВАРОВ) — при повышении комиссий WB (напр. 07.07.2026) ЮЭ отставала до
+     * следующего полного синка каталога, а у интеграций с ключом в Sellico синк
+     * товаров вообще не гоняется программно. Снапшоты же обновляются ежедневно
+     * (wb:refresh-tariffs) для ВСЕХ активных WB-интеграций, поэтому берём комиссию
+     * из них — актуально и без синка/ключа. Фолбэк на wb_data сохраняется в
+     * prepareCalculationInput.
+     *
+     * Только по субъектам, реально присутствующим в каталоге интеграции (иначе
+     * таблица снапшотов огромна). DISTINCT ON — свежий на дату effective ≤ сегодня.
+     * pgsql-only; на других драйверах пусто → фолбэк на wb_data (текущее поведение).
+     *
+     * @return array<string, array<string, mixed>> subject_id => raw payload комиссий
+     */
+    private function loadWildberriesCommissionBySubject(int $integrationId): array
+    {
+        if (\Illuminate\Support\Facades\DB::connection()->getDriverName() !== 'pgsql') {
+            return [];
+        }
+
+        $subjectIds = \Illuminate\Support\Facades\DB::table('products')
+            ->where('integration_id', $integrationId)
+            ->where('marketplace', 'wildberries')
+            ->whereRaw("wb_data->>'subjectID' IS NOT NULL AND wb_data->>'subjectID' <> ''")
+            ->distinct()
+            ->pluck(\Illuminate\Support\Facades\DB::raw("wb_data->>'subjectID' as sid"))
+            ->all();
+
+        if ($subjectIds === []) {
+            return [];
+        }
+
+        $rows = \Illuminate\Support\Facades\DB::table('wildberries_tariff_snapshots')
+            ->selectRaw('DISTINCT ON (subject_id) subject_id, payload')
+            ->where('integration_id', $integrationId)
+            ->where('tariff_type', 'commission')
+            ->whereIn('subject_id', $subjectIds)
+            ->whereDate('effective_date', '<=', now()->toDateString())
+            ->orderByRaw('subject_id, effective_date DESC, fetched_at DESC')
+            ->get();
+
+        $map = [];
+        foreach ($rows as $row) {
+            $payload = is_string($row->payload) ? json_decode($row->payload, true) : (array) $row->payload;
+            $raw = $payload['raw'] ?? null;
+            if (is_array($raw)) {
+                $map[(string) $row->subject_id] = $raw;
+            }
+        }
+
+        return $map;
+    }
+
+    /**
+     * Процент комиссии WB для схемы из живого снапшота (по subject_id товара).
+     * null → снапшота нет, вызывающий оставляет значение из wb_data.
+     */
+    private function resolveWildberriesCommissionPercentFromSnapshot(int $integrationId, array $marketplaceData, string $schemeKey): ?float
+    {
+        $subjectId = $marketplaceData['subjectID'] ?? null;
+        if ($subjectId === null || $subjectId === '') {
+            return null;
+        }
+
+        $this->warmWildberriesTariffSnapshotCache($integrationId);
+        $raw = $this->wildberriesTariffSnapshotCache[$integrationId]['commission_by_subject'][(string) $subjectId] ?? null;
+        if (! is_array($raw)) {
+            return null;
+        }
+
+        // scheme-ключ ЮЭ → ключ в raw снапшота (тот же маппинг, что делает синк товаров).
+        $rawKeyByScheme = ['fbo' => 'fbo', 'fbs' => 'fbs', 'edbs' => 'fbs_express', 'dbs' => 'pickup', 'dbw' => 'booking'];
+        foreach ([$schemeKey, 'fbs', 'fbo'] as $key) {
+            $rawKey = $rawKeyByScheme[$key] ?? null;
+            if ($rawKey !== null && isset($raw[$rawKey]) && is_numeric($raw[$rawKey])) {
+                return (float) $raw[$rawKey];
+            }
+        }
+
+        return null;
     }
 
     private function resolveWildberriesTariffBreakdown(int $integrationId, string $fulfillmentType, array $marketplaceData, array $existing): array
