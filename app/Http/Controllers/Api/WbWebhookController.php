@@ -77,7 +77,7 @@ class WbWebhookController extends Controller
 
         try {
             $response = Http::withHeaders([
-                'User-Agent' => config('services.wildberries.user_agent', 'wbas_sellico.ru9757'),
+                'User-Agent' => config('services.wildberries.user_agent', 'wbas_sellico.ru2823'),
             ])
                 ->withToken($wbToken)
                 ->timeout(15)

@@ -29,7 +29,7 @@ class WildberriesClient
     public function __construct(?string $apiKey = null)
     {
         $this->apiKey = $apiKey ?? config('services.wildberries.api_key') ?? '';
-        $this->userAgent = (string) config('services.wildberries.user_agent', 'wbas_sellico.ru9757');
+        $this->userAgent = (string) config('services.wildberries.user_agent', 'wbas_sellico.ru2823');
     }
 
     /**

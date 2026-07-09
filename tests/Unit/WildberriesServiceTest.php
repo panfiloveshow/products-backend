@@ -124,15 +124,15 @@ class WildberriesServiceTest extends TestCase
 
         Http::assertSent(function ($request) {
             return str_contains($request->url(), 'content-api.wildberries.ru/content/v2/get/cards/list')
-                && $request->hasHeader('User-Agent', 'wbas_sellico.ru9757');
+                && $request->hasHeader('User-Agent', 'wbas_sellico.ru2823');
         });
         Http::assertSent(function ($request) {
             return str_contains($request->url(), 'discounts-prices-api.wildberries.ru/api/v2/list/goods/filter')
-                && $request->hasHeader('User-Agent', 'wbas_sellico.ru9757');
+                && $request->hasHeader('User-Agent', 'wbas_sellico.ru2823');
         });
         Http::assertSent(function ($request) {
             return str_contains($request->url(), 'common-api.wildberries.ru/api/v1/tariffs/commission')
-                && $request->hasHeader('User-Agent', 'wbas_sellico.ru9757');
+                && $request->hasHeader('User-Agent', 'wbas_sellico.ru2823');
         });
     }
 
