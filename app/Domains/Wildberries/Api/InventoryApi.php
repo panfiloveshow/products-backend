@@ -18,9 +18,11 @@ use Illuminate\Support\Facades\Log;
  *
  * Analytics API (seller-analytics-api.wildberries.ru):
  * - POST /api/analytics/v1/stocks-report/wb-warehouses - отчёт по остаткам на складах WB
+ *   (требует Персональный/Сервисный токен либо Базовый с секретом — Базовый без
+ *   секрета получит пустой ответ независимо от прав категории «Аналитика»)
  *
  * Statistics API (statistics-api.wildberries.ru):
- * - GET /api/v1/supplier/stocks - legacy отчёт по остаткам на складах WB
+ * - GET /api/v1/supplier/stocks - ОТКЛЮЧЁН WB 14.07.2026, не использовать
  *
  * ВАЖНО:
  * - Параметр `skus` DEPRECATED (отключается 9 февраля 2025)!
@@ -47,11 +49,6 @@ class InventoryApi implements InventoryApiInterface
     public function getStocks(?Integration $integration = null, array $chrtIds = []): array
     {
         $stocksReport = $this->getWbWarehousesStocksReport($integration, $chrtIds);
-
-        if (empty($stocksReport)) {
-            Log::warning('WB InventoryApi: Analytics API returned no data, trying legacy Statistics API');
-            $stocksReport = $this->getStocksReport();
-        }
 
         if (empty($stocksReport)) {
             Log::warning('WB InventoryApi: No stocks from WB warehouses APIs, trying FBS warehouses');
@@ -340,60 +337,6 @@ class InventoryApi implements InventoryApiInterface
         ]);
 
         return $response !== null;
-    }
-
-    /**
-     * Получить отчёт по остаткам на складах WB (Statistics API)
-     *
-     * GET /api/v1/supplier/stocks (statistics-api.wildberries.ru)
-     *
-     * Данные обновляются каждые 30 минут.
-     * Лимит: 60 000 строк за запрос.
-     *
-     * Response fields:
-     * - lastChangeDate: дата последнего изменения остатка
-     * - warehouseName: название склада
-     * - supplierArticle: артикул поставщика
-     * - nmId: ID товара WB
-     * - barcode: штрихкод
-     * - quantity: доступное количество
-     * - inWayToClient: в пути к клиенту
-     * - inWayFromClient: в пути от клиента
-     * - quantityFull: полное количество
-     * - category, subject, brand: категория, предмет, бренд
-     * - techSize: размер
-     * - Price: цена
-     * - Discount: скидка
-     *
-     * @param  string  $dateFrom  Дата в формате RFC3339 (UTC+3)
-     *
-     * @see https://dev.wildberries.ru/openapi/reports
-     */
-    public function getStocksReport(string $dateFrom = '2019-06-20', int $retriesOn429 = 2): array
-    {
-        Log::info('WB InventoryApi: Requesting stocks from Statistics API', [
-            'endpoint' => '/api/v1/supplier/stocks',
-            'dateFrom' => $dateFrom,
-        ]);
-
-        // retriesOn429: остатки по складам критичны для КС (разбивка по складам
-        // в юнит-экономике) — без ретрая 429 склады деградируют до FBS-«Мой склад».
-        $response = $this->client->statisticsGet('/api/v1/supplier/stocks', [
-            'dateFrom' => $dateFrom,
-        ], retriesOn429: $retriesOn429);
-
-        if ($response === null) {
-            Log::warning('WB InventoryApi: Statistics API returned null (check API key permissions)');
-
-            return [];
-        }
-
-        Log::info('WB InventoryApi: Statistics API response', [
-            'count' => count($response),
-            'sample' => array_slice($response, 0, 2),
-        ]);
-
-        return $response;
     }
 
     /**

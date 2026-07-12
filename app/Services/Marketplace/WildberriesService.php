@@ -480,11 +480,6 @@ class WildberriesService implements MarketplaceInterface
             $sizeMap = $this->getWbSizeMap();
             $stocks = $this->getWbWarehouseStocksReport();
 
-            if (empty($stocks)) {
-                Log::warning('WB getInventory: new analytics stocks report returned no rows, falling back to legacy statistics endpoint');
-                $stocks = $this->getLegacyStocksReport();
-            }
-
             foreach ($stocks as $stock) {
                 $nmId = (int) ($stock['nmId'] ?? 0);
                 $chrtId = (int) ($stock['chrtId'] ?? 0);
@@ -558,24 +553,6 @@ class WildberriesService implements MarketplaceInterface
         } while ($count === $limit && $pages < 20);
 
         return $result;
-    }
-
-    private function getLegacyStocksReport(): array
-    {
-        $response = $this->wbGet("{$this->statisticsApiUrl}/api/v1/supplier/stocks", [
-            'dateFrom' => '2019-01-01',
-        ]);
-
-        if (! $response->successful()) {
-            Log::error('WB legacy stocks report error', [
-                'status' => $response->status(),
-                'body' => $response->body(),
-            ]);
-
-            return [];
-        }
-
-        return $response->json() ?? [];
     }
 
     private function getWbSizeMap(): array

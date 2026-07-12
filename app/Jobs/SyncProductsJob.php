@@ -497,7 +497,7 @@ class SyncProductsJob implements ShouldBeUnique, ShouldQueue
 
     /**
      * WB: не даём складской разбивке деградировать. Отчёт остатков по складам WB
-     * (Statistics API /supplier/stocks) рейт-лимитен и иногда пустеет во время
+     * (Analytics API stocks-report/wb-warehouses) рейт-лимитен и иногда пустеет во время
      * синка — тогда в stock_warehouses остаются только FBS-склады продавца
      * («Мой склад»), и КС в юнит-экономике теряет разбивку по реальным складам.
      * Если в новых данных нет ни одного FBO-склада, а в старых были — сохраняем
