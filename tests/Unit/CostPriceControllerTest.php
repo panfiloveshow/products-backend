@@ -5,6 +5,7 @@ namespace Tests\Unit;
 use App\Http\Controllers\Api\CostPriceController;
 use App\Models\Integration;
 use App\Models\Product;
+use App\Models\UnitEconomics;
 use App\Models\UnitEconomicsCache;
 use App\Models\UnitEconomicsSettings;
 use App\Services\CostPriceParserService;
@@ -15,6 +16,45 @@ use Tests\TestCase;
 class CostPriceControllerTest extends TestCase
 {
     use LazilyRefreshDatabase;
+
+    public function test_unit_economics_export_includes_calculated_spp_and_customer_price(): void
+    {
+        $integration = Integration::factory()->wildberries()->create(['id' => 61005]);
+        $product = Product::factory()->wildberries()->create([
+            'integration_id' => $integration->id,
+            'sku' => '2038816371457',
+            'marketplace_id' => '184010772:2038816371457',
+            'commission' => 24.5,
+            'wb_data' => ['nmID' => 184010772],
+        ]);
+        UnitEconomicsSettings::create([
+            'integration_id' => $integration->id,
+            'sku' => $product->sku,
+            'cost_price' => 700,
+            'tax_percent' => 6,
+        ]);
+        UnitEconomics::create([
+            'integration_id' => $integration->id,
+            'sku' => $product->sku,
+            'marketplace' => 'wildberries',
+            'fulfillment_type' => 'FBO',
+            'is_actual_scheme' => true,
+            'price' => 1581.38,
+            'spp_percent' => 40.12,
+            'customer_price' => 947,
+        ]);
+
+        $controller = new CostPriceController(new CostPriceParserService());
+        $response = $controller->unitEconomicsExport(Request::create(
+            '/api/products/unit-economics/export?integration_id=' . $integration->id
+        ));
+
+        $items = $response->getData(true)['items'];
+        $this->assertCount(1, $items);
+        $this->assertSame(184010772, $items[0]['nm_id']);
+        $this->assertSame(40.12, $items[0]['spp_percent']);
+        $this->assertSame(947, $items[0]['customer_price']);
+    }
 
     public function test_template_uses_browser_safe_utf8_filename_and_excel_friendly_csv(): void
     {

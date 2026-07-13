@@ -81,7 +81,8 @@ class CostPriceController extends Controller
     /**
      * Экспорт юнит-экономики по nmID для внешних сервисов (репрайсер).
      * Джойнит себестоимость (unit_economics_settings по sku=баркод) с товаром WB,
-     * чтобы отдать себестоимость + комиссию + налог с ключом nmID, а не баркодом.
+     * чтобы отдать себестоимость, комиссию, налог и рассчитанный СПП
+     * с ключом nmID, а не баркодом.
      * GET /api/products/unit-economics/export?integration_id=X
      */
     public function unitEconomicsExport(Request $request): JsonResponse
@@ -94,17 +95,24 @@ class CostPriceController extends Controller
         $rows = Product::query()
             ->where('products.integration_id', $integrationId)
             ->where('products.marketplace', 'wildberries')
-            ->join('unit_economics_settings as ue', function ($j) {
-                $j->on('ue.integration_id', '=', 'products.integration_id')
-                    ->on('ue.sku', '=', 'products.sku');
+            ->join('unit_economics_settings as settings', function ($j) {
+                $j->on('settings.integration_id', '=', 'products.integration_id')
+                    ->on('settings.sku', '=', 'products.sku');
             })
-            ->where('ue.cost_price', '>', 0)
+            ->leftJoin('unit_economics as calculated', function ($j) {
+                $j->on('calculated.integration_id', '=', 'products.integration_id')
+                    ->on('calculated.sku', '=', 'products.sku')
+                    ->where('calculated.is_actual_scheme', '=', true);
+            })
+            ->where('settings.cost_price', '>', 0)
             ->get([
                 'products.marketplace_id',
                 'products.wb_data',
                 'products.commission',
-                'ue.cost_price',
-                'ue.tax_percent',
+                'settings.cost_price',
+                'settings.tax_percent',
+                'calculated.spp_percent',
+                'calculated.customer_price',
             ]);
 
         $items = [];
@@ -124,6 +132,8 @@ class CostPriceController extends Controller
                 'cost_price' => (float) $row->cost_price,
                 'commission_percent' => $row->commission !== null ? (float) $row->commission : null,
                 'tax_percent' => $row->tax_percent !== null ? (float) $row->tax_percent : null,
+                'spp_percent' => $row->spp_percent !== null ? (float) $row->spp_percent : null,
+                'customer_price' => $row->customer_price !== null ? (float) $row->customer_price : null,
             ];
         }
 
