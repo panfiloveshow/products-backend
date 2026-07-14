@@ -50,9 +50,10 @@ class WildberriesUnitEconomicsCalculator implements UnitEconomicsCalculatorInter
         $warehouseCoefPercent = $warehouseCoef * 100; // Для отображения КС: 1.4 = 140%
         // ИЛ (индекс локализации) — множитель логистики (1.0 = без изменений, < 1.0 = скидка, > 1.0 = наценка)
         $localizationIndex = $options['localization_index'] ?? $input->localizationIndex ?? 1.0;
-        $salesDistributionIndexPercent = $this->normalizeSalesDistributionIndexPercent(
-            (float) ($options['sales_distribution_index'] ?? $input->salesDistributionIndex ?? 0.0)
-        );
+        // ИРП отключён WB с 13.07.2026 (новость WB Partners от 08.07.2026): индекс
+        // исключён из формулы логистики, действует формула до 23.03.2026.
+        // Сохранённые/ручные значения игнорируем; поля в выдаче остаются нулями.
+        $salesDistributionIndexPercent = 0.0;
         $redemptionRate = $input->redemptionRate ?? 100; // % выкупа
         $drrPercent = $input->drrPercent ?? 0; // ДРР, %
         $taxPercent = $input->taxPercent ?? 0; // Налог, %
@@ -119,8 +120,8 @@ class WildberriesUnitEconomicsCalculator implements UnitEconomicsCalculatorInter
             ? 0.0
             : ($wbDiscountBasePrice * ($salesDistributionIndexPercent / 100));
 
-        // Логистика WB с 23.03.2026:
-        // (базовая логистика × КС × ИЛ) + цена до скидки WB × ИРП.
+        // Логистика WB с 13.07.2026 — как до 23.03.2026:
+        // базовая логистика × КС × ИЛ (ИРП отключён, salesDistributionAmount = 0).
         $logistics = $usesOwnDelivery
             ? $baseLogistics
             : (($baseLogistics * $warehouseCoefForCalculation * $localizationIndexForCalculation) + $salesDistributionAmount);
@@ -260,21 +261,6 @@ class WildberriesUnitEconomicsCalculator implements UnitEconomicsCalculatorInter
         ];
 
         return $result;
-    }
-
-    private function normalizeSalesDistributionIndexPercent(float $value): float
-    {
-        if ($value <= 0) {
-            return 0.0;
-        }
-
-        // Иногда коэффициенты хранятся дробью: 0.0115 = 1.15%.
-        // Значения больше 0.05 считаем уже процентами: 1.15 = 1.15%.
-        if ($value <= 0.05) {
-            return $value * 100;
-        }
-
-        return $value;
     }
 
     private function resolveOfficialWarehouseCoefficient(string $scheme, mixed $boxTariff): ?float

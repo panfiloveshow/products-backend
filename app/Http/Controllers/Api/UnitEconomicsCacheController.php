@@ -2911,19 +2911,10 @@ class UnitEconomicsCacheController extends Controller
             // Сумма надбавки/скидки ИЛ = базовая логистика × КС × (ИЛ - 1)
             $data['localization_amount'] = round((float) ($marketplaceData['localization_amount'] ?? ($baseLogistics * $avgWarehouseCoef * ($localizationIndex - 1))), 2);
 
-            $salesDistributionIndex = (float) (
-                $marketplaceData['sales_distribution_index']
-                ?? $marketplaceData['sales_distribution_index_percent']
-                ?? $integrationSettings['wb_sales_distribution_index']
-                ?? $integrationSettings['sales_distribution_index']
-                ?? 0.0
-            );
-            $salesDistributionAmount = (float) (
-                $marketplaceData['sales_distribution_amount']
-                ?? (((float) ($cache->old_price ?: $cache->price)) * ($salesDistributionIndex / 100))
-            );
-            $data['sales_distribution_index'] = round($salesDistributionIndex, 4);
-            $data['sales_distribution_amount'] = round($salesDistributionAmount, 2);
+            // ИРП отключён WB с 13.07.2026 — показываем 0 независимо от кэша
+            // и ручных настроек (стар. значения в marketplace_data/settings игнорируем).
+            $data['sales_distribution_index'] = 0.0;
+            $data['sales_distribution_amount'] = 0.0;
 
             // Базовая логистика
             $data['base_logistics'] = round($baseLogistics, 2);
