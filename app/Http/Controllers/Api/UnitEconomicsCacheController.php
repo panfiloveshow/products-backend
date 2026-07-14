@@ -713,6 +713,7 @@ class UnitEconomicsCacheController extends Controller
             // ровно то, что менеджер видит на странице, без листания пагинации.
             'search' => 'nullable|string|max:255',
             'profitable' => 'nullable|boolean',
+            'in_stock' => 'nullable|boolean',
             'quick_filter' => 'nullable|string|in:unprofitable,negative_margin,no_sales_28d,low_confidence,high_non_locality,locality_risk,high_non_local_markup,data_gap',
             'margin_min' => 'nullable|numeric',
             'margin_max' => 'nullable|numeric',
@@ -792,6 +793,10 @@ class UnitEconomicsCacheController extends Controller
             ->orderBy('sku')
             ->orderBy('id');
 
+        // «Только в продаже»: фильтруем после обогащения по current_stock —
+        // тот же источник, что бейдж «В продаже» (для WB это wb_data.stock_warehouses).
+        $onlyInStock = filter_var($validated['in_stock'] ?? false, FILTER_VALIDATE_BOOLEAN);
+
         $enrichedItems = [];
         $exportQuery->chunk(500, function (Collection $items) use (
             &$enrichedItems,
@@ -799,7 +804,8 @@ class UnitEconomicsCacheController extends Controller
             $marketplace,
             $fulfillmentType,
             $ozonLocalitySnapshotDate,
-            $ozonLocalityPeriodDays
+            $ozonLocalityPeriodDays,
+            $onlyInStock
         ) {
             $settingsMap = UnitEconomicsSettings::where('integration_id', $integrationId)
                 ->whereIn('sku', $items->pluck('sku')->unique()->values()->all())
@@ -845,6 +851,10 @@ class UnitEconomicsCacheController extends Controller
                         $ozonLocalityPeriodDays,
                         $ozonLocalitySnapshotDate
                     );
+                }
+
+                if ($onlyInStock && (float) ($enriched['current_stock'] ?? 0) <= 0) {
+                    continue;
                 }
 
                 $enrichedItems[] = $enriched;
