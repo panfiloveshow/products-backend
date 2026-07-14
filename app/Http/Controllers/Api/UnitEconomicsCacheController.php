@@ -47,7 +47,7 @@ use Symfony\Component\HttpFoundation\StreamedResponse;
  */
 class UnitEconomicsCacheController extends Controller
 {
-    private const EXPORT_TEMPLATE_VERSION = '2026-05-25-04';
+    private const EXPORT_TEMPLATE_VERSION = '2026-07-14-01';
 
     private const EXPORT_TEMPLATE_FORMAT = 'v2';
 
@@ -1387,6 +1387,8 @@ class UnitEconomicsCacheController extends Controller
             'AG' => ['header' => 'Чистая прибыль, ₽',  'width' => 14, 'field' => 'net_profit',                'format' => $money],
             'AH' => ['header' => 'Маржа, %',           'width' => 10, 'field' => 'margin_percent',            'format' => $pct],
             'AI' => ['header' => 'Цена для цели, ₽',   'width' => 14, 'field' => 'target_price',              'format' => $money],
+            // ponytail: колонка в конце, а не рядом с A — вставка сдвинула бы все буквенные ссылки в живых формулах
+            'AJ' => ['header' => 'Артикул WB',         'width' => 12, 'field' => 'nm_id',                     'format' => '@'],
         ];
     }
 
@@ -1427,6 +1429,7 @@ class UnitEconomicsCacheController extends Controller
         $sheet->setCellValue("AA{$r}", $num('tax_percent'));
         $sheet->setCellValue("AC{$r}", $num('vat_percent'));
         $sheet->setCellValue("AE{$r}", $num('our_share_percent'));
+        $sheet->setCellValueExplicit("AJ{$r}", (string) ($item['nm_id'] ?? ''), \PhpOffice\PhpSpreadsheet\Cell\DataType::TYPE_STRING);
 
         // Живые формулы (пересчитываются при ручной правке в Excel).
         $sheet->setCellValue("G{$r}",  "=IF(E{$r}>0,F{$r}/E{$r},0)");
@@ -2333,6 +2336,11 @@ class UnitEconomicsCacheController extends Controller
         $vendorCode = $product?->vendor_code;
         $data['vendor_code'] = $vendorCode;
         $data['article'] = ($vendorCode !== null && $vendorCode !== '') ? $vendorCode : $cache->sku;
+
+        // Артикул WB (nmID карточки на сайте) — для колонки «Артикул WB» в экспорте.
+        $data['nm_id'] = $cache->marketplace === 'wildberries'
+            ? (($product?->wb_data ?? [])['nmID'] ?? null)
+            : null;
 
         // Картинка товара (для таблиц UE). Берём первую из products.images.
         $productImages = is_array($product?->images ?? null) ? $product->images : [];
