@@ -47,7 +47,7 @@ use Symfony\Component\HttpFoundation\StreamedResponse;
  */
 class UnitEconomicsCacheController extends Controller
 {
-    private const EXPORT_TEMPLATE_VERSION = '2026-07-14-01';
+    private const EXPORT_TEMPLATE_VERSION = '2026-07-15-01';
 
     private const EXPORT_TEMPLATE_FORMAT = 'v2';
 
@@ -968,8 +968,8 @@ class UnitEconomicsCacheController extends Controller
         $collapsibleGroups = $isWildberriesExport
             ? [
                 ['J', 'K'],   // СПП (% + ₽)
-                ['L', 'N'],   // КС / ИЛ / ИРП
-                ['P', 'T'],   // Возвраты / логистика / хранение
+                ['L', 'M'],   // КС / ИЛ
+                ['O', 'S'],   // Возвраты / логистика / хранение
             ]
             : [
                 ['I', 'J'],   // Комиссия (% + ₽)
@@ -1208,8 +1208,8 @@ class UnitEconomicsCacheController extends Controller
 
             // Колонки цены/прибыли/маржи различаются между Ozon- и WB-раскладкой.
             $priceCol = $isWildberriesExport ? 'F' : 'C';
-            $profitCol = $isWildberriesExport ? 'AG' : 'AB';
-            $marginCol = $isWildberriesExport ? 'AH' : 'AC';
+            $profitCol = $isWildberriesExport ? 'AF' : 'AB';
+            $marginCol = $isWildberriesExport ? 'AG' : 'AC';
 
             // Маркер акции: левый синий бордер на колонке цены
             if ($isInPromotion) {
@@ -1282,7 +1282,7 @@ class UnitEconomicsCacheController extends Controller
         // SUM формулы для денежных колонок и количеств
         $sumCols = array_values(array_intersect(
             $isWildberriesExport
-                ? ['E', 'F', 'K', 'O', 'P', 'R', 'S', 'T', 'V', 'X', 'Z', 'AB', 'AD', 'AF', 'AG']
+                ? ['E', 'F', 'K', 'N', 'O', 'Q', 'R', 'S', 'U', 'W', 'Y', 'AA', 'AC', 'AE', 'AF']
                 : ['C', 'F', 'G', 'J', 'K', 'L', 'M', 'N', 'O', 'AA', 'AB', 'AE', 'AH', 'AJ', 'AN', 'AO'],
             array_keys($columns)
         ));
@@ -1297,7 +1297,7 @@ class UnitEconomicsCacheController extends Controller
         // AVERAGE формулы для процентных/относительных колонок
         $avgCols = array_values(array_intersect(
             $isWildberriesExport
-                ? ['D', 'G', 'H', 'I', 'J', 'L', 'M', 'N', 'Q', 'U', 'W', 'Y', 'AA', 'AC', 'AE', 'AH', 'AI']
+                ? ['D', 'G', 'H', 'I', 'J', 'L', 'M', 'P', 'T', 'V', 'X', 'Z', 'AB', 'AD', 'AG', 'AH']
                 : ['E', 'H', 'I', 'P', 'Q', 'R', 'S', 'T', 'V', 'W', 'Y', 'AC', 'AD', 'AF', 'AG', 'AI', 'AK', 'AM', 'AP'],
             array_keys($columns)
         ));
@@ -1375,30 +1375,30 @@ class UnitEconomicsCacheController extends Controller
             'K'  => ['header' => 'СПП, ₽',             'width' => 10, 'field' => 'spp_amount',                'format' => $money],
             'L'  => ['header' => 'КС, %',              'width' => 9,  'field' => 'warehouse_coef_percent',    'format' => $pct],
             'M'  => ['header' => 'ИЛ',                 'width' => 8,  'field' => 'localization_index',        'format' => '0.00'],
-            'N'  => ['header' => 'ИРП, %',             'width' => 9,  'field' => 'sales_distribution_index',  'format' => $pct],
-            'O'  => ['header' => 'Логистика, ₽',       'width' => 12, 'field' => 'logistics_cost',            'format' => $money],
-            'P'  => ['header' => 'Обр. логистика, ₽',  'width' => 14, 'field' => 'return_logistics',          'format' => $money],
-            'Q'  => ['header' => '% выкупа',           'width' => 10, 'field' => 'redemption_rate',           'format' => $pct],
-            'R'  => ['header' => 'Ожид. возвраты, ₽',  'width' => 15, 'field' => 'expected_return_cost',      'format' => $money],
-            'S'  => ['header' => 'Эфф. логистика, ₽',  'width' => 15, 'field' => 'effective_logistics',       'format' => $money],
-            'T'  => ['header' => 'Хранение, ₽',        'width' => 12, 'field' => 'storage_cost',              'format' => $money],
-            'U'  => ['header' => 'Эквайринг, %',       'width' => 12, 'field' => 'acquiring_percent',         'format' => $pct],
-            'V'  => ['header' => 'Эквайринг, ₽',       'width' => 12, 'field' => 'acquiring_amount',          'format' => $money],
-            'W'  => ['header' => 'Всего затрат, %',    'width' => 13, 'field' => 'total_expenses_percent',    'format' => $pct],
-            'X'  => ['header' => 'На р/с, ₽',          'width' => 12, 'field' => 'to_settlement_account',     'format' => $money],
-            'Y'  => ['header' => 'ДРР, %',             'width' => 9,  'field' => 'drr_percent',               'format' => $pct],
-            'Z'  => ['header' => 'ДРР, ₽',             'width' => 10, 'field' => 'drr_amount',                'format' => $money],
-            'AA' => ['header' => 'Налог, %',           'width' => 9,  'field' => 'tax_percent',               'format' => $pct],
-            'AB' => ['header' => 'Налог, ₽',           'width' => 10, 'field' => 'tax_amount',                'format' => $money],
-            'AC' => ['header' => 'НДС, %',             'width' => 8,  'field' => 'vat_percent',               'format' => $pct],
-            'AD' => ['header' => 'НДС, ₽',             'width' => 10, 'field' => 'vat_amount',                'format' => $money],
-            'AE' => ['header' => 'Наша часть, %',      'width' => 12, 'field' => 'our_share_percent',         'format' => $pct],
-            'AF' => ['header' => 'Наша часть, ₽',      'width' => 12, 'field' => 'our_share_amount',          'format' => $money],
-            'AG' => ['header' => 'Чистая прибыль, ₽',  'width' => 14, 'field' => 'net_profit',                'format' => $money],
-            'AH' => ['header' => 'Маржа, %',           'width' => 10, 'field' => 'margin_percent',            'format' => $pct],
-            'AI' => ['header' => 'Цена для цели, ₽',   'width' => 14, 'field' => 'target_price',              'format' => $money],
+            // Колонки «ИРП, %» больше нет: ИРП отключён WB с 13.07.2026.
+            'N'  => ['header' => 'Логистика, ₽',       'width' => 12, 'field' => 'logistics_cost',            'format' => $money],
+            'O'  => ['header' => 'Обр. логистика, ₽',  'width' => 14, 'field' => 'return_logistics',          'format' => $money],
+            'P'  => ['header' => '% выкупа',           'width' => 10, 'field' => 'redemption_rate',           'format' => $pct],
+            'Q'  => ['header' => 'Ожид. возвраты, ₽',  'width' => 15, 'field' => 'expected_return_cost',      'format' => $money],
+            'R'  => ['header' => 'Эфф. логистика, ₽',  'width' => 15, 'field' => 'effective_logistics',       'format' => $money],
+            'S'  => ['header' => 'Хранение, ₽',        'width' => 12, 'field' => 'storage_cost',              'format' => $money],
+            'T'  => ['header' => 'Эквайринг, %',       'width' => 12, 'field' => 'acquiring_percent',         'format' => $pct],
+            'U'  => ['header' => 'Эквайринг, ₽',       'width' => 12, 'field' => 'acquiring_amount',          'format' => $money],
+            'V'  => ['header' => 'Всего затрат, %',    'width' => 13, 'field' => 'total_expenses_percent',    'format' => $pct],
+            'W'  => ['header' => 'На р/с, ₽',          'width' => 12, 'field' => 'to_settlement_account',     'format' => $money],
+            'X'  => ['header' => 'ДРР, %',             'width' => 9,  'field' => 'drr_percent',               'format' => $pct],
+            'Y'  => ['header' => 'ДРР, ₽',             'width' => 10, 'field' => 'drr_amount',                'format' => $money],
+            'Z'  => ['header' => 'Налог, %',           'width' => 9,  'field' => 'tax_percent',               'format' => $pct],
+            'AA' => ['header' => 'Налог, ₽',           'width' => 10, 'field' => 'tax_amount',                'format' => $money],
+            'AB' => ['header' => 'НДС, %',             'width' => 8,  'field' => 'vat_percent',               'format' => $pct],
+            'AC' => ['header' => 'НДС, ₽',             'width' => 10, 'field' => 'vat_amount',                'format' => $money],
+            'AD' => ['header' => 'Наша часть, %',      'width' => 12, 'field' => 'our_share_percent',         'format' => $pct],
+            'AE' => ['header' => 'Наша часть, ₽',      'width' => 12, 'field' => 'our_share_amount',          'format' => $money],
+            'AF' => ['header' => 'Чистая прибыль, ₽',  'width' => 14, 'field' => 'net_profit',                'format' => $money],
+            'AG' => ['header' => 'Маржа, %',           'width' => 10, 'field' => 'margin_percent',            'format' => $pct],
+            'AH' => ['header' => 'Цена для цели, ₽',   'width' => 14, 'field' => 'target_price',              'format' => $money],
             // ponytail: колонка в конце, а не рядом с A — вставка сдвинула бы все буквенные ссылки в живых формулах
-            'AJ' => ['header' => 'Артикул WB',         'width' => 12, 'field' => 'nm_id',                     'format' => '@'],
+            'AI' => ['header' => 'Артикул WB',         'width' => 12, 'field' => 'nm_id',                     'format' => '@'],
         ];
     }
 
@@ -1427,35 +1427,34 @@ class UnitEconomicsCacheController extends Controller
         $sheet->setCellValue("K{$r}", $num('spp_amount'));
         $sheet->setCellValue("L{$r}", $num('warehouse_coef_percent'));
         $sheet->setCellValue("M{$r}", (float) ($item['localization_index'] ?? 1));
-        $sheet->setCellValue("N{$r}", $num('sales_distribution_index'));
-        $sheet->setCellValue("O{$r}", $num('logistics_cost'));
-        $sheet->setCellValue("P{$r}", (float) ($item['return_logistics'] ?? $item['return_logistics_cost'] ?? 0));
-        $sheet->setCellValue("Q{$r}", $num('redemption_rate'));
-        $sheet->setCellValue("R{$r}", $num('expected_return_cost'));
-        $sheet->setCellValue("S{$r}", (float) ($item['effective_logistics'] ?? $item['logistics_cost'] ?? 0));
-        $sheet->setCellValue("T{$r}", $num('storage_cost'));
-        $sheet->setCellValue("U{$r}", (float) ($item['acquiring_percent'] ?? 0));
-        $sheet->setCellValue("Y{$r}", $num('drr_percent'));
-        $sheet->setCellValue("AA{$r}", $num('tax_percent'));
-        $sheet->setCellValue("AC{$r}", $num('vat_percent'));
-        $sheet->setCellValue("AE{$r}", $num('our_share_percent'));
-        $sheet->setCellValueExplicit("AJ{$r}", (string) ($item['nm_id'] ?? ''), \PhpOffice\PhpSpreadsheet\Cell\DataType::TYPE_STRING);
+        $sheet->setCellValue("N{$r}", $num('logistics_cost'));
+        $sheet->setCellValue("O{$r}", (float) ($item['return_logistics'] ?? $item['return_logistics_cost'] ?? 0));
+        $sheet->setCellValue("P{$r}", $num('redemption_rate'));
+        $sheet->setCellValue("Q{$r}", $num('expected_return_cost'));
+        $sheet->setCellValue("R{$r}", (float) ($item['effective_logistics'] ?? $item['logistics_cost'] ?? 0));
+        $sheet->setCellValue("S{$r}", $num('storage_cost'));
+        $sheet->setCellValue("T{$r}", (float) ($item['acquiring_percent'] ?? 0));
+        $sheet->setCellValue("X{$r}", $num('drr_percent'));
+        $sheet->setCellValue("Z{$r}", $num('tax_percent'));
+        $sheet->setCellValue("AB{$r}", $num('vat_percent'));
+        $sheet->setCellValue("AD{$r}", $num('our_share_percent'));
+        $sheet->setCellValueExplicit("AI{$r}", (string) ($item['nm_id'] ?? ''), \PhpOffice\PhpSpreadsheet\Cell\DataType::TYPE_STRING);
 
         // Живые формулы (пересчитываются при ручной правке в Excel).
         $sheet->setCellValue("G{$r}",  "=IF(E{$r}>0,F{$r}/E{$r},0)");
-        $sheet->setCellValue("V{$r}",  "=F{$r}*U{$r}/100");
-        $sheet->setCellValue("W{$r}",  "=IF(F{$r}>0,(F{$r}*I{$r}/100+S{$r}+T{$r}+F{$r}*U{$r}/100)/F{$r}*100,0)");
-        $sheet->setCellValue("X{$r}",  "=F{$r}-(F{$r}*I{$r}/100)-S{$r}-T{$r}-(F{$r}*U{$r}/100)-Z{$r}-AB{$r}");
-        $sheet->setCellValue("Z{$r}",  "=F{$r}*Y{$r}/100");
-        $sheet->setCellValue("AB{$r}", "=F{$r}*AA{$r}/100");
-        $sheet->setCellValue("AD{$r}", "=F{$r}*AC{$r}/100");
-        $sheet->setCellValue("AF{$r}", "=AG{$r}*AE{$r}/100");
-        $sheet->setCellValue("AG{$r}", "=X{$r}-E{$r}");
-        $sheet->setCellValue("AH{$r}", "=IF(F{$r}>0,AG{$r}/F{$r}*100,0)");
+        $sheet->setCellValue("U{$r}",  "=F{$r}*T{$r}/100");
+        $sheet->setCellValue("V{$r}",  "=IF(F{$r}>0,(F{$r}*I{$r}/100+R{$r}+S{$r}+F{$r}*T{$r}/100)/F{$r}*100,0)");
+        $sheet->setCellValue("W{$r}",  "=F{$r}-(F{$r}*I{$r}/100)-R{$r}-S{$r}-(F{$r}*T{$r}/100)-Y{$r}-AA{$r}");
+        $sheet->setCellValue("Y{$r}",  "=F{$r}*X{$r}/100");
+        $sheet->setCellValue("AA{$r}", "=F{$r}*Z{$r}/100");
+        $sheet->setCellValue("AC{$r}", "=F{$r}*AB{$r}/100");
+        $sheet->setCellValue("AE{$r}", "=AF{$r}*AD{$r}/100");
+        $sheet->setCellValue("AF{$r}", "=W{$r}-E{$r}");
+        $sheet->setCellValue("AG{$r}", "=IF(F{$r}>0,AF{$r}/F{$r}*100,0)");
         $sheet->setCellValue(
-            "AI{$r}",
-            "=IF((1-(I{$r}+U{$r}+Y{$r}+AA{$r})/100-\$E\$3/100)>0,"
-            . "(S{$r}+T{$r}+E{$r})/(1-(I{$r}+U{$r}+Y{$r}+AA{$r})/100-\$E\$3/100),\"\")"
+            "AH{$r}",
+            "=IF((1-(I{$r}+T{$r}+X{$r}+Z{$r})/100-\$E\$3/100)>0,"
+            . "(R{$r}+S{$r}+E{$r})/(1-(I{$r}+T{$r}+X{$r}+Z{$r})/100-\$E\$3/100),\"\")"
         );
     }
 
