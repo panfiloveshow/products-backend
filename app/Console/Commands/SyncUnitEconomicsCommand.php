@@ -98,7 +98,7 @@ class SyncUnitEconomicsCommand extends Command
         $this->newLine();
         $this->info("Total synced: {$totalSynced}, Total errors: {$totalErrors}");
 
-        return 0;
+        return $totalErrors === 0 ? self::SUCCESS : self::FAILURE;
     }
 
     private function syncByIntegrationId(
@@ -177,7 +177,7 @@ class SyncUnitEconomicsCommand extends Command
         return 0;
     }
 
-    private function syncProducts(
+    protected function syncProducts(
         UnitEconomicsService $service,
         OzonSupplyFixationService $fixationService,
         OzonOrderUnitEconomicsService $orderUnitEconomicsService,

@@ -202,6 +202,10 @@ class CostPriceController extends Controller
                 $join->on('settings.integration_id', '=', 'products.integration_id')
                     ->on('settings.sku', '=', 'products.sku');
             })
+            ->leftJoin('unit_economics_settings as vendor_settings', function ($join) {
+                $join->on('vendor_settings.integration_id', '=', 'products.integration_id')
+                    ->on('vendor_settings.sku', '=', 'products.vendor_code');
+            })
             ->leftJoin('unit_economics as calculated', function ($join) {
                 $join->on('calculated.integration_id', '=', 'products.integration_id')
                     ->on('calculated.sku', '=', 'products.sku')
@@ -210,8 +214,8 @@ class CostPriceController extends Controller
             ->get([
                 'products.marketplace_id',
                 'products.wb_data',
-                'settings.cost_price',
-                'settings.tax_percent',
+                DB::raw('COALESCE(NULLIF(settings.cost_price, 0), NULLIF(vendor_settings.cost_price, 0)) AS cost_price'),
+                DB::raw('COALESCE(settings.tax_percent, vendor_settings.tax_percent) AS tax_percent'),
                 'calculated.price',
                 'calculated.customer_price',
                 'calculated.spp_percent',
@@ -250,8 +254,11 @@ class CostPriceController extends Controller
         $netProfit = $number($row->net_profit_per_unit ?? $row->net_profit);
         $marginPercent = $number($row->margin_percent);
         $drrPercent = $number($row->drr_percent);
-        $maxAllowedDrr = ($marginPercent !== null && $drrPercent !== null)
-            ? round(max(0, min(100, $marginPercent + $drrPercent)), 2)
+        // A missing current advertising DRR is not synthetic zero: keep it null
+        // in the response. Margin is already calculated without advertising in
+        // that case, so it is itself the real pre-ads break-even ceiling.
+        $maxAllowedDrr = $marginPercent !== null
+            ? round(max(0, min(100, $marginPercent + ($drrPercent ?? 0))), 2)
             : null;
         $marginBeforeAds = ($price !== null && $maxAllowedDrr !== null)
             ? round($price * $maxAllowedDrr / 100, 2)
@@ -279,11 +286,15 @@ class CostPriceController extends Controller
             'tax' => $taxPercent,
             'logistics' => $logisticsCost,
             'profit' => $netProfit,
-            'max_allowed_drr' => $maxAllowedDrr,
         ] as $field => $value) {
-            if ($value === null || (in_array($field, ['price', 'cost_price', 'max_allowed_drr'], true) && $value <= 0)) {
+            if ($value === null || (in_array($field, ['price', 'cost_price'], true) && $value <= 0)) {
                 $reasons[] = 'missing_' . $field;
             }
+        }
+        if ($maxAllowedDrr === null) {
+            $reasons[] = 'missing_max_allowed_drr';
+        } elseif ($maxAllowedDrr <= 0) {
+            $reasons[] = 'unprofitable';
         }
         if ($calculatedAt === null || $calculatedAt->lt($checkedAt->copy()->subHours(72))) {
             $reasons[] = 'stale_calculation';
@@ -318,6 +329,7 @@ class CostPriceController extends Controller
             'spp_percent' => $number($row->spp_percent),
             'net_profit' => $netProfit,
             'margin_percent' => $marginPercent,
+            'drr_percent' => $drrPercent,
             'margin_before_ads' => $marginBeforeAds,
             'max_allowed_drr' => $maxAllowedDrr,
             'calculated_at' => $calculatedAt?->toRfc3339String(),
