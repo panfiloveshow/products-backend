@@ -119,6 +119,10 @@ class StorageApi
                         'warehouse' => $item['warehouse'] ?? null,
                         'warehouse_coef' => (float)($item['warehouseCoef'] ?? 1),
                         'volume' => (float)($item['volume'] ?? 0),
+                        // Paid Storage API returns the package volume in litres.
+                        // The unit-economics builder consumes volume_liters and
+                        // must never silently replace this real value with 10x10x10.
+                        'volume_liters' => (float)($item['volume'] ?? 0),
                         'loyalty_discount' => (float)($item['loyaltyDiscount'] ?? 0),
                         'days_count' => 0,
                     ];
@@ -126,6 +130,10 @@ class StorageApi
 
                 $result[$key]['storage_cost'] += $warehousePrice;
                 $result[$key]['days_count']++;
+                $result[$key]['volume_liters'] = max(
+                    (float) $result[$key]['volume_liters'],
+                    (float) ($item['volume'] ?? 0)
+                );
             }
 
             // Рассчитываем среднюю стоимость за день
@@ -154,13 +162,57 @@ class StorageApi
     public function getSupplyTariffs(): array
     {
         try {
-            $response = $this->client->get("/api/v1/tariffs/box");
+            // The box tariff belongs to common-api (not marketplace-api) and
+            // `date` is mandatory. Normalize WB's comma-decimal response into
+            // the fields consumed by SyncUnitEconomicsCommand.
+            $response = $this->client->commonGet('/api/v1/tariffs/box', [
+                'date' => now()->format('Y-m-d'),
+            ]);
+            $warehouses = $response['response']['data']['warehouseList'] ?? [];
+            if (! is_array($warehouses)) {
+                return [];
+            }
 
-            return $response['response']['data'] ?? [];
+            $result = [];
+            foreach ($warehouses as $warehouse) {
+                if (! is_array($warehouse)) {
+                    continue;
+                }
+                $name = trim((string) ($warehouse['warehouseName'] ?? ''));
+                if ($name === '') {
+                    continue;
+                }
+                $result[$name] = [
+                    'warehouse_name' => $name,
+                    'geo_name' => $warehouse['geoName'] ?? null,
+                    'delivery_coefficient' => $this->decimal($warehouse['boxDeliveryCoefExpr'] ?? null, 100),
+                    'storage_coefficient' => $this->decimal($warehouse['boxStorageCoefExpr'] ?? null, 100),
+                    'delivery_base_liter' => $this->decimal($warehouse['boxDeliveryBase'] ?? null),
+                    'delivery_additional_liter' => $this->decimal($warehouse['boxDeliveryLiter'] ?? null),
+                    'storage_base_liter' => $this->decimal($warehouse['boxStorageBase'] ?? null),
+                    'storage_additional_liter' => $this->decimal($warehouse['boxStorageLiter'] ?? null),
+                ];
+            }
+
+            return $result;
         } catch (\Exception $e) {
             Log::error('WB getSupplyTariffs error', ['error' => $e->getMessage()]);
             return [];
         }
+    }
+
+    private function decimal(mixed $value, float $divisor = 1): ?float
+    {
+        if ($value === null || $value === '') {
+            return null;
+        }
+
+        $normalized = str_replace([' ', ','], ['', '.'], (string) $value);
+        if (! is_numeric($normalized)) {
+            return null;
+        }
+
+        return (float) $normalized / $divisor;
     }
 
     /**

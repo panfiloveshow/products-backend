@@ -249,4 +249,48 @@ class WildberriesServiceTest extends TestCase
         $this->assertStringStartsWith('name:', $boxSnapshots[0]['warehouse_id']);
         $this->assertSame($boxSnapshots[0]['warehouse_id'], $palletSnapshots[0]['warehouse_id']);
     }
+
+    public function test_supply_tariffs_use_common_api_date_and_normalize_wb_decimals(): void
+    {
+        Carbon::setTestNow('2026-07-15 10:00:00');
+        Http::fake([
+            'common-api.wildberries.ru/api/v1/tariffs/box*' => Http::response([
+                'response' => ['data' => ['warehouseList' => [[
+                    'warehouseName' => 'Коледино',
+                    'geoName' => 'ЦФО',
+                    'boxDeliveryCoefExpr' => '160',
+                    'boxStorageCoefExpr' => '115',
+                    'boxDeliveryBase' => '48',
+                    'boxDeliveryLiter' => '11,2',
+                    'boxStorageBase' => '0,14',
+                    'boxStorageLiter' => '0,07',
+                ]]],
+            ]]),
+        ]);
+
+        $tariffs = (new WildberriesStorageApi(new WildberriesClient('test-token')))->getSupplyTariffs();
+
+        $this->assertSame(1.6, $tariffs['Коледино']['delivery_coefficient']);
+        $this->assertSame(1.15, $tariffs['Коледино']['storage_coefficient']);
+        $this->assertSame(11.2, $tariffs['Коледино']['delivery_additional_liter']);
+        Http::assertSent(fn ($request) => $request->url() === 'https://common-api.wildberries.ru/api/v1/tariffs/box?date=2026-07-15');
+    }
+
+    public function test_paid_storage_volume_is_exposed_as_real_litres(): void
+    {
+        $storage = new class(new WildberriesClient('test-token')) extends WildberriesStorageApi {
+            public function getPaidStorage(?string $dateFrom = null, ?string $dateTo = null): array
+            {
+                return [
+                    ['barcode' => '2038000000001', 'warehousePrice' => 4, 'volume' => 2.35],
+                    ['barcode' => '2038000000001', 'warehousePrice' => 6, 'volume' => 2.35],
+                ];
+            }
+        };
+
+        $rows = $storage->getStorageCostBySku();
+
+        $this->assertSame(2.35, $rows['2038000000001']['volume_liters']);
+        $this->assertSame(5.0, $rows['2038000000001']['storage_cost_per_day']);
+    }
 }

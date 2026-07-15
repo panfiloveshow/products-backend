@@ -34,19 +34,43 @@ class RealizationReportApi
         string $dateTo,
         array $fields = []
     ): array {
-        $payload = [
-            'dateFrom' => $dateFrom,
-            'dateTo' => $dateTo,
-        ];
-
-        if ($fields !== []) {
-            $payload['fields'] = array_values($fields);
-        }
-
         try {
-            $response = $this->client->financePost('/api/finance/v1/sales-reports/detailed', $payload);
+            $allRows = [];
+            $rrdId = 0;
+            $limit = 100000;
 
-            return is_array($response) ? $response : [];
+            do {
+                $payload = [
+                    'dateFrom' => $dateFrom,
+                    'dateTo' => $dateTo,
+                    'limit' => $limit,
+                    'rrdId' => $rrdId,
+                    'period' => 'weekly',
+                ];
+                if ($fields !== []) {
+                    $payload['fields'] = array_values(array_unique(array_merge(['rrdId'], $fields)));
+                }
+
+                $rows = $this->client->financePost('/api/finance/v1/sales-reports/detailed', $payload);
+                if (! is_array($rows) || $rows === []) {
+                    break;
+                }
+
+                $allRows = array_merge($allRows, $rows);
+                $last = end($rows);
+                $nextRrdId = (int) ($last['rrdId'] ?? 0);
+                if (count($rows) < $limit || $nextRrdId <= $rrdId) {
+                    break;
+                }
+                $rrdId = $nextRrdId;
+
+                // Finance reports are limited to one request per minute. A
+                // second page without this delay would turn a complete report
+                // into a silently partial one.
+                sleep(61);
+            } while (true);
+
+            return $allRows;
         } catch (\Throwable $e) {
             Log::error('WB Finance detailed sales reports error', [
                 'date_from' => $dateFrom,
@@ -146,99 +170,64 @@ class RealizationReportApi
         $dateFrom = now()->subWeeks($weeks)->format('Y-m-d');
         
         $result = [];
-        $rrdId = 0;
-        $limit = 50000; // Уменьшаем лимит для экономии памяти
-        $maxIterations = 100;
-        $iteration = 0;
-        $totalProcessed = 0;
-        
+
         try {
-            do {
-                $response = $this->client->statisticsGet('/api/v5/supplier/reportDetailByPeriod', [
-                    'dateFrom' => $dateFrom,
-                    'dateTo' => $dateTo,
-                    'rrdid' => $rrdId,
-                    'limit' => $limit,
-                    'periodicity' => 'weekly',
-                ]);
-                
-                if (empty($response)) {
-                    break;
-                }
-                
-                // Обрабатываем данные сразу, не накапливая в памяти
-                foreach ($response as $item) {
-                    $barcode = $item['barcode'] ?? null;
-                    $nmId = $item['nm_id'] ?? null;
-                    $saName = $item['sa_name'] ?? null;
-                    
-                    $key = $barcode ?: (string)$nmId ?: $saName;
-                    if (!$key) continue;
-                    
-                    $storageFee = (float)($item['storage_fee'] ?? 0);
-                    $reportId = $item['realizationreport_id'] ?? null;
-                    
-                    if (!isset($result[$key])) {
+            $rows = $this->getDetailedSalesReportsByPeriod($dateFrom, $dateTo, [
+                'reportId',
+                'dateFrom',
+                'dateTo',
+                'sku',
+                'nmId',
+                'vendorCode',
+                'paidStorage',
+            ]);
+
+            foreach ($rows as $item) {
+                $sku = $item['sku'] ?? null;
+                $nmId = $item['nmId'] ?? null;
+                $vendorCode = $item['vendorCode'] ?? null;
+                $storageFee = (float) ($item['paidStorage'] ?? 0);
+                $reportId = (int) ($item['reportId'] ?? 0);
+
+                foreach ([$sku, $nmId, $vendorCode] as $rawKey) {
+                    if ($rawKey === null || $rawKey === '') {
+                        continue;
+                    }
+                    $key = (string) $rawKey;
+                    if (! isset($result[$key])) {
                         $result[$key] = [
-                            'storage_fee_total' => 0,
-                            'storage_fee_last_week' => 0,
-                            'report_date_from' => $item['date_from'] ?? null,
-                            'report_date_to' => $item['date_to'] ?? null,
+                            'storage_fee_total' => 0.0,
+                            'storage_fee_last_week' => 0.0,
+                            'report_date_from' => $item['dateFrom'] ?? null,
+                            'report_date_to' => $item['dateTo'] ?? null,
                             'nm_id' => $nmId,
-                            'sa_name' => $saName,
-                            'barcode' => $barcode,
-                            'last_report_id' => null,
+                            'sa_name' => $vendorCode,
+                            'barcode' => $sku,
+                            '_by_report' => [],
                         ];
                     }
-                    
                     $result[$key]['storage_fee_total'] += $storageFee;
-                    
-                    if ($item['date_from'] && (!$result[$key]['report_date_from'] || $item['date_from'] < $result[$key]['report_date_from'])) {
-                        $result[$key]['report_date_from'] = $item['date_from'];
-                    }
-                    if ($item['date_to'] && (!$result[$key]['report_date_to'] || $item['date_to'] > $result[$key]['report_date_to'])) {
-                        $result[$key]['report_date_to'] = $item['date_to'];
-                    }
-                    
-                    if ($reportId && (!$result[$key]['last_report_id'] || $reportId > $result[$key]['last_report_id'])) {
-                        $result[$key]['last_report_id'] = $reportId;
-                        $result[$key]['storage_fee_last_week'] = $storageFee;
-                    }
+                    $result[$key]['_by_report'][$reportId] = ($result[$key]['_by_report'][$reportId] ?? 0) + $storageFee;
                 }
-                
-                $lastItem = end($response);
-                $rrdId = $lastItem['rrd_id'] ?? 0;
-                $totalProcessed += count($response);
-                $iteration++;
-                
-                // Освобождаем память
-                unset($response);
-                
-                Log::debug('WB getStorageFeesBySku: chunk processed', [
-                    'iteration' => $iteration,
-                    'total_processed' => $totalProcessed,
-                    'unique_skus' => count($result),
-                ]);
-                
-            } while ($rrdId > 0 && $iteration < $maxIterations);
-            
-            // Округляем значения и убираем служебные поля
+            }
+
             foreach ($result as $key => &$data) {
+                $latestReportId = $data['_by_report'] === [] ? null : max(array_keys($data['_by_report']));
+                $data['storage_fee_last_week'] = $latestReportId === null ? 0.0 : $data['_by_report'][$latestReportId];
                 $data['storage_fee_total'] = round($data['storage_fee_total'], 2);
                 $data['storage_fee_last_week'] = round($data['storage_fee_last_week'], 2);
-                unset($data['last_report_id']);
+                unset($data['_by_report']);
             }
-            
+
             Log::info('WB getStorageFeesBySku: completed', [
                 'count' => count($result),
-                'total_processed' => $totalProcessed,
-                'iterations' => $iteration,
+                'total_processed' => count($rows),
                 'date_from' => $dateFrom,
                 'date_to' => $dateTo,
             ]);
-            
+
             return $result;
-            
+
         } catch (\Exception $e) {
             Log::error('WB getStorageFeesBySku error', ['error' => $e->getMessage()]);
             return [];
@@ -269,51 +258,35 @@ class RealizationReportApi
         $agg = [];               // key => ['acq' => float, 'rev' => float]
         $totalAcq = 0.0;
         $totalRev = 0.0;
-        $rrdId = 0;
-        $limit = 50000;
-        $maxIterations = 100;
-        $iteration = 0;
-
         try {
-            do {
-                // Отчёт жёстко лимитирован (429) — ретраим внутри statisticsGet.
-                $response = $this->client->statisticsGet('/api/v5/supplier/reportDetailByPeriod', [
-                    'dateFrom' => $dateFrom,
-                    'dateTo' => $dateTo,
-                    'rrdid' => $rrdId,
-                    'limit' => $limit,
-                ], 3);
+            $rows = $this->getDetailedSalesReportsByPeriod($dateFrom, $dateTo, [
+                'sku',
+                'nmId',
+                'vendorCode',
+                'retailAmount',
+                'acquiringFee',
+            ]);
 
-                if (empty($response) || ! is_array($response)) {
-                    break;
-                }
+            foreach ($rows as $item) {
+                $acquiring = (float) ($item['acquiringFee'] ?? 0);
+                $revenue = (float) ($item['retailAmount'] ?? 0);
 
-                foreach ($response as $item) {
-                    $acquiring = (float) ($item['acquiring_fee'] ?? 0);
-                    $revenue = (float) ($item['retail_amount'] ?? 0);
-
-                    // Ключи, по которым WB-товар матчится на product.sku (=barcode).
-                    foreach ([$item['barcode'] ?? null, $item['nm_id'] ?? null, $item['sa_name'] ?? null] as $key) {
-                        if ($key === null || $key === '') {
-                            continue;
-                        }
-                        $key = (string) $key;
-                        if (! isset($agg[$key])) {
-                            $agg[$key] = ['acq' => 0.0, 'rev' => 0.0];
-                        }
-                        $agg[$key]['acq'] += $acquiring;
-                        $agg[$key]['rev'] += $revenue;
+                // New Finance API uses sku/nmId/vendorCode (camelCase).
+                foreach ([$item['sku'] ?? null, $item['nmId'] ?? null, $item['vendorCode'] ?? null] as $key) {
+                    if ($key === null || $key === '') {
+                        continue;
                     }
-
-                    $totalAcq += $acquiring;
-                    $totalRev += $revenue;
+                    $key = (string) $key;
+                    if (! isset($agg[$key])) {
+                        $agg[$key] = ['acq' => 0.0, 'rev' => 0.0];
+                    }
+                    $agg[$key]['acq'] += $acquiring;
+                    $agg[$key]['rev'] += $revenue;
                 }
 
-                $lastItem = end($response);
-                $rrdId = (int) ($lastItem['rrd_id'] ?? 0);
-                $iteration++;
-                unset($response);
-            } while ($rrdId > 0 && $iteration < $maxIterations);
+                $totalAcq += $acquiring;
+                $totalRev += $revenue;
+            }
 
             $bySku = [];
             foreach ($agg as $key => $v) {
