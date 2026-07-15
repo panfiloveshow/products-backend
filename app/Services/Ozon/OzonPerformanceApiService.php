@@ -1099,6 +1099,9 @@ class OzonPerformanceApiService
         if (! is_array($prog)) {
             $uuids = [];
             $errors = [];
+            // Ozon Performance генерит ОДИН отчёт за раз: при бёрсте генераций всё, кроме
+            // первого, ловит 429. Несозданные чанки не теряем — дозаказываем на шагах поллинга.
+            $pendingChunks = [];
             foreach (array_chunk(array_values(array_filter($campaignIds)), 10) as $chunk) {
                 if ($chunk === []) {
                     continue;
@@ -1109,14 +1112,17 @@ class OzonPerformanceApiService
                         $uuids[$uuid] = false;
                     } else {
                         $errors[] = 'Async: отчёт не создан (нет UUID)';
+                        $pendingChunks[] = $chunk;
                     }
                 } catch (\Throwable $e) {
                     $errors[] = 'Async: ' . $e->getMessage();
+                    $pendingChunks[] = $chunk;
                 }
             }
             // Отчёт «Оплата за заказ — все товары»: отдельный UUID в общем пуле поллинга,
             // но со своим парсером (per-order CSV → агрегированные per-SKU CPO-строки).
             $aspUuids = [];
+            $aspPending = false;
             if ($includeAllSkuPromo) {
                 try {
                     $uuid = $this->generateAllSkuPromoOrdersReport($accessToken, $dateFrom, $dateTo);
@@ -1124,24 +1130,75 @@ class OzonPerformanceApiService
                         $uuids[$uuid] = false;
                         $aspUuids[] = $uuid;
                     } else {
-                        $errors[] = 'ASP: отчёт по заказам «все товары» не создан (нет UUID)';
+                        $aspPending = true;
                     }
                 } catch (\Throwable $e) {
                     $errors[] = 'ASP: ' . $e->getMessage();
+                    $aspPending = true;
                 }
             }
 
-            $prog = ['uuids' => $uuids, 'asp_uuids' => $aspUuids, 'rows_by_uuid' => [], 'errors' => $errors, 'created' => time()];
+            $prog = [
+                'uuids' => $uuids,
+                'asp_uuids' => $aspUuids,
+                'pending_chunks' => $pendingChunks,
+                'asp_pending' => $aspPending,
+                'gen_attempts' => 0,
+                'rows_by_uuid' => [],
+                'errors' => $errors,
+                'created' => time(),
+            ];
             Cache::put($progKey, $prog, now()->addMinutes(15));
 
-            // Если ни один отчёт не создан — не зависаем в pending, отдаём пустой результат.
-            if ($uuids === []) {
+            // Если ни один отчёт не создан и дозаказывать нечего — не зависаем в pending.
+            if ($uuids === [] && $pendingChunks === [] && ! $aspPending) {
                 Cache::forget($progKey);
 
                 return $this->assembleCampaignStats([], $errors, 'fallback');
             }
 
             return $this->assembleCampaignStats([], $errors, 'pending') + ['pending' => true];
+        }
+
+        // Шаг 2а: дозаказываем отчёты, не созданные из-за 429 (лимит «один отчёт за раз»).
+        // Паузы между HTTP-запросами фронта дают естественный бэкофф; после 8 попыток сдаёмся,
+        // чтобы не зависнуть в pending (стейл-защита в 300с — общий предохранитель).
+        if (($prog['pending_chunks'] ?? []) !== [] || ($prog['asp_pending'] ?? false)) {
+            $prog['gen_attempts'] = (int) ($prog['gen_attempts'] ?? 0) + 1;
+
+            $stillPending = [];
+            foreach ((array) ($prog['pending_chunks'] ?? []) as $chunk) {
+                try {
+                    $uuid = $this->generateCampaignStatsReport($accessToken, (array) $chunk, $dateFrom, $dateTo);
+                    if ($uuid !== '') {
+                        $prog['uuids'][$uuid] = false;
+                    } else {
+                        $stillPending[] = $chunk;
+                    }
+                } catch (\Throwable $e) {
+                    $prog['errors'][] = 'Async retry: ' . $e->getMessage();
+                    $stillPending[] = $chunk;
+                }
+            }
+            $prog['pending_chunks'] = $stillPending;
+
+            if ($prog['asp_pending'] ?? false) {
+                try {
+                    $uuid = $this->generateAllSkuPromoOrdersReport($accessToken, $dateFrom, $dateTo);
+                    if ($uuid !== '') {
+                        $prog['uuids'][$uuid] = false;
+                        $prog['asp_uuids'][] = $uuid;
+                        $prog['asp_pending'] = false;
+                    }
+                } catch (\Throwable $e) {
+                    $prog['errors'][] = 'ASP retry: ' . $e->getMessage();
+                }
+            }
+
+            if ((int) $prog['gen_attempts'] >= 8) {
+                $prog['pending_chunks'] = [];
+                $prog['asp_pending'] = false;
+            }
         }
 
         // Шаг 2: проверяем неготовые UUID, скачиваем готовые. Без длинного ожидания.
@@ -1183,7 +1240,9 @@ class OzonPerformanceApiService
         // Накопленные строки из всех скачанных отчётов (плоский список).
         $accumulated = array_merge([], ...array_values($prog['rows_by_uuid'] ?? []));
 
-        $allDone = ! in_array(false, $prog['uuids'], true);
+        $allDone = ! in_array(false, $prog['uuids'], true)
+            && ($prog['pending_chunks'] ?? []) === []
+            && ! ($prog['asp_pending'] ?? false);
         $stale = (time() - (int) ($prog['created'] ?? time())) > 300; // защита от вечного pending
 
         // Шаг 3: готово (или устарело) — собираем итог и СОХРАНЯЕМ В БД (персистентно, с меткой времени).
