@@ -664,13 +664,14 @@ class OzonPerformanceApiServiceTest extends TestCase
         ];
         $service = new OzonPerformanceApiService();
 
-        // Прогрессивный сбор (integrationId>0): первый вызов создаёт отчёты (pending),
-        // второй — скачивает готовые и собирает итог.
-        $first = $service->productAdvertisingImpact($credentials, 'report-uuid', 5000, '2026-06-15', '2026-07-15', 15);
-        $this->assertTrue($first['success']);
-        $this->assertTrue((bool) $first['coverage']['campaign_stats_pending']);
-
+        // Прогрессивный сбор (integrationId>0): отчёты заказываются по одному за вызов
+        // (лимит Ozon «один отчёт за раз»), поэтому поллим до готовности, как это делает фронт.
         $result = $service->productAdvertisingImpact($credentials, 'report-uuid', 5000, '2026-06-15', '2026-07-15', 15);
+        $this->assertTrue($result['success']);
+        $this->assertTrue((bool) $result['coverage']['campaign_stats_pending']);
+        for ($attempt = 0; $attempt < 6 && ($result['coverage']['campaign_stats_pending'] ?? false); $attempt++) {
+            $result = $service->productAdvertisingImpact($credentials, 'report-uuid', 5000, '2026-06-15', '2026-07-15', 15);
+        }
         $this->assertTrue($result['success']);
         $this->assertSame('async_report', $result['coverage']['campaign_stats_source']);
 

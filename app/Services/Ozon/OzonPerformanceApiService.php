@@ -1055,14 +1055,16 @@ class OzonPerformanceApiService
     }
 
     /**
-     * Прогрессивный сбор per-SKU CPC без блокирующего ожидания в HTTP-запросе.
+     * Прогрессивный сбор per-SKU рекламы (CPC-чанки + CPO «все товары») без блокирующего ожидания.
      *
-     * Async-отчёты Ozon готовятся минуты — синхронно ждать нельзя (таймаут php-fpm/nginx → пустой ответ).
+     * Async-отчёты Ozon готовятся минуты, а генерится ОДИН отчёт за раз (второй параллельный → 429).
      * Поэтому состояние держим в кэше и каждый HTTP-запрос делает короткий шаг:
-     *   1) нет прогресса     → создаём отчёты по чанкам (быстрые POST), сохраняем UUID, отдаём 'pending';
-     *   2) прогресс есть      → проверяем готовность UUID, скачиваем готовые, копим строки;
-     *   3) всё готово/устарело→ собираем итог, кэшируем на 30 мин, отдаём 'async_report'.
-     * Фронт повторяет запрос, пока source='pending'.
+     *   1) поллим заказанные UUID, скачиваем готовые, копим строки;
+     *   2) слот свободен → заказываем следующий отчёт из очереди (429 не выбрасывает элемент);
+     *   3) всё готово/устарело → собираем итог, сохраняем в БД, отдаём 'async_report'.
+     * Пока идёт пересборка — отдаём последние сохранённые данные с source='pending'
+     * (stale-while-revalidate): пользователь видит цифры, фронт продолжает поллить.
+     * Стейл с недоделанной очередью не перетирает полные сохранённые данные частичными.
      *
      * @param array<int, string> $campaignIds
      * @return array<string, mixed>
@@ -1086,115 +1088,45 @@ class OzonPerformanceApiService
 
         $prog = Cache::get($progKey);
 
-        // Нет активной перегенерации и не форс — мгновенно отдаём сохранённое из БД.
-        // Переживает рестарты и не сбрасывается после обновления страницы (в отличие от Cache TTL).
-        if (! is_array($prog) && ! $forceRefresh) {
-            $stored = $this->readStoredCampaignStats($integrationId, $dateFrom, $dateTo);
-            if ($stored !== null) {
-                return $stored;
-            }
+        // Сохранённое из БД: мгновенный ответ без перегенерации и данные на время
+        // пересборки (stale-while-revalidate ниже). Переживает рестарты, в отличие от Cache TTL.
+        $stored = $this->readStoredCampaignStats($integrationId, $dateFrom, $dateTo);
+
+        if (! is_array($prog) && ! $forceRefresh && $stored !== null) {
+            return $stored;
         }
 
-        // Шаг 1: прогресса нет — создаём отчёты по всем чанкам (быстрые POST) и сразу отвечаем 'pending'.
+        // Инициализация: только ОЧЕРЕДЬ генераций, без запросов к Ozon. Ozon Performance
+        // формирует один отчёт за раз — бёрст генераций ловит 429 на всё, кроме первого,
+        // поэтому отчёты заказываются строго последовательно на шаге 2.
         if (! is_array($prog)) {
-            $uuids = [];
-            $errors = [];
-            // Ozon Performance генерит ОДИН отчёт за раз: при бёрсте генераций всё, кроме
-            // первого, ловит 429. Несозданные чанки не теряем — дозаказываем на шагах поллинга.
-            $pendingChunks = [];
+            $queue = [];
             foreach (array_chunk(array_values(array_filter($campaignIds)), 10) as $chunk) {
-                if ($chunk === []) {
-                    continue;
-                }
-                try {
-                    $uuid = $this->generateCampaignStatsReport($accessToken, $chunk, $dateFrom, $dateTo);
-                    if ($uuid !== '') {
-                        $uuids[$uuid] = false;
-                    } else {
-                        $errors[] = 'Async: отчёт не создан (нет UUID)';
-                        $pendingChunks[] = $chunk;
-                    }
-                } catch (\Throwable $e) {
-                    $errors[] = 'Async: ' . $e->getMessage();
-                    $pendingChunks[] = $chunk;
+                if ($chunk !== []) {
+                    $queue[] = ['type' => 'cpc', 'chunk' => $chunk];
                 }
             }
             // Отчёт «Оплата за заказ — все товары»: отдельный UUID в общем пуле поллинга,
             // но со своим парсером (per-order CSV → агрегированные per-SKU CPO-строки).
-            $aspUuids = [];
-            $aspPending = false;
             if ($includeAllSkuPromo) {
-                try {
-                    $uuid = $this->generateAllSkuPromoOrdersReport($accessToken, $dateFrom, $dateTo);
-                    if ($uuid !== '') {
-                        $uuids[$uuid] = false;
-                        $aspUuids[] = $uuid;
-                    } else {
-                        $aspPending = true;
-                    }
-                } catch (\Throwable $e) {
-                    $errors[] = 'ASP: ' . $e->getMessage();
-                    $aspPending = true;
-                }
+                $queue[] = ['type' => 'asp'];
+            }
+
+            if ($queue === []) {
+                return $this->assembleCampaignStats([], [], 'fallback');
             }
 
             $prog = [
-                'uuids' => $uuids,
-                'asp_uuids' => $aspUuids,
-                'pending_chunks' => $pendingChunks,
-                'asp_pending' => $aspPending,
+                'queue' => $queue,
+                'uuids' => [],
+                'asp_uuids' => [],
                 'rows_by_uuid' => [],
-                'errors' => $errors,
+                'errors' => [],
                 'created' => time(),
             ];
-            Cache::put($progKey, $prog, now()->addMinutes(15));
-
-            // Если ни один отчёт не создан и дозаказывать нечего — не зависаем в pending.
-            if ($uuids === [] && $pendingChunks === [] && ! $aspPending) {
-                Cache::forget($progKey);
-
-                return $this->assembleCampaignStats([], $errors, 'fallback');
-            }
-
-            return $this->assembleCampaignStats([], $errors, 'pending') + ['pending' => true];
         }
 
-        // Шаг 2а: дозаказываем отчёты, не созданные из-за 429 (лимит «один отчёт за раз»).
-        // Паузы между HTTP-запросами фронта дают естественный бэкофф; пробуем до общего
-        // стейл-предохранителя (300с) — он соберёт частичный итог и снимет pending.
-        if (($prog['pending_chunks'] ?? []) !== [] || ($prog['asp_pending'] ?? false)) {
-            $stillPending = [];
-            foreach ((array) ($prog['pending_chunks'] ?? []) as $chunk) {
-                try {
-                    $uuid = $this->generateCampaignStatsReport($accessToken, (array) $chunk, $dateFrom, $dateTo);
-                    if ($uuid !== '') {
-                        $prog['uuids'][$uuid] = false;
-                    } else {
-                        $stillPending[] = $chunk;
-                    }
-                } catch (\Throwable $e) {
-                    $prog['errors'][] = 'Async retry: ' . $e->getMessage();
-                    $stillPending[] = $chunk;
-                }
-            }
-            $prog['pending_chunks'] = $stillPending;
-
-            if ($prog['asp_pending'] ?? false) {
-                try {
-                    $uuid = $this->generateAllSkuPromoOrdersReport($accessToken, $dateFrom, $dateTo);
-                    if ($uuid !== '') {
-                        $prog['uuids'][$uuid] = false;
-                        $prog['asp_uuids'][] = $uuid;
-                        $prog['asp_pending'] = false;
-                    }
-                } catch (\Throwable $e) {
-                    $prog['errors'][] = 'ASP retry: ' . $e->getMessage();
-                }
-            }
-
-        }
-
-        // Шаг 2: проверяем неготовые UUID, скачиваем готовые. Без длинного ожидания.
+        // Шаг 1: проверяем неготовые UUID, скачиваем готовые. Без длинного ожидания.
         foreach ($prog['uuids'] as $uuid => $done) {
             if ($done) {
                 continue;
@@ -1230,16 +1162,46 @@ class OzonPerformanceApiService
             }
         }
 
+        // Шаг 2: слот генерации свободен (нет неготовых UUID) — заказываем СЛЕДУЮЩИЙ отчёт
+        // из очереди. 429 (слот занят или лимит) не выбрасывает элемент из очереди: та же
+        // генерация повторится в следующем поллинге — паузы фронта дают естественный бэкофф.
+        $generating = in_array(false, $prog['uuids'], true);
+        if (! $generating && ($prog['queue'] ?? []) !== []) {
+            $next = $prog['queue'][0];
+            $isAsp = ($next['type'] ?? '') === 'asp';
+            try {
+                $uuid = $isAsp
+                    ? $this->generateAllSkuPromoOrdersReport($accessToken, $dateFrom, $dateTo)
+                    : $this->generateCampaignStatsReport($accessToken, (array) ($next['chunk'] ?? []), $dateFrom, $dateTo);
+                if ($uuid !== '') {
+                    $prog['uuids'][$uuid] = false;
+                    if ($isAsp) {
+                        $prog['asp_uuids'][] = $uuid;
+                    }
+                    array_shift($prog['queue']);
+                }
+            } catch (\Throwable $e) {
+                $prog['errors'][] = ($isAsp ? 'ASP: ' : 'Async: ') . $e->getMessage();
+            }
+        }
+
         // Накопленные строки из всех скачанных отчётов (плоский список).
         $accumulated = array_merge([], ...array_values($prog['rows_by_uuid'] ?? []));
 
-        $allDone = ! in_array(false, $prog['uuids'], true)
-            && ($prog['pending_chunks'] ?? []) === []
-            && ! ($prog['asp_pending'] ?? false);
-        $stale = (time() - (int) ($prog['created'] ?? time())) > 300; // защита от вечного pending
+        $allDone = ! in_array(false, $prog['uuids'], true) && ($prog['queue'] ?? []) === [];
+        $stale = (time() - (int) ($prog['created'] ?? time())) > 600; // защита от вечного pending
 
         // Шаг 3: готово (или устарело) — собираем итог и СОХРАНЯЕМ В БД (персистентно, с меткой времени).
         if ($allDone || $stale) {
+            Cache::forget($progKey);
+
+            // Стейл с недоделанной очередью: НЕ перетираем полные сохранённые данные частичными —
+            // пользователь продолжает видеть последний удачный сбор, перегенерация уйдёт в
+            // следующий заход (страница/кнопка обновления).
+            if (! $allDone && $stored !== null) {
+                return $stored;
+            }
+
             $stats = $this->assembleCampaignStats(
                 $accumulated,
                 $prog['errors'],
@@ -1249,12 +1211,20 @@ class OzonPerformanceApiService
                 $stats['from_storage'] = false;
                 $stats['fetched_at'] = $this->writeStoredCampaignStats($integrationId, $dateFrom, $dateTo, $stats);
             }
-            Cache::forget($progKey);
 
             return $stats;
         }
 
         Cache::put($progKey, $prog, now()->addMinutes(15));
+
+        // Пока пересборка идёт — отдаём последние сохранённые данные (stale-while-revalidate):
+        // пользователь сразу видит цифры, а фронт продолжает поллить по source='pending'.
+        if ($stored !== null) {
+            $stored['source'] = 'pending';
+            $stored['pending'] = true;
+
+            return $stored;
+        }
 
         return $this->assembleCampaignStats($accumulated, $prog['errors'], 'pending') + ['pending' => true];
     }
