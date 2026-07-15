@@ -194,6 +194,7 @@ class WildberriesServiceTest extends TestCase
 
     public function test_domain_products_api_does_not_rescan_cards_for_dimensions_by_default(): void
     {
+        Carbon::setTestNow('2026-07-15 10:00:00');
         Http::fake([
             'content-api.wildberries.ru/content/v2/get/cards/list' => Http::response([
                 'cards' => [[
@@ -209,7 +210,34 @@ class WildberriesServiceTest extends TestCase
         $result = (new WildberriesProductsApi(new WildberriesClient('test-token')))->getProducts(null, ['limit' => 100]);
 
         $this->assertCount(1, $result['cards']);
+        $this->assertSame('2026-07-15T10:00:00+00:00', $result['cards'][0]['_dimensions_observed_at']);
         Http::assertSentCount(1);
+    }
+
+    public function test_sales_funnel_redemption_carries_actual_response_time(): void
+    {
+        Carbon::setTestNow('2026-07-15 10:00:00');
+        Http::fake([
+            'seller-analytics-api.wildberries.ru/api/analytics/v3/sales-funnel/products' => Http::response([
+                'data' => [
+                    'products' => [[
+                        'product' => ['nmId' => 111, 'productRating' => 9, 'feedbackRating' => 4.8],
+                        'statistic' => [
+                            'selected' => [
+                                'orderCount' => 10,
+                                'buyoutCount' => 8,
+                                'conversions' => ['buyoutPercent' => 80],
+                            ],
+                        ],
+                    ]],
+                ],
+            ]),
+        ]);
+
+        $result = (new WildberriesProductsApi(new WildberriesClient('test-token')))->getCardRatings([111]);
+
+        $this->assertSame('2026-07-15T10:00:00+00:00', $result['111']['redemption_observed_at']);
+        $this->assertSame('wb_sales_funnel', $result['111']['redemption_source']);
     }
 
     public function test_tariff_snapshots_use_distinct_synthetic_warehouse_ids_for_box_tariffs(): void
@@ -292,5 +320,6 @@ class WildberriesServiceTest extends TestCase
 
         $this->assertSame(2.35, $rows['2038000000001']['volume_liters']);
         $this->assertSame(5.0, $rows['2038000000001']['storage_cost_per_day']);
+        $this->assertNotEmpty($rows['2038000000001']['observed_at']);
     }
 }

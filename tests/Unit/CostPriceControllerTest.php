@@ -106,6 +106,7 @@ class CostPriceControllerTest extends TestCase
             'drr_percent' => 8,
             'tariff_source' => 'wildberries_tariff_snapshots',
             'redemption_source' => 'wb_sales_funnel',
+            ...$this->wbObservationFields(),
             'marketplace_data' => [
                 'commission_source' => 'wb_commission_api_scheme',
                 'dimensions_source' => 'wb_product_characteristics',
@@ -128,6 +129,9 @@ class CostPriceControllerTest extends TestCase
         $this->assertNotEmpty($payload['items'][0]['calculated_at']);
         $this->assertNotEmpty($payload['items'][0]['source_observed_at']['commission']);
         $this->assertNotEmpty($payload['items'][0]['source_observed_at']['tariff']);
+        $this->assertNotEmpty($payload['items'][0]['source_observed_at']['redemption']);
+        $this->assertNotEmpty($payload['items'][0]['source_observed_at']['dimensions']);
+        $this->assertNotEmpty($payload['items'][0]['source_observed_at']['acquiring']);
     }
 
     public function test_calculated_zero_drr_is_not_treated_as_missing(): void
@@ -161,6 +165,7 @@ class CostPriceControllerTest extends TestCase
             'drr_percent' => 0,
             'tariff_source' => 'wb_tariffs_api',
             'redemption_source' => 'wb_sales_funnel',
+            ...$this->wbObservationFields(),
             'marketplace_data' => [
                 'commission_source' => 'wb_commission_snapshot_scheme',
                 'dimensions_source' => 'wb_product_characteristics',
@@ -216,6 +221,7 @@ class CostPriceControllerTest extends TestCase
             'drr_percent' => null,
             'tariff_source' => 'wb_tariffs_api',
             'redemption_source' => 'wb_sales_funnel',
+            ...$this->wbObservationFields(),
             'marketplace_data' => [
                 'commission_source' => 'wb_commission_snapshot_scheme',
                 'dimensions_source' => 'wb_product_characteristics',
@@ -271,6 +277,7 @@ class CostPriceControllerTest extends TestCase
             'drr_percent' => 0,
             'tariff_source' => 'wb_tariffs_api',
             'redemption_source' => 'wb_sales_funnel',
+            ...$this->wbObservationFields(),
             'marketplace_data' => [
                 'commission_source' => 'wb_commission_snapshot_scheme',
                 'dimensions_source' => 'wb_product_characteristics',
@@ -329,6 +336,7 @@ class CostPriceControllerTest extends TestCase
             'drr_percent' => 0,
             'tariff_source' => 'wb_tariffs_api',
             'redemption_source' => 'wb_sales_funnel',
+            ...$this->wbObservationFields(),
             'marketplace_data' => [
                 'commission_source' => 'wb_commission_snapshot_scheme',
                 'dimensions_source' => 'wb_product_characteristics',
@@ -389,6 +397,7 @@ class CostPriceControllerTest extends TestCase
             'drr_percent' => 5,
             'tariff_source' => 'wildberries_tariff_snapshots',
             'redemption_source' => 'api_orders_sku_sales',
+            ...$this->wbObservationFields(),
             'marketplace_data' => [
                 'commission_source' => 'wb_commission_snapshot',
                 'dimensions_source' => 'wb_storage_api_volume',
@@ -497,6 +506,7 @@ class CostPriceControllerTest extends TestCase
             'drr_percent' => null,
             'tariff_source' => 'wb_tariffs_api',
             'redemption_source' => 'wb_sales_funnel',
+            ...$this->wbObservationFields(),
             'marketplace_data' => [
                 'commission_source' => 'wb_commission_snapshot_scheme',
                 'dimensions_source' => 'wb_product_characteristics',
@@ -514,6 +524,57 @@ class CostPriceControllerTest extends TestCase
         $this->assertSame('incomplete', $payload['items'][0]['status']);
         $this->assertContains('stale_commission_source', $payload['items'][0]['reasons']);
         $this->assertContains('stale_tariff_source', $payload['items'][0]['reasons']);
+    }
+
+    public function test_unit_economics_readiness_blocks_stale_item_level_wb_sources(): void
+    {
+        $integration = Integration::factory()->wildberries()->create(['id' => 61015]);
+        $this->recordWbSourceEvidence($integration->id);
+        $product = Product::factory()->wildberries()->create([
+            'integration_id' => $integration->id,
+            'sku' => '2038816371466',
+            'marketplace_id' => '184010781:2038816371466',
+            'wb_data' => ['nmID' => 184010781],
+        ]);
+        UnitEconomicsSettings::create([
+            'integration_id' => $integration->id,
+            'sku' => $product->sku,
+            'cost_price' => 600,
+            'tax_percent' => 6,
+        ]);
+        UnitEconomics::create([
+            'integration_id' => $integration->id,
+            'sku' => $product->sku,
+            'marketplace' => 'wildberries',
+            'fulfillment_type' => 'FBO',
+            'is_actual_scheme' => true,
+            'price' => 1400,
+            'commission_percent' => 19,
+            'effective_logistics' => 100,
+            'net_profit' => 140,
+            'net_profit_per_unit' => 140,
+            'margin_percent' => 10,
+            'tariff_source' => 'wb_tariffs_api',
+            'redemption_source' => 'wb_sales_funnel',
+            ...$this->wbObservationFields(now()->subDays(4)),
+            'marketplace_data' => [
+                'commission_source' => 'wb_commission_snapshot_scheme',
+                'dimensions_source' => 'wb_product_characteristics',
+                'acquiring_source' => 'wb_realization_report_sku',
+            ],
+        ]);
+
+        $payload = (new CostPriceController(new CostPriceParserService()))
+            ->unitEconomicsReadiness(Request::create(
+                '/api/products/unit-economics/readiness',
+                'POST',
+                ['integration_id' => $integration->id, 'wb_product_ids' => [184010781]]
+            ))->getData(true);
+
+        $this->assertSame('incomplete', $payload['items'][0]['status']);
+        $this->assertContains('stale_redemption_source', $payload['items'][0]['reasons']);
+        $this->assertContains('stale_dimensions_source', $payload['items'][0]['reasons']);
+        $this->assertContains('stale_acquiring_source', $payload['items'][0]['reasons']);
     }
 
     public function test_template_uses_browser_safe_utf8_filename_and_excel_friendly_csv(): void
@@ -667,5 +728,16 @@ class CostPriceControllerTest extends TestCase
                 'fetched_at' => $fetchedAt,
             ]);
         }
+    }
+
+    private function wbObservationFields($observedAt = null): array
+    {
+        $observedAt ??= now();
+
+        return [
+            'redemption_observed_at' => $observedAt,
+            'dimensions_observed_at' => $observedAt,
+            'acquiring_observed_at' => $observedAt,
+        ];
     }
 }

@@ -244,7 +244,8 @@ class RealizationReportApi
      *
      * @return array{
      *   by_sku: array<string,float>,   // barcode/nm_id/sa_name => acquiring %
-     *   avg: float                     // средневзвешенный эквайринг по магазину, %
+     *   avg: float,                    // средневзвешенный эквайринг по магазину, %
+     *   observed_at: string            // реальное время получения отчёта API
      * }
      */
     public function getAcquiringBySku(int $weeks = 4): array
@@ -306,11 +307,15 @@ class RealizationReportApi
                 'date_to' => $dateTo,
             ]);
 
-            return ['by_sku' => $bySku, 'avg' => $avg];
+            return [
+                'by_sku' => $bySku,
+                'avg' => $avg,
+                'observed_at' => now()->utc()->toIso8601String(),
+            ];
         } catch (\Exception $e) {
             Log::error('WB getAcquiringBySku error', ['error' => $e->getMessage()]);
 
-            return ['by_sku' => [], 'avg' => 0.0];
+            return ['by_sku' => [], 'avg' => 0.0, 'observed_at' => null];
         }
     }
 }

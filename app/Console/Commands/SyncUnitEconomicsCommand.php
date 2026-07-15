@@ -203,6 +203,7 @@ class SyncUnitEconomicsCommand extends Command
         // Получаем настройки интеграции (avg_delivery_time_hours и др.)
         $integration = \App\Models\Integration::find($integrationId);
         $integrationSettings = $integration?->settings ?? [];
+        $integrationSettings['manual_redemption_observed_at'] = $integration?->redemption_checked_at?->utc()?->toIso8601String();
 
         // Загружаем себестоимость из UnitEconomicsSettings (приоритет — ввод пользователя)
         $skus = $products->pluck('sku');
@@ -909,6 +910,13 @@ class SyncUnitEconomicsCommand extends Command
                     // sales/orders как фолбэк, если воронки по товару нет.
                     $wbRedemptionData = $wbService->getRedemptionStatsByNmId(30);
                     if (! empty($wbRedemptionData)) {
+                        $redemptionObservedAt = now()->utc()->toIso8601String();
+                        foreach ($wbRedemptionData as &$redemptionItem) {
+                            if (is_array($redemptionItem)) {
+                                $redemptionItem['observed_at'] = $redemptionObservedAt;
+                            }
+                        }
+                        unset($redemptionItem);
                         $this->info('  WB Выкуп (sales/orders, фолбэк): получено для '.count($wbRedemptionData).' товаров');
                     }
                     // Ручной % выкупа из интеграции
@@ -924,12 +932,16 @@ class SyncUnitEconomicsCommand extends Command
                         $wbAcquiring = $wbService->getAcquiringBySku(4);
                         $wbAcquiringAvg = (float) ($wbAcquiring['avg'] ?? 0);
                         foreach (($wbAcquiring['by_sku'] ?? []) as $acqKey => $acqPct) {
-                            $acquiringData[(string) $acqKey] = ['acquiring_percent' => (float) $acqPct];
+                            $acquiringData[(string) $acqKey] = [
+                                'acquiring_percent' => (float) $acqPct,
+                                'observed_at' => $wbAcquiring['observed_at'] ?? null,
+                            ];
                         }
                         // Средний по магазину — фолбэк для товаров без продаж за период.
                         // Кладём в settings, чтобы он дошёл до buildCalculationData.
                         if ($wbAcquiringAvg > 0) {
                             $integrationSettings['wb_acquiring_avg'] = $wbAcquiringAvg;
+                            $integrationSettings['wb_acquiring_observed_at'] = $wbAcquiring['observed_at'] ?? null;
                         }
                         if (! empty($wbAcquiring['by_sku'])) {
                             $this->info('  WB Эквайринг (отчёт реализации): '.count($wbAcquiring['by_sku']).' SKU, средний '.$wbAcquiringAvg.'%');
@@ -1686,10 +1698,13 @@ class SyncUnitEconomicsCommand extends Command
                 if ($wbStorageData && isset($wbStorageData['volume_liters']) && $wbStorageData['volume_liters'] > 0) {
                     $volumeLiters = $wbStorageData['volume_liters'];
                     $data['dimensions_source'] = 'wb_storage_api_volume';
+                    $data['dimensions_observed_at'] = $wbStorageData['observed_at'] ?? null;
                 } elseif ($lengthCm !== null && $widthCm !== null && $heightCm !== null) {
                     $data['dimensions_source'] = 'wb_product_characteristics';
+                    $data['dimensions_observed_at'] = $wbData['dimensions_observed_at'] ?? null;
                 } else {
                     $data['dimensions_source'] = 'default';
+                    $data['dimensions_observed_at'] = null;
                 }
 
                 $data['volume_liters'] = round($volumeLiters, 2);
@@ -1806,11 +1821,13 @@ class SyncUnitEconomicsCommand extends Command
                     $data['orders_count'] = $wbFunnelOrders ?: ($data['orders_count'] ?? null);
                     $data['returns_count'] = $wbFunnelOrders > 0 ? max(0, $wbFunnelOrders - $wbFunnelBuyouts) : null;
                     $data['redemption_source'] = 'wb_sales_funnel';
+                    $data['redemption_observed_at'] = $wbData['redemption_observed_at'] ?? null;
                 } elseif ($wbRedemptionData && isset($wbRedemptionData['redemption_rate']) && $wbRedemptionData['redemption_rate'] > 0) {
                     $data['redemption_rate'] = $wbRedemptionData['redemption_rate'];
                     $data['orders_count'] = $wbRedemptionData['orders_count'] ?? ($data['orders_count'] ?? null);
                     $data['returns_count'] = $wbRedemptionData['returns_count'] ?? null;
-                    $data['redemption_source'] = $wbRedemptionData['source'] ?? 'api';
+                    $data['redemption_source'] = 'api_orders_sku_sales';
+                    $data['redemption_observed_at'] = $wbRedemptionData['observed_at'] ?? null;
                 } elseif (($wbRedemptionData['orders_count'] ?? 0) > 0) {
                     $ordersCount = (int) ($wbRedemptionData['orders_count'] ?? 0);
                     $deliveredCount = min($ordersCount, max(0, (int) $salesCount));
@@ -1820,15 +1837,18 @@ class SyncUnitEconomicsCommand extends Command
                     $data['orders_count'] = $ordersCount;
                     $data['returns_count'] = $returnsCount;
                     $data['redemption_source'] = 'api_orders_sku_sales';
+                    $data['redemption_observed_at'] = $wbRedemptionData['observed_at'] ?? null;
                 } elseif (isset($wbData['redemption_rate']) && $wbData['redemption_rate'] > 0) {
                     $data['redemption_rate'] = $wbData['redemption_rate'];
                     $data['redemption_source'] = 'product';
                 } elseif ($manualRedemptionRate !== null && $manualRedemptionRate > 0) {
                     $data['redemption_rate'] = $manualRedemptionRate;
                     $data['redemption_source'] = 'manual';
+                    $data['redemption_observed_at'] = $integrationSettings['manual_redemption_observed_at'] ?? null;
                 } else {
                     $data['redemption_rate'] = 80; // WB обычно ниже выкуп чем Ozon
                     $data['redemption_source'] = 'default';
+                    $data['redemption_observed_at'] = null;
                 }
 
                 // === ЭКВАЙРИНГ ПО ФАКТУ (отчёт реализации) ===
@@ -1841,12 +1861,15 @@ class SyncUnitEconomicsCommand extends Command
                     $data['acquiring_percent'] = round($wbPreciseAcquiring, 2);
                     $data['_acquiring_precise'] = true; // транзиентный маркер: не перетирать старым
                     $data['acquiring_source'] = 'wb_realization_report_sku';
+                    $data['acquiring_observed_at'] = $acquiringData['observed_at'] ?? null;
                 } elseif ($wbAcquiringStoreAvg > 0) {
                     $data['acquiring_percent'] = round($wbAcquiringStoreAvg, 2);
                     $data['_acquiring_precise'] = true;
                     $data['acquiring_source'] = 'wb_realization_report_store_avg';
+                    $data['acquiring_observed_at'] = $integrationSettings['wb_acquiring_observed_at'] ?? null;
                 } else {
                     $data['acquiring_source'] = 'default';
+                    $data['acquiring_observed_at'] = null;
                 }
 
                 // === СВОЯ ДОСТАВКА (DBS) ===
@@ -2374,6 +2397,7 @@ class SyncUnitEconomicsCommand extends Command
                 'volume_liters' => $calculated['volume_liters'] ?? $data['volume_liters'] ?? null,
                 'volume_weight' => $calculated['volume_weight'] ?? $data['volume_weight'] ?? null,
                 'actual_weight' => $calculated['actual_weight'] ?? $data['actual_weight'] ?? null,
+                'dimensions_observed_at' => $data['dimensions_observed_at'] ?? null,
 
                 // === НАЦЕНКА (множитель x) ===
                 'markup_multiplier' => $calculated['markup_multiplier'] ?? null,
@@ -2408,6 +2432,7 @@ class SyncUnitEconomicsCommand extends Command
                 // === % ВЫКУПА 28д ===
                 'redemption_rate' => $calculated['redemption_rate'] ?? $data['redemption_rate'] ?? 80,
                 'redemption_source' => $data['redemption_source'] ?? 'default',
+                'redemption_observed_at' => $data['redemption_observed_at'] ?? null,
                 'orders_count' => $data['orders_count'] ?? null,
                 'returns_count' => $data['returns_count'] ?? null,
 
@@ -2421,6 +2446,7 @@ class SyncUnitEconomicsCommand extends Command
                 // === ЭКВАЙРИНГ (WB: 0%) ===
                 'acquiring_percent' => $calculated['acquiring_percent'] ?? $data['acquiring_percent'] ?? 1.5,
                 'acquiring_amount' => $calculated['acquiring_amount'] ?? null,
+                'acquiring_observed_at' => $data['acquiring_observed_at'] ?? null,
 
                 // === ИТОГОВЫЙ % РАСХОДОВ ===
                 'total_expenses_percent' => $calculated['total_expenses_percent'] ?? null,

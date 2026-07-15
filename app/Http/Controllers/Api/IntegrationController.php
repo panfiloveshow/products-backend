@@ -873,6 +873,7 @@ class IntegrationController extends Controller
 
         $integration->update([
             'manual_redemption_rate' => $request->redemption_rate,
+            'redemption_checked_at' => now(),
         ]);
 
         Log::info('Manual redemption rate set', [

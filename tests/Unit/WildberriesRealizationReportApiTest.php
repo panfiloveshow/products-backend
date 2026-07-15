@@ -37,6 +37,7 @@ class WildberriesRealizationReportApiTest extends TestCase
         $this->assertSame(3.5, $result['by_sku']['2038000000001']);
         $this->assertSame(3.5, $result['by_sku']['123456']);
         $this->assertSame(3.5, $result['by_sku']['A-1']);
+        $this->assertSame('2026-07-15T10:00:00+00:00', $result['observed_at']);
         Http::assertSent(function ($request) {
             $payload = $request->data();
 

@@ -60,6 +60,13 @@ class ProductsApi implements ProductsApiInterface
         }
 
         $cards = $response['cards'] ?? [];
+        $dimensionsObservedAt = now()->utc()->toIso8601String();
+        foreach ($cards as &$card) {
+            // This is the actual time the Content API page was received. Persist it
+            // with the dimensions instead of deriving freshness from a later calc.
+            $card['_dimensions_observed_at'] = $dimensionsObservedAt;
+        }
+        unset($card);
         
         // Не делаем дополнительный поиск по nmID по умолчанию: при полной пагинации
         // это превращает sync в O(pages^2) Content API calls. Включать только для
@@ -421,6 +428,7 @@ class ProductsApi implements ProductsApiInterface
                     $entry = [
                         'productRating' => $product['productRating'] ?? null,
                         'feedbackRating' => $product['feedbackRating'] ?? null,
+                        'redemption_observed_at' => now()->utc()->toIso8601String(),
                     ];
 
                     // % выкупа из воронки продаж WB (как в ЛК). Авторитетнее трейлингового

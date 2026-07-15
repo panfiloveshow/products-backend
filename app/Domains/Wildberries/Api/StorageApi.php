@@ -100,6 +100,7 @@ class StorageApi
                 return [];
             }
 
+            $observedAt = now()->utc()->toIso8601String();
             $result = [];
             foreach ($storage as $item) {
                 // Используем barcode как основной ключ (совпадает с InventoryApi)
@@ -125,6 +126,7 @@ class StorageApi
                         'volume_liters' => (float)($item['volume'] ?? 0),
                         'loyalty_discount' => (float)($item['loyaltyDiscount'] ?? 0),
                         'days_count' => 0,
+                        'observed_at' => $observedAt,
                     ];
                 }
 

@@ -237,6 +237,9 @@ class CostPriceController extends Controller
                 'calculated.sales_count',
                 'calculated.tariff_source',
                 'calculated.redemption_source',
+                'calculated.redemption_observed_at',
+                'calculated.dimensions_observed_at',
+                'calculated.acquiring_observed_at',
                 'calculated.marketplace_data',
                 'calculated.updated_at as calculated_at',
             ]);
@@ -286,6 +289,11 @@ class CostPriceController extends Controller
         $dimensionsSource = trim((string) ($marketplaceData['dimensions_source'] ?? ''));
         $acquiringSource = trim((string) ($marketplaceData['acquiring_source'] ?? ''));
         $calculatedAt = $row->calculated_at ? \Illuminate\Support\Carbon::parse($row->calculated_at)->utc() : null;
+        $sourceObservedAt = [
+            'redemption' => $this->sourceFreshness->observedAt($row->redemption_observed_at),
+            'dimensions' => $this->sourceFreshness->observedAt($row->dimensions_observed_at),
+            'acquiring' => $this->sourceFreshness->observedAt($row->acquiring_observed_at),
+        ];
 
         $reasons = [];
         foreach ([
@@ -321,6 +329,27 @@ class CostPriceController extends Controller
             $normalized = strtolower($source);
             if ($normalized === '' || str_contains($normalized, 'default') || str_contains($normalized, 'fallback')) {
                 $reasons[] = 'untrusted_' . $sourceName . '_source';
+            }
+        }
+        $trustedWbSources = [
+            'redemption' => ['wb_sales_funnel', 'api_orders_sku_sales', 'manual'],
+            'dimensions' => ['wb_storage_api_volume', 'wb_product_characteristics'],
+            'acquiring' => ['wb_realization_report_sku', 'wb_realization_report_store_avg'],
+        ];
+        foreach ([
+            'redemption' => $redemptionSource,
+            'dimensions' => $dimensionsSource,
+            'acquiring' => $acquiringSource,
+        ] as $sourceName => $source) {
+            $normalized = strtolower($source);
+            if (! in_array($normalized, $trustedWbSources[$sourceName], true)) {
+                $reasons[] = 'untrusted_' . $sourceName . '_source';
+                continue;
+            }
+            // Explicit user input is allowed by the real-data policy. Automated
+            // marketplace observations, however, must carry their own fresh time.
+            if ($normalized !== 'manual' && ! $this->sourceFreshness->isFresh($sourceObservedAt[$sourceName], $checkedAt)) {
+                $reasons[] = 'stale_' . $sourceName . '_source';
             }
         }
         if (str_starts_with(strtolower($commissionSource), 'wb_commission_snapshot_') && $sourceEvidence['commission'] === null) {
@@ -363,9 +392,9 @@ class CostPriceController extends Controller
             'source_observed_at' => [
                 'commission' => $sourceEvidence['commission']?->toRfc3339String(),
                 'tariff' => $sourceEvidence['tariff']?->toRfc3339String(),
-                'redemption' => null,
-                'dimensions' => null,
-                'acquiring' => null,
+                'redemption' => $sourceObservedAt['redemption']?->toRfc3339String(),
+                'dimensions' => $sourceObservedAt['dimensions']?->toRfc3339String(),
+                'acquiring' => $sourceObservedAt['acquiring']?->toRfc3339String(),
             ],
         ];
     }

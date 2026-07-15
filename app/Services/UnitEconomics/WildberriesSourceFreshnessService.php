@@ -35,6 +35,31 @@ final class WildberriesSourceFreshnessService
         ];
     }
 
+    /**
+     * Parse a persisted observation timestamp without pretending that the
+     * unit-economics calculation time is the source fetch time.
+     */
+    public function observedAt(mixed $value): ?Carbon
+    {
+        try {
+            return $this->parse($value);
+        } catch (\Throwable) {
+            return null;
+        }
+    }
+
+    public function isFresh(?Carbon $observedAt, Carbon $checkedAt, int $maxAgeHours = 72): bool
+    {
+        if ($observedAt === null) {
+            return false;
+        }
+
+        return $observedAt->betweenIncluded(
+            $checkedAt->copy()->subHours($maxAgeHours),
+            $checkedAt->copy()->addMinutes(5),
+        );
+    }
+
     private function parse(mixed $value): ?Carbon
     {
         return $value === null ? null : Carbon::parse($value)->utc();

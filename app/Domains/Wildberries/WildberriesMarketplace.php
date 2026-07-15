@@ -399,10 +399,12 @@ class WildberriesMarketplace implements MarketplaceInterface, LegacyMarketplaceI
                 'redemption_orders_count' => $ratingData['redemption_orders_count'] ?? null,
                 'redemption_buyouts_count' => $ratingData['redemption_buyouts_count'] ?? null,
                 'redemption_source' => $ratingData['redemption_source'] ?? null,
+                'redemption_observed_at' => $ratingData['redemption_observed_at'] ?? null,
                 'imtID' => $card['imtID'] ?? null,
                 'subjectID' => $card['subjectID'] ?? null,
                 'vendorCode' => $card['vendorCode'] ?? null,
                 'dimensions' => $dimensions,
+                'dimensions_observed_at' => $card['_dimensions_observed_at'] ?? null,
                 'characteristics' => $card['characteristics'] ?? [],
                 // Комиссии по схемам (аналогично ozon_data.commissions)
                 'commissions' => $this->normalizeCommissionSchemes($commissionData, $category),
