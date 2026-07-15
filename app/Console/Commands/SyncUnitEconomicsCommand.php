@@ -2,6 +2,9 @@
 
 namespace App\Console\Commands;
 
+use App\Domains\Marketplace\MarketplaceFactory;
+use App\Domains\Ozon\Api\DeliveryAnalyticsApi;
+use App\Domains\Ozon\OzonMarketplace;
 use App\Domains\Ozon\Tariffs\OzonPricingMatrix;
 use App\Domains\Wildberries\UnitEconomics\WildberriesCommissionResolver;
 use App\Domains\Wildberries\UnitEconomics\WildberriesSppResolver;
@@ -15,15 +18,20 @@ use App\Models\OzonSkuDeliveryProfile;
 use App\Models\OzonWarehouseCluster;
 use App\Models\Product;
 use App\Models\UnitEconomics;
+use App\Models\UnitEconomicsSettings;
 use App\Services\LocalizationIndexService;
+use App\Services\Marketplace\YandexMarketService;
 use App\Services\Ozon\OzonOrderUnitEconomicsService;
 use App\Services\Ozon\OzonPostingsBuyoutCalculator;
 use App\Services\Ozon\OzonSupplyFixationService;
 use App\Services\Ozon\OzonSupplySyncService;
 use App\Services\PostingService;
+use App\Services\SellicoApiService;
 use App\Services\UnitEconomicsService;
 use Illuminate\Console\Command;
+use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Log;
 
 class SyncUnitEconomicsCommand extends Command
 {
@@ -41,8 +49,7 @@ class SyncUnitEconomicsCommand extends Command
         OzonOrderUnitEconomicsService $orderUnitEconomicsService,
         OzonSupplySyncService $supplySyncService,
         PostingService $postingService
-    ): int
-    {
+    ): int {
         $integrationId = $this->option('integration');
         $marketplace = $this->option('marketplace');
         $syncAll = $this->option('all');
@@ -70,8 +77,7 @@ class SyncUnitEconomicsCommand extends Command
         OzonOrderUnitEconomicsService $orderUnitEconomicsService,
         OzonSupplySyncService $supplySyncService,
         PostingService $postingService
-    ): int
-    {
+    ): int {
         $integrations = Product::select('integration_id', 'marketplace')
             ->whereNotNull('integration_id')
             ->whereNotNull('price')
@@ -108,8 +114,7 @@ class SyncUnitEconomicsCommand extends Command
         OzonSupplySyncService $supplySyncService,
         PostingService $postingService,
         int $integrationId
-    ): int
-    {
+    ): int {
         $marketplace = Product::where('integration_id', $integrationId)->value('marketplace');
 
         if (! $marketplace) {
@@ -138,8 +143,7 @@ class SyncUnitEconomicsCommand extends Command
         OzonSupplySyncService $supplySyncService,
         PostingService $postingService,
         string $marketplace
-    ): int
-    {
+    ): int {
         if ($marketplace === 'yandex') {
             $marketplace = 'yandex_market';
         }
@@ -185,8 +189,7 @@ class SyncUnitEconomicsCommand extends Command
         PostingService $postingService,
         int $integrationId,
         string $marketplace
-    ): array
-    {
+    ): array {
         $marketplaceAliases = $this->marketplaceAliases($marketplace);
         $phaseStart = microtime(true); // тайминг фаз: видно, что именно жрёт минуты (API vs расчёт)
 
@@ -201,14 +204,14 @@ class SyncUnitEconomicsCommand extends Command
         }
 
         // Получаем настройки интеграции (avg_delivery_time_hours и др.)
-        $integration = \App\Models\Integration::find($integrationId);
+        $integration = Integration::find($integrationId);
         $integrationSettings = $integration?->settings ?? [];
         $integrationSettings['manual_redemption_observed_at'] = $integration?->redemption_checked_at?->utc()?->toIso8601String();
 
         // Загружаем себестоимость из UnitEconomicsSettings (приоритет — ввод пользователя)
         $skus = $products->pluck('sku');
         $vendorCodes = $products->pluck('vendor_code')->filter();
-        $costPriceSettings = \App\Models\UnitEconomicsSettings::where('integration_id', $integrationId)
+        $costPriceSettings = UnitEconomicsSettings::where('integration_id', $integrationId)
             ->where(function ($q) use ($skus, $vendorCodes) {
                 $q->whereIn('sku', $skus);
                 if ($vendorCodes->isNotEmpty()) {
@@ -297,7 +300,7 @@ class SyncUnitEconomicsCommand extends Command
         if ($marketplace === 'uzum') {
             try {
                 $creds = $integration?->resolveCredentials() ?? [];
-                $uzumMp = \App\Domains\Marketplace\MarketplaceFactory::create('uzum', $creds, $integration);
+                $uzumMp = MarketplaceFactory::create('uzum', $creds, $integration);
                 $financeByProduct = $uzumMp->getFinanceByProduct(30);
                 foreach ($products as $product) {
                     $ud = is_array($product->uzum_data ?? null) ? $product->uzum_data : [];
@@ -316,7 +319,7 @@ class SyncUnitEconomicsCommand extends Command
                 }
                 $this->info('  Uzum finance: обогащено товаров из '.count($financeByProduct).' productId');
             } catch (\Throwable $e) {
-                \Illuminate\Support\Facades\Log::warning('Uzum finance enrich failed', [
+                Log::warning('Uzum finance enrich failed', [
                     'integration_id' => $integrationId,
                     'error' => $e->getMessage(),
                 ]);
@@ -342,7 +345,7 @@ class SyncUnitEconomicsCommand extends Command
 
                 // 2. Пробуем Sellico API
                 if (empty($clientId)) {
-                    $sellicoService = new \App\Services\SellicoApiService;
+                    $sellicoService = new SellicoApiService;
                     $sellicoResult = $sellicoService->getIntegrationById($integrationId);
 
                     if ($sellicoResult['success'] && ! empty($sellicoResult['credentials'])) {
@@ -366,7 +369,7 @@ class SyncUnitEconomicsCommand extends Command
                 }
 
                 if (! empty($clientId) && ! empty($apiKey)) {
-                    $ozonService = new \App\Domains\Ozon\OzonMarketplace(['client_id' => $clientId, 'api_key' => $apiKey]);
+                    $ozonService = new OzonMarketplace(['client_id' => $clientId, 'api_key' => $apiKey]);
                     // Потолок бэкфилла постингов при первом синке (нет водяного знака).
                     // Дальше PostingService идёт инкрементально от ozon_postings_synced_until.
                     $operationalSince = now()->subDays(90)->format('Y-m-d');
@@ -386,6 +389,22 @@ class SyncUnitEconomicsCommand extends Command
                     }
 
                     $actualCosts = $ozonService->getActualCostsBySku();
+
+                    // === НАЛОГОВАЯ БАЗА: фактические цены продажи (отчёт о реализации) ===
+                    // Ozon ставит доп. скидки за счёт продавца («Баллы за скидки») — товар
+                    // реально продаётся дешевле цены продавца. Налог УСН считается от
+                    // фактической цены («реализовано со скидкой»), а не от цены продавца.
+                    try {
+                        $ozonActualSalePrices = $ozonService->getActualSalePricesBySku();
+                        if (! empty($ozonActualSalePrices['by_offer_id'])) {
+                            $integrationSettings['ozon_actual_sale_prices'] = $ozonActualSalePrices;
+                            $this->info('  Ozon факт. цены продажи (реализация '.($ozonActualSalePrices['month'] ?? '?').'): '.count($ozonActualSalePrices['by_offer_id']).' SKU');
+                        } else {
+                            $this->warn('  Ozon факт. цены продажи: отчёт о реализации пуст/недоступен — налог от цены продавца');
+                        }
+                    } catch (\Throwable $realizationEx) {
+                        $this->warn('  Ozon факт. цены продажи: '.$realizationEx->getMessage());
+                    }
 
                     // Получаем актуальные цены (включая акционные marketing_seller_price)
                     $productPrices = $ozonService->getProductPrices();
@@ -460,7 +479,7 @@ class SyncUnitEconomicsCommand extends Command
                     $sellerFboSales7Days = (int) $inventoryRaw->where('fulfillment_type', 'FBO')->sum('sales_7_days');
 
                     try {
-                        $deliveryAnalyticsApi = new \App\Domains\Ozon\Api\DeliveryAnalyticsApi($ozonService->api());
+                        $deliveryAnalyticsApi = new DeliveryAnalyticsApi($ozonService->api());
                         $deliveryProfiles = $this->buildOzonDeliveryProfiles(
                             $deliveryAnalyticsApi->getSupplyRecommendations([], 'ALL', 'EIGHT_WEEKS'),
                             $ozonStockProfiles,
@@ -579,7 +598,7 @@ class SyncUnitEconomicsCommand extends Command
                     // иногда отдаёт устаревший delivering по заказам, которые на Ozon
                     // уже доставлены и учтены в виджете «Выкупы» как выкупленные.
                     try {
-                        $integrationModel = \App\Models\Integration::find($integrationId);
+                        $integrationModel = Integration::find($integrationId);
                         if ($integrationModel) {
                             $refreshStats = $postingService->refreshInFlightOzonPostings($integrationModel, 28);
                             if (($refreshStats['changed'] ?? 0) > 0 || ($refreshStats['refreshed'] ?? 0) > 0) {
@@ -591,7 +610,7 @@ class SyncUnitEconomicsCommand extends Command
                     }
 
                     // Шаг 1: Postings (28д) — основной источник по всем SKU с заказами за окно.
-                    $postingsCalculator = app(\App\Services\Ozon\OzonPostingsBuyoutCalculator::class);
+                    $postingsCalculator = app(OzonPostingsBuyoutCalculator::class);
                     $postingsBuyoutMap = $postingsCalculator->calculateForIntegration((int) $integrationId, 28);
                     foreach ($postingsBuyoutMap as $sku => $buyout) {
                         $buyout['period_days'] = 28;
@@ -792,8 +811,18 @@ class SyncUnitEconomicsCommand extends Command
         $wbRedemptionData = [];
         $wbLocalizationByNmId = [];
         $wbCommissionsData = [];
+        $existingWbSppBySku = collect();
 
         if ($marketplace === 'wildberries') {
+            // При временной недоступности обоих источников СПП не имеем права
+            // затирать последнее успешное значение нулём.
+            $existingWbSppBySku = UnitEconomics::query()
+                ->where('integration_id', $integrationId)
+                ->where('marketplace', 'wildberries')
+                ->selectRaw('sku, MAX(spp_percent) as spp_percent')
+                ->groupBy('sku')
+                ->pluck('spp_percent', 'sku');
+
             try {
                 $wbApiKey = null;
 
@@ -804,7 +833,7 @@ class SyncUnitEconomicsCommand extends Command
 
                 // 2. Пробуем Sellico API
                 if (empty($wbApiKey)) {
-                    $sellicoService = new \App\Services\SellicoApiService;
+                    $sellicoService = new SellicoApiService;
                     $sellicoResult = $sellicoService->getIntegrationById($integrationId);
 
                     if ($sellicoResult['success'] && ! empty($sellicoResult['credentials'])) {
@@ -814,7 +843,7 @@ class SyncUnitEconomicsCommand extends Command
                 }
 
                 if (! empty($wbApiKey)) {
-                    $wbService = new \App\Domains\Wildberries\WildberriesMarketplace(['api_key' => $wbApiKey], $integration);
+                    $wbService = new WildberriesMarketplace(['api_key' => $wbApiKey], $integration);
 
                     // Ручной ввод ИЛ/ИРП из ЛК WB имеет приоритет — авто-расчёт пропускаем.
                     $wbIndicesManual = (bool) ($integrationSettings['wb_indices_manual'] ?? false);
@@ -852,14 +881,34 @@ class SyncUnitEconomicsCommand extends Command
                             // на /api/v1/supplier/sales, ~1 запрос/мин). Ставим расчёт
                             // ИЛ/ИРП в очередь с backoff (release(90)), чтобы пробить лимит.
                             $this->warn('  WB ИЛ: нет свежих данных (вероятно 429) — расчёт ИЛ/ИРП поставлен в очередь с backoff');
-                            \App\Jobs\SyncWildberriesLocalizationJob::dispatch($integrationId)->onQueue('unit-economics');
+                            SyncWildberriesLocalizationJob::dispatch($integrationId)->onQueue('unit-economics');
                         }
                     }
 
-                    // Получаем продажи по SKU (7/14/30 дней)
-                    $wbSalesData = $wbService->getSalesBySku();
-                    if (! empty($wbSalesData)) {
-                        $this->info('  WB Продажи: получено для '.count($wbSalesData).' SKU');
+                    // /supplier/sales имеет лимит 1 запрос/мин на продавца.
+                    // Загружаем отчёт один раз и из него строим продажи, СПП и выкуп.
+                    $wbSalesReport = $wbService->getSalesReport(30);
+                    if (is_array($wbSalesReport)) {
+                        $wbSalesData = $wbService->buildSalesBySku($wbSalesReport, 30);
+                        $wbSppData = $wbService->buildSppFromSales($wbSalesReport);
+
+                        if (! empty($wbSalesData)) {
+                            $this->info('  WB Продажи: получено для '.count($wbSalesData).' SKU');
+                        }
+                        if (! empty($wbSppData)) {
+                            $this->info('  WB СПП: получено для '.count($wbSppData).' товаров');
+                        }
+                    } else {
+                        // WB может надолго заблокировать конкретно /supplier/sales,
+                        // хотя отдельный /supplier/orders продолжает отвечать. В
+                        // заказах есть то же поле spp — используем его как fallback.
+                        $wbOrdersReport = $wbService->getOrdersReport(30);
+                        if (is_array($wbOrdersReport)) {
+                            $wbSppData = $wbService->buildSppFromSales($wbOrdersReport);
+                            $this->info('  WB СПП (резерв из заказов): получено для '.count($wbSppData).' товаров');
+                        } else {
+                            $this->warn('  WB Продажи/СПП: отчёты недоступны — сохраняем последние значения СПП');
+                        }
                     }
 
                     // Получаем стоимость хранения по SKU
@@ -879,27 +928,26 @@ class SyncUnitEconomicsCommand extends Command
                         $this->info('  WB Комиссии: получено для '.count($wbCommissionsData).' категорий');
                     }
 
-                    // === ПОЛУЧАЕМ СПП ИЗ СТАТИСТИКИ ПРОДАЖ ===
-                    $wbSppData = $wbService->getSppFromSales(30); // За последние 30 дней
-                    if (! empty($wbSppData)) {
-                        $this->info('  WB СПП: получено для '.count($wbSppData).' товаров');
-                    }
-
                     // === ВИТРИННЫЙ СПП ИЗ КАРТОЧЕК (фолбэк для товаров без продаж) ===
                     // У товаров без продаж СПП из статистики недоступен, поэтому
                     // добираем «витринный» СПП из публичных карточек card.wb.ru.
-                    $wbNmIds = Product::query()
+                    $wbProductsForSpp = Product::query()
                         ->where('integration_id', $integrationId)
                         ->where('marketplace', 'wildberries')
-                        ->get(['wb_data'])
+                        ->get(['wb_data', 'price']);
+                    $wbNmIds = $wbProductsForSpp
                         ->map(static fn ($p) => $p->wb_data['nmID'] ?? null)
                         ->filter()
                         ->map(static fn ($v) => (string) $v)
                         ->unique()
                         ->values()
                         ->all();
+                    $wbSellerPricesByNmId = $wbProductsForSpp
+                        ->filter(static fn ($p) => ! empty($p->wb_data['nmID']) && (float) $p->price > 0)
+                        ->mapWithKeys(static fn ($p) => [(string) $p->wb_data['nmID'] => (float) $p->price])
+                        ->all();
                     if (! empty($wbNmIds)) {
-                        $wbCardSppData = $wbService->getDisplayedSppByNmIds($wbNmIds);
+                        $wbCardSppData = $wbService->getDisplayedSppByNmIds($wbNmIds, $wbSellerPricesByNmId);
                         if (! empty($wbCardSppData)) {
                             $this->info('  WB СПП (витрина): получено для '.count($wbCardSppData).' товаров');
                         }
@@ -908,7 +956,9 @@ class SyncUnitEconomicsCommand extends Command
                     // % выкупа из воронки продаж WB (приоритетный источник) приходит в
                     // wb_data из синка товаров (getCardRatings). Здесь — трейлинговый
                     // sales/orders как фолбэк, если воронки по товару нет.
-                    $wbRedemptionData = $wbService->getRedemptionStatsByNmId(30);
+                    $wbRedemptionData = is_array($wbSalesReport)
+                        ? $wbService->getRedemptionStatsByNmId(30, $wbSalesReport)
+                        : [];
                     if (! empty($wbRedemptionData)) {
                         $redemptionObservedAt = now()->utc()->toIso8601String();
                         foreach ($wbRedemptionData as &$redemptionItem) {
@@ -979,8 +1029,10 @@ class SyncUnitEconomicsCommand extends Command
                         $yandexToken = $token;
                         $yandexCampaignId = $campaignId;
                         $yandexBusinessId = $businessId;
+
                         return true;
                     }
+
                     return false;
                 };
 
@@ -991,7 +1043,7 @@ class SyncUnitEconomicsCommand extends Command
 
                 // 2. Пробуем Sellico API (сервис-аккаунт)
                 if (empty($yandexToken)) {
-                    $sellicoService = new \App\Services\SellicoApiService;
+                    $sellicoService = new SellicoApiService;
                     $sellicoResult = $sellicoService->getIntegrationById($integrationId);
 
                     if ($sellicoResult['success'] && ! empty($sellicoResult['credentials'])) {
@@ -1005,9 +1057,9 @@ class SyncUnitEconomicsCommand extends Command
                 if (empty($yandexToken)) {
                     $workspaceId = $integration?->work_space_id;
                     if ($workspaceId) {
-                        $cachedUserToken = \Illuminate\Support\Facades\Cache::get("workspace_user_token:{$workspaceId}");
+                        $cachedUserToken = Cache::get("workspace_user_token:{$workspaceId}");
                         if ($cachedUserToken) {
-                            $sellicoService2 = new \App\Services\SellicoApiService;
+                            $sellicoService2 = new SellicoApiService;
                             $sellicoService2->setAccessToken($cachedUserToken);
                             $sellicoResult2 = $sellicoService2->getIntegrationById($integrationId);
 
@@ -1029,8 +1081,8 @@ class SyncUnitEconomicsCommand extends Command
                     $existingCampaign = $existingCreds['campaign_id'] ?? $existingCreds['client_id'] ?? null;
                     if (empty($existingKey) || empty($existingCampaign)) {
                         $integration->credentials = array_merge($existingCreds, [
-                            'api_key'     => $yandexToken,
-                            'client_id'   => $yandexCampaignId,
+                            'api_key' => $yandexToken,
+                            'client_id' => $yandexCampaignId,
                             'business_id' => $yandexBusinessId,
                         ]);
                         $integration->save();
@@ -1039,9 +1091,9 @@ class SyncUnitEconomicsCommand extends Command
                 }
 
                 if (! empty($yandexToken) && ! empty($yandexCampaignId)) {
-                    $yandexService = new \App\Domains\YandexMarket\YandexMarketMarketplace([
-                        'api_key'     => $yandexToken,
-                        'client_id'   => $yandexCampaignId,
+                    $yandexService = new YandexMarketMarketplace([
+                        'api_key' => $yandexToken,
+                        'client_id' => $yandexCampaignId,
                         'business_id' => $yandexBusinessId,
                     ]);
 
@@ -1057,7 +1109,7 @@ class SyncUnitEconomicsCommand extends Command
                         $this->info('  Yandex Цены: получено для '.count($yandexPricesData).' товаров');
                     }
 
-                    $yandexTariffService = new \App\Services\Marketplace\YandexMarketService(
+                    $yandexTariffService = new YandexMarketService(
                         $yandexToken,
                         (string) $yandexCampaignId,
                         $yandexBusinessId !== null ? (string) $yandexBusinessId : null
@@ -1143,7 +1195,7 @@ class SyncUnitEconomicsCommand extends Command
                         $product,
                         $previewFixationMap[$product->sku] ?? null
                     );
-                    if (!empty($orderEconomicsPreview[$product->sku]['order_economics_summary'] ?? null)) {
+                    if (! empty($orderEconomicsPreview[$product->sku]['order_economics_summary'] ?? null)) {
                         $currentOzonData = is_array($product->ozon_data ?? null) ? $product->ozon_data : [];
                         $currentOzonData['order_economics_summary'] = $orderEconomicsPreview[$product->sku]['order_economics_summary'];
                         $product->forceFill(['ozon_data' => $currentOzonData])->saveQuietly();
@@ -1155,11 +1207,24 @@ class SyncUnitEconomicsCommand extends Command
                 foreach ($fulfillmentTypes as $fulfillmentType) {
                     // WB: получаем СПП по nmId товара
                     $nmId = isset($product->wb_data['nmID']) ? (string) $product->wb_data['nmID'] : null;
-                    $productWbSpp = $nmId ? ($wbSppData[$nmId] ?? null) : null;
-                    // Фолбэк: витринный СПП из карточки, если по продажам нет данных
-                    if ($nmId && ($productWbSpp === null || (float) $productWbSpp === 0.0) && isset($wbCardSppData[$nmId])) {
-                        $productWbSpp = $wbCardSppData[$nmId];
-                    }
+                    $salesSpp = $nmId !== null && array_key_exists($nmId, $wbSppData)
+                        ? (float) $wbSppData[$nmId]
+                        : null;
+                    $cardSpp = $nmId !== null && array_key_exists($nmId, $wbCardSppData)
+                        ? (float) $wbCardSppData[$nmId]
+                        : null;
+                    $existingSpp = $existingWbSppBySku->has($product->sku)
+                        ? (float) $existingWbSppBySku->get($product->sku)
+                        : null;
+                    $embeddedSpp = isset($product->wb_data['spp_percent'])
+                        ? (float) $product->wb_data['spp_percent']
+                        : null;
+                    $productWbSpp = WildberriesSppResolver::resolve(
+                        $salesSpp,
+                        $cardSpp,
+                        $existingSpp,
+                        $embeddedSpp
+                    );
                     $productWbRedemption = $nmId ? ($wbRedemptionData[$nmId] ?? null) : null;
                     $productWbLocalization = $nmId ? ($wbLocalizationByNmId[$nmId] ?? null) : null;
                     $productYandexTariffs = $yandexTariffsData[$fulfillmentType][$product->sku] ?? null;
@@ -1334,7 +1399,7 @@ class SyncUnitEconomicsCommand extends Command
             }
         }
 
-        \Illuminate\Support\Facades\Log::info('SyncUnitEconomicsCommand phases', [
+        Log::info('SyncUnitEconomicsCommand phases', [
             'integration_id' => $integrationId,
             'marketplace' => $marketplace,
             'products' => $products->count(),
@@ -1348,7 +1413,7 @@ class SyncUnitEconomicsCommand extends Command
         if ($synced > 0 && ! $this->option('skip-cache-dispatch')) {
             $lockKey = "ue_recalculate_{$integrationId}";
             if (Cache::lock($lockKey, 900)->get()) {
-                \App\Jobs\RecalculateUnitEconomicsCacheJob::dispatch($integrationId);
+                RecalculateUnitEconomicsCacheJob::dispatch($integrationId);
                 $this->info("  Запущен пересчёт кэша для integration_id={$integrationId}");
             } else {
                 $this->info("  Пересчёт кэша для integration_id={$integrationId} уже выполняется, пропускаем");
@@ -1551,6 +1616,7 @@ class SyncUnitEconomicsCommand extends Command
         }
 
         $color = strtoupper(trim($color));
+
         return match ($color) {
             'COLOR_INDEX_GREEN' => 'GREEN',
             'COLOR_INDEX_YELLOW' => 'YELLOW',
@@ -1889,6 +1955,17 @@ class SyncUnitEconomicsCommand extends Command
                     ? strtoupper($forceFulfillmentType)
                     : strtoupper($inventory?->fulfillment_type ?? 'FBO');
                 $data['fulfillment_type'] = $fulfillmentType;
+
+                // === НАЛОГОВАЯ БАЗА: фактическая цена продажи («реализовано со скидкой») ===
+                // Ozon даёт скидки за счёт продавца (компенсируя «Баллами за скидки»), поэтому
+                // налог УСН считается от фактической цены продажи из отчёта о реализации,
+                // а не от цены продавца. Нет данных по SKU — движки возьмут цену продавца.
+                $ozonActualSale = $integrationSettings['ozon_actual_sale_prices'] ?? null;
+                $actualSalePrice = (float) ($ozonActualSale['by_offer_id'][(string) $product->sku] ?? 0);
+                if ($actualSalePrice > 0) {
+                    $data['tax_base_price'] = $actualSalePrice;
+                    $data['tax_base_source'] = 'ozon_realization_'.($ozonActualSale['month'] ?? '');
+                }
 
                 // === ГАБАРИТЫ ИЗ ТОВАРА/Ozon DATA/ХАРАКТЕРИСТИК ===
                 $characteristics = $product->characteristics ?? [];
@@ -2375,6 +2452,9 @@ class SyncUnitEconomicsCommand extends Command
                 // === НАЛОГИ (рассчитанные суммы) ===
                 // drr_percent и our_share_percent НЕ включаем — они вводятся вручную и не перезаписываются
                 'tax_amount' => $calculated['tax_amount'] ?? null,
+                // База налога = факт. цена продажи из отчёта о реализации (баллы за скидки)
+                'tax_base_price' => $data['tax_base_price'] ?? null,
+                'tax_base_source' => $data['tax_base_source'] ?? null,
                 'vat_amount' => $calculated['vat_amount'] ?? null,
                 'drr_amount' => $calculated['drr_amount'] ?? null,
                 'our_share_amount' => $calculated['our_share_amount'] ?? null,
@@ -2601,7 +2681,7 @@ class SyncUnitEconomicsCommand extends Command
     private function loadYandexTariffsData(
         iterable $products,
         array $yandexPricesData,
-        \App\Services\Marketplace\YandexMarketService $yandexTariffService,
+        YandexMarketService $yandexTariffService,
         string $campaignId
     ): array {
         $offersBySku = [];
@@ -2716,8 +2796,8 @@ class SyncUnitEconomicsCommand extends Command
     private function buildOzonDeliveryProfiles(array $recommendations, array $stockProfiles = [], int $sellerFboSales7Days = 0): array
     {
         $profiles = [];
-        $pricing = new OzonPricingMatrix();
-        $clusterDirectory = \App\Models\OzonWarehouseCluster::query()
+        $pricing = new OzonPricingMatrix;
+        $clusterDirectory = OzonWarehouseCluster::query()
             ->select('cluster_id', 'cluster_name', 'region')
             ->get()
             ->groupBy(fn ($item) => (string) $item->cluster_id)
@@ -2779,8 +2859,8 @@ class SyncUnitEconomicsCommand extends Command
                 $clusterRegion = $cluster['region'] ?? $clusterMeta['region'] ?? null;
                 $route = $pricing->resolveRoute(null, $clusterName);
                 $clusterMarkupPercent = $pricing->resolveDestinationMarkupPercent($clusterName, $pricing->getEffectiveFrom());
-                $effectiveClusterMarkupPercent = (!$markupAllowed || $isLocalCluster) ? 0.0 : $clusterMarkupPercent;
-                $markupReason = !$markupAllowed
+                $effectiveClusterMarkupPercent = (! $markupAllowed || $isLocalCluster) ? 0.0 : $clusterMarkupPercent;
+                $markupReason = ! $markupAllowed
                     ? $markupRuleReason
                     : ($isLocalCluster ? 'local_cluster' : ($clusterMarkupPercent > 0 ? 'non_local_markup_applied' : 'no_markup_for_cluster'));
 
@@ -2819,17 +2899,17 @@ class SyncUnitEconomicsCommand extends Command
             $isSingleDemandCluster = count(array_filter($clusters, fn (array $cluster): bool => (float) ($cluster['orders_percent'] ?? 0) > 0)) === 1;
             $isSingleStockCluster = count($stockClusterIds) === 1;
             $localityResolved = $isSingleDemandCluster && $isSingleStockCluster;
-            $routeResolutionStatus = !empty($stockProfile['dominant_cluster_id'])
+            $routeResolutionStatus = ! empty($stockProfile['dominant_cluster_id'])
                 ? 'resolved'
-                : (!empty($clusters) ? 'estimated' : 'unknown');
+                : (! empty($clusters) ? 'estimated' : 'unknown');
             $localityResolutionStatus = $localityResolved
                 ? 'resolved'
-                : (($expectedLocalityRate !== null || !empty($clusters)) ? 'estimated' : 'unknown');
+                : (($expectedLocalityRate !== null || ! empty($clusters)) ? 'estimated' : 'unknown');
             $calculationConfidence = match (true) {
                 $routeResolutionStatus === 'resolved' && $dominantClusterShare >= 70 => 'high',
                 $routeResolutionStatus === 'resolved' && $dominantClusterShare >= 45 => 'medium',
                 $dominantClusterShare >= 70 => 'medium',
-                !empty($clusters) => 'low',
+                ! empty($clusters) => 'low',
                 default => 'low',
             };
 
@@ -2865,13 +2945,13 @@ class SyncUnitEconomicsCommand extends Command
         return $profiles;
     }
 
-    private function buildOzonStockProfiles(\Illuminate\Support\Collection $inventoryRaw, array $directSalesByWarehouse = []): array
+    private function buildOzonStockProfiles(Collection $inventoryRaw, array $directSalesByWarehouse = []): array
     {
         $profiles = [];
 
         // Pre-load all warehouse clusters to avoid N*M queries per SKU
-        $warehouseClusterMap = \App\Models\OzonWarehouseCluster::all()
-            ->keyBy(fn($c) => $c->warehouse_name_normalized);
+        $warehouseClusterMap = OzonWarehouseCluster::all()
+            ->keyBy(fn ($c) => $c->warehouse_name_normalized);
 
         foreach ($inventoryRaw->groupBy('sku') as $sku => $items) {
             $stockItems = $items->filter(fn ($item) => (int) ($item->quantity ?? 0) > 0);
@@ -2892,7 +2972,7 @@ class SyncUnitEconomicsCommand extends Command
                     continue;
                 }
 
-                $normalizedName = \App\Models\OzonWarehouseCluster::normalizeWarehouseName($warehouseName);
+                $normalizedName = OzonWarehouseCluster::normalizeWarehouseName($warehouseName);
                 $cluster = $warehouseClusterMap[$normalizedName] ?? null;
                 if (! $cluster) {
                     continue;
@@ -2927,14 +3007,14 @@ class SyncUnitEconomicsCommand extends Command
                 }
             }
 
-            if (!empty($directSalesByWarehouse[(string) $sku])) {
+            if (! empty($directSalesByWarehouse[(string) $sku])) {
                 foreach ($directSalesByWarehouse[(string) $sku] as $warehouseSales) {
                     $warehouseName = (string) ($warehouseSales['warehouse_name'] ?? '');
                     if ($warehouseName === '') {
                         continue;
                     }
 
-                    $normalizedName = \App\Models\OzonWarehouseCluster::normalizeWarehouseName($warehouseName);
+                    $normalizedName = OzonWarehouseCluster::normalizeWarehouseName($warehouseName);
                     $cluster = $warehouseClusterMap[$normalizedName] ?? null;
                     if (! $cluster) {
                         continue;
@@ -3024,7 +3104,7 @@ class SyncUnitEconomicsCommand extends Command
             foreach ($entry['source'] as $sku => $warehouses) {
                 foreach ($warehouses as $warehouseId => $data) {
                     $fulfillmentType = $data['fulfillment_type'] ?? $entry['default_type'];
-                    $key = $warehouseId . '_' . $fulfillmentType;
+                    $key = $warehouseId.'_'.$fulfillmentType;
                     $result[$sku][$key] = [
                         'warehouse_name' => $data['warehouse_name'] ?? $warehouseId,
                         'sales_7_days' => (int) ($data['sales_7_days'] ?? 0),
@@ -3041,7 +3121,7 @@ class SyncUnitEconomicsCommand extends Command
         return $result;
     }
 
-    private function getIntegrationCredentialsSafely(?\App\Models\Integration $integration): array
+    private function getIntegrationCredentialsSafely(?Integration $integration): array
     {
         if (! $integration) {
             return [];
@@ -3049,14 +3129,16 @@ class SyncUnitEconomicsCommand extends Command
 
         try {
             $credentials = $integration->getDecryptedCredentials();
+
             return is_array($credentials) ? $credentials : [];
         } catch (\Throwable $e) {
             $this->warn("  Не удалось расшифровать локальные credentials integration_id={$integration->id}: {$e->getMessage()}");
+
             return [];
         }
     }
 
-    private function persistIntegrationCredentials(\App\Models\Integration $integration, array $patch): void
+    private function persistIntegrationCredentials(Integration $integration, array $patch): void
     {
         $current = $this->getIntegrationCredentialsSafely($integration);
         $merged = array_merge($current, array_filter($patch, static fn ($value) => $value !== null && $value !== ''));
@@ -3103,6 +3185,7 @@ class SyncUnitEconomicsCommand extends Command
         $merged = array_merge($current, $patch);
         if ($merged === $current) {
             $this->upsertOzonDeliveryProfileRecord($integrationId, $product, $deliveryProfile);
+
             return;
         }
 

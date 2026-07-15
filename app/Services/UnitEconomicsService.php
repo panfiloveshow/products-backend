@@ -56,7 +56,10 @@ class UnitEconomicsService
         $ourSharePercent = (float) ($data['our_share_percent'] ?? 0);
         $ourShareAmount = $revenue * ($ourSharePercent / 100);
         $taxPercent = (float) ($data['tax_percent'] ?? 0);
-        $taxAmount = $revenue * ($taxPercent / 100);
+        // Налоговая база: фактическая цена продажи («реализовано со скидкой» — Ozon даёт
+        // скидки за счёт продавца, компенсируя баллами), если синк её принёс; иначе цена.
+        $taxBasePrice = (float) ($data['tax_base_price'] ?? 0);
+        $taxAmount = ($taxBasePrice > 0 ? $taxBasePrice * $salesCount : $revenue) * ($taxPercent / 100);
         $vatPercent = (float) ($data['vat_percent'] ?? 0);
         $vatAmount = $revenue * ($vatPercent / 100);
         $advertisingCost = (float) ($data['advertising_cost'] ?? 0);

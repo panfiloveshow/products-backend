@@ -17,6 +17,7 @@ use App\Domains\Ozon\Api\FboCargoesApi;
 use App\Domains\Ozon\Api\FboPostingsApi;
 use App\Domains\Ozon\Api\FbsPostingsApi;
 use App\Domains\Ozon\Api\FbsReturnsApi;
+use App\Domains\Ozon\Api\FinanceApi;
 use App\Models\Integration;
 
 /**
@@ -47,6 +48,7 @@ class OzonMarketplace implements MarketplaceInterface
     private FboPostingsApi $fboPostings;
     private FbsPostingsApi $fbsPostings;
     private FbsReturnsApi $fbsReturns;
+    private FinanceApi $finance;
     private ?Integration $integration;
 
     public function __construct(array $credentials = [], ?Integration $integration = null)
@@ -68,7 +70,19 @@ class OzonMarketplace implements MarketplaceInterface
         $this->fboPostings = new FboPostingsApi($this->client);
         $this->fbsPostings = new FbsPostingsApi($this->client);
         $this->fbsReturns = new FbsReturnsApi($this->client);
+        $this->finance = new FinanceApi($this->client);
         $this->integration = $integration;
+    }
+
+    /**
+     * Фактические цены продажи по SKU («реализовано со скидкой») из отчёта о реализации —
+     * база налога УСН в юнит-экономике (см. FinanceApi::getActualSalePrices).
+     *
+     * @return array{by_offer_id: array<string, float>, by_sku: array<string, float>, month: string|null}
+     */
+    public function getActualSalePricesBySku(): array
+    {
+        return $this->finance->getActualSalePrices();
     }
 
     /**

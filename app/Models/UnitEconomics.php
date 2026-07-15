@@ -92,6 +92,8 @@ class UnitEconomics extends Model
         'to_settlement_account',
         'tax_percent',
         'tax_amount',
+        'tax_base_price',
+        'tax_base_source',
         'vat_percent',
         'vat_amount',
         'drr_percent',

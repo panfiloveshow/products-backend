@@ -107,6 +107,7 @@ class UnitEconomicsCacheController extends Controller
             'locality_state' => 'nullable|string|in:local,non_local,mixed,no_sales',
             'sort' => 'nullable|string|in:sku,product_name,price,net_profit,margin_percent,commission_percent,sales_count,stock,total_stock,current_stock,days_of_stock,relevance',
             'sort_order' => 'nullable|string|in:asc,desc',
+            'spp_known_first' => 'nullable|boolean',
             'limit' => 'nullable|integer|min:1|max:500',
             'page' => 'nullable|integer|min:1',
         ])->validate();
@@ -163,7 +164,8 @@ class UnitEconomicsCacheController extends Controller
             $sortOrder,
             (int) $validated['integration_id'],
             $marketplace,
-            $searchQuery
+            $searchQuery,
+            (bool) ($validated['spp_known_first'] ?? false)
         );
 
         // Пагинация без paginate(): стандартный paginate() делает COUNT(*) до
@@ -243,11 +245,24 @@ class UnitEconomicsCacheController extends Controller
         string $sortOrder,
         ?int $integrationId = null,
         ?string $marketplace = null,
-        ?string $searchQuery = null
+        ?string $searchQuery = null,
+        bool $sppKnownFirst = false
     ): void {
         $sortOrder = strtolower($sortOrder) === 'desc' ? 'desc' : 'asc';
 
-        // === Наличие («в продаже») всегда первым ключом сортировки ===
+        // Для WB сначала показываем товары с подтверждённым ненулевым СПП из WB.
+        // Проверяем и источник, и само значение: строка с успешным заказом, но СПП=0,
+        // не должна вытеснять товар, для которого реально получена скидка.
+        // Сортировка выполняется до пагинации.
+        if ($marketplace === 'wildberries' && $sppKnownFirst) {
+            $query->orderByRaw(
+                "CASE WHEN COALESCE(stock_products.wb_data->>'spp_source', unit_economics_cache.marketplace_data->>'spp_source', '') IN ('orders', 'sales', 'card', 'cards') "
+                ."AND COALESCE(NULLIF(stock_products.wb_data->>'spp_percent', '')::numeric, NULLIF(unit_economics_cache.marketplace_data->>'spp_percent', '')::numeric, 0) > 0 "
+                ."THEN 0 ELSE 1 END asc"
+            );
+        }
+
+        // === Наличие («в продаже») всегда следующим ключом сортировки ===
         // Товары в продаже — всегда сверху, серые (нет остатков) — всегда снизу,
         // поверх любой выбранной пользователем сортировки. Наличие считаем так же,
         // как current_stock на фронте: остаток на складах МП (inventory_warehouses)
@@ -2842,6 +2857,9 @@ class UnitEconomicsCacheController extends Controller
             $data['spp_percent'] = round($sppPercent, 2);
             $data['customer_price'] = round($customerPrice, 2);
             $data['spp_amount'] = round(max(0.0, $price - $customerPrice), 2);
+            $data['spp_source'] = $wbData['spp_source'] ?? $marketplaceData['spp_source'] ?? null;
+            $data['spp_stale'] = (bool) ($wbData['spp_stale'] ?? $marketplaceData['spp_stale'] ?? false);
+            $data['spp_synced_at'] = $wbData['spp_synced_at'] ?? $marketplaceData['spp_synced_at'] ?? null;
 
             // Наценка, x = цена / себестоимость
             $data['markup_multiplier'] = $costPrice > 0 ? round($price / $costPrice, 2) : 0;
@@ -3022,6 +3040,9 @@ class UnitEconomicsCacheController extends Controller
         $data['our_share_percent'] = (float) ($settings?->our_share_percent ?? $cache->our_share_percent ?? 0);
         $data['tax_percent'] = (float) ($settings?->tax_percent ?? $cache->tax_percent ?? 0);
         $data['vat_percent'] = (float) ($settings?->vat_percent ?? $cache->vat_percent ?? 0);
+        // Налоговая база Ozon: факт. цена продажи из отчёта о реализации («реализовано
+        // со скидкой» — скидки Ozon за счёт продавца, баллы за скидки). 0 → цена продавца.
+        $data['tax_base_price'] = (float) ($cache->tax_base_price ?? 0);
 
         $price = (float) $cache->price;
 
@@ -3106,7 +3127,10 @@ class UnitEconomicsCacheController extends Controller
         $acquiringAmount = round($price * $acquiringPercent / 100, 2);
         $storageCost = $isWb ? round((float) ($data['storage_cost'] ?? 0), 2) : 0.0;
         $drrAmount = round($price * (float) ($data['drr_percent'] ?? 0) / 100, 2);
-        $taxAmount = round($price * (float) ($data['tax_percent'] ?? 0) / 100, 2);
+        // Налог: база — фактическая цена продажи из отчёта о реализации Ozon («реализовано
+        // со скидкой», скидки Ozon за счёт продавца + баллы), если синк её принёс; иначе цена.
+        $taxBasePrice = (float) ($data['tax_base_price'] ?? 0);
+        $taxAmount = round(($taxBasePrice > 0 ? $taxBasePrice : $price) * (float) ($data['tax_percent'] ?? 0) / 100, 2);
         // НДС и «наша часть» — только Ozon; у WB их нет.
         $vatAmount = $isWb ? 0.0 : round($price * (float) ($data['vat_percent'] ?? 0) / 100, 2);
         $ourShareAmount = $isWb ? 0.0 : round($price * (float) ($data['our_share_percent'] ?? 0) / 100, 2);
