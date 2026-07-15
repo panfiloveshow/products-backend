@@ -670,14 +670,6 @@ class CostPriceController extends Controller
             }
         }
 
-        if (empty($rows)) {
-            $rows = [
-                ['АРТИКУЛ-001', ''],
-                ['АРТИКУЛ-002', ''],
-                ['АРТИКУЛ-003', ''],
-            ];
-        }
-
         $escapeCsv = static function (string $value): string {
             $needsQuotes = str_contains($value, ';')
                 || str_contains($value, '"')

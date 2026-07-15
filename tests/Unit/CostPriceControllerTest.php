@@ -610,6 +610,18 @@ class CostPriceControllerTest extends TestCase
         );
     }
 
+    public function test_template_without_real_products_contains_only_headers(): void
+    {
+        $controller = new CostPriceController(new CostPriceParserService());
+        $response = $controller->template(Request::create('/api/products/cost-price/template?marketplace=wildberries&integration_id=999999'));
+
+        $this->assertSame(200, $response->getStatusCode());
+        $content = preg_replace('/^\xEF\xBB\xBF/', '', $response->getContent());
+
+        $this->assertSame("Артикул продавца;Себестоимость\r\n", $content);
+        $this->assertStringNotContainsString('АРТИКУЛ-001', $content);
+    }
+
     public function test_wildberries_template_uses_vendor_code_instead_of_barcode_sku(): void
     {
         $integration = Integration::factory()->wildberries()->create(['id' => 61002]);
