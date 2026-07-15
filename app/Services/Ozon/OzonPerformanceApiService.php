@@ -13,6 +13,13 @@ class OzonPerformanceApiService
     private const BASE_URL = 'https://api-performance.ozon.ru';
 
     /**
+     * Версия схемы сохранённой per-SKU статистики. Бамп версии автоматически перезапускает
+     * пересборку у всех интеграций при следующем открытии страницы (старые данные видны через
+     * stale-while-revalidate, пока не соберутся новые). v2 = добавлен CPO «все товары» (ASP).
+     */
+    private const CAMPAIGN_STATS_SCHEMA_VERSION = 2;
+
+    /**
      * @param array<string, mixed> $credentials
      * @return array<string, mixed>
      */
@@ -1092,7 +1099,13 @@ class OzonPerformanceApiService
         // пересборки (stale-while-revalidate ниже). Переживает рестарты, в отличие от Cache TTL.
         $stored = $this->readStoredCampaignStats($integrationId, $dateFrom, $dateTo);
 
-        if (! is_array($prog) && ! $forceRefresh && $stored !== null) {
+        // Payload старой схемы (например, без CPO «все товары») не считаем финальным:
+        // отдаём его через SWR, но автоматически запускаем пересборку — пользователю не
+        // нужно жать «Обновить рекламу», чтобы получить данные нового формата.
+        $storedOutdated = $stored !== null
+            && (int) ($stored['schema_version'] ?? 1) < self::CAMPAIGN_STATS_SCHEMA_VERSION;
+
+        if (! is_array($prog) && ! $forceRefresh && $stored !== null && ! $storedOutdated) {
             return $stored;
         }
 
@@ -1208,6 +1221,7 @@ class OzonPerformanceApiService
                 $accumulated !== [] ? 'async_report' : 'fallback'
             );
             if ($accumulated !== []) {
+                $stats['schema_version'] = self::CAMPAIGN_STATS_SCHEMA_VERSION;
                 $stats['from_storage'] = false;
                 $stats['fetched_at'] = $this->writeStoredCampaignStats($integrationId, $dateFrom, $dateTo, $stats);
             }
