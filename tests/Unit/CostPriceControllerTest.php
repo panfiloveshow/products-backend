@@ -9,6 +9,7 @@ use App\Models\Product;
 use App\Models\UnitEconomics;
 use App\Models\UnitEconomicsCache;
 use App\Models\UnitEconomicsSettings;
+use App\Models\WildberriesTariffSnapshot;
 use App\Services\CostPriceParserService;
 use Illuminate\Foundation\Testing\LazilyRefreshDatabase;
 use Illuminate\Http\Request;
@@ -77,6 +78,7 @@ class CostPriceControllerTest extends TestCase
     public function test_unit_economics_export_includes_real_margin_ceiling_and_freshness(): void
     {
         $integration = Integration::factory()->wildberries()->create(['id' => 61006]);
+        $this->recordWbSourceEvidence($integration->id);
         $product = Product::factory()->wildberries()->create([
             'integration_id' => $integration->id,
             'sku' => '2038816371458',
@@ -124,11 +126,14 @@ class CostPriceControllerTest extends TestCase
         $this->assertEquals(20.0, $payload['items'][0]['other_costs']);
         $this->assertTrue($payload['items'][0]['ready']);
         $this->assertNotEmpty($payload['items'][0]['calculated_at']);
+        $this->assertNotEmpty($payload['items'][0]['source_observed_at']['commission']);
+        $this->assertNotEmpty($payload['items'][0]['source_observed_at']['tariff']);
     }
 
     public function test_calculated_zero_drr_is_not_treated_as_missing(): void
     {
         $integration = Integration::factory()->wildberries()->create(['id' => 61009]);
+        $this->recordWbSourceEvidence($integration->id);
         $product = Product::factory()->wildberries()->create([
             'integration_id' => $integration->id,
             'sku' => '2038816371461',
@@ -183,6 +188,7 @@ class CostPriceControllerTest extends TestCase
     public function test_missing_drr_uses_trustworthy_margin_as_break_even_ceiling(): void
     {
         $integration = Integration::factory()->wildberries()->create(['id' => 61013]);
+        $this->recordWbSourceEvidence($integration->id);
         $product = Product::factory()->wildberries()->create([
             'integration_id' => $integration->id,
             'sku' => '2038816371464',
@@ -237,6 +243,7 @@ class CostPriceControllerTest extends TestCase
     public function test_zero_margin_ceiling_is_unprofitable_not_missing(): void
     {
         $integration = Integration::factory()->wildberries()->create(['id' => 61010]);
+        $this->recordWbSourceEvidence($integration->id);
         $product = Product::factory()->wildberries()->create([
             'integration_id' => $integration->id,
             'sku' => '2038816371462',
@@ -286,6 +293,7 @@ class CostPriceControllerTest extends TestCase
     public function test_unit_economics_cost_falls_back_to_vendor_code_only_within_integration(): void
     {
         $integration = Integration::factory()->wildberries()->create(['id' => 61011]);
+        $this->recordWbSourceEvidence($integration->id);
         $foreign = Integration::factory()->wildberries()->create(['id' => 61012]);
         $product = Product::factory()->wildberries()->create([
             'integration_id' => $integration->id,
@@ -353,6 +361,7 @@ class CostPriceControllerTest extends TestCase
     public function test_unit_economics_readiness_is_complete_only_for_requested_real_rows(): void
     {
         $integration = Integration::factory()->wildberries()->create(['id' => 61007]);
+        $this->recordWbSourceEvidence($integration->id);
         $product = Product::factory()->wildberries()->create([
             'integration_id' => $integration->id,
             'sku' => '2038816371459',
@@ -455,6 +464,56 @@ class CostPriceControllerTest extends TestCase
         $this->assertContains('untrusted_commission_source', $payload['items'][0]['reasons']);
         $this->assertContains('untrusted_tariff_source', $payload['items'][0]['reasons']);
         $this->assertContains('untrusted_redemption_source', $payload['items'][0]['reasons']);
+    }
+
+    public function test_unit_economics_readiness_blocks_stale_persisted_source_evidence(): void
+    {
+        $integration = Integration::factory()->wildberries()->create(['id' => 61014]);
+        $this->recordWbSourceEvidence($integration->id, now()->subDays(4));
+        $product = Product::factory()->wildberries()->create([
+            'integration_id' => $integration->id,
+            'sku' => '2038816371465',
+            'marketplace_id' => '184010780:2038816371465',
+            'wb_data' => ['nmID' => 184010780],
+        ]);
+        UnitEconomicsSettings::create([
+            'integration_id' => $integration->id,
+            'sku' => $product->sku,
+            'cost_price' => 600,
+            'tax_percent' => 6,
+        ]);
+        UnitEconomics::create([
+            'integration_id' => $integration->id,
+            'sku' => $product->sku,
+            'marketplace' => 'wildberries',
+            'fulfillment_type' => 'FBO',
+            'is_actual_scheme' => true,
+            'price' => 1400,
+            'commission_percent' => 19,
+            'effective_logistics' => 100,
+            'net_profit' => 140,
+            'net_profit_per_unit' => 140,
+            'margin_percent' => 10,
+            'drr_percent' => null,
+            'tariff_source' => 'wb_tariffs_api',
+            'redemption_source' => 'wb_sales_funnel',
+            'marketplace_data' => [
+                'commission_source' => 'wb_commission_snapshot_scheme',
+                'dimensions_source' => 'wb_product_characteristics',
+                'acquiring_source' => 'wb_realization_report_sku',
+            ],
+        ]);
+
+        $payload = (new CostPriceController(new CostPriceParserService()))
+            ->unitEconomicsReadiness(Request::create(
+                '/api/products/unit-economics/readiness',
+                'POST',
+                ['integration_id' => $integration->id, 'wb_product_ids' => [184010780]]
+            ))->getData(true);
+
+        $this->assertSame('incomplete', $payload['items'][0]['status']);
+        $this->assertContains('stale_commission_source', $payload['items'][0]['reasons']);
+        $this->assertContains('stale_tariff_source', $payload['items'][0]['reasons']);
     }
 
     public function test_template_uses_browser_safe_utf8_filename_and_excel_friendly_csv(): void
@@ -590,5 +649,23 @@ class CostPriceControllerTest extends TestCase
 
         $this->assertSame(['ALIAS-1'], $foreignResponse->getData(true)['data']['not_found']);
         $this->assertSame(111.11, (float) $product->refresh()->cost_price);
+    }
+
+    private function recordWbSourceEvidence(int $integrationId, $fetchedAt = null): void
+    {
+        $fetchedAt ??= now();
+        foreach (['commission', 'box'] as $type) {
+            WildberriesTariffSnapshot::create([
+                'integration_id' => $integrationId,
+                'marketplace' => 'wildberries',
+                'tariff_type' => $type,
+                'effective_date' => $fetchedAt->toDateString(),
+                'warehouse_id' => $type === 'box' ? 'test-warehouse' : '',
+                'subject_id' => $type === 'commission' ? 'test-subject' : '',
+                'scheme' => $type === 'commission' ? 'FBO' : '',
+                'payload' => ['verified' => true],
+                'fetched_at' => $fetchedAt,
+            ]);
+        }
     }
 }

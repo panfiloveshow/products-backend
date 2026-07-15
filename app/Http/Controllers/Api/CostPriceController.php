@@ -8,6 +8,7 @@ use App\Models\UnitEconomics;
 use App\Models\UnitEconomicsCache;
 use App\Models\UnitEconomicsSettings;
 use App\Services\CostPriceParserService;
+use App\Services\UnitEconomics\WildberriesSourceFreshnessService;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Query\Expression;
 use Illuminate\Http\JsonResponse;
@@ -17,9 +18,14 @@ use Illuminate\Support\Facades\Log;
 
 class CostPriceController extends Controller
 {
+    private WildberriesSourceFreshnessService $sourceFreshness;
+
     public function __construct(
-        private CostPriceParserService $parserService
-    ) {}
+        private CostPriceParserService $parserService,
+        ?WildberriesSourceFreshnessService $sourceFreshness = null,
+    ) {
+        $this->sourceFreshness = $sourceFreshness ?? app(WildberriesSourceFreshnessService::class);
+    }
 
     /**
      * Загрузка файла себестоимости
@@ -92,9 +98,10 @@ class CostPriceController extends Controller
         ]);
         $integrationId = (int) $validated['integration_id'];
         $generatedAt = now()->utc();
+        $sourceEvidence = $this->sourceFreshness->freshEvidence($integrationId, $generatedAt);
 
         $items = $this->unitEconomicsRows($integrationId)
-            ->map(fn ($row): array => $this->unitEconomicsItem($row, $generatedAt))
+            ->map(fn ($row): array => $this->unitEconomicsItem($row, $generatedAt, $sourceEvidence))
             ->filter(fn (array $item): bool => $item['nm_id'] > 0 && $item['cost_price'] !== null)
             ->sortByDesc(fn (array $item): string => (string) ($item['calculated_at'] ?? ''))
             ->unique('nm_id')
@@ -131,9 +138,10 @@ class CostPriceController extends Controller
             ->sort()
             ->values();
         $checkedAt = now()->utc();
+        $sourceEvidence = $this->sourceFreshness->freshEvidence($integrationId, $checkedAt);
 
         $items = $this->unitEconomicsRows($integrationId)
-            ->map(fn ($row): array => $this->unitEconomicsItem($row, $checkedAt))
+            ->map(fn ($row): array => $this->unitEconomicsItem($row, $checkedAt, $sourceEvidence))
             ->filter(fn (array $item): bool => $requested->contains($item['nm_id']))
             ->sortByDesc(fn (array $item): string => (string) ($item['calculated_at'] ?? ''))
             ->unique('nm_id')
@@ -234,7 +242,8 @@ class CostPriceController extends Controller
             ]);
     }
 
-    private function unitEconomicsItem($row, $checkedAt): array
+    /** @param array{commission:?\Illuminate\Support\Carbon,tariff:?\Illuminate\Support\Carbon} $sourceEvidence */
+    private function unitEconomicsItem($row, $checkedAt, array $sourceEvidence): array
     {
         $wbData = is_array($row->wb_data) ? $row->wb_data : (json_decode((string) $row->wb_data, true) ?: []);
         $marketplaceData = is_array($row->marketplace_data)
@@ -314,6 +323,12 @@ class CostPriceController extends Controller
                 $reasons[] = 'untrusted_' . $sourceName . '_source';
             }
         }
+        if (str_starts_with(strtolower($commissionSource), 'wb_commission_snapshot_') && $sourceEvidence['commission'] === null) {
+            $reasons[] = 'stale_commission_source';
+        }
+        if (in_array(strtolower($tariffSource), ['wb_tariffs_api', 'wildberries_tariff_snapshots'], true) && $sourceEvidence['tariff'] === null) {
+            $reasons[] = 'stale_tariff_source';
+        }
 
         $reasons = array_values(array_unique($reasons));
 
@@ -344,6 +359,13 @@ class CostPriceController extends Controller
                 'redemption' => $redemptionSource ?: null,
                 'dimensions' => $dimensionsSource ?: null,
                 'acquiring' => $acquiringSource ?: null,
+            ],
+            'source_observed_at' => [
+                'commission' => $sourceEvidence['commission']?->toRfc3339String(),
+                'tariff' => $sourceEvidence['tariff']?->toRfc3339String(),
+                'redemption' => null,
+                'dimensions' => null,
+                'acquiring' => null,
             ],
         ];
     }
