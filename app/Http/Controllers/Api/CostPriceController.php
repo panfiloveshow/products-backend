@@ -102,9 +102,9 @@ class CostPriceController extends Controller
 
         $items = $this->unitEconomicsRows($integrationId)
             ->map(fn ($row): array => $this->unitEconomicsItem($row, $generatedAt, $sourceEvidence))
-            ->filter(fn (array $item): bool => $item['nm_id'] > 0 && $item['cost_price'] !== null)
-            ->sortByDesc(fn (array $item): string => (string) ($item['calculated_at'] ?? ''))
-            ->unique('nm_id')
+            ->filter(fn (array $item): bool => $item['nm_id'] > 0)
+            ->groupBy('nm_id')
+            ->map(fn ($variants): array => $this->conservativeUnitEconomicsItem($variants))
             ->sortBy('nm_id')
             ->values();
 
@@ -143,8 +143,8 @@ class CostPriceController extends Controller
         $items = $this->unitEconomicsRows($integrationId)
             ->map(fn ($row): array => $this->unitEconomicsItem($row, $checkedAt, $sourceEvidence))
             ->filter(fn (array $item): bool => $requested->contains($item['nm_id']))
-            ->sortByDesc(fn (array $item): string => (string) ($item['calculated_at'] ?? ''))
-            ->unique('nm_id')
+            ->groupBy('nm_id')
+            ->map(fn ($variants): array => $this->conservativeUnitEconomicsItem($variants))
             ->keyBy('nm_id');
 
         $missing = [];
@@ -243,6 +243,40 @@ class CostPriceController extends Controller
                 'calculated.marketplace_data',
                 'calculated.updated_at as calculated_at',
             ]);
+    }
+
+    /**
+     * Fold all SKU/size variants of one WB nmID into a fail-closed economics
+     * record. Profitability fields use the least profitable real variant and
+     * readiness is true only when every variant is ready.
+     */
+    private function conservativeUnitEconomicsItem($variants): array
+    {
+        $variants = collect($variants)->values();
+        $base = $variants
+            ->sortByDesc(fn (array $item): string => (string) ($item['calculated_at'] ?? ''))
+            ->first();
+
+        foreach (['price', 'customer_price', 'net_profit', 'margin_percent', 'margin_before_ads', 'max_allowed_drr'] as $field) {
+            $values = $variants->pluck($field)->filter(fn ($value): bool => $value !== null);
+            $base[$field] = $values->isEmpty() ? null : $values->min();
+        }
+        foreach (['cost_price', 'logistics_cost', 'other_costs', 'commission_percent', 'tax_percent'] as $field) {
+            $values = $variants->pluck($field)->filter(fn ($value): bool => $value !== null);
+            $base[$field] = $values->isEmpty() ? null : $values->max();
+        }
+
+        $timestamps = $variants->pluck('calculated_at')->filter()->sort()->values();
+        $base['calculated_at'] = $timestamps->first();
+        $base['ready'] = $variants->every(fn (array $item): bool => $item['ready'] === true);
+        $base['readiness_reasons'] = $variants
+            ->flatMap(fn (array $item): array => $item['readiness_reasons'])
+            ->unique()
+            ->values()
+            ->all();
+        $base['variant_count'] = $variants->count();
+
+        return $base;
     }
 
     /** @param array{commission:?\Illuminate\Support\Carbon,tariff:?\Illuminate\Support\Carbon} $sourceEvidence */

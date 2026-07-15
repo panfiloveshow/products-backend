@@ -134,6 +134,67 @@ class CostPriceControllerTest extends TestCase
         $this->assertNotEmpty($payload['items'][0]['source_observed_at']['acquiring']);
     }
 
+    public function test_unit_economics_export_uses_least_profitable_variant_for_same_nm_id(): void
+    {
+        $integration = Integration::factory()->wildberries()->create(['id' => 61014]);
+        $this->recordWbSourceEvidence($integration->id);
+        $nmId = 184010780;
+
+        foreach ([
+            ['sku' => '2038816371470', 'price' => 1500, 'customer_price' => 900, 'cost' => 700, 'margin' => 10, 'drr' => 8],
+            ['sku' => '2038816371471', 'price' => 1000, 'customer_price' => 600, 'cost' => 800, 'margin' => 5, 'drr' => 5],
+        ] as $variant) {
+            Product::factory()->wildberries()->create([
+                'integration_id' => $integration->id,
+                'sku' => $variant['sku'],
+                'marketplace_id' => $nmId . ':' . $variant['sku'],
+                'wb_data' => ['nmID' => $nmId],
+            ]);
+            UnitEconomicsSettings::create([
+                'integration_id' => $integration->id,
+                'sku' => $variant['sku'],
+                'cost_price' => $variant['cost'],
+                'tax_percent' => 6,
+            ]);
+            UnitEconomics::create([
+                'integration_id' => $integration->id,
+                'sku' => $variant['sku'],
+                'marketplace' => 'wildberries',
+                'fulfillment_type' => 'FBO',
+                'is_actual_scheme' => true,
+                'price' => $variant['price'],
+                'customer_price' => $variant['customer_price'],
+                'commission_percent' => 20,
+                'effective_logistics' => 100,
+                'net_profit' => 100,
+                'net_profit_per_unit' => 100,
+                'margin_percent' => $variant['margin'],
+                'drr_percent' => $variant['drr'],
+                'tariff_source' => 'wildberries_tariff_snapshots',
+                'redemption_source' => 'wb_sales_funnel',
+                ...$this->wbObservationFields(),
+                'marketplace_data' => [
+                    'commission_source' => 'wb_commission_api_scheme',
+                    'dimensions_source' => 'wb_product_characteristics',
+                    'acquiring_source' => 'wb_realization_report_sku',
+                ],
+            ]);
+        }
+
+        $controller = new CostPriceController(new CostPriceParserService());
+        $payload = $controller->unitEconomicsExport(Request::create(
+            '/api/products/unit-economics/export?integration_id=' . $integration->id
+        ))->getData(true);
+
+        $this->assertCount(1, $payload['items']);
+        $this->assertSame(2, $payload['items'][0]['variant_count']);
+        $this->assertEquals(600.0, $payload['items'][0]['customer_price']);
+        $this->assertEquals(100.0, $payload['items'][0]['margin_before_ads']);
+        $this->assertEquals(10.0, $payload['items'][0]['max_allowed_drr']);
+        $this->assertEquals(800.0, $payload['items'][0]['cost_price']);
+        $this->assertTrue($payload['items'][0]['ready']);
+    }
+
     public function test_calculated_zero_drr_is_not_treated_as_missing(): void
     {
         $integration = Integration::factory()->wildberries()->create(['id' => 61009]);
