@@ -1143,7 +1143,6 @@ class OzonPerformanceApiService
                 'asp_uuids' => $aspUuids,
                 'pending_chunks' => $pendingChunks,
                 'asp_pending' => $aspPending,
-                'gen_attempts' => 0,
                 'rows_by_uuid' => [],
                 'errors' => $errors,
                 'created' => time(),
@@ -1161,11 +1160,9 @@ class OzonPerformanceApiService
         }
 
         // Шаг 2а: дозаказываем отчёты, не созданные из-за 429 (лимит «один отчёт за раз»).
-        // Паузы между HTTP-запросами фронта дают естественный бэкофф; после 8 попыток сдаёмся,
-        // чтобы не зависнуть в pending (стейл-защита в 300с — общий предохранитель).
+        // Паузы между HTTP-запросами фронта дают естественный бэкофф; пробуем до общего
+        // стейл-предохранителя (300с) — он соберёт частичный итог и снимет pending.
         if (($prog['pending_chunks'] ?? []) !== [] || ($prog['asp_pending'] ?? false)) {
-            $prog['gen_attempts'] = (int) ($prog['gen_attempts'] ?? 0) + 1;
-
             $stillPending = [];
             foreach ((array) ($prog['pending_chunks'] ?? []) as $chunk) {
                 try {
@@ -1195,10 +1192,6 @@ class OzonPerformanceApiService
                 }
             }
 
-            if ((int) $prog['gen_attempts'] >= 8) {
-                $prog['pending_chunks'] = [];
-                $prog['asp_pending'] = false;
-            }
         }
 
         // Шаг 2: проверяем неготовые UUID, скачиваем готовые. Без длинного ожидания.
