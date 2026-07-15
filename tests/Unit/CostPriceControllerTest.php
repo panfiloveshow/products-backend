@@ -2,6 +2,7 @@
 
 namespace Tests\Unit;
 
+use App\Domains\Wildberries\UnitEconomics\WildberriesCommissionResolver;
 use App\Http\Controllers\Api\CostPriceController;
 use App\Models\Integration;
 use App\Models\Product;
@@ -16,6 +17,22 @@ use Tests\TestCase;
 class CostPriceControllerTest extends TestCase
 {
     use LazilyRefreshDatabase;
+
+    public function test_commission_source_distinguishes_live_snapshot_from_default(): void
+    {
+        $this->assertSame(
+            ['value' => 21.0, 'source' => 'wb_commission_snapshot_scheme'],
+            WildberriesCommissionResolver::resolveWithSource(
+                ['commissions' => ['fbo' => ['percent' => 19]]],
+                ['fbo' => 21],
+                'FBO'
+            )
+        );
+        $this->assertSame(
+            ['value' => 15.0, 'source' => 'default'],
+            WildberriesCommissionResolver::resolveWithSource([], null, 'FBO')
+        );
+    }
 
     public function test_unit_economics_export_includes_calculated_spp_and_customer_price(): void
     {
@@ -54,6 +71,165 @@ class CostPriceControllerTest extends TestCase
         $this->assertSame(184010772, $items[0]['nm_id']);
         $this->assertSame(40.12, $items[0]['spp_percent']);
         $this->assertSame(947, $items[0]['customer_price']);
+    }
+
+    public function test_unit_economics_export_includes_real_margin_ceiling_and_freshness(): void
+    {
+        $integration = Integration::factory()->wildberries()->create(['id' => 61006]);
+        $product = Product::factory()->wildberries()->create([
+            'integration_id' => $integration->id,
+            'sku' => '2038816371458',
+            'marketplace_id' => '184010773:2038816371458',
+            'wb_data' => ['nmID' => 184010773],
+        ]);
+        UnitEconomicsSettings::create([
+            'integration_id' => $integration->id,
+            'sku' => $product->sku,
+            'cost_price' => 700,
+            'tax_percent' => 6,
+        ]);
+        UnitEconomics::create([
+            'integration_id' => $integration->id,
+            'sku' => $product->sku,
+            'marketplace' => 'wildberries',
+            'fulfillment_type' => 'FBO',
+            'is_actual_scheme' => true,
+            'price' => 1500,
+            'commission_percent' => 20,
+            'effective_logistics' => 120,
+            'net_profit' => 150,
+            'net_profit_per_unit' => 150,
+            'margin_percent' => 10,
+            'drr_percent' => 8,
+            'tariff_source' => 'wildberries_tariff_snapshots',
+            'redemption_source' => 'wb_sales_funnel',
+            'marketplace_data' => [
+                'commission_source' => 'wb_commission_api_scheme',
+                'dimensions_source' => 'wb_product_characteristics',
+                'acquiring_source' => 'wb_realization_report_sku',
+            ],
+        ]);
+
+        $controller = new CostPriceController(new CostPriceParserService());
+        $payload = $controller->unitEconomicsExport(Request::create(
+            '/api/products/unit-economics/export?integration_id=' . $integration->id
+        ))->getData(true);
+
+        $this->assertSame(2, $payload['schema_version']);
+        $this->assertSame($integration->id, $payload['integration_id']);
+        $this->assertTrue($payload['complete']);
+        $this->assertEquals(18.0, $payload['items'][0]['max_allowed_drr']);
+        $this->assertEquals(270.0, $payload['items'][0]['margin_before_ads']);
+        $this->assertEquals(20.0, $payload['items'][0]['other_costs']);
+        $this->assertTrue($payload['items'][0]['ready']);
+        $this->assertNotEmpty($payload['items'][0]['calculated_at']);
+    }
+
+    public function test_unit_economics_readiness_is_complete_only_for_requested_real_rows(): void
+    {
+        $integration = Integration::factory()->wildberries()->create(['id' => 61007]);
+        $product = Product::factory()->wildberries()->create([
+            'integration_id' => $integration->id,
+            'sku' => '2038816371459',
+            'marketplace_id' => '184010774:2038816371459',
+            'wb_data' => ['nmID' => 184010774],
+        ]);
+        UnitEconomicsSettings::create([
+            'integration_id' => $integration->id,
+            'sku' => $product->sku,
+            'cost_price' => 600,
+            'tax_percent' => 6,
+        ]);
+        UnitEconomics::create([
+            'integration_id' => $integration->id,
+            'sku' => $product->sku,
+            'marketplace' => 'wildberries',
+            'fulfillment_type' => 'FBO',
+            'is_actual_scheme' => true,
+            'price' => 1400,
+            'commission_percent' => 19,
+            'effective_logistics' => 100,
+            'net_profit' => 200,
+            'net_profit_per_unit' => 200,
+            'margin_percent' => 14.29,
+            'drr_percent' => 5,
+            'tariff_source' => 'wildberries_tariff_snapshots',
+            'redemption_source' => 'api_orders_sku_sales',
+            'marketplace_data' => [
+                'commission_source' => 'wb_commission_snapshot',
+                'dimensions_source' => 'wb_storage_api_volume',
+                'acquiring_source' => 'wb_realization_report_store_avg',
+            ],
+        ]);
+
+        $controller = new CostPriceController(new CostPriceParserService());
+        $payload = $controller->unitEconomicsReadiness(Request::create(
+            '/api/products/unit-economics/readiness',
+            'POST',
+            [
+                'integration_id' => $integration->id,
+                'wb_product_ids' => [184010774, 184010799],
+            ]
+        ))->getData(true);
+
+        $this->assertTrue($payload['complete']);
+        $this->assertSame((string) $integration->id, $payload['integration_id']);
+        $this->assertSame([184010774, 184010799], $payload['checked_product_ids']);
+        $this->assertSame([184010799], $payload['missing_economics_product_ids']);
+        $this->assertSame('ready', $payload['items'][0]['status']);
+        $this->assertSame('missing', $payload['items'][1]['status']);
+    }
+
+    public function test_unit_economics_readiness_blocks_fallback_sources_and_stale_rows(): void
+    {
+        $integration = Integration::factory()->wildberries()->create(['id' => 61008]);
+        $product = Product::factory()->wildberries()->create([
+            'integration_id' => $integration->id,
+            'sku' => '2038816371460',
+            'marketplace_id' => '184010775:2038816371460',
+            'wb_data' => ['nmID' => 184010775],
+        ]);
+        UnitEconomicsSettings::create([
+            'integration_id' => $integration->id,
+            'sku' => $product->sku,
+            'cost_price' => 600,
+            'tax_percent' => 6,
+        ]);
+        $economics = UnitEconomics::create([
+            'integration_id' => $integration->id,
+            'sku' => $product->sku,
+            'marketplace' => 'wildberries',
+            'fulfillment_type' => 'FBO',
+            'is_actual_scheme' => true,
+            'price' => 1400,
+            'commission_percent' => 15,
+            'effective_logistics' => 100,
+            'net_profit' => 100,
+            'net_profit_per_unit' => 100,
+            'margin_percent' => 7.14,
+            'drr_percent' => 5,
+            'tariff_source' => 'wildberries_tariff_snapshots_fallback',
+            'redemption_source' => 'default',
+            'marketplace_data' => ['commission_source' => 'default'],
+        ]);
+        $economics->timestamps = false;
+        $economics->forceFill(['updated_at' => now()->subDays(4)])->saveQuietly();
+
+        $controller = new CostPriceController(new CostPriceParserService());
+        $payload = $controller->unitEconomicsReadiness(Request::create(
+            '/api/products/unit-economics/readiness',
+            'POST',
+            [
+                'integration_id' => $integration->id,
+                'wb_product_ids' => [184010775],
+            ]
+        ))->getData(true);
+
+        $this->assertSame([184010775], $payload['stale_product_ids']);
+        $this->assertSame('stale', $payload['items'][0]['status']);
+        $this->assertContains('untrusted_commission_source', $payload['items'][0]['reasons']);
+        $this->assertContains('untrusted_tariff_source', $payload['items'][0]['reasons']);
+        $this->assertContains('untrusted_redemption_source', $payload['items'][0]['reasons']);
     }
 
     public function test_template_uses_browser_safe_utf8_filename_and_excel_friendly_csv(): void

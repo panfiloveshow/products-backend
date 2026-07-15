@@ -87,57 +87,253 @@ class CostPriceController extends Controller
      */
     public function unitEconomicsExport(Request $request): JsonResponse
     {
-        $integrationId = $request->query('integration_id');
-        if (!$integrationId) {
-            return response()->json(['items' => []]);
-        }
+        $validated = $request->validate([
+            'integration_id' => 'required|integer|min:1|exists:integrations,id',
+        ]);
+        $integrationId = (int) $validated['integration_id'];
+        $generatedAt = now()->utc();
 
-        $rows = Product::query()
-            ->where('products.integration_id', $integrationId)
-            ->where('products.marketplace', 'wildberries')
-            ->join('unit_economics_settings as settings', function ($j) {
-                $j->on('settings.integration_id', '=', 'products.integration_id')
-                    ->on('settings.sku', '=', 'products.sku');
-            })
-            ->leftJoin('unit_economics as calculated', function ($j) {
-                $j->on('calculated.integration_id', '=', 'products.integration_id')
-                    ->on('calculated.sku', '=', 'products.sku')
-                    ->where('calculated.is_actual_scheme', '=', true);
-            })
-            ->where('settings.cost_price', '>', 0)
-            ->get([
-                'products.marketplace_id',
-                'products.wb_data',
-                'products.commission',
-                'settings.cost_price',
-                'settings.tax_percent',
-                'calculated.spp_percent',
-                'calculated.customer_price',
-            ]);
+        $items = $this->unitEconomicsRows($integrationId)
+            ->map(fn ($row): array => $this->unitEconomicsItem($row, $generatedAt))
+            ->filter(fn (array $item): bool => $item['nm_id'] > 0 && $item['cost_price'] !== null)
+            ->sortByDesc(fn (array $item): string => (string) ($item['calculated_at'] ?? ''))
+            ->unique('nm_id')
+            ->sortBy('nm_id')
+            ->values();
 
-        $items = [];
-        foreach ($rows as $row) {
-            $wbData = is_array($row->wb_data) ? $row->wb_data : (json_decode((string) $row->wb_data, true) ?: []);
-            // nmID: из карточки, иначе префикс marketplace_id ("nmID:barcode").
-            $nmId = $wbData['nmID'] ?? $wbData['nmId'] ?? null;
-            if (!$nmId && $row->marketplace_id) {
-                $nmId = strtok((string) $row->marketplace_id, ':');
-            }
-            $nmId = (int) $nmId;
-            if ($nmId <= 0) {
+        return response()->json([
+            'schema_version' => 2,
+            'source' => 'sellico-products-unit-economics',
+            'generated_at' => $generatedAt->toRfc3339String(),
+            'integration_id' => $integrationId,
+            'complete' => true,
+            'items' => $items,
+        ]);
+    }
+
+    /**
+     * Строгая проверка готовности реальной юнит-экономики для денежных действий.
+     * Любая неполнота, fallback-источник или устаревший расчёт возвращается как
+     * блокирующее состояние; endpoint никогда не подставляет бизнес-значения.
+     * POST /api/products/unit-economics/readiness
+     */
+    public function unitEconomicsReadiness(Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'integration_id' => 'required|integer|min:1|exists:integrations,id',
+            'wb_product_ids' => 'required|array|min:1|max:100',
+            'wb_product_ids.*' => 'required|integer|min:1|distinct',
+        ]);
+        $integrationId = (int) $validated['integration_id'];
+        $requested = collect($validated['wb_product_ids'])
+            ->map(fn ($id): int => (int) $id)
+            ->unique()
+            ->sort()
+            ->values();
+        $checkedAt = now()->utc();
+
+        $items = $this->unitEconomicsRows($integrationId)
+            ->map(fn ($row): array => $this->unitEconomicsItem($row, $checkedAt))
+            ->filter(fn (array $item): bool => $requested->contains($item['nm_id']))
+            ->sortByDesc(fn (array $item): string => (string) ($item['calculated_at'] ?? ''))
+            ->unique('nm_id')
+            ->keyBy('nm_id');
+
+        $missing = [];
+        $unprofitable = [];
+        $stale = [];
+        $readinessItems = [];
+        foreach ($requested as $nmId) {
+            $item = $items->get($nmId);
+            if ($item === null) {
+                $missing[] = $nmId;
+                $readinessItems[] = [
+                    'nm_id' => $nmId,
+                    'status' => 'missing',
+                    'reasons' => ['unit_economics_not_found'],
+                    'observed_at' => null,
+                    'max_allowed_drr_percent' => null,
+                ];
                 continue;
             }
-            $items[$nmId] = [
+
+            $reasons = $item['readiness_reasons'];
+            $isStale = in_array('stale_calculation', $reasons, true);
+            $isUnprofitable = in_array('unprofitable', $reasons, true);
+            if ($isStale) {
+                $stale[] = $nmId;
+            }
+            if ($isUnprofitable) {
+                $unprofitable[] = $nmId;
+            }
+            if (! $item['ready'] && ! $isStale && ! $isUnprofitable) {
+                $missing[] = $nmId;
+            }
+
+            $readinessItems[] = [
                 'nm_id' => $nmId,
-                'cost_price' => (float) $row->cost_price,
-                'commission_percent' => $row->commission !== null ? (float) $row->commission : null,
-                'tax_percent' => $row->tax_percent !== null ? (float) $row->tax_percent : null,
-                'spp_percent' => $row->spp_percent !== null ? (float) $row->spp_percent : null,
-                'customer_price' => $row->customer_price !== null ? (float) $row->customer_price : null,
+                'status' => $item['ready'] ? 'ready' : ($isStale ? 'stale' : ($isUnprofitable ? 'unprofitable' : 'incomplete')),
+                'reasons' => $reasons,
+                'observed_at' => $item['calculated_at'],
+                'max_allowed_drr_percent' => $item['max_allowed_drr'],
             ];
         }
 
-        return response()->json(['items' => array_values($items)]);
+        return response()->json([
+            'schema_version' => 1,
+            'source' => 'sellico-products-unit-economics',
+            'integration_id' => (string) $integrationId,
+            'checked_at' => $checkedAt->toRfc3339String(),
+            'complete' => true,
+            'checked_product_ids' => $requested,
+            'missing_economics_product_ids' => array_values(array_unique($missing)),
+            'unprofitable_product_ids' => array_values(array_unique($unprofitable)),
+            'stale_product_ids' => array_values(array_unique($stale)),
+            'items' => $readinessItems,
+        ]);
+    }
+
+    private function unitEconomicsRows(int $integrationId)
+    {
+        return Product::query()
+            ->where('products.integration_id', $integrationId)
+            ->where('products.marketplace', 'wildberries')
+            ->leftJoin('unit_economics_settings as settings', function ($join) {
+                $join->on('settings.integration_id', '=', 'products.integration_id')
+                    ->on('settings.sku', '=', 'products.sku');
+            })
+            ->leftJoin('unit_economics as calculated', function ($join) {
+                $join->on('calculated.integration_id', '=', 'products.integration_id')
+                    ->on('calculated.sku', '=', 'products.sku')
+                    ->where('calculated.is_actual_scheme', '=', true);
+            })
+            ->get([
+                'products.marketplace_id',
+                'products.wb_data',
+                'settings.cost_price',
+                'settings.tax_percent',
+                'calculated.price',
+                'calculated.customer_price',
+                'calculated.spp_percent',
+                'calculated.commission_percent',
+                'calculated.effective_logistics',
+                'calculated.net_profit',
+                'calculated.net_profit_per_unit',
+                'calculated.margin_percent',
+                'calculated.drr_percent',
+                'calculated.drr_amount',
+                'calculated.sales_count',
+                'calculated.tariff_source',
+                'calculated.redemption_source',
+                'calculated.marketplace_data',
+                'calculated.updated_at as calculated_at',
+            ]);
+    }
+
+    private function unitEconomicsItem($row, $checkedAt): array
+    {
+        $wbData = is_array($row->wb_data) ? $row->wb_data : (json_decode((string) $row->wb_data, true) ?: []);
+        $marketplaceData = is_array($row->marketplace_data)
+            ? $row->marketplace_data
+            : (json_decode((string) $row->marketplace_data, true) ?: []);
+        $nmId = (int) ($wbData['nmID'] ?? $wbData['nmId'] ?? 0);
+        if ($nmId <= 0 && $row->marketplace_id) {
+            $nmId = (int) strtok((string) $row->marketplace_id, ':');
+        }
+
+        $number = static fn ($value): ?float => $value === null ? null : (float) $value;
+        $price = $number($row->price);
+        $costPrice = $number($row->cost_price);
+        $commissionPercent = $number($row->commission_percent);
+        $taxPercent = $number($row->tax_percent);
+        $logisticsCost = $number($row->effective_logistics);
+        $netProfit = $number($row->net_profit_per_unit ?? $row->net_profit);
+        $marginPercent = $number($row->margin_percent);
+        $drrPercent = $number($row->drr_percent);
+        $maxAllowedDrr = ($marginPercent !== null && $drrPercent !== null)
+            ? round(max(0, min(100, $marginPercent + $drrPercent)), 2)
+            : null;
+        $marginBeforeAds = ($price !== null && $maxAllowedDrr !== null)
+            ? round($price * $maxAllowedDrr / 100, 2)
+            : null;
+
+        $otherCosts = null;
+        if ($price !== null && $costPrice !== null && $logisticsCost !== null && $commissionPercent !== null && $taxPercent !== null && $marginBeforeAds !== null) {
+            $commissionAmount = $price * $commissionPercent / 100;
+            $taxAmount = $price * $taxPercent / 100;
+            $otherCosts = round(max(0, $price - $costPrice - $logisticsCost - $commissionAmount - $taxAmount - $marginBeforeAds), 2);
+        }
+
+        $commissionSource = trim((string) ($marketplaceData['commission_source'] ?? ''));
+        $tariffSource = trim((string) ($row->tariff_source ?? $marketplaceData['tariff_source'] ?? ''));
+        $redemptionSource = trim((string) ($row->redemption_source ?? $marketplaceData['redemption_source'] ?? ''));
+        $dimensionsSource = trim((string) ($marketplaceData['dimensions_source'] ?? ''));
+        $acquiringSource = trim((string) ($marketplaceData['acquiring_source'] ?? ''));
+        $calculatedAt = $row->calculated_at ? \Illuminate\Support\Carbon::parse($row->calculated_at)->utc() : null;
+
+        $reasons = [];
+        foreach ([
+            'price' => $price,
+            'cost_price' => $costPrice,
+            'commission' => $commissionPercent,
+            'tax' => $taxPercent,
+            'logistics' => $logisticsCost,
+            'profit' => $netProfit,
+            'max_allowed_drr' => $maxAllowedDrr,
+        ] as $field => $value) {
+            if ($value === null || (in_array($field, ['price', 'cost_price', 'max_allowed_drr'], true) && $value <= 0)) {
+                $reasons[] = 'missing_' . $field;
+            }
+        }
+        if ($calculatedAt === null || $calculatedAt->lt($checkedAt->copy()->subHours(72))) {
+            $reasons[] = 'stale_calculation';
+        }
+        if ($netProfit !== null && $netProfit <= 0) {
+            $reasons[] = 'unprofitable';
+        }
+        foreach ([
+            'commission' => $commissionSource,
+            'tariff' => $tariffSource,
+            'redemption' => $redemptionSource,
+            'dimensions' => $dimensionsSource,
+            'acquiring' => $acquiringSource,
+        ] as $sourceName => $source) {
+            $normalized = strtolower($source);
+            if ($normalized === '' || str_contains($normalized, 'default') || str_contains($normalized, 'fallback')) {
+                $reasons[] = 'untrusted_' . $sourceName . '_source';
+            }
+        }
+
+        $reasons = array_values(array_unique($reasons));
+
+        return [
+            'nm_id' => $nmId,
+            'price' => $price,
+            'customer_price' => $number($row->customer_price),
+            'cost_price' => $costPrice,
+            'logistics_cost' => $logisticsCost,
+            'other_costs' => $otherCosts,
+            'commission_percent' => $commissionPercent,
+            'tax_percent' => $taxPercent,
+            'spp_percent' => $number($row->spp_percent),
+            'net_profit' => $netProfit,
+            'margin_percent' => $marginPercent,
+            'margin_before_ads' => $marginBeforeAds,
+            'max_allowed_drr' => $maxAllowedDrr,
+            'calculated_at' => $calculatedAt?->toRfc3339String(),
+            'ready' => $reasons === [],
+            'readiness_reasons' => $reasons,
+            'sources' => [
+                'cost' => 'unit_economics_settings',
+                'price' => 'unit_economics',
+                'commission' => $commissionSource ?: null,
+                'logistics' => $tariffSource ?: null,
+                'tax' => 'unit_economics_settings',
+                'redemption' => $redemptionSource ?: null,
+                'dimensions' => $dimensionsSource ?: null,
+                'acquiring' => $acquiringSource ?: null,
+            ],
+        ];
     }
 
     /**

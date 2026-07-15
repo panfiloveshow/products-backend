@@ -142,6 +142,8 @@ Route::middleware('throttle:60,1')->group(function () {
 // shared service secret, NOT the per-user sellico.permission flow.
 Route::get('products/unit-economics/export', [CostPriceController::class, 'unitEconomicsExport'])
     ->middleware('repricer.service')->name('products.unit-economics.export');
+Route::post('products/unit-economics/readiness', [CostPriceController::class, 'unitEconomicsReadiness'])
+    ->middleware('repricer.service')->name('products.unit-economics.readiness');
 
 Route::prefix('products')->middleware('sellico.permission')->group(function () {
     Route::get('/', [ProductController::class, 'index'])->name('products.index');

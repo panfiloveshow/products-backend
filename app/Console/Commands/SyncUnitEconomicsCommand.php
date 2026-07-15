@@ -3,8 +3,16 @@
 namespace App\Console\Commands;
 
 use App\Domains\Ozon\Tariffs\OzonPricingMatrix;
-use App\Models\OzonSkuDeliveryProfile;
+use App\Domains\Wildberries\UnitEconomics\WildberriesCommissionResolver;
+use App\Domains\Wildberries\UnitEconomics\WildberriesSppResolver;
+use App\Domains\Wildberries\WildberriesMarketplace;
+use App\Domains\YandexMarket\YandexMarketMarketplace;
+use App\Jobs\RecalculateUnitEconomicsCacheJob;
+use App\Jobs\SyncWildberriesLocalizationJob;
+use App\Models\Integration;
 use App\Models\InventoryWarehouse;
+use App\Models\OzonSkuDeliveryProfile;
+use App\Models\OzonWarehouseCluster;
 use App\Models\Product;
 use App\Models\UnitEconomics;
 use App\Services\LocalizationIndexService;
@@ -1677,6 +1685,11 @@ class SyncUnitEconomicsCommand extends Command
                 // Если есть объём из API хранения — используем его
                 if ($wbStorageData && isset($wbStorageData['volume_liters']) && $wbStorageData['volume_liters'] > 0) {
                     $volumeLiters = $wbStorageData['volume_liters'];
+                    $data['dimensions_source'] = 'wb_storage_api_volume';
+                } elseif ($lengthCm !== null && $widthCm !== null && $heightCm !== null) {
+                    $data['dimensions_source'] = 'wb_product_characteristics';
+                } else {
+                    $data['dimensions_source'] = 'default';
                 }
 
                 $data['volume_liters'] = round($volumeLiters, 2);
@@ -1693,20 +1706,16 @@ class SyncUnitEconomicsCommand extends Command
                 $data['actual_weight'] = round($weight / 1000, 2);
 
                 // === КОМИССИЯ ЗА ПРОДАЖУ (0.5% - 29.5% в зависимости от категории) ===
-                $wbCommissionScheme = match (strtoupper($fulfillmentType)) {
-                    'FBS', 'DBS', 'EDBS', 'DBW' => 'fbs',
-                    default => 'fbo',
-                };
                 $subjectId = $wbData['subjectID'] ?? $wbData['subjectId'] ?? null;
                 $subjectCommission = $subjectId ? ($wbCommissionsData[(string) $subjectId] ?? $wbCommissionsData[$subjectId] ?? null) : null;
-                $data['commission_percent'] = data_get($wbData, "commissions.{$wbCommissionScheme}.percent")
-                    ?? data_get($subjectCommission, $wbCommissionScheme)
-                    ?? data_get($subjectCommission, 'fbo')
-                    ?? data_get($wbData, 'commissions.fbo.percent')
-                    ?? data_get($wbData, 'commissions.fbs.percent')
-                    ?? $wbData['commission_percent']
-                    ?? $integrationSettings['wb_commission_percent']
-                    ?? 15;
+                $commissionResolution = WildberriesCommissionResolver::resolveWithSource(
+                    $wbData,
+                    $subjectCommission,
+                    $fulfillmentType,
+                    $integrationSettings
+                );
+                $data['commission_percent'] = $commissionResolution['value'];
+                $data['commission_source'] = $commissionResolution['source'];
 
                 // === КОЭФФИЦИЕНТЫ ИЗ API ТАРИФОВ ===
                 // Если есть данные из API тарифов — используем их
@@ -1726,6 +1735,9 @@ class SyncUnitEconomicsCommand extends Command
                         $deliveryAdditionalLiter = $firstTariff['delivery_additional_liter'] ?? 14;
                         $storageBaseLiter = $firstTariff['storage_base_liter'] ?? 0.08;
                     }
+                    $data['tariff_source'] = 'wb_tariffs_api';
+                } else {
+                    $data['tariff_source'] = 'default';
                 }
 
                 // Коэффициент склада (логистики) — приоритет: API > wb_data > settings > дефолт
@@ -1828,9 +1840,13 @@ class SyncUnitEconomicsCommand extends Command
                 if ($wbPreciseAcquiring !== null && $wbPreciseAcquiring > 0) {
                     $data['acquiring_percent'] = round($wbPreciseAcquiring, 2);
                     $data['_acquiring_precise'] = true; // транзиентный маркер: не перетирать старым
+                    $data['acquiring_source'] = 'wb_realization_report_sku';
                 } elseif ($wbAcquiringStoreAvg > 0) {
                     $data['acquiring_percent'] = round($wbAcquiringStoreAvg, 2);
                     $data['_acquiring_precise'] = true;
+                    $data['acquiring_source'] = 'wb_realization_report_store_avg';
+                } else {
+                    $data['acquiring_source'] = 'default';
                 }
 
                 // === СВОЯ ДОСТАВКА (DBS) ===
