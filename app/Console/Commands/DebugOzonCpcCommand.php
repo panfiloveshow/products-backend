@@ -94,7 +94,7 @@ class DebugOzonCpcCommand extends Command
         if ($integration === null) {
             $this->warn("Интеграция {$integrationId} не найдена локально.");
         } else {
-            $local = $integration->getCredentials();
+            $local = $integration->getDecryptedCredentials();
             if (! empty($local['performance_api_key']) && ! empty($local['performance_client_secret'])) {
                 $this->line('Креды: из локальной интеграции (encrypted credentials).');
 

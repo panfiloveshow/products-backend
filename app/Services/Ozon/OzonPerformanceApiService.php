@@ -649,16 +649,35 @@ class OzonPerformanceApiService
 
             if ($dateFrom !== null && $dateTo !== null) {
                 $campaigns = $this->fetchCampaigns($token['access_token']);
-                // Только товарные (SKU) кампании: per-SKU отчёт возможен лишь для них. Нетоварные
-                // типы (REF_VK, SEARCH_PROMO и пр.) Ozon отбивает 400 на генерации товарного отчёта.
-                $productCampaigns = array_values(array_filter(
+                // Только SKU-кампании (оплата за клик): per-SKU async-отчёт возможен лишь для них.
+                // CPO-кампании («Оплата за заказ») в /api/client/statistics НЕЛЬЗЯ: Ozon отвечает
+                // 400 «generation of this type of report is forbidden» и роняет ВЕСЬ чанк из 10
+                // кампаний — терялась и CPC-статистика соседей по чанку. Нетоварные типы (REF_VK,
+                // баннеры) точно так же ломают генерацию.
+                $skuCampaigns = array_values(array_filter(
                     $campaigns['list'],
-                    fn (array $campaign): bool => $this->isProductCampaign($campaign)
+                    fn (array $campaign): bool => $this->isProductCampaign($campaign) && ! $this->isCpoCampaign($campaign)
+                ));
+                // Фолбэк: часть аккаунтов отдаёт кампании без advObjectType — тогда берём все,
+                // кроме CPO (они гарантированно ломают генерацию).
+                $asyncCampaigns = $skuCampaigns !== [] ? $skuCampaigns : array_values(array_filter(
+                    $campaigns['list'],
+                    fn (array $campaign): bool => ! $this->isCpoCampaign($campaign)
                 ));
                 $campaignIds = array_values(array_filter(array_map(
                     static fn (array $campaign): string => (string) ($campaign['id'] ?? ''),
-                    $productCampaigns !== [] ? $productCampaigns : $campaigns['list']
+                    $asyncCampaigns
                 )));
+
+                // «Оплата за заказ — все товары» (ALL_SKU_PROMO): расход этой кампании не попадает
+                // ни в UUID-отчёт по товарам, ни в async-статистику кампаний. Единственный per-SKU
+                // источник — выделенный отчёт по заказам all_sku_promo/orders/generate (строка =
+                // заказ со SKU, ставкой и списанием). Кампания могла быть уже выключена — отчёт
+                // всё равно отдаёт историю за период, поэтому смотрим на наличие, а не на state.
+                $hasAllSkuPromo = array_filter(
+                    $campaigns['list'],
+                    static fn (array $campaign): bool => mb_strtoupper((string) ($campaign['advObjectType'] ?? '')) === 'ALL_SKU_PROMO'
+                ) !== [];
 
                 // Async-отчёты Ozon (генерация + поллинг) длятся минуты и превышают таймауты
                 // php-fpm/nginx, поэтому в проде (известная интеграция) собираем их ПРОГРЕССИВНО:
@@ -672,9 +691,12 @@ class OzonPerformanceApiService
                         $dateFrom,
                         $dateTo,
                         $campaignIds,
-                        $forceRefresh
+                        $forceRefresh,
+                        $hasAllSkuPromo
                     );
                 } else {
+                    // ponytail: CLI/тестовый путь без ASP-отчёта — прогрессивный сбор (integrationId>0)
+                    // покрывает прод; добавить ASP сюда, если понадобится в advertisingSummary.
                     $campaignStats = $this->fetchProductCampaignStats(
                         $token['access_token'],
                         $dateFrom,
@@ -1051,7 +1073,8 @@ class OzonPerformanceApiService
         string $dateFrom,
         string $dateTo,
         array $campaignIds,
-        bool $forceRefresh = false
+        bool $forceRefresh = false,
+        bool $includeAllSkuPromo = false
     ): array {
         $progKey = "ozon_perf_cpc_prog:{$integrationId}:{$dateFrom}:{$dateTo}";
 
@@ -1091,7 +1114,24 @@ class OzonPerformanceApiService
                     $errors[] = 'Async: ' . $e->getMessage();
                 }
             }
-            $prog = ['uuids' => $uuids, 'rows_by_uuid' => [], 'errors' => $errors, 'created' => time()];
+            // Отчёт «Оплата за заказ — все товары»: отдельный UUID в общем пуле поллинга,
+            // но со своим парсером (per-order CSV → агрегированные per-SKU CPO-строки).
+            $aspUuids = [];
+            if ($includeAllSkuPromo) {
+                try {
+                    $uuid = $this->generateAllSkuPromoOrdersReport($accessToken, $dateFrom, $dateTo);
+                    if ($uuid !== '') {
+                        $uuids[$uuid] = false;
+                        $aspUuids[] = $uuid;
+                    } else {
+                        $errors[] = 'ASP: отчёт по заказам «все товары» не создан (нет UUID)';
+                    }
+                } catch (\Throwable $e) {
+                    $errors[] = 'ASP: ' . $e->getMessage();
+                }
+            }
+
+            $prog = ['uuids' => $uuids, 'asp_uuids' => $aspUuids, 'rows_by_uuid' => [], 'errors' => $errors, 'created' => time()];
             Cache::put($progKey, $prog, now()->addMinutes(15));
 
             // Если ни один отчёт не создан — не зависаем в pending, отдаём пустой результат.
@@ -1126,7 +1166,10 @@ class OzonPerformanceApiService
                 try {
                     // Идемпотентно: пишем строки отчёта ПО uuid (перезапись, не append) — повторная
                     // обработка того же готового отчёта (гонка двух запросов) не задваивает клики/расход.
-                    $prog['rows_by_uuid'][(string) $uuid] = $this->downloadCampaignStatsReportRows($accessToken, $link);
+                    $isAsp = in_array((string) $uuid, (array) ($prog['asp_uuids'] ?? []), true);
+                    $prog['rows_by_uuid'][(string) $uuid] = $isAsp
+                        ? $this->downloadAllSkuPromoOrderRows($accessToken, $link)
+                        : $this->downloadCampaignStatsReportRows($accessToken, $link);
                 } catch (\Throwable $e) {
                     $prog['errors'][] = 'Async: ' . $e->getMessage();
                 }
@@ -1453,6 +1496,136 @@ class OzonPerformanceApiService
         }
 
         return $rows;
+    }
+
+    /**
+     * Заказывает отчёт по заказам инструмента «Оплата за заказ — все товары» (ALL_SKU_PROMO).
+     *
+     * GET /api/client/statistics/all_sku_promo/orders/generate — единственный источник
+     * per-SKU расхода этого инструмента: обычная статистика кампаний для CPO запрещена (400),
+     * а «отчёт по товарам» all_sku_promo/products/generate отдаёт только дневные агрегаты без SKU.
+     */
+    private function generateAllSkuPromoOrdersReport(string $accessToken, string $dateFrom, string $dateTo): string
+    {
+        $response = Http::connectTimeout(15)
+            ->timeout(40)
+            ->withToken($accessToken)
+            ->acceptJson()
+            ->get(self::BASE_URL . '/api/client/statistics/all_sku_promo/orders/generate', [
+                'timeBounds.from' => $this->toRfc3339Start($dateFrom),
+                'timeBounds.to' => $this->toRfc3339End($dateTo),
+            ]);
+
+        if (! $response->successful()) {
+            throw new \RuntimeException('all_sku_promo/orders/generate HTTP ' . $response->status());
+        }
+
+        return (string) ($response->json('UUID') ?? $response->json('uuid') ?? '');
+    }
+
+    /**
+     * Скачивает готовый отчёт по заказам «все товары» и агрегирует его в per-SKU CPO-строки.
+     *
+     * @return array<int, array<string, mixed>>
+     */
+    private function downloadAllSkuPromoOrderRows(string $accessToken, string $link): array
+    {
+        $response = Http::connectTimeout(15)
+            ->timeout(60)
+            ->withToken($accessToken)
+            ->accept('*/*')
+            ->get($link);
+
+        if (! $response->successful()) {
+            throw new \RuntimeException('ASP: скачивание отчёта HTTP ' . $response->status());
+        }
+
+        $body = (string) $response->body();
+        $contentType = strtolower((string) $response->header('content-type'));
+
+        $csvParts = (str_starts_with($body, "PK\x03\x04") || str_contains($contentType, 'zip'))
+            ? $this->extractCsvFromZip($body)
+            : [$body];
+
+        $rows = [];
+        foreach ($csvParts as $csv) {
+            $rows = array_merge($rows, $this->aggregateAllSkuPromoOrdersCsv($csv));
+        }
+
+        return $rows;
+    }
+
+    /**
+     * CSV отчёта по заказам «все товары» (строка = заказ: дата, ID заказа, SKU, ставка, расход)
+     * агрегируется по SKU в строки, которые CPO-ветка campaignStatsRowsToProductReportRows
+     * превращает в «Расход/Продажи/Заказы (Оплата за заказ)».
+     *
+     * @return array<int, array<string, mixed>>
+     */
+    private function aggregateAllSkuPromoOrdersCsv(string $csv): array
+    {
+        $lines = preg_split("/\r\n|\n|\r/", $csv) ?: [];
+        $header = [];
+        $bySku = [];
+
+        foreach ($lines as $line) {
+            $line = trim((string) $line);
+            if ($line === '') {
+                continue;
+            }
+
+            $line = preg_replace('/^\xEF\xBB\xBF/', '', $line) ?? $line;
+            $cells = str_getcsv($line, ';', '"', '\\');
+            $cells = array_map(static fn ($cell): string => trim((string) $cell), $cells);
+
+            if ($header === []) {
+                if (in_array('SKU', $cells, true) && in_array('Дата', $cells, true)) {
+                    $header = $cells;
+                }
+                continue;
+            }
+
+            $row = [];
+            foreach ($header as $index => $name) {
+                $row[$name] = (string) ($cells[$index] ?? '');
+            }
+
+            // Только строки-заказы (дата dd.mm.yyyy): отсекаем «Всего», «Корректировка» и прочие итоги.
+            if (! preg_match('/^\d{2}\.\d{2}\.\d{4}$/', trim((string) ($row['Дата'] ?? '')))) {
+                continue;
+            }
+
+            $sku = trim((string) ($row['SKU продвигаемого товара'] ?? ''));
+            if ($sku === '') {
+                $sku = trim((string) ($row['SKU'] ?? ''));
+            }
+            $offerId = trim((string) ($row['Артикул'] ?? ''));
+            $key = $sku !== '' ? $sku : $offerId;
+            if ($key === '') {
+                continue;
+            }
+
+            if (! isset($bySku[$key])) {
+                $bySku[$key] = [
+                    'SKU' => $sku,
+                    'Артикул' => $offerId,
+                    'Название товара' => trim((string) ($row['Название товара'] ?? '')),
+                    'Расход' => 0.0,
+                    'Выручка' => 0.0,
+                    'Заказы' => 0,
+                    '_source' => 'all_sku_promo_orders',
+                    '_payment_type' => 'cpo',
+                    '_campaign_id' => 'all_sku_promo',
+                ];
+            }
+
+            $bySku[$key]['Расход'] += $this->number($row['Расход, ₽'] ?? 0);
+            // «Стоимость, ₽» = цена × количество (продажи в продвижении); фолбэк — цена за единицу.
+            $bySku[$key]['Выручка'] += $this->number($row['Стоимость, ₽'] ?? ($row['Стоимость продажи, ₽'] ?? 0));
+            $bySku[$key]['Заказы']++;
+        }
+
+        return array_values($bySku);
     }
 
     /**

@@ -598,4 +598,113 @@ class OzonPerformanceApiServiceTest extends TestCase
                 && ! in_array('900', $request['campaigns'], true);
         });
     }
+
+    public function test_product_advertising_impact_collects_all_sku_promo_cpo_and_excludes_cpo_from_async(): void
+    {
+        // Реальная схема Ozon (диагноз 2026-07-15, интеграция 15): расход «Оплата за заказ — все
+        // товары» (ALL_SKU_PROMO) доступен ТОЛЬКО через выделенный отчёт по заказам
+        // all_sku_promo/orders/generate. CPO-кампании в POST /api/client/statistics запрещены —
+        // Ozon отвечает 400 и роняет весь чанк (терялась и CPC-статистика соседей).
+        $cpcCsv = "\xEF\xBB\xBF;Кампания по продвижению товаров № 101, период 15.06.2026-15.07.2026\n"
+            . "sku;Название товара;Цена товара, ₽;Показы;Клики;CTR, %;В корзину;Средняя стоимость клика, ₽;Расход, ₽, с НДС;Заказы;Продажи, ₽;Дата добавления\n"
+            . "1275702683;Петли мебельные комплект 2 шт;180,00;1000;20;2,0;5;15,00;300,00;2;360,00;12.03.2026\n";
+
+        // Отчёт по заказам «все товары»: строка = заказ (как в реальном CSV Ozon).
+        $aspCsv = "\xEF\xBB\xBF;Оплата за заказ (все товары). Отчёт по заказам, Период 15.06.2026-16.07.2026\n"
+            . "Дата;ID заказа;Номер заказа;SKU;SKU продвигаемого товара;Артикул;Название товара;Количество;Стоимость продажи, ₽;Стоимость, ₽;Ставка, %;Ставка, ₽;Расход, ₽\n"
+            . "15.06.2026;111;52753137-0289;1275702683;1275702683;P002;Петли мебельные комплект 2 шт;1;180,00;180,00;7,00;12,60;12,60\n"
+            . "16.06.2026;222;52753137-0290;1275702683;1275702683;P002;Петли мебельные комплект 2 шт;2;180,00;360,00;7,00;12,60;25,20\n"
+            . "17.06.2026;333;52753137-0291;1275704268;1275704268;P004;Петли мебельные комплект 4 шт;1;300,00;300,00;7,00;21,00;21,00\n"
+            . "Всего;;;;;;;4;660,00;840,00;;;58,80\n";
+
+        Http::fake([
+            'https://api-performance.ozon.ru/api/client/token' => Http::response([
+                'access_token' => 'token-value', 'token_type' => 'Bearer', 'expires_in' => 1800,
+            ]),
+            'https://api-performance.ozon.ru/api/client/statistics/report-uuid' => Http::response([
+                'UUID' => 'report-uuid', 'state' => 'OK',
+                'link' => '/api/client/statistics/report?UUID=report-uuid',
+            ]),
+            'https://api-performance.ozon.ru/api/client/statistics/report?UUID=report-uuid' => Http::response(
+                "SKU;Артикул;Название товара;Категория товара;Продвижение;Цена товара, ₽\n"
+                . "1275702683;P002;Петли мебельные комплект 2 шт;Петли;Включено;180,00\n"
+                . "1275704268;P004;Петли мебельные комплект 4 шт;Петли;Включено;300,00\n",
+                200,
+                ['content-type' => 'text/csv; charset=utf-8']
+            ),
+            'https://api-performance.ozon.ru/api/client/campaign' => Http::response([
+                'total' => 3,
+                'list' => [
+                    ['id' => '101', 'title' => 'Клики', 'advObjectType' => 'SKU', 'state' => 'CAMPAIGN_STATE_RUNNING'],
+                    ['id' => '202', 'title' => 'Оплата за заказ - все товары', 'advObjectType' => 'ALL_SKU_PROMO', 'PaymentType' => 'CPO', 'state' => 'CAMPAIGN_STATE_INACTIVE'],
+                    ['id' => '303', 'title' => 'Оплата за заказ: выбранные', 'advObjectType' => 'SEARCH_PROMO', 'PaymentType' => 'CPO', 'state' => 'CAMPAIGN_STATE_RUNNING'],
+                ],
+            ]),
+            'https://api-performance.ozon.ru/api/client/statistics/all_sku_promo/orders/generate*' => Http::response(['UUID' => 'asp-uuid']),
+            'https://api-performance.ozon.ru/api/client/statistics/asp-uuid' => Http::response([
+                'UUID' => 'asp-uuid', 'state' => 'OK',
+                'link' => '/api/client/statistics/report?UUID=asp-uuid',
+            ]),
+            'https://api-performance.ozon.ru/api/client/statistics/report?UUID=asp-uuid' => Http::response(
+                $aspCsv, 200, ['content-type' => 'text/csv; charset=utf-8']
+            ),
+            'https://api-performance.ozon.ru/api/client/statistics' => Http::response(['UUID' => 'stat-uuid']),
+            'https://api-performance.ozon.ru/api/client/statistics/stat-uuid' => Http::response([
+                'UUID' => 'stat-uuid', 'state' => 'OK',
+                'link' => '/api/client/statistics/report?UUID=stat-uuid',
+            ]),
+            'https://api-performance.ozon.ru/api/client/statistics/report?UUID=stat-uuid' => Http::response(
+                $cpcCsv, 200, ['content-type' => 'text/csv; charset=utf-8']
+            ),
+        ]);
+
+        $credentials = [
+            'performance_api_key' => 'performance-client-id',
+            'performance_client_secret' => 'performance-secret',
+        ];
+        $service = new OzonPerformanceApiService();
+
+        // Прогрессивный сбор (integrationId>0): первый вызов создаёт отчёты (pending),
+        // второй — скачивает готовые и собирает итог.
+        $first = $service->productAdvertisingImpact($credentials, 'report-uuid', 5000, '2026-06-15', '2026-07-15', 15);
+        $this->assertTrue($first['success']);
+        $this->assertTrue((bool) $first['coverage']['campaign_stats_pending']);
+
+        $result = $service->productAdvertisingImpact($credentials, 'report-uuid', 5000, '2026-06-15', '2026-07-15', 15);
+        $this->assertTrue($result['success']);
+        $this->assertSame('async_report', $result['coverage']['campaign_stats_source']);
+
+        // Расход «все товары» разложен по SKU из отчёта по заказам.
+        $p002 = $result['by_offer_id']['P002'];
+        $this->assertSame(37.8, $p002['ad_cpo_spend']);
+        $this->assertSame(540.0, $p002['ad_cpo_revenue']);
+        $this->assertSame(2, $p002['ad_cpo_orders']);
+        $cpoModel = collect($p002['payment_models'])->firstWhere('name', 'Оплата за заказ');
+        $this->assertNotNull($cpoModel);
+        $this->assertSame(37.8, $cpoModel['spend']);
+
+        $p004 = $result['by_offer_id']['P004'];
+        $this->assertSame(21.0, $p004['ad_cpo_spend']);
+        $this->assertSame(1, $p004['ad_cpo_orders']);
+
+        // CPC-строки того же товара не потерялись и слились в общий ad_spend.
+        $this->assertSame(20, $p002['clicks']);
+        $this->assertSame(337.8, $p002['ad_spend']); // 300 CPC + 37,8 CPO
+
+        // CPO-кампании (202, 303) не попали в POST /api/client/statistics — иначе Ozon 400 на весь чанк.
+        Http::assertSent(function ($request): bool {
+            if ($request->method() !== 'POST'
+                || $request->url() !== 'https://api-performance.ozon.ru/api/client/statistics') {
+                return false;
+            }
+
+            return $request['campaigns'] === ['101'];
+        });
+
+        // Отчёт «все товары» заказан с корректными timeBounds.
+        Http::assertSent(function ($request): bool {
+            return str_starts_with($request->url(), 'https://api-performance.ozon.ru/api/client/statistics/all_sku_promo/orders/generate')
+                && str_contains(urldecode($request->url()), 'timeBounds.from=2026-06-15T00:00:00Z');
+        });
+    }
 }
