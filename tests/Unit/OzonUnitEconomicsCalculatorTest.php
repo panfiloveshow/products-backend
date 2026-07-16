@@ -497,6 +497,51 @@ class OzonUnitEconomicsCalculatorTest extends TestCase
         $this->assertSame(8.0, $result['non_local_markup_percent']);
     }
 
+    public function test_fbo_uses_enriched_cluster_locality_with_multi_cluster_stock(): void
+    {
+        $calculator = new OzonUnitEconomicsCalculator();
+        $input = CalculationInput::fromArray([
+            'sku' => '9217/newdarkgreen',
+            'integration_id' => 55,
+            'marketplace' => 'ozon',
+            'fulfillment_type' => 'FBO',
+            'price' => 14500,
+            'cost_price' => 5000,
+            'length' => 10,
+            'width' => 10,
+            'height' => 10,
+            'sales_7_days' => 344,
+            'stock_profile' => [
+                ['cluster_name' => 'Казань', 'share_percent' => 60],
+                ['cluster_name' => 'Москва, МО и Дальние регионы', 'share_percent' => 40],
+            ],
+            'clusters_summary' => [[
+                'cluster_id' => '154',
+                'cluster_name' => 'Москва, МО и Дальние регионы',
+                'orders_count' => 1,
+                'orders_percent' => 100,
+                'is_local_cluster' => true,
+                'effective_markup_percent' => 0,
+            ]],
+            // Более полный sales_profile должен быть выбран без потери locality-флагов.
+            'sales_profile' => [[
+                'cluster_id' => '154',
+                'cluster_name' => 'Москва, МО и Дальние регионы',
+                'sales_30_days' => 3,
+                'sales_share_percent' => 100,
+                'is_local_cluster' => true,
+                'effective_markup_percent' => 0,
+            ]],
+        ]);
+
+        $result = $calculator->calculate($input)->toArray();
+
+        $this->assertSame(100.0, $result['expected_locality_rate']);
+        $this->assertSame(true, $result['is_local_sale']);
+        $this->assertSame(0.0, $result['non_local_markup_percent']);
+        $this->assertSame($result['base_logistics'], $result['costs']['logistics']);
+    }
+
     public function test_fbo_uses_volume_weight_for_chargeable_tariff_bucket(): void
     {
         $calculator = new OzonUnitEconomicsCalculator();

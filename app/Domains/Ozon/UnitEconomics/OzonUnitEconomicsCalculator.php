@@ -547,24 +547,38 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
             || ($input->ordersCount !== null && $input->ordersCount <= 0);
         $commissionData = $this->pricing->resolveCommission($scheme, $input->categoryId, $input->price);
         $pricingDate = $input->orderDate ?? $input->tariffEffectiveFrom ?? $this->pricing->getEffectiveFrom();
-        $hasExactClusters = ! $hasNoSales && ($input->shippingClusterName !== null || $input->destinationClusterName !== null);
-        $clusterLogisticsData = $hasExactClusters
+        $hasExactClusters = ! $hasNoSales
+            && ($input->shippingClusterName !== null || $input->destinationClusterName !== null);
+        $hasLegacyRouteMetadata = ! $hasNoSales
+            && (! empty($input->routeKey) || ! empty($input->routeLabel));
+        $usesOfficialLogisticsMatrix = in_array($scheme, ['FBO', 'FBS'], true);
+        $clusterLogisticsData = $usesOfficialLogisticsMatrix
             ? $this->pricing->resolveClusterLogistics(
                 $scheme,
                 $volume,
                 $input->price,
-                $input->shippingClusterName,
-                $input->destinationClusterName,
+                $hasNoSales ? null : $input->shippingClusterName,
+                $hasNoSales ? null : $input->destinationClusterName,
                 $pricingDate
             )
             : null;
+        $legacyRouteData = $this->pricing->resolveLogistics(
+            $scheme,
+            $volume,
+            $hasNoSales ? null : $input->routeKey,
+            $hasNoSales ? null : $input->routeLabel
+        );
         $logisticsData = $clusterLogisticsData
-            ?? $this->pricing->resolveLogistics(
-                $scheme,
-                $volume,
-                $hasNoSales ? null : $input->routeKey,
-                $hasNoSales ? null : $input->routeLabel
-            );
+            ?? $legacyRouteData;
+        if ($clusterLogisticsData !== null && ! $hasExactClusters && $hasLegacyRouteMetadata) {
+            // Старый route_key остаётся только источником подписи/локальности для
+            // legacy-входов. Стоимость не берём из его укрупнённых литровых ставок:
+            // base_cost уже рассчитан по универсальной строке Excel-матрицы.
+            $logisticsData['route_key'] = $legacyRouteData['route_key'];
+            $logisticsData['route_label'] = $legacyRouteData['route_label'];
+            $logisticsData['is_local_sale'] = $legacyRouteData['is_local_sale'];
+            $logisticsData['non_local_markup_percent'] = $legacyRouteData['non_local_markup_percent'];
+        }
         $schemeCosts = $this->pricing->getSchemeCosts($scheme);
         $commissionRate = $input->commissionRate ?? (float) $commissionData['sales_fee_percent'];
         $acquiringRate = $input->acquiringPercent ?? 1.5;
@@ -669,12 +683,25 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
             $analyticsTotal = array_sum(array_column($demandClusters, 'orders_count'));
             $salesTotal = array_sum(array_column($input->salesProfile, 'sales_30_days'));
             if ($salesTotal > $analyticsTotal) {
-                $demandClusters = array_map(fn(array $sp) => [
-                    'cluster_id' => $sp['cluster_id'] ?? null,
-                    'cluster_name' => $sp['cluster_name'] ?? null,
-                    'orders_count' => (int) ($sp['sales_30_days'] ?? 0),
-                    'orders_percent' => (float) ($sp['sales_share_percent'] ?? 0),
-                ], $input->salesProfile);
+                $demandClusters = array_map(static function (array $sp): array {
+                    $cluster = [
+                        'cluster_id' => $sp['cluster_id'] ?? null,
+                        'cluster_name' => $sp['cluster_name'] ?? null,
+                        'orders_count' => (int) ($sp['sales_30_days'] ?? 0),
+                        'orders_percent' => (float) ($sp['sales_share_percent'] ?? 0),
+                    ];
+
+                    // sales_profile обогащается теми же locality-полями, что и
+                    // clusters_summary. Не теряем их при выборе более полного
+                    // источника спроса, иначе наценка снова становится нелокальной.
+                    foreach (['is_local_cluster', 'effective_markup_percent', 'markup_reason'] as $key) {
+                        if (array_key_exists($key, $sp)) {
+                            $cluster[$key] = $sp[$key];
+                        }
+                    }
+
+                    return $cluster;
+                }, $input->salesProfile);
             }
         }
 
@@ -712,13 +739,21 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
                 ?? null
             );
 
-            // Локальная продажа: если fixation задаёт кластер отгрузки — сравниваем с ним,
-            // иначе — destination совпадает с любым кластером остатков
-            $isLocalCluster = $destinationCluster !== null && (
-                $fixedShippingCluster !== null
-                    ? $destinationCluster === $fixedShippingCluster
-                    : ($singleStockCluster !== null && $destinationCluster === $singleStockCluster)
-            );
+            // Фиксация — самый точный источник: при ней stale-флаги профиля
+            // игнорируем. Без фиксации обогащённый clusters_summary уже содержит
+            // per-cluster locality, рассчитанный из реальных заказов и остатков. Раньше
+            // калькулятор игнорировал этот флаг при нескольких складах: на экране
+            // получалось 0%, а в logistics_cost незаметно добавлялась наценка.
+            if ($fixedShippingCluster !== null) {
+                $isLocalCluster = $destinationCluster !== null
+                    && $destinationCluster === $fixedShippingCluster;
+            } elseif (array_key_exists('is_local_cluster', $cluster) && $cluster['is_local_cluster'] !== null) {
+                $isLocalCluster = (bool) $cluster['is_local_cluster'];
+            } else {
+                $isLocalCluster = $destinationCluster !== null
+                    && $singleStockCluster !== null
+                    && $destinationCluster === $singleStockCluster;
+            }
 
             if ($isLocalCluster) {
                 $localityShare += $share;
@@ -745,6 +780,14 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
             // правило Ozon применяется на момент отгрузки, не на момент обогащения кэша.
             if ($isLocalCluster || ! $markupAllowed) {
                 $clusterMarkup = 0.0;
+            } elseif (
+                $fixedShippingCluster === null
+                && array_key_exists('is_local_cluster', $cluster)
+                && $cluster['is_local_cluster'] !== null
+                && array_key_exists('effective_markup_percent', $cluster)
+                && $cluster['effective_markup_percent'] !== null
+            ) {
+                $clusterMarkup = (float) $cluster['effective_markup_percent'];
             } else {
                 $clusterMarkup = $this->pricing->resolveDestinationMarkupPercent($destinationCluster, $pricingDate);
             }

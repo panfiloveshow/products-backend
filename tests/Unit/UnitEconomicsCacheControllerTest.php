@@ -262,6 +262,8 @@ class UnitEconomicsCacheControllerTest extends TestCase
 
         $result = $method->invoke($controller, [
             'orders_count' => 14,
+            'factual_orders_count' => 14,
+            'estimate_orders_count' => 0,
             'avg_non_local_markup_percent' => 0.574,
             'avg_non_local_markup_amount' => 3.216,
         ], 8.0, 44.0);
@@ -288,6 +290,125 @@ class UnitEconomicsCacheControllerTest extends TestCase
         ], 8.0, 44.0);
 
         $this->assertSame([8.0, 44.0, false], $result);
+    }
+
+    public function test_ozon_display_non_local_markup_does_not_treat_estimates_as_factual(): void
+    {
+        $controller = new UnitEconomicsCacheController(
+            $this->createMock(UnitEconomicsCacheService::class),
+            $this->createMock(UnitEconomicsService::class),
+            $this->createMock(UnitEconomicsOrchestrator::class),
+            $this->createMock(IntegrationAccessService::class),
+        );
+
+        $method = new \ReflectionMethod($controller, 'resolveOzonDisplayNonLocalMarkup');
+        $method->setAccessible(true);
+
+        $result = $method->invoke($controller, [
+            'orders_count' => 28,
+            'factual_orders_count' => 0,
+            'estimate_orders_count' => 28,
+            'avg_non_local_markup_percent' => 1.71,
+            'avg_non_local_markup_amount' => 179.83,
+        ], 0.0, 0.0);
+
+        $this->assertSame([0.0, 0.0, false], $result);
+    }
+
+    public function test_ozon_enrich_reconciles_stale_logistics_with_zero_display_markup(): void
+    {
+        $controller = new UnitEconomicsCacheController(
+            $this->createMock(UnitEconomicsCacheService::class),
+            $this->createMock(UnitEconomicsService::class),
+            $this->createMock(UnitEconomicsOrchestrator::class),
+            $this->createMock(IntegrationAccessService::class),
+        );
+
+        $product = new Product([
+            'id' => 10,
+            'integration_id' => 55,
+            'marketplace' => 'ozon',
+            'sku' => '9217/newdarkgreen',
+            'name' => 'Regression product',
+        ]);
+        $product->fulfillment_type = 'FBO';
+
+        $cache = new UnitEconomicsCache([
+            'integration_id' => 55,
+            'product_id' => 10,
+            'sku' => '9217/newdarkgreen',
+            'marketplace' => 'ozon',
+            'fulfillment_type' => 'FBO',
+            'sales_count' => 1,
+            'price' => 14500,
+            'cost_price' => 5000,
+            'commission_percent' => 10,
+            'commission_amount' => 1450,
+            'acquiring_percent' => 1.5,
+            'acquiring_amount' => 217.5,
+            'base_logistics_cost' => 67.99,
+            'logistics_cost' => 840.84,
+            'last_mile_cost' => 25,
+            'processing_cost' => 0,
+            'return_logistics_cost' => 67.99,
+            'return_processing_cost' => 15,
+            'expected_return_cost' => 51.87,
+            'effective_logistics' => 917.71,
+            'non_local_markup_percent' => 5.33,
+            'redemption_rate' => 37.5,
+            'orders_count' => 8,
+            'storage_cost' => 0,
+            'drr_percent' => 0,
+            'our_share_percent' => 0,
+            'tax_percent' => 0,
+            'vat_percent' => 0,
+            'total_costs' => 7585.21,
+            'net_profit' => 6914.79,
+            'marketplace_data' => [
+                'sales_7_days' => 344,
+                'clusters_summary' => [[
+                    'cluster_name' => 'Москва, МО и Дальние регионы',
+                    'orders_count' => 3,
+                    'orders_percent' => 100,
+                    'is_local_cluster' => true,
+                    'effective_markup_percent' => 0,
+                ]],
+                'stock_profile' => [[
+                    'cluster_name' => 'Москва, МО и Дальние регионы',
+                    'quantity' => 6,
+                    'share_percent' => 100,
+                ]],
+                'order_economics_summary' => [
+                    'orders_count' => 28,
+                    'factual_orders_count' => 0,
+                    'estimate_orders_count' => 28,
+                    'avg_non_local_markup_percent' => 1.71,
+                    'avg_non_local_markup_amount' => 179.83,
+                ],
+                'calculation_warnings' => [],
+            ],
+        ]);
+        $cache->setRelation('product', $product);
+
+        $method = new \ReflectionMethod(UnitEconomicsCacheController::class, 'enrichCacheItem');
+        $method->setAccessible(true);
+        $result = $method->invoke($controller, $cache, 'FBO', null, [
+            'inventory_by_product_key' => collect(['10|55' => collect()]),
+            'actual_schemes_by_product_key' => collect(['10|55' => 'FBO']),
+        ]);
+
+        $this->assertSame(0.0, $result['non_local_markup_percent']);
+        $this->assertSame(0.0, $result['non_local_markup_amount']);
+        $this->assertSame(67.99, $result['logistics_cost']);
+        $this->assertSame(92.99, $result['delivery_cost']);
+        $this->assertSame(144.86, $result['effective_logistics']);
+        $this->assertSame('reconciled', $result['logistics_invariant_status']);
+        $this->assertContains(
+            'ozon_logistics_reconciled_with_display_markup',
+            $result['calculation_warnings']
+        );
+        $this->assertSame(67.99, $result['marketplace_data']['logistics']);
+        $this->assertSame(144.86, $result['marketplace_data']['effective_logistics']);
     }
 
     public function test_enrich_cache_item_exposes_volume_weight_and_chargeable_volume(): void

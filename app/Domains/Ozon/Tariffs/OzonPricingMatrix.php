@@ -224,8 +224,16 @@ class OzonPricingMatrix
             $baseCost = $this->logisticsMatrix['matrix'][$sourceCanonical][$destinationCanonical][$bucketLabel][$priceKey] ?? null;
         }
 
+        $rawBaseCost = $baseCost;
+        $estimateMarkupPercent = 0.0;
+
         if ($baseCost === null) {
-            $baseCost = $this->logisticsMatrix['universal_tariffs'][$bucketLabel][$priceKey] ?? 0.0;
+            $rawBaseCost = (float) ($this->logisticsMatrix['universal_tariffs'][$bucketLabel][$priceKey] ?? 0.0);
+            $estimateMarkupPercent = max(
+                0.0,
+                (float) ($this->config['universal_logistics_fallback_markup_percent'] ?? 50.0)
+            );
+            $baseCost = $rawBaseCost * (1 + $estimateMarkupPercent / 100);
             $usedUniversal = true;
         }
 
@@ -234,6 +242,8 @@ class OzonPricingMatrix
             'destination_cluster' => $destinationCanonical,
             'volume_bucket' => $bucketLabel,
             'base_cost' => round((float) $baseCost, 2),
+            'unadjusted_base_cost' => round((float) ($rawBaseCost ?? $baseCost), 2),
+            'estimate_markup_percent' => round($estimateMarkupPercent, 2),
             'tariff_source' => $usedUniversal ? 'universal' : 'official',
             'used_universal_tariff' => $usedUniversal,
             'non_local_markup_percent' => $this->resolveDestinationMarkupPercent($destinationCanonical, $date),

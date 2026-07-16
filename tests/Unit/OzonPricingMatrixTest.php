@@ -45,6 +45,20 @@ class OzonPricingMatrixTest extends TestCase
         $this->assertSame(57.0, $local['base_cost']);
         $this->assertSame(60.0, $nonLocal['base_cost']);
         $this->assertSame(8.0, $nonLocal['non_local_markup_percent']);
+        $this->assertSame(0.0, $nonLocal['estimate_markup_percent']);
+    }
+
+    public function test_unknown_route_uses_universal_excel_tariff_with_configurable_safety_reserve(): void
+    {
+        $matrix = new OzonPricingMatrix();
+
+        $estimate = $matrix->resolveClusterLogistics('FBO', 0.2, 500, null, null);
+
+        $this->assertSame('universal', $estimate['tariff_source']);
+        $this->assertTrue($estimate['used_universal_tariff']);
+        $this->assertSame(56.0, $estimate['unadjusted_base_cost']);
+        $this->assertSame(50.0, $estimate['estimate_markup_percent']);
+        $this->assertSame(84.0, $estimate['base_cost']);
     }
 
     public function test_resolves_june_2026_ozon_markup_rules(): void

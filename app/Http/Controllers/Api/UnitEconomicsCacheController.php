@@ -3,6 +3,7 @@
 namespace App\Http\Controllers\Api;
 
 use App\Domains\Ozon\Tariffs\OzonPricingMatrix;
+use App\Domains\Ozon\Tariffs\OzonRfbsTariffMatrix;
 use App\Domains\UnitEconomics\DTO\CalculationInput;
 use App\Domains\UnitEconomics\UnitEconomicsOrchestrator;
 use App\Http\Controllers\Controller;
@@ -633,6 +634,76 @@ class UnitEconomicsCacheController extends Controller
             'sales_distribution_index' => (float) (($integration->settings['wb_sales_distribution_index'] ?? null) ?? 0.0),
             'wb_indices_manual' => (bool) ($integration->settings['wb_indices_manual'] ?? false),
             'cache' => $cache,
+        ]);
+    }
+
+    public function rfbsTariffs(Request $request, int $integrationId): JsonResponse
+    {
+        $resolution = $this->integrationAccessService->ensureAccessibleIntegration(
+            $request,
+            $integrationId,
+            'ozon'
+        );
+        if (! ($resolution['success'] ?? false)) {
+            return response()->json([
+                'message' => $resolution['message'] ?? 'Интеграция не найдена',
+            ], $resolution['status'] ?? 404);
+        }
+
+        /** @var Integration $integration */
+        $integration = $resolution['integration'];
+        $stored = is_array($integration->settings['rfbs_logistics_tariffs'] ?? null)
+            ? $integration->settings['rfbs_logistics_tariffs']
+            : null;
+
+        return response()->json([
+            'data' => (new OzonRfbsTariffMatrix())->configuration($stored),
+        ]);
+    }
+
+    public function updateRfbsTariffs(Request $request, int $integrationId): JsonResponse
+    {
+        $validated = Validator::make($request->all(), [
+            'enabled' => 'required|boolean',
+            'rates' => 'required|array|size:8',
+            'rates.*' => 'required|array|size:7',
+            'rates.*.*' => 'required|numeric|min:0|max:1000000',
+        ])->validate();
+
+        $resolution = $this->integrationAccessService->ensureAccessibleIntegration(
+            $request,
+            $integrationId,
+            'ozon'
+        );
+        if (! ($resolution['success'] ?? false)) {
+            return response()->json([
+                'message' => $resolution['message'] ?? 'Интеграция не найдена',
+            ], $resolution['status'] ?? 404);
+        }
+
+        /** @var Integration $integration */
+        $integration = $resolution['integration'];
+        $integrationSettings = is_array($integration->settings) ? $integration->settings : [];
+        $integrationSettings['rfbs_logistics_tariffs'] = [
+            'enabled' => (bool) $validated['enabled'],
+            'rates' => array_map(
+                static fn (array $row): array => array_map(
+                    static fn (mixed $value): float => round((float) $value, 2),
+                    array_values($row)
+                ),
+                array_values($validated['rates'])
+            ),
+            'updated_at' => now()->toIso8601String(),
+        ];
+        $integration->update(['settings' => $integrationSettings]);
+
+        $this->cacheService->onIntegrationSettingsChanged($integrationId);
+
+        return response()->json([
+            'message' => 'Тарифы rFBS сохранены; пересчёт юнит-экономики поставлен в очередь',
+            'data' => (new OzonRfbsTariffMatrix())->configuration(
+                $integrationSettings['rfbs_logistics_tariffs']
+            ),
         ]);
     }
 
@@ -1505,7 +1576,9 @@ class UnitEconomicsCacheController extends Controller
     }
 
     /**
-     * For Ozon the visible non-local markup must be factual when order API data exists.
+     * For Ozon the visible non-local markup may be factual only when every row in the
+     * summary was resolved in factual mode. A mixed/estimate-only summary is a forecast
+     * and must not override the current delivery profile.
      *
      * @return array{0: float, 1: float, 2: bool}
      */
@@ -1515,7 +1588,13 @@ class UnitEconomicsCacheController extends Controller
         float $expectedMarkupAmount
     ): array {
         $ordersCount = (int) ($orderEconomicsSummary['orders_count'] ?? 0);
-        if ($ordersCount <= 0 || ! array_key_exists('avg_non_local_markup_percent', $orderEconomicsSummary)) {
+        $factualOrdersCount = (int) ($orderEconomicsSummary['factual_orders_count'] ?? 0);
+        $estimateOrdersCount = (int) ($orderEconomicsSummary['estimate_orders_count'] ?? 0);
+        $hasOnlyFactualOrders = $ordersCount > 0
+            && $factualOrdersCount >= $ordersCount
+            && $estimateOrdersCount === 0;
+
+        if (! $hasOnlyFactualOrders || ! array_key_exists('avg_non_local_markup_percent', $orderEconomicsSummary)) {
             return [
                 round($expectedMarkupPercent, 2),
                 round($expectedMarkupAmount, 2),
@@ -1529,6 +1608,67 @@ class UnitEconomicsCacheController extends Controller
             : round($expectedMarkupAmount, 2);
 
         return [$factualPercent, $factualAmount, true];
+    }
+
+    /**
+     * Enforce the Ozon logistics invariant used by the screen, exports and profit formula:
+     * logistics = base tariff + current price × displayed non-local markup percent.
+     *
+     * @return array{0: array, 1: array}
+     */
+    private function reconcileOzonLogisticsWithDisplayedMarkup(
+        array $data,
+        array $marketplaceData,
+        UnitEconomicsCache $cache,
+        float $displayMarkupPercent
+    ): array {
+        $price = (float) $cache->price;
+        $cachedLogistics = (float) $cache->logistics_cost;
+        $cachedMarkupAmount = $price * ((float) $cache->non_local_markup_percent / 100);
+        $baseLogistics = (float) $cache->base_logistics_cost;
+        if ($baseLogistics <= 0 && $cachedLogistics > 0) {
+            $baseLogistics = max(0.0, $cachedLogistics - $cachedMarkupAmount);
+        }
+
+        $markupAmount = round($price * ($displayMarkupPercent / 100), 2);
+        $logistics = round($baseLogistics + $markupAmount, 2);
+        $lastMile = round((float) $cache->last_mile_cost, 2);
+        $processing = round((float) $cache->processing_cost, 2);
+        $expectedReturn = round((float) ($data['expected_return_cost'] ?? $cache->expected_return_cost), 2);
+        $delivery = round($logistics + $lastMile + $processing, 2);
+        $effective = round($delivery + $expectedReturn, 2);
+        $wasReconciled = abs($cachedLogistics - $logistics) > 0.02;
+
+        $data['base_logistics_cost'] = round($baseLogistics, 2);
+        $data['base_logistics'] = round($baseLogistics, 2);
+        $data['non_local_markup_amount'] = $markupAmount;
+        $data['logistics_markup_amount'] = $markupAmount;
+        $data['logistics_cost'] = $logistics;
+        $data['logistics_per_unit'] = $logistics;
+        $data['delivery_cost'] = $delivery;
+        $data['effective_logistics'] = $effective;
+        $data['logistics_invariant_status'] = $wasReconciled ? 'reconciled' : 'consistent';
+
+        $marketplaceData['base_logistics'] = round($baseLogistics, 2);
+        $marketplaceData['non_local_markup_amount'] = $markupAmount;
+        $marketplaceData['logistics_markup_amount'] = $markupAmount;
+        $marketplaceData['logistics'] = $logistics;
+        $marketplaceData['delivery_cost'] = $delivery;
+        $marketplaceData['effective_logistics'] = $effective;
+        $marketplaceData['logistics_invariant_status'] = $data['logistics_invariant_status'];
+
+        if ($wasReconciled) {
+            $warning = 'ozon_logistics_reconciled_with_display_markup';
+            $warnings = is_array($marketplaceData['calculation_warnings'] ?? null)
+                ? $marketplaceData['calculation_warnings']
+                : [];
+            $warnings[] = $warning;
+            $warnings = array_values(array_unique($warnings));
+            $data['calculation_warnings'] = $warnings;
+            $marketplaceData['calculation_warnings'] = $warnings;
+        }
+
+        return [$data, $marketplaceData];
     }
 
     /**
@@ -2676,11 +2816,18 @@ class UnitEconomicsCacheController extends Controller
                 $recalculatedWeighted += ($share / 100) * (float) ($clusterRow['effective_markup_percent'] ?? 0);
             }
             $weightedMarkup = round($recalculatedWeighted, 2);
-            [$displayMarkup, $displayMarkupAmount, $hasFactualMarkup] = $this->resolveOzonDisplayNonLocalMarkup(
-                $orderEconomicsSummary,
-                $weightedMarkup,
-                round((float) $cache->price * ($weightedMarkup / 100), 2)
-            );
+            [$displayMarkup, $displayMarkupAmount, $hasFactualMarkup] = $isFboScheme
+                ? $this->resolveOzonDisplayNonLocalMarkup(
+                    $orderEconomicsSummary,
+                    $weightedMarkup,
+                    round((float) $cache->price * ($weightedMarkup / 100), 2)
+                )
+                : [0.0, 0.0, false];
+
+            // Юнит-экономика считается по текущей цене, поэтому сумма наценки
+            // всегда должна быть price × отображаемый %. Средняя рублёвая сумма из
+            // исторических заказов может относиться к другой цене.
+            $displayMarkupAmount = round((float) $cache->price * ($displayMarkup / 100), 2);
             $displayMarkupSource = $hasFactualMarkup ? 'order_economics_summary' : 'delivery_profile';
             $data['weighted_non_local_markup_percent'] = $weightedMarkup;
             $data['expected_non_local_markup_percent'] = $weightedMarkup;
@@ -2706,7 +2853,25 @@ class UnitEconomicsCacheController extends Controller
             if ($hasFactualMarkup) {
                 $marketplaceData['factual_non_local_markup_percent'] = $displayMarkup;
                 $marketplaceData['factual_non_local_markup_amount'] = $displayMarkupAmount;
+            } else {
+                unset(
+                    $data['factual_non_local_markup_percent'],
+                    $data['factual_non_local_markup_amount'],
+                    $marketplaceData['factual_non_local_markup_percent'],
+                    $marketplaceData['factual_non_local_markup_amount']
+                );
             }
+
+            // Защита от рассинхрона: процент, рублёвая наценка, logistics_cost,
+            // delivery_cost, effective_logistics и прибыль строятся из одного каноничного %.
+            // Даже если асинхронный кэш ещё хранит старую наценку, API не
+            // отдаст финансово противоречивую строку.
+            [$data, $marketplaceData] = $this->reconcileOzonLogisticsWithDisplayedMarkup(
+                $data,
+                $marketplaceData,
+                $cache,
+                $displayMarkup
+            );
 
             $data['markup_rule_reason'] = null;
             if (! $isFboScheme) {

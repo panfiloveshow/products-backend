@@ -14,6 +14,7 @@ use App\Models\UnitEconomicsCache;
 use App\Models\UnitEconomicsSettings;
 use App\Models\WildberriesTariffSnapshot;
 use App\Domains\Ozon\Tariffs\OzonPricingMatrix;
+use App\Domains\Ozon\Tariffs\OzonRfbsTariffMatrix;
 use App\Domains\UnitEconomics\UnitEconomicsOrchestrator;
 use App\Domains\UnitEconomics\DTO\CalculationInput;
 use Illuminate\Support\Collection;
@@ -129,6 +130,17 @@ class UnitEconomicsCacheService
         $integrationId = $product->integration_id;
         $marketplace = $product->marketplace;
         $sku = $product->sku;
+
+        // Full integration recalculation batch-loads locality in recalculateIntegration().
+        // Direct/SKU recalculation used to skip that phase and silently fell back to a
+        // route forecast (for 9217/newdarkgreen: 0% on screen, 10% in cache). Make every
+        // entry point load the same per-SKU source before calculation.
+        if (
+            $marketplace === 'ozon'
+            && ($this->localityCache === null || ! array_key_exists($sku, $this->localityCache))
+        ) {
+            $this->primeOzonSkuLocality($product);
+        }
         
         // Получаем настройки пользователя
         $settings = $this->getSettingsCached($integrationId, $sku);
@@ -303,6 +315,7 @@ class UnitEconomicsCacheService
     {
         $this->forgetSettingsCache($integrationId, $sku);
         $this->forgetUnitEconomicsCache($integrationId, $sku);
+        $this->sellerFboOrders7DaysCache = null;
 
         $product = Product::query()
             ->where('integration_id', $integrationId)
@@ -319,6 +332,20 @@ class UnitEconomicsCacheService
         }
 
         return $this->recalculateProductAllSchemes($product);
+    }
+
+    private function primeOzonSkuLocality(Product $product): void
+    {
+        $localityService = app(\App\Services\Ozon\OzonLocalityService::class);
+        $locality = $localityService->resolveSkuLocality(
+            (int) $product->integration_id,
+            (string) $product->sku
+        );
+        $routes = $localityService->buildShippingRoutesForIntegration((int) $product->integration_id);
+        $locality['shipping_routes'] = $routes[$product->sku] ?? [];
+
+        $this->localityCache ??= [];
+        $this->localityCache[$product->sku] = $locality;
     }
 
     /**
@@ -790,9 +817,32 @@ class UnitEconomicsCacheService
         );
         $ownReturnCost = (float) (
             $marketplaceData['own_return_cost']
+            ?? (strtoupper($fulfillmentType) === 'RFBS' ? $settings?->return_fee : null)
             ?? $existingUE?->return_logistics_cost
             ?? 0
         );
+
+        if ($marketplace === 'ozon' && strtoupper($fulfillmentType) === 'RFBS') {
+            $volumeWeightKg = (float) (
+                $marketplaceData['volume_weight']
+                ?? $product->volume_weight
+                ?? (($lengthCm * $widthCm * $heightCm) / 5000)
+            );
+            $rfbsTariff = (new OzonRfbsTariffMatrix())->resolve(
+                (float) $actualPrice,
+                $weightKg,
+                $volumeWeightKg,
+                is_array($integrationSettings['rfbs_logistics_tariffs'] ?? null)
+                    ? $integrationSettings['rfbs_logistics_tariffs']
+                    : null
+            );
+
+            $ownDeliveryCost = (float) $rfbsTariff['cost'];
+            $tariffSource = (string) $rfbsTariff['source'];
+            $tariffEffectiveFrom = now()->toDateString();
+            $tariffBreakdown = is_array($tariffBreakdown) ? $tariffBreakdown : [];
+            $tariffBreakdown['rfbs'] = $rfbsTariff;
+        }
         $marketplaceCompensation = (float) (
             $marketplaceData['ozon_compensation']
             ?? $marketplaceData['marketplace_compensation']

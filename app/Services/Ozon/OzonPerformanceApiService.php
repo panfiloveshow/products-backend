@@ -753,6 +753,11 @@ class OzonPerformanceApiService
                     'campaign_stats_from_storage' => (bool) ($campaignStats['from_storage'] ?? false),
                     'campaign_stats_fetched_at' => $campaignStats['fetched_at'] ?? null,
                     'campaign_stats_pending' => (bool) ($campaignStats['pending'] ?? false),
+                    // Клиент не должен применять частичный product UUID как итог:
+                    // CPC/ALL_SKU могут ещё готовиться и расход будет занижен.
+                    'campaign_stats_complete' => $campaignStats !== null
+                        && ! (bool) ($campaignStats['pending'] ?? false)
+                        && (string) ($campaignStats['source'] ?? '') !== 'pending',
                     'campaign_stats_source_error' => $campaignStats['source_error'] ?? null,
                     'campaign_stat_field_keys' => $campaignStats['field_keys'] ?? [],
                     'campaign_sample_rows' => $campaignStats['sample_rows'] ?? [],
@@ -2280,6 +2285,8 @@ class OzonPerformanceApiService
                 str_contains($lower, 'корзин') => 'В корзину (Оплата за клик)',
                 str_contains($lower, 'ср. цена клика') || str_contains($lower, 'средняя стоимость клика') => 'Ср. цена клика (Оплата за клик)',
                 str_contains($lower, 'расход') => 'Расход (Оплата за клик)',
+                str_contains($lower, 'продано товаров модели') => 'Заказы модели (Оплата за клик)',
+                str_contains($lower, 'продано товаров') => 'Заказы (Оплата за клик)',
                 str_contains($lower, 'заказы модели') => 'Заказы модели (Оплата за клик)',
                 str_contains($lower, 'выручка с заказов модели') || str_contains($lower, 'продажи с заказов модели') => 'Выручка с заказов модели (Оплата за клик)',
                 str_contains($lower, 'заказы') => 'Заказы (Оплата за клик)',

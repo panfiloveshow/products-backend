@@ -5,6 +5,13 @@ return [
     // логистики FBO/FBS и обновлённые наценки за нелокальную продажу.
     'effective_from' => '2026-06-16',
     'version' => '2026-06-16',
+    // Если кластеры отправления/назначения неизвестны, используем универсальный
+    // тариф из официальной Excel-таблицы и консервативный запас. Это отдельный
+    // резерв оценки, не «наценка за нелокальность» Ozon.
+    'universal_logistics_fallback_markup_percent' => (float) env(
+        'OZON_UNIVERSAL_LOGISTICS_FALLBACK_MARKUP_PERCENT',
+        50
+    ),
     'announcement_dates' => [
         '2026-04-06' => '2026-02-05', // Tariffs announced Feb 5, effective Apr 6
         '2026-04-18' => '2026-04-06', // Markup update announced Apr 6 (вместе с тарифами), effective Apr 18

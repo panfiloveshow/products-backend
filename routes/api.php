@@ -398,6 +398,15 @@ Route::prefix('unit-economics')->middleware('sellico.permission')->group(functio
         ->where('sku', '.*')
         ->name('unit-economics.settings.update');
 
+    Route::get('/integrations/{integrationId}/rfbs-tariffs', [UnitEconomicsCacheController::class, 'rfbsTariffs'])
+        ->whereNumber('integrationId')
+        ->middleware('integration.access')
+        ->name('unit-economics.rfbs-tariffs.show');
+    Route::put('/integrations/{integrationId}/rfbs-tariffs', [UnitEconomicsCacheController::class, 'updateRfbsTariffs'])
+        ->whereNumber('integrationId')
+        ->middleware('integration.access')
+        ->name('unit-economics.rfbs-tariffs.update');
+
     Route::get('/cache-stats/{integrationId}', [UnitEconomicsCacheController::class, 'cacheStats'])
         ->middleware('integration.access')
         ->name('unit-economics.cache-stats');

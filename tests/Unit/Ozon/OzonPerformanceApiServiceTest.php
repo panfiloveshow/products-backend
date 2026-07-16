@@ -518,7 +518,7 @@ class OzonPerformanceApiServiceTest extends TestCase
         // Реальная схема Ozon: per-SKU клики/CTR/ДРР приходят асинхронным отчётом
         // (POST /api/client/statistics → poll → ZIP с CSV по кампаниям), а не синхронным campaign/product.
         $campaignCsv = "\xEF\xBB\xBF;Кампания по продвижению товаров № 101, период 04.05.2026-03.06.2026\n"
-            . "sku;Название товара;Цена товара, ₽;Показы;Клики;CTR, %;В корзину;Средняя стоимость клика, ₽;Расход, ₽, с НДС;Заказы;Продажи, ₽;Заказы модели;Продажи с заказов модели, ₽;ДРР, %;Заказано на сумму, ₽;Общий ДРР, %;Дата добавления\n"
+            . "sku;Название товара;Цена товара, ₽;Показы;Клики;CTR, %;В корзину;Средняя стоимость клика, ₽;Расход, ₽, с НДС;Продано товаров;Продажи, ₽;Продано товаров модели;Продажи с заказов модели, ₽;ДРР, %;Заказано на сумму, ₽;Общий ДРР, %;Дата добавления\n"
             . "2127759756;Чековая лента 80 мм;259,00;1000;50;5,0;10;2,01;100,50;5;1000,00;3;800,00;10,05;1200,00;8,3;12.03.2026\n"
             . "Корректировка;;;;;;;;-0,50;;;;;;;;\n"
             . "Всего;;;1000;50;5,0;10;2,01;100,00;5;1000,00;3;800,00;10,05;1200,00;8,3;\n";
@@ -586,6 +586,7 @@ class OzonPerformanceApiServiceTest extends TestCase
         $this->assertSame(50, $product['clicks']);
         $this->assertSame(5.0, $product['ctr_percent']);
         $this->assertSame(100.5, $product['ad_spend']);
+        $this->assertSame(5, $product['ad_orders']);
 
         // Нетоварная кампания REF_VK не должна попасть в запрос статистики (иначе Ozon вернёт 400).
         Http::assertSent(function ($request): bool {
@@ -669,11 +670,13 @@ class OzonPerformanceApiServiceTest extends TestCase
         $result = $service->productAdvertisingImpact($credentials, 'report-uuid', 5000, '2026-06-15', '2026-07-15', 15);
         $this->assertTrue($result['success']);
         $this->assertTrue((bool) $result['coverage']['campaign_stats_pending']);
+        $this->assertFalse((bool) $result['coverage']['campaign_stats_complete']);
         for ($attempt = 0; $attempt < 6 && ($result['coverage']['campaign_stats_pending'] ?? false); $attempt++) {
             $result = $service->productAdvertisingImpact($credentials, 'report-uuid', 5000, '2026-06-15', '2026-07-15', 15);
         }
         $this->assertTrue($result['success']);
         $this->assertSame('async_report', $result['coverage']['campaign_stats_source']);
+        $this->assertTrue((bool) $result['coverage']['campaign_stats_complete']);
 
         // Расход «все товары» разложен по SKU из отчёта по заказам.
         $p002 = $result['by_offer_id']['P002'];
