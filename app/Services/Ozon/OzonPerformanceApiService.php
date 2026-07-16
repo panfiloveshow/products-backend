@@ -17,7 +17,10 @@ class OzonPerformanceApiService
      * пересборку у всех интеграций при следующем открытии страницы (старые данные видны через
      * stale-while-revalidate, пока не соберутся новые). v2 = добавлен CPO «все товары» (ASP).
      */
-    private const CAMPAIGN_STATS_SCHEMA_VERSION = 2;
+    // v3: реальные колонки Ozon «Продано товаров» / «Продано товаров модели»
+    // нормализуются в количество рекламных заказов. Старые сохранённые строки
+    // нужно пересобрать, иначе расход на заказ и часть сводки остаются нулевыми.
+    private const CAMPAIGN_STATS_SCHEMA_VERSION = 3;
 
     /**
      * @param array<string, mixed> $credentials
