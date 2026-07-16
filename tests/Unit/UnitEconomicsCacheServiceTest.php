@@ -698,4 +698,20 @@ class UnitEconomicsCacheServiceTest extends TestCase
         $this->assertSame($fixation, $method->invoke($service, 5, 'SKU1'));
         $this->assertNull($method->invoke($service, 5, 'SKU2'));
     }
+
+    public function test_legacy_ozon_period_total_is_normalized_to_per_unit_amount(): void
+    {
+        $service = new UnitEconomicsCacheService(
+            $this->createMock(UnitEconomicsOrchestrator::class)
+        );
+
+        $method = new \ReflectionMethod(UnitEconomicsCacheService::class, 'legacyAggregatePerUnit');
+        $method->setAccessible(true);
+
+        // Production regression: P004 had 1 694 000 ₽ in the legacy aggregate
+        // for 16 940 sales. RFBS must receive the 100 ₽ per-order amount.
+        $this->assertSame(100.0, $method->invoke($service, 1694000.0, 16940));
+        $this->assertSame(100.0, $method->invoke($service, 718200.0, 7182));
+        $this->assertSame(0.0, $method->invoke($service, 0.0, 0));
+    }
 }

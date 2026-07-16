@@ -809,16 +809,34 @@ class UnitEconomicsCacheService
         if ($marketplace === 'wildberries' && ! in_array(strtoupper($fulfillmentType), ['FBO', 'FBW'], true)) {
             $storageCost = 0.0;
         }
+        $legacyOwnDeliveryCost = (float) ($existingUE?->logistics_cost ?? 0);
+        $legacyOwnReturnCost = (float) ($existingUE?->return_logistics_cost ?? 0);
+
+        // unit_economics is the legacy period aggregate: logistics/returns there are
+        // totals for sales_count. The cache and domain calculator use per-order
+        // amounts. Feeding the aggregate directly into RFBS produced values such as
+        // 1 694 000 ₽ (= 100 ₽ × 16 940 sales) in a single-order calculation.
+        if ($marketplace === 'ozon' && in_array(strtoupper($fulfillmentType), ['RFBS', 'EXPRESS'], true)) {
+            $legacyOwnDeliveryCost = $this->legacyAggregatePerUnit(
+                $legacyOwnDeliveryCost,
+                $existingUE?->sales_count
+            );
+            $legacyOwnReturnCost = $this->legacyAggregatePerUnit(
+                $legacyOwnReturnCost,
+                $existingUE?->sales_count
+            );
+        }
+
         $ownDeliveryCost = (float) (
             $marketplaceData['own_delivery_cost']
             ?? $integrationSettings['own_delivery_cost']
-            ?? $existingUE?->logistics_cost
+            ?? $legacyOwnDeliveryCost
             ?? 0
         );
         $ownReturnCost = (float) (
             $marketplaceData['own_return_cost']
             ?? (strtoupper($fulfillmentType) === 'RFBS' ? $settings?->return_fee : null)
-            ?? $existingUE?->return_logistics_cost
+            ?? $legacyOwnReturnCost
             ?? 0
         );
 
@@ -2457,6 +2475,15 @@ class UnitEconomicsCacheService
 
         $this->unitEconomicsCache[$key] = $query->first();
         return $this->unitEconomicsCache[$key];
+    }
+
+    private function legacyAggregatePerUnit(float $amount, int|string|null $salesCount): float
+    {
+        if ($amount <= 0) {
+            return 0.0;
+        }
+
+        return round($amount / max(1, (int) $salesCount), 2);
     }
 
     private function getSettingsCached(int $integrationId, string $sku): ?UnitEconomicsSettings
