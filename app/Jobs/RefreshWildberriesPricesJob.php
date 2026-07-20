@@ -3,6 +3,7 @@
 namespace App\Jobs;
 
 use App\Domains\Wildberries\Api\WildberriesRateLimitException;
+use App\Models\Integration;
 use App\Models\SyncLog;
 use App\Services\Wildberries\WildberriesPriceRefreshService;
 use Illuminate\Bus\Queueable;
@@ -13,6 +14,7 @@ use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
 use Illuminate\Support\Facades\Log;
 use RuntimeException;
+use Throwable;
 
 class RefreshWildberriesPricesJob implements ShouldBeUnique, ShouldQueue
 {
@@ -39,15 +41,7 @@ class RefreshWildberriesPricesJob implements ShouldBeUnique, ShouldQueue
 
     public function handle(WildberriesPriceRefreshService $service): void
     {
-        $syncLog = SyncLog::query()
-            ->where('integration_id', $this->integrationId)
-            ->where('marketplace', 'wildberries')
-            ->where('sync_type', 'products')
-            ->where('status', SyncLog::STATUS_COMPLETED)
-            ->latest('created_at')
-            ->first();
-        $credentials = $syncLog?->credentials ?? [];
-        $apiKey = (string) ($credentials['api_key'] ?? '');
+        $apiKey = $this->resolveApiKey();
 
         if ($apiKey === '') {
             throw new RuntimeException('WB API key is unavailable for delayed price refresh');
@@ -77,6 +71,39 @@ class RefreshWildberriesPricesJob implements ShouldBeUnique, ShouldQueue
         if ($stats['updated'] > 0) {
             RecalculateUnitEconomicsCacheJob::dispatch($this->integrationId)
                 ->onQueue('unit-economics');
+        }
+    }
+
+    private function resolveApiKey(): string
+    {
+        $syncLog = SyncLog::query()
+            ->where('integration_id', $this->integrationId)
+            ->where('marketplace', 'wildberries')
+            ->where('sync_type', 'products')
+            ->where('status', SyncLog::STATUS_COMPLETED)
+            ->latest('created_at')
+            ->first();
+        $credentials = $syncLog?->credentials ?? [];
+        $apiKey = (string) ($credentials['api_key'] ?? '');
+
+        if ($apiKey !== '') {
+            return $apiKey;
+        }
+
+        try {
+            $integration = Integration::query()
+                ->whereKey($this->integrationId)
+                ->where('marketplace', 'wildberries')
+                ->first();
+
+            return (string) (($integration?->resolveCredentials() ?? [])['api_key'] ?? '');
+        } catch (Throwable $e) {
+            Log::warning('Delayed WB price refresh could not resolve integration credentials', [
+                'integration_id' => $this->integrationId,
+                'error_class' => $e::class,
+            ]);
+
+            return '';
         }
     }
 }
