@@ -3,6 +3,7 @@
 namespace App\Domains\Wildberries\Api;
 
 use App\Models\Integration;
+use Illuminate\Http\Client\Response;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
@@ -38,10 +39,24 @@ class WildberriesClient
 
     private string $userAgent;
 
+    private ?int $lastResponseStatus = null;
+
+    private ?int $lastRateLimitRetryAfter = null;
+
     public function __construct(?string $apiKey = null)
     {
         $this->apiKey = $apiKey ?? config('services.wildberries.api_key') ?? '';
         $this->userAgent = (string) config('services.wildberries.user_agent', 'wbas_sellico.ru2823');
+    }
+
+    public function getLastResponseStatus(): ?int
+    {
+        return $this->lastResponseStatus;
+    }
+
+    public function getLastRateLimitRetryAfter(): ?int
+    {
+        return $this->lastRateLimitRetryAfter;
     }
 
     /**
@@ -209,6 +224,8 @@ class WildberriesClient
      */
     public function get(string $endpoint, array $params = [], string $baseUrl = self::BASE_URL): ?array
     {
+        $this->lastResponseStatus = null;
+        $this->lastRateLimitRetryAfter = null;
         $requestId = uniqid('wb_req_', true);
         $apiName = $this->getApiName($baseUrl);
 
@@ -234,6 +251,7 @@ class WildberriesClient
 
                 $status = $response->status();
                 $body = $response->body();
+                $this->lastResponseStatus = $status;
 
                 Log::info('WB API Response', [
                     'request_id' => $requestId,
@@ -246,18 +264,36 @@ class WildberriesClient
                 ]);
 
                 if ($response->successful()) {
+                    $this->lastRateLimitRetryAfter = null;
+
                     return $response->json();
                 }
 
-                // Retry при 429 (rate limit)
-                if ($status === 429 && $attempt < $maxAttempts) {
-                    $delay = min(2 * pow(2, $attempt - 1), 15);
-                    Log::info('WB API 429 rate limit, retrying', [
-                        'request_id' => $requestId, 'attempt' => $attempt, 'delay_s' => $delay,
-                    ]);
-                    sleep($delay);
+                if ($status === 429) {
+                    $headerDelay = $this->rateLimitRetryAfter($response);
+                    $this->lastRateLimitRetryAfter = $headerDelay ?? 60;
 
-                    continue;
+                    // Short WB cooldowns are safe to handle in this worker. Longer
+                    // ones (notably base tokens with a 15-minute interval) must be
+                    // deferred by the queued job instead of blocking a worker.
+                    if ($attempt < $maxAttempts && ($headerDelay === null || $headerDelay <= 15)) {
+                        $delay = max(1, $headerDelay ?? min(2 * pow(2, $attempt - 1), 15));
+                        Log::info('WB API 429 rate limit, retrying', [
+                            'request_id' => $requestId,
+                            'attempt' => $attempt,
+                            'delay_s' => $delay,
+                            'retry_source' => $headerDelay === null ? 'fallback' : 'x-ratelimit-retry',
+                        ]);
+                        sleep($delay);
+
+                        continue;
+                    }
+
+                    Log::info('WB API 429 rate limit deferred to queue', [
+                        'request_id' => $requestId,
+                        'attempt' => $attempt,
+                        'delay_s' => $this->lastRateLimitRetryAfter,
+                    ]);
                 }
 
                 Log::warning('WB API error', [
@@ -282,6 +318,16 @@ class WildberriesClient
         }
 
         return null;
+    }
+
+    private function rateLimitRetryAfter(Response $response): ?int
+    {
+        $value = trim((string) $response->header('X-Ratelimit-Retry', ''));
+        if ($value === '' || ! is_numeric($value)) {
+            return null;
+        }
+
+        return max(1, (int) ceil((float) $value));
     }
 
     /**

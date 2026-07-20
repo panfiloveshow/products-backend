@@ -2,6 +2,7 @@
 
 namespace App\Jobs;
 
+use App\Domains\Wildberries\Api\WildberriesRateLimitException;
 use App\Models\SyncLog;
 use App\Services\Wildberries\WildberriesPriceRefreshService;
 use Illuminate\Bus\Queueable;
@@ -17,11 +18,11 @@ class RefreshWildberriesPricesJob implements ShouldBeUnique, ShouldQueue
 {
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
 
-    public int $tries = 4;
+    public int $tries = 12;
 
     public int $timeout = 180;
 
-    public int $uniqueFor = 900;
+    public int $uniqueFor = 14400;
 
     public function __construct(public int $integrationId) {}
 
@@ -33,7 +34,7 @@ class RefreshWildberriesPricesJob implements ShouldBeUnique, ShouldQueue
     /** @return list<int> */
     public function backoff(): array
     {
-        return [60, 180, 300];
+        return [60, 180, 300, 900, 900, 1800, 1800, 3600];
     }
 
     public function handle(WildberriesPriceRefreshService $service): void
@@ -52,7 +53,21 @@ class RefreshWildberriesPricesJob implements ShouldBeUnique, ShouldQueue
             throw new RuntimeException('WB API key is unavailable for delayed price refresh');
         }
 
-        $stats = $service->refresh($this->integrationId, $apiKey);
+        try {
+            $stats = $service->refresh($this->integrationId, $apiKey);
+        } catch (WildberriesRateLimitException $e) {
+            $delay = min(max($e->retryAfterSeconds + 1, 5), 3600);
+
+            Log::info('Delayed WB price refresh released after rate limit', [
+                'integration_id' => $this->integrationId,
+                'attempt' => $this->attempts(),
+                'delay_s' => $delay,
+            ]);
+
+            $this->release($delay);
+
+            return;
+        }
 
         Log::info('Delayed WB price refresh completed', [
             'integration_id' => $this->integrationId,
