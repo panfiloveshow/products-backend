@@ -2,6 +2,8 @@
 
 namespace Tests\Unit;
 
+use App\Domains\Wildberries\Api\WildberriesClient;
+use App\Domains\Wildberries\Api\WildberriesRateLimitException;
 use App\Jobs\RecalculateUnitEconomicsCacheJob;
 use App\Jobs\RefreshWildberriesPricesJob;
 use App\Models\Product;
@@ -118,5 +120,71 @@ class RefreshWildberriesPricesJobTest extends TestCase
             RecalculateUnitEconomicsCacheJob::class,
             fn (RecalculateUnitEconomicsCacheJob $queued) => $queued->integrationId === 31
         );
+    }
+
+    public function test_prices_client_exposes_wb_retry_header_without_blocking_worker(): void
+    {
+        Http::fake([
+            'https://discounts-prices-api.wildberries.ru/api/v2/list/goods/filter*' => Http::response(
+                ['title' => 'too many requests'],
+                429,
+                ['X-Ratelimit-Retry' => '901'],
+            ),
+        ]);
+
+        $client = new WildberriesClient('test-wb-token');
+
+        $this->assertNull($client->pricesGet('/api/v2/list/goods/filter', [
+            'limit' => 1000,
+            'offset' => 0,
+        ]));
+        $this->assertSame(429, $client->getLastResponseStatus());
+        $this->assertSame(901, $client->getLastRateLimitRetryAfter());
+        Http::assertSentCount(1);
+    }
+
+    public function test_price_refresh_preserves_wb_retry_delay_for_queue_job(): void
+    {
+        Http::fake([
+            'https://discounts-prices-api.wildberries.ru/api/v2/list/goods/filter*' => Http::response(
+                ['title' => 'too many requests'],
+                429,
+                ['X-Ratelimit-Retry' => '900'],
+            ),
+        ]);
+
+        try {
+            (new WildberriesPriceRefreshService)->refresh(31, 'test-wb-token');
+            $this->fail('Expected the WB rate-limit exception');
+        } catch (WildberriesRateLimitException $e) {
+            $this->assertSame(900, $e->retryAfterSeconds);
+        }
+
+        Http::assertSentCount(1);
+    }
+
+    public function test_delayed_job_releases_itself_for_wb_retry_window(): void
+    {
+        Http::fake([
+            'https://discounts-prices-api.wildberries.ru/api/v2/list/goods/filter*' => Http::response(
+                ['title' => 'too many requests'],
+                429,
+                ['X-Ratelimit-Retry' => '900'],
+            ),
+        ]);
+        SyncLog::create([
+            'marketplace' => 'wildberries',
+            'integration_id' => 58,
+            'sync_type' => 'products',
+            'status' => SyncLog::STATUS_COMPLETED,
+            'credentials' => ['api_key' => 'test-wb-token'],
+            'completed_at' => now(),
+        ]);
+
+        $job = (new RefreshWildberriesPricesJob(58))->withFakeQueueInteractions();
+        $job->handle(new WildberriesPriceRefreshService);
+
+        $job->assertReleased(901);
+        Http::assertSentCount(1);
     }
 }

@@ -4,6 +4,7 @@ namespace App\Services\Wildberries;
 
 use App\Domains\Wildberries\Api\ProductsApi;
 use App\Domains\Wildberries\Api\WildberriesClient;
+use App\Domains\Wildberries\Api\WildberriesRateLimitException;
 use App\Models\Product;
 use RuntimeException;
 
@@ -16,9 +17,16 @@ class WildberriesPriceRefreshService
      */
     public function refresh(int $integrationId, string $apiKey): array
     {
-        $prices = (new ProductsApi(new WildberriesClient($apiKey)))->getPrices();
+        $client = new WildberriesClient($apiKey);
+        $prices = (new ProductsApi($client))->getPrices();
 
         if ($prices === []) {
+            if ($client->getLastResponseStatus() === 429) {
+                throw new WildberriesRateLimitException(
+                    $client->getLastRateLimitRetryAfter() ?? 60,
+                );
+            }
+
             throw new RuntimeException('WB Prices API returned no prices');
         }
 
