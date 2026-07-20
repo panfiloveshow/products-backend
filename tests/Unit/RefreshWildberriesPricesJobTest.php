@@ -6,6 +6,7 @@ use App\Domains\Wildberries\Api\WildberriesClient;
 use App\Domains\Wildberries\Api\WildberriesRateLimitException;
 use App\Jobs\RecalculateUnitEconomicsCacheJob;
 use App\Jobs\RefreshWildberriesPricesJob;
+use App\Models\Integration;
 use App\Models\Product;
 use App\Models\SyncLog;
 use App\Services\Wildberries\WildberriesPriceRefreshService;
@@ -24,6 +25,16 @@ class RefreshWildberriesPricesJobTest extends TestCase
 
         Schema::dropIfExists('products');
         Schema::dropIfExists('sync_logs');
+        Schema::dropIfExists('integrations');
+
+        Schema::create('integrations', function (Blueprint $table): void {
+            $table->unsignedBigInteger('id')->primary();
+            $table->string('name')->nullable();
+            $table->string('marketplace');
+            $table->text('credentials')->nullable();
+            $table->boolean('is_active')->default(true);
+            $table->timestamps();
+        });
 
         Schema::create('sync_logs', function (Blueprint $table): void {
             $table->uuid('id')->primary();
@@ -59,6 +70,7 @@ class RefreshWildberriesPricesJobTest extends TestCase
     {
         Schema::dropIfExists('products');
         Schema::dropIfExists('sync_logs');
+        Schema::dropIfExists('integrations');
 
         parent::tearDown();
     }
@@ -186,5 +198,47 @@ class RefreshWildberriesPricesJobTest extends TestCase
 
         $job->assertReleased(901);
         Http::assertSentCount(1);
+    }
+
+    public function test_delayed_job_falls_back_to_integration_credentials_without_sync_log(): void
+    {
+        Queue::fake();
+        Http::fake([
+            'https://discounts-prices-api.wildberries.ru/api/v2/list/goods/filter*' => Http::response([
+                'data' => [
+                    'listGoods' => [[
+                        'nmID' => 68001,
+                        'vendorCode' => 'fallback-vendor',
+                        'sizes' => [[
+                            'sizeID' => 68002,
+                            'price' => 1000,
+                            'discountedPrice' => 800,
+                        ]],
+                    ]],
+                ],
+            ]),
+        ]);
+        Integration::create([
+            'id' => 68,
+            'name' => 'WB credentials fallback',
+            'marketplace' => 'wildberries',
+            'credentials' => ['api_key' => 'integration-wb-token'],
+            'is_active' => true,
+        ]);
+        $product = Product::create([
+            'sku' => 'fallback-sku',
+            'vendor_code' => 'fallback-vendor',
+            'name' => 'WB fallback product',
+            'price' => 700,
+            'marketplace' => 'wildberries',
+            'integration_id' => 68,
+            'wb_data' => ['nmID' => 68001, 'sizeID' => 68002],
+        ]);
+
+        (new RefreshWildberriesPricesJob(68))->handle(new WildberriesPriceRefreshService);
+
+        $this->assertSame('800.00', $product->fresh()->price);
+        Http::assertSent(fn ($request) => $request->header('Authorization') === ['integration-wb-token']);
+        Queue::assertPushed(RecalculateUnitEconomicsCacheJob::class);
     }
 }
