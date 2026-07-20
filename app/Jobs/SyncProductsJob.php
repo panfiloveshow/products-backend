@@ -735,7 +735,14 @@ class SyncProductsJob implements ShouldBeUnique, ShouldQueue
         RecalculateUnitEconomicsCacheJob::dispatch((int) $this->syncLog->integration_id)
             ->onQueue('unit-economics');
 
-        Log::info('UnitEconomics cache refresh dispatched after WB products sync', [
+        // WB can keep returning the previous discount for several minutes after
+        // the seller changes it. Re-read the authoritative Prices API after the
+        // propagation window and rebuild UE only when the price actually changed.
+        RefreshWildberriesPricesJob::dispatch((int) $this->syncLog->integration_id)
+            ->delay(now()->addMinutes(5))
+            ->onQueue('default');
+
+        Log::info('Immediate UE and delayed price refresh dispatched after WB products sync', [
             'integration_id' => $this->syncLog->integration_id,
         ]);
     }

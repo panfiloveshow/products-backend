@@ -3,6 +3,7 @@
 namespace Tests\Unit;
 
 use App\Jobs\RecalculateUnitEconomicsCacheJob;
+use App\Jobs\RefreshWildberriesPricesJob;
 use App\Jobs\SyncProductsJob;
 use App\Models\Product;
 use App\Models\SyncLog;
@@ -205,6 +206,12 @@ class SyncProductsJobTest extends TestCase
         Queue::assertPushed(
             RecalculateUnitEconomicsCacheJob::class,
             fn (RecalculateUnitEconomicsCacheJob $queued) => $queued->integrationId === 76
+        );
+        Queue::assertPushedOn('default', RefreshWildberriesPricesJob::class);
+        Queue::assertPushed(
+            RefreshWildberriesPricesJob::class,
+            fn (RefreshWildberriesPricesJob $queued) => $queued->integrationId === 76
+                && $queued->delay !== null
         );
     }
 }
