@@ -731,11 +731,12 @@ class UnitEconomicsCacheService
             ? $settings->cost_price
             : ($existingUE?->cost_price ?? 0);
 
-        $actualPrice = $marketplaceData['actual_price']
-            ?? $marketplaceData['marketing_seller_price']
-            ?? $commissions['actual_price']
-            ?? $existingUE?->price
-            ?? $product->price;
+        $actualPrice = $this->resolvePriceForCalculation(
+            $product,
+            $marketplaceData,
+            $commissions,
+            $existingUE
+        );
 
         $marketingPrice = (float) ($marketplaceData['marketing_seller_price'] ?? 0);
         if ($marketingPrice > 0 && $marketingPrice < $actualPrice) {
@@ -1100,6 +1101,31 @@ class UnitEconomicsCacheService
                 'current_price_competitor_delta_percent' => $currentPriceCompetitorDeltaPercent !== null ? round((float) $currentPriceCompetitorDeltaPercent, 2) : null,
             ],
         ];
+    }
+
+    /**
+     * Resolve the current sale price without allowing a derived, stale
+     * UnitEconomics row to override a freshly synchronized Product price.
+     */
+    private function resolvePriceForCalculation(
+        Product $product,
+        array $marketplaceData,
+        array $commissions,
+        ?UnitEconomics $existingUE
+    ): float {
+        foreach ([
+            $marketplaceData['actual_price'] ?? null,
+            $marketplaceData['marketing_seller_price'] ?? null,
+            $commissions['actual_price'] ?? null,
+            $product->price,
+            $existingUE?->price,
+        ] as $candidate) {
+            if (is_numeric($candidate) && (float) $candidate > 0) {
+                return (float) $candidate;
+            }
+        }
+
+        return 0.0;
     }
 
     /**

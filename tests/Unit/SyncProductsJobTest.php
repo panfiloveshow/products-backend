@@ -2,10 +2,12 @@
 
 namespace Tests\Unit;
 
+use App\Jobs\RecalculateUnitEconomicsCacheJob;
 use App\Jobs\SyncProductsJob;
 use App\Models\Product;
 use App\Models\SyncLog;
 use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Queue;
 use Illuminate\Support\Facades\Schema;
 use ReflectionMethod;
 use Tests\TestCase;
@@ -182,5 +184,27 @@ class SyncProductsJobTest extends TestCase
         $this->assertEquals(540, $product->weight);
         $this->assertEquals(5.456, $product->volume_weight);
         $this->assertSame(310, $product->ozon_data['length_mm']);
+    }
+
+    public function test_wildberries_products_sync_dispatches_immediate_unit_economics_cache_refresh(): void
+    {
+        Queue::fake();
+
+        $syncLog = SyncLog::create([
+            'marketplace' => 'wildberries',
+            'integration_id' => 76,
+            'sync_type' => 'products',
+            'status' => SyncLog::STATUS_PENDING,
+        ]);
+
+        $job = new SyncProductsJob($syncLog);
+        $method = new ReflectionMethod($job, 'dispatchWildberriesPriceCacheRefresh');
+        $method->invoke($job);
+
+        Queue::assertPushedOn('unit-economics', RecalculateUnitEconomicsCacheJob::class);
+        Queue::assertPushed(
+            RecalculateUnitEconomicsCacheJob::class,
+            fn (RecalculateUnitEconomicsCacheJob $queued) => $queued->integrationId === 76
+        );
     }
 }

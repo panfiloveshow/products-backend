@@ -3,7 +3,6 @@
 namespace App\Domains\Wildberries;
 
 use App\Domains\Marketplace\Contracts\MarketplaceInterface;
-use App\Services\Marketplace\MarketplaceInterface as LegacyMarketplaceInterface;
 use App\Domains\Wildberries\Api\CardApi;
 use App\Domains\Wildberries\Api\FbsSuppliesApi;
 use App\Domains\Wildberries\Api\InventoryApi;
@@ -13,7 +12,10 @@ use App\Domains\Wildberries\Api\SalesApi;
 use App\Domains\Wildberries\Api\StorageApi;
 use App\Domains\Wildberries\Api\SuppliesApi;
 use App\Domains\Wildberries\Api\WildberriesClient;
+use App\Jobs\SyncInventoryJob;
 use App\Models\Integration;
+use App\Services\Marketplace\MarketplaceInterface as LegacyMarketplaceInterface;
+use Illuminate\Support\Facades\Log;
 
 /**
  * Фасад для работы с Wildberries API
@@ -24,7 +26,7 @@ use App\Models\Integration;
  * - SalesApi — продажи
  * - StorageApi — хранение, тарифы
  */
-class WildberriesMarketplace implements MarketplaceInterface, LegacyMarketplaceInterface
+class WildberriesMarketplace implements LegacyMarketplaceInterface, MarketplaceInterface
 {
     private WildberriesClient $client;
 
@@ -58,7 +60,7 @@ class WildberriesMarketplace implements MarketplaceInterface, LegacyMarketplaceI
         $this->realizationReport = new RealizationReportApi($this->client);
         $this->supplies = new SuppliesApi($this->client);
         $this->fbsSupplies = new FbsSuppliesApi($this->client);
-        $this->card = new CardApi();
+        $this->card = new CardApi;
         $this->integration = $integration;
     }
 
@@ -133,12 +135,12 @@ class WildberriesMarketplace implements MarketplaceInterface, LegacyMarketplaceI
         } while ($hasMore && $pages < 500);
 
         if (empty($cards)) {
-            \Illuminate\Support\Facades\Log::warning('WB Marketplace: No cards returned from Products API');
+            Log::warning('WB Marketplace: No cards returned from Products API');
 
             return [];
         }
 
-        \Illuminate\Support\Facades\Log::info('WB Marketplace: Got cards from Products API', [
+        Log::info('WB Marketplace: Got cards from Products API', [
             'count' => count($cards),
         ]);
 
@@ -148,14 +150,14 @@ class WildberriesMarketplace implements MarketplaceInterface, LegacyMarketplaceI
         // Собираем nmID для запроса цен
         $nmIds = array_filter(array_column($cards, 'nmID'));
 
-        \Illuminate\Support\Facades\Log::info('WB Marketplace: Fetching prices for nmIds', [
+        Log::info('WB Marketplace: Fetching prices for nmIds', [
             'count' => count($nmIds),
         ]);
 
         // Получаем цены через Prices API (актуальный эндпоинт!)
         $prices = ! empty($nmIds) ? $this->products->getPrices(null, $nmIds) : [];
 
-        \Illuminate\Support\Facades\Log::info('WB Marketplace: Prices loaded', [
+        Log::info('WB Marketplace: Prices loaded', [
             'count' => count($prices),
             'sample_keys' => array_slice(array_keys($prices), 0, 5),
         ]);
@@ -165,7 +167,7 @@ class WildberriesMarketplace implements MarketplaceInterface, LegacyMarketplaceI
         // feedbackRating = рейтинг по отзывам (0-5)
         $cardRatings = $this->products->getCardRatings(array_values($nmIds));
 
-        \Illuminate\Support\Facades\Log::info('WB Marketplace: Card ratings loaded', [
+        Log::info('WB Marketplace: Card ratings loaded', [
             'count' => count($cardRatings),
         ]);
 
@@ -177,7 +179,7 @@ class WildberriesMarketplace implements MarketplaceInterface, LegacyMarketplaceI
         // Получаем остатки через Statistics API (возвращает ВСЕ остатки сразу с ценами!)
         $stocksRaw = $this->inventory->getStocks();
 
-        \Illuminate\Support\Facades\Log::info('WB Marketplace: Stocks loaded from Statistics API', [
+        Log::info('WB Marketplace: Stocks loaded from Statistics API', [
             'count' => count($stocksRaw),
         ]);
 
@@ -210,7 +212,7 @@ class WildberriesMarketplace implements MarketplaceInterface, LegacyMarketplaceI
             }
         }
 
-        \Illuminate\Support\Facades\Log::info('WB Marketplace: Stocks indexed', [
+        Log::info('WB Marketplace: Stocks indexed', [
             'keys_count' => count($stocks),
             'sample_keys' => array_slice(array_keys($stocks), 0, 5),
         ]);
@@ -622,13 +624,28 @@ class WildberriesMarketplace implements MarketplaceInterface, LegacyMarketplaceI
         return $this->sales->getSalesStats($dateFrom, $dateTo);
     }
 
+    public function getSalesReport(int $days = 30): ?array
+    {
+        return $this->sales->getSalesReport($days);
+    }
+
+    public function getOrdersReport(int $days = 30): ?array
+    {
+        return $this->sales->getOrdersReport($days);
+    }
+
+    public function buildSalesBySku(array $salesReport, int $days = 30): array
+    {
+        return $this->sales->buildSalesBySku($salesReport, $days);
+    }
+
     public function getSalesBySku(): array
     {
         return $this->sales->getSalesBySku();
     }
 
     /**
-     * Продажи по складам для {@see \App\Jobs\SyncInventoryJob} (остатки × sales_* / avg_daily_sales).
+     * Продажи по складам для {@see SyncInventoryJob} (остатки × sales_* / avg_daily_sales).
      */
     public function getSalesByWarehouse(int $days = 30): array
     {
@@ -643,14 +660,24 @@ class WildberriesMarketplace implements MarketplaceInterface, LegacyMarketplaceI
         return $this->sales->getSalesByRegion($days);
     }
 
-    public function getRedemptionStatsByNmId(int $days = 30): array
+    public function getRedemptionStatsByNmId(int $days = 30, ?array $salesReport = null): array
     {
-        return $this->sales->getRedemptionStatsByNmId($days);
+        return $this->sales->getRedemptionStatsByNmId($days, $salesReport);
     }
 
     public function getSppFromSales(int $days = 30): array
     {
         return $this->sales->getSppFromSales($days);
+    }
+
+    public function buildSppFromSales(array $salesReport): array
+    {
+        return $this->sales->buildSppFromSales($salesReport);
+    }
+
+    public function buildSppMapsFromReport(array $report): array
+    {
+        return $this->sales->buildSppMapsFromReport($report);
     }
 
     /**
@@ -659,11 +686,11 @@ class WildberriesMarketplace implements MarketplaceInterface, LegacyMarketplaceI
      * продаж недоступен.
      *
      * @param  array<int|string>  $nmIds
-     * @return array<string,float>  map [nmId => spp%]
+     * @return array<string,float> map [nmId => spp%]
      */
-    public function getDisplayedSppByNmIds(array $nmIds): array
+    public function getDisplayedSppByNmIds(array $nmIds, array $sellerPricesByNmId = []): array
     {
-        return $this->card->getSppByNmIds($nmIds);
+        return $this->card->getSppByNmIds($nmIds, $sellerPricesByNmId);
     }
 
     // === Storage ===

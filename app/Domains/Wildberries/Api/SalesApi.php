@@ -2,6 +2,7 @@
 
 namespace App\Domains\Wildberries\Api;
 
+use App\Jobs\SyncInventoryJob;
 use Illuminate\Support\Facades\Log;
 
 /**
@@ -78,6 +79,22 @@ class SalesApi
     }
 
     /**
+     * Один сырой отчёт продаж для всех расчётов юнит-экономики.
+     *
+     * /api/v1/supplier/sales разрешает только один запрос в минуту на продавца.
+     * Поэтому вызывающий код должен получить отчёт один раз и переиспользовать
+     * его для продаж, СПП и выкупа.
+     */
+    public function getSalesReport(int $days = 30): ?array
+    {
+        $dateFrom = now()->subDays($days)->format('Y-m-d');
+
+        return $this->client->statistics('/api/v1/supplier/sales', [
+            'dateFrom' => $dateFrom,
+        ]);
+    }
+
+    /**
      * Получить продажи по SKU за последние N дней
      *
      * Индексирует по barcode (основной ключ в InventoryApi) и supplierArticle (fallback)
@@ -85,15 +102,26 @@ class SalesApi
     public function getSalesBySku(int $days = 30): array
     {
         try {
-            $dateFrom = now()->subDays($days)->format('Y-m-d');
+            $response = $this->getSalesReport($days);
 
-            $response = $this->client->statistics('/api/v1/supplier/sales', [
-                'dateFrom' => $dateFrom,
-            ]);
+            return $response === null ? [] : $this->buildSalesBySku($response, $days);
+        } catch (\Exception $e) {
+            Log::error('WB getSalesBySku error', ['error' => $e->getMessage()]);
+
+            return [];
+        }
+    }
+
+    /**
+     * Построить продажи по SKU из уже загруженного отчёта.
+     */
+    public function buildSalesBySku(array $response, int $days = 30): array
+    {
+        try {
 
             $salesBySku = [];
 
-            foreach ($response ?? [] as $sale) {
+            foreach ($response as $sale) {
                 // Используем barcode как основной ключ (совпадает с InventoryApi)
                 $barcode = $sale['barcode'] ?? null;
                 $supplierArticle = $sale['supplierArticle'] ?? null;
@@ -146,7 +174,7 @@ class SalesApi
 
             // Добавляем avg_daily_sales
             foreach ($salesBySku as $sku => &$data) {
-                $data['avg_daily_sales'] = round($data['sales_30_days'] / 30, 2);
+                $data['avg_daily_sales'] = round($data['sales_30_days'] / max(1, $days), 2);
             }
 
             Log::info('WB getSalesBySku: loaded sales data', [
@@ -156,7 +184,7 @@ class SalesApi
 
             return $salesBySku;
         } catch (\Exception $e) {
-            Log::error('WB getSalesBySku error', ['error' => $e->getMessage()]);
+            Log::error('WB buildSalesBySku error', ['error' => $e->getMessage()]);
 
             return [];
         }
@@ -164,7 +192,7 @@ class SalesApi
 
     /**
      * Продажи по SKU и складу отгрузки (warehouseName из /api/v1/supplier/sales).
-     * Формат для {@see \App\Jobs\SyncInventoryJob}: при записи в БД метрики суммируются по всем складам одного SKU.
+     * Формат для {@see SyncInventoryJob}: при записи в БД метрики суммируются по всем складам одного SKU.
      *
      * @return array<string, array<string, array{sales_7_days:int,sales_14_days:int,sales_30_days:int,avg_daily_sales:float}>>
      */
@@ -256,16 +284,24 @@ class SalesApi
     public function getSalesCountByNmId(int $days = 30): array
     {
         try {
-            $dateFrom = now()->subDays($days)->format('Y-m-d');
+            $response = $this->getSalesReport($days);
 
-            $response = $this->client->statistics('/api/v1/supplier/sales', [
-                'dateFrom' => $dateFrom,
-            ]);
+            return $response === null ? [] : $this->buildSalesCountByNmId($response);
+        } catch (\Exception $e) {
+            Log::error('WB getSalesCountByNmId error', ['error' => $e->getMessage()]);
+
+            return [];
+        }
+    }
+
+    public function buildSalesCountByNmId(array $response): array
+    {
+        try {
 
             $salesByNmId = [];
             $salesStateByNmId = [];
 
-            foreach ($response ?? [] as $sale) {
+            foreach ($response as $sale) {
                 $nmId = $this->extractNmId($sale);
                 if (! $nmId) {
                     continue;
@@ -296,25 +332,46 @@ class SalesApi
 
             return $salesByNmId;
         } catch (\Exception $e) {
-            Log::error('WB getSalesCountByNmId error', ['error' => $e->getMessage()]);
+            Log::error('WB buildSalesCountByNmId error', ['error' => $e->getMessage()]);
 
             return [];
         }
     }
 
-    public function getOrdersByNmId(int $days = 30): array
+    /**
+     * Один сырой отчёт заказов. Используется как резервный источник СПП, когда
+     * WB отдельно блокирует /supplier/sales глобальным лимитером.
+     */
+    public function getOrdersReport(int $days = 30): ?array
+    {
+        $dateFrom = now()->subDays($days)->format('Y-m-d');
+
+        return $this->client->statistics('/api/v1/supplier/orders', [
+            'dateFrom' => $dateFrom,
+        ]);
+    }
+
+    public function getOrdersByNmId(int $days = 30, ?array $ordersReport = null): array
     {
         try {
-            $dateFrom = now()->subDays($days)->format('Y-m-d');
+            $response = $ordersReport ?? $this->getOrdersReport($days);
 
-            $response = $this->client->statistics('/api/v1/supplier/orders', [
-                'dateFrom' => $dateFrom,
-            ]);
+            return $response === null ? [] : $this->buildOrdersByNmId($response);
+        } catch (\Exception $e) {
+            Log::error('WB getOrdersByNmId error', ['error' => $e->getMessage()]);
+
+            return [];
+        }
+    }
+
+    public function buildOrdersByNmId(array $response): array
+    {
+        try {
 
             $ordersByNmId = [];
             $orderStateByNmId = [];
 
-            foreach ($response ?? [] as $order) {
+            foreach ($response as $order) {
                 $nmId = $this->extractNmId($order);
                 if (! $nmId) {
                     continue;
@@ -345,17 +402,19 @@ class SalesApi
 
             return $ordersByNmId;
         } catch (\Exception $e) {
-            Log::error('WB getOrdersByNmId error', ['error' => $e->getMessage()]);
+            Log::error('WB buildOrdersByNmId error', ['error' => $e->getMessage()]);
 
             return [];
         }
     }
 
-    public function getRedemptionStatsByNmId(int $days = 30): array
+    public function getRedemptionStatsByNmId(int $days = 30, ?array $salesReport = null): array
     {
         try {
             $ordersByNmId = $this->getOrdersByNmId($days);
-            $salesByNmId = $this->getSalesCountByNmId($days);
+            $salesByNmId = $salesReport === null
+                ? $this->getSalesCountByNmId($days)
+                : $this->buildSalesCountByNmId($salesReport);
 
             $keys = array_unique(array_merge(array_keys($ordersByNmId), array_keys($salesByNmId)));
             $result = [];
@@ -600,43 +659,127 @@ class SalesApi
     public function getSppFromSales(int $days = 30): array
     {
         try {
-            $dateFrom = now()->subDays($days)->format('Y-m-d');
+            $response = $this->getSalesReport($days);
 
-            $response = $this->client->statistics('/api/v1/supplier/sales', [
-                'dateFrom' => $dateFrom,
-            ]);
-
-            $sppByNmId = [];
-            foreach ($response ?? [] as $sale) {
-                $nmId = $this->extractNmId($sale);
-                if (! $nmId) {
-                    continue;
-                }
-
-                $spp = (float) ($sale['spp'] ?? 0);
-
-                if (! isset($sppByNmId[$nmId])) {
-                    $sppByNmId[$nmId] = ['values' => [], 'count' => 0];
-                }
-
-                $sppByNmId[$nmId]['values'][] = $spp;
-                $sppByNmId[$nmId]['count']++;
-            }
-
-            // Вычисляем средний SPP
-            $result = [];
-            foreach ($sppByNmId as $nmId => $data) {
-                $avgSpp = count($data['values']) > 0
-                    ? array_sum($data['values']) / count($data['values'])
-                    : 0;
-                $result[$nmId] = round($avgSpp, 2);
-            }
-
-            return $result;
+            return $response === null ? [] : $this->buildSppFromSales($response);
         } catch (\Exception $e) {
             Log::error('WB getSppFromSales error', ['error' => $e->getMessage()]);
 
             return [];
         }
+    }
+
+    /**
+     * Построить последний известный СПП по nmId из уже загруженного отчёта.
+     */
+    public function buildSppFromSales(array $response): array
+    {
+        try {
+            return $this->buildSppMapsFromReport($response)['by_nm_id'];
+        } catch (\Exception $e) {
+            Log::error('WB buildSppFromSales error', ['error' => $e->getMessage()]);
+
+            return [];
+        }
+    }
+
+    /**
+     * Barcode is the exact product-size key used by products.sku. nmId is only
+     * a card-level fallback and can combine sizes with different prices.
+     * Missing/non-numeric spp is ignored; an explicit numeric zero is valid.
+     * The newest order/sale observation wins; averaging historical discounts
+     * would produce a value that never existed for a real buyer.
+     *
+     * @return array{by_sku:array<string,float>,by_nm_id:array<string,float>}
+     */
+    public function buildSppMapsFromReport(array $response): array
+    {
+        $bySku = [];
+        $byNmId = [];
+
+        foreach ($response as $sequence => $row) {
+            if (! array_key_exists('spp', $row) || ! is_numeric($row['spp'])) {
+                continue;
+            }
+
+            $spp = (float) $row['spp'];
+            if (! is_finite($spp)) {
+                continue;
+            }
+
+            $observation = [
+                'value' => $spp,
+                'rank' => $this->sppObservationRank($row, (int) $sequence),
+            ];
+            $nmId = $this->extractNmId($row);
+            if ($nmId !== null && $this->isNewerSppObservation($observation, $byNmId[$nmId] ?? null)) {
+                $byNmId[$nmId] = $observation;
+            }
+
+            foreach (['barcode', 'supplierArticle'] as $key) {
+                $sku = $row[$key] ?? null;
+                if ($sku !== null && $sku !== '') {
+                    $sku = (string) $sku;
+                    if ($this->isNewerSppObservation($observation, $bySku[$sku] ?? null)) {
+                        $bySku[$sku] = $observation;
+                    }
+                }
+            }
+        }
+
+        $values = static fn (array $observations): array => array_map(
+            static fn (array $observation): float => round($observation['value'], 2),
+            $observations,
+        );
+
+        return [
+            'by_sku' => $values($bySku),
+            'by_nm_id' => $values($byNmId),
+        ];
+    }
+
+    /**
+     * `date` is the moment the buyer placed the order. `lastChangeDate` can be
+     * updated later (for example, after cancellation), so it is only a fallback.
+     */
+    private function sppObservationRank(array $row, int $sequence): array
+    {
+        $parse = static function (mixed $value): ?int {
+            if (! is_string($value) || trim($value) === '') {
+                return null;
+            }
+
+            $timestamp = strtotime($value);
+
+            return $timestamp === false ? null : $timestamp;
+        };
+
+        $dateTimestamp = $parse($row['date'] ?? null);
+        $changeTimestamp = $parse($row['lastChangeDate'] ?? null);
+
+        return [
+            $dateTimestamp ?? $changeTimestamp ?? PHP_INT_MIN,
+            $changeTimestamp ?? PHP_INT_MIN,
+            $sequence,
+        ];
+    }
+
+    /**
+     * @param  array{value:float,rank:array{int,int,int}}  $candidate
+     * @param  array{value:float,rank:array{int,int,int}}|null  $current
+     */
+    private function isNewerSppObservation(array $candidate, ?array $current): bool
+    {
+        if ($current === null) {
+            return true;
+        }
+
+        foreach ([0, 1, 2] as $index) {
+            if ($candidate['rank'][$index] !== $current['rank'][$index]) {
+                return $candidate['rank'][$index] > $current['rank'][$index];
+            }
+        }
+
+        return false;
     }
 }

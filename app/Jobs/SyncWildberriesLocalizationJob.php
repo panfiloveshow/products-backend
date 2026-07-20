@@ -5,6 +5,7 @@ namespace App\Jobs;
 use App\Models\Integration;
 use App\Services\LocalizationIndexService;
 use Illuminate\Bus\Queueable;
+use Illuminate\Contracts\Queue\ShouldBeUnique;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
@@ -19,14 +20,22 @@ use Illuminate\Support\Facades\Log;
  * (вероятный троттл) делаем release(90) и повторяем позже, не блокируя воркер.
  * После исчерпания попыток сдаёмся тихо (не падаем в failed_jobs).
  */
-class SyncWildberriesLocalizationJob implements ShouldQueue
+class SyncWildberriesLocalizationJob implements ShouldBeUnique, ShouldQueue
 {
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
 
     public int $tries = 12;   // до ~12 попыток × 90с ≈ 18 мин на пробивание лимита
+
     public int $timeout = 120;
 
+    public int $uniqueFor = 1800;
+
     public function __construct(public int $integrationId) {}
+
+    public function uniqueId(): string
+    {
+        return (string) $this->integrationId;
+    }
 
     public function handle(LocalizationIndexService $localization): void
     {

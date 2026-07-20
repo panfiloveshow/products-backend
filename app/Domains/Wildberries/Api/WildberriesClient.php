@@ -12,18 +12,30 @@ use Illuminate\Support\Facades\Log;
  */
 class WildberriesClient
 {
+    private const STRICT_STATISTICS_COOLDOWN_SECONDS = 65;
+
     private const BASE_URL = 'https://marketplace-api.wildberries.ru';
+
     private const CONTENT_URL = 'https://content-api.wildberries.ru';
+
     private const SUPPLIERS_URL = 'https://suppliers-api.wildberries.ru';
+
     private const STATISTICS_URL = 'https://statistics-api.wildberries.ru';
+
     private const ADVERT_URL = 'https://advert-api.wb.ru';
+
     private const COMMON_URL = 'https://common-api.wildberries.ru';
+
     private const ANALYTICS_URL = 'https://seller-analytics-api.wildberries.ru';
+
     private const PRICES_URL = 'https://discounts-prices-api.wildberries.ru';
+
     private const FINANCE_URL = 'https://finance-api.wildberries.ru';
-    
+
     private string $apiKey;
+
     private int $timeout = 30;
+
     private string $userAgent;
 
     public function __construct(?string $apiKey = null)
@@ -54,29 +66,42 @@ class WildberriesClient
     public static function fromIntegration(Integration $integration): self
     {
         $credentials = $integration->getDecryptedCredentials();
+
         return new self($credentials['api_key'] ?? null);
     }
 
     /**
      * Запрос к Statistics API
-     * 
+     *
      * Statistics API может быть медленным (особенно /supplier/sales),
      * поэтому используем увеличенный таймаут 60 секунд
      */
     public function statistics(string $endpoint, array $params = []): ?array
     {
         $requestId = uniqid('wb_stat_', true);
-        
+
         Log::info('WB Statistics API Request', [
             'request_id' => $requestId,
             'method' => 'GET',
             'endpoint' => $endpoint,
-            'url' => self::STATISTICS_URL . $endpoint,
+            'url' => self::STATISTICS_URL.$endpoint,
             'params' => $this->sanitizeParams($params),
-            'api_key_prefix' => substr($this->apiKey, 0, 6) . '***',
+            'api_key_prefix' => substr($this->apiKey, 0, 6).'***',
         ]);
 
-        $maxAttempts = 3;
+        // /supplier/sales has a strict per-seller limit. Immediate retries after
+        // 3/6 seconds only extend WB's global 429 penalty and can keep the seller
+        // locked for a long time. Let the caller retry in a later sync instead.
+        $strictOnePerMinuteEndpoints = [
+            '/api/v1/supplier/sales',
+            '/api/v1/supplier/orders',
+        ];
+        $isStrict = in_array($endpoint, $strictOnePerMinuteEndpoints, true);
+        $maxAttempts = $isStrict ? 1 : 3;
+
+        if ($isStrict && ! $this->reserveStrictStatisticsSlot($endpoint)) {
+            return null;
+        }
 
         for ($attempt = 1; $attempt <= $maxAttempts; $attempt++) {
             try {
@@ -84,7 +109,7 @@ class WildberriesClient
 
                 $response = Http::withHeaders($this->getHeaders())
                     ->timeout(60)
-                    ->get(self::STATISTICS_URL . $endpoint, $params);
+                    ->get(self::STATISTICS_URL.$endpoint, $params);
 
                 $status = $response->status();
                 $body = $response->body();
@@ -108,6 +133,7 @@ class WildberriesClient
                         'request_id' => $requestId, 'attempt' => $attempt, 'delay_s' => $delay,
                     ]);
                     sleep($delay);
+
                     continue;
                 }
 
@@ -125,11 +151,57 @@ class WildberriesClient
                     'endpoint' => $endpoint,
                     'error' => $e->getMessage(),
                 ]);
+
                 return null;
             }
         }
 
         return null;
+    }
+
+    /**
+     * Atomically reserves the seller-wide Statistics API slot. WB applies the
+     * one-minute throttle across sales/orders, so all workers and all features
+     * sharing a token must coordinate before sending a request.
+     */
+    private function reserveStrictStatisticsSlot(string $endpoint): bool
+    {
+        $fingerprint = hash('sha256', $this->apiKey);
+        $lock = Cache::lock("wb:statistics:lock:{$fingerprint}", 10);
+
+        if (! $lock->get()) {
+            Log::info('WB Statistics API skipped: token lock is busy', [
+                'endpoint' => $endpoint,
+                'token_fingerprint' => substr($fingerprint, 0, 12),
+            ]);
+
+            return false;
+        }
+
+        try {
+            $cooldownKey = "wb:statistics:cooldown:{$fingerprint}";
+            $nextAllowedAt = (int) Cache::get($cooldownKey, 0);
+            if ($nextAllowedAt > now()->timestamp) {
+                Log::info('WB Statistics API skipped: shared cooldown active', [
+                    'endpoint' => $endpoint,
+                    'retry_after_s' => $nextAllowedAt - now()->timestamp,
+                    'token_fingerprint' => substr($fingerprint, 0, 12),
+                ]);
+
+                return false;
+            }
+
+            $nextAllowedAt = now()->addSeconds(self::STRICT_STATISTICS_COOLDOWN_SECONDS)->timestamp;
+            Cache::put(
+                $cooldownKey,
+                $nextAllowedAt,
+                now()->addSeconds(self::STRICT_STATISTICS_COOLDOWN_SECONDS + 5),
+            );
+
+            return true;
+        } finally {
+            $lock->release();
+        }
     }
 
     /**
@@ -145,9 +217,9 @@ class WildberriesClient
             'api' => $apiName,
             'method' => 'GET',
             'endpoint' => $endpoint,
-            'url' => $baseUrl . $endpoint,
+            'url' => $baseUrl.$endpoint,
             'params' => $this->sanitizeParams($params),
-            'api_key_prefix' => substr($this->apiKey, 0, 6) . '***',
+            'api_key_prefix' => substr($this->apiKey, 0, 6).'***',
         ]);
 
         $maxAttempts = 3;
@@ -158,7 +230,7 @@ class WildberriesClient
 
                 $response = Http::withHeaders($this->getHeaders())
                     ->timeout($this->timeout)
-                    ->get($baseUrl . $endpoint, $params);
+                    ->get($baseUrl.$endpoint, $params);
 
                 $status = $response->status();
                 $body = $response->body();
@@ -184,6 +256,7 @@ class WildberriesClient
                         'request_id' => $requestId, 'attempt' => $attempt, 'delay_s' => $delay,
                     ]);
                     sleep($delay);
+
                     continue;
                 }
 
@@ -203,6 +276,7 @@ class WildberriesClient
                     'endpoint' => $endpoint,
                     'error' => $e->getMessage(),
                 ]);
+
                 return null;
             }
         }
@@ -212,10 +286,10 @@ class WildberriesClient
 
     /**
      * GET запрос к API с Bearer авторизацией
-     * 
+     *
      * Некоторые эндпоинты Wildberries (особенно новые Marketplace API v3)
      * требуют формат авторизации: "Bearer {api_key}"
-     * 
+     *
      * @see https://dev.wildberries.ru/openapi/api-information
      */
     public function getWithBearer(string $endpoint, array $params = [], string $baseUrl = self::BASE_URL): ?array
@@ -223,7 +297,7 @@ class WildberriesClient
         try {
             $response = Http::withHeaders($this->getBearerHeaders())
                 ->timeout($this->timeout)
-                ->get($baseUrl . $endpoint, $params);
+                ->get($baseUrl.$endpoint, $params);
 
             if ($response->successful()) {
                 return $response->json();
@@ -241,6 +315,7 @@ class WildberriesClient
                 'endpoint' => $endpoint,
                 'error' => $e->getMessage(),
             ]);
+
             return null;
         }
     }
@@ -258,10 +333,10 @@ class WildberriesClient
             'api' => $apiName,
             'method' => 'POST',
             'endpoint' => $endpoint,
-            'url' => $baseUrl . $endpoint,
+            'url' => $baseUrl.$endpoint,
             'payload_size' => strlen(json_encode($data)),
             'payload_sample' => $this->truncateResponse(json_encode($data), 500),
-            'api_key_prefix' => substr($this->apiKey, 0, 6) . '***',
+            'api_key_prefix' => substr($this->apiKey, 0, 6).'***',
         ]);
 
         $maxAttempts = 3;
@@ -272,7 +347,7 @@ class WildberriesClient
 
                 $response = Http::withHeaders($this->getHeaders())
                     ->timeout($this->timeout)
-                    ->post($baseUrl . $endpoint, $data);
+                    ->post($baseUrl.$endpoint, $data);
 
                 $status = $response->status();
                 $body = $response->body();
@@ -298,6 +373,7 @@ class WildberriesClient
                         'request_id' => $requestId, 'attempt' => $attempt, 'delay_s' => $delay,
                     ]);
                     sleep($delay);
+
                     continue;
                 }
 
@@ -317,6 +393,7 @@ class WildberriesClient
                     'endpoint' => $endpoint,
                     'error' => $e->getMessage(),
                 ]);
+
                 return null;
             }
         }
@@ -332,7 +409,7 @@ class WildberriesClient
         try {
             $response = Http::withHeaders($this->getHeaders())
                 ->timeout($this->timeout)
-                ->put($baseUrl . $endpoint, $data);
+                ->put($baseUrl.$endpoint, $data);
 
             // 204 No Content - успешное обновление без тела ответа
             if ($response->status() === 204) {
@@ -355,6 +432,7 @@ class WildberriesClient
                 'endpoint' => $endpoint,
                 'error' => $e->getMessage(),
             ]);
+
             return null;
         }
     }
@@ -367,7 +445,7 @@ class WildberriesClient
         try {
             $response = Http::withHeaders($this->getHeaders())
                 ->timeout($this->timeout)
-                ->delete($baseUrl . $endpoint);
+                ->delete($baseUrl.$endpoint);
 
             if ($response->status() === 204) {
                 return ['success' => true];
@@ -389,6 +467,7 @@ class WildberriesClient
                 'endpoint' => $endpoint,
                 'error' => $e->getMessage(),
             ]);
+
             return null;
         }
     }
@@ -401,7 +480,7 @@ class WildberriesClient
         try {
             $response = Http::withHeaders($this->getHeaders())
                 ->timeout($this->timeout)
-                ->patch($baseUrl . $endpoint, $data);
+                ->patch($baseUrl.$endpoint, $data);
 
             if ($response->status() === 204) {
                 return ['success' => true];
@@ -423,13 +502,14 @@ class WildberriesClient
                 'endpoint' => $endpoint,
                 'error' => $e->getMessage(),
             ]);
+
             return null;
         }
     }
 
     /**
      * Запрос к Statistics API (GET)
-     * 
+     *
      * Statistics API может быть медленным (особенно /supplier/sales),
      * поэтому используем увеличенный таймаут 60 секунд
      */
@@ -440,7 +520,7 @@ class WildberriesClient
             try {
                 $response = Http::withHeaders($this->getHeaders())
                     ->timeout(60) // Увеличенный таймаут для Statistics API
-                    ->get(self::STATISTICS_URL . $endpoint, $params);
+                    ->get(self::STATISTICS_URL.$endpoint, $params);
 
                 if ($response->successful()) {
                     return $response->json();
@@ -490,7 +570,7 @@ class WildberriesClient
 
     /**
      * Запрос к Seller Analytics API (GET)
-     * 
+     *
      * Используется для отчётов: Paid Storage, Warehouse Remains и др.
      * URL: https://seller-analytics-api.wildberries.ru
      */
@@ -499,7 +579,7 @@ class WildberriesClient
         try {
             $response = Http::withHeaders($this->getHeaders())
                 ->timeout(60)
-                ->get(self::ANALYTICS_URL . $endpoint, $params);
+                ->get(self::ANALYTICS_URL.$endpoint, $params);
 
             if ($response->successful()) {
                 return $response->json();
@@ -517,13 +597,14 @@ class WildberriesClient
                 'endpoint' => $endpoint,
                 'error' => $e->getMessage(),
             ]);
+
             return null;
         }
     }
 
     /**
      * Запрос к Seller Analytics API (POST)
-     * 
+     *
      * Используется для аналитики: воронка продаж, рейтинги карточек и др.
      */
     public function analyticsPost(string $endpoint, array $data = []): ?array
@@ -578,6 +659,7 @@ class WildberriesClient
                         'endpoint' => $endpoint,
                         'status' => $status,
                     ]);
+
                     return null;
                 }
 
@@ -587,6 +669,7 @@ class WildberriesClient
                 // (~1-5 запросов в час), и повторные попытки только сжигают квоту впустую.
                 if ($status === 429 && $attempts < $maxAttempts && str_contains($endpoint, 'stocks-report')) {
                     $sleepSeconds = 20;
+
                     continue;
                 }
 
@@ -603,6 +686,7 @@ class WildberriesClient
                 'endpoint' => $endpoint,
                 'error' => $e->getMessage(),
             ]);
+
             return null;
         } finally {
             optional($lock)->release();
@@ -632,7 +716,7 @@ class WildberriesClient
     {
         return $this->get($endpoint, $params, self::PRICES_URL);
     }
-    
+
     /**
      * POST запрос к Prices API (цены и скидки)
      */
@@ -651,14 +735,14 @@ class WildberriesClient
 
     /**
      * Заголовки запроса
-     * 
+     *
      * WB API использует два формата авторизации:
      * - Старый: Authorization: {api_key} (без Bearer)
      * - Новый: Authorization: Bearer {api_key}
-     * 
+     *
      * Большинство эндпоинтов работают с обоими форматами,
      * но некоторые (Statistics API) требуют формат без Bearer.
-     * 
+     *
      * @see https://dev.wildberries.ru/openapi/api-information
      */
     /**
@@ -666,7 +750,7 @@ class WildberriesClient
      */
     private function rateLimitDelay(): void
     {
-        $cacheKey = 'wb_api_last_req:' . substr(md5($this->apiKey ?? ''), 0, 8);
+        $cacheKey = 'wb_api_last_req:'.substr(md5($this->apiKey ?? ''), 0, 8);
         $lastMs = Cache::get($cacheKey, 0);
         $elapsed = (microtime(true) * 1000) - $lastMs;
 
@@ -689,15 +773,15 @@ class WildberriesClient
 
     /**
      * Заголовки запроса с Bearer авторизацией
-     * 
+     *
      * Новые эндпоинты Marketplace API v3 требуют Bearer формат.
-     * 
+     *
      * @see https://dev.wildberries.ru/openapi/api-information
      */
     private function getBearerHeaders(): array
     {
         return [
-            'Authorization' => 'Bearer ' . $this->apiKey,
+            'Authorization' => 'Bearer '.$this->apiKey,
             'User-Agent' => $this->userAgent,
             'Content-Type' => 'application/json',
             'Accept' => 'application/json',
@@ -710,6 +794,7 @@ class WildberriesClient
     public function setTimeout(int $seconds): self
     {
         $this->timeout = $seconds;
+
         return $this;
     }
 
@@ -739,8 +824,9 @@ class WildberriesClient
     {
         return array_map(function ($value) {
             if (is_string($value) && strlen($value) > 50) {
-                return substr($value, 0, 50) . '...';
+                return substr($value, 0, 50).'...';
             }
+
             return $value;
         }, $params);
     }
@@ -753,6 +839,7 @@ class WildberriesClient
         if (strlen($body) <= $maxLength) {
             return $body;
         }
-        return substr($body, 0, $maxLength) . '... [truncated]';
+
+        return substr($body, 0, $maxLength).'... [truncated]';
     }
 }

@@ -4,14 +4,14 @@ namespace App\Domains\Wildberries\UnitEconomics;
 
 use App\Domains\UnitEconomics\Contracts\UnitEconomicsCalculatorInterface;
 use App\Domains\UnitEconomics\DTO\CalculationInput;
-use App\Domains\UnitEconomics\DTO\UnitEconomicsResult;
 use App\Domains\UnitEconomics\DTO\CostBreakdown;
-use App\Domains\Wildberries\Tariffs\WildberriesTariffs;
+use App\Domains\UnitEconomics\DTO\UnitEconomicsResult;
 use App\Domains\Wildberries\Tariffs\CommissionCalculator;
+use App\Domains\Wildberries\Tariffs\WildberriesTariffs;
 
 /**
  * Калькулятор юнит-экономики для Wildberries
- * 
+ *
  * Расчёт всех полей:
  * - Схема, Объём, Габариты, Вес — из API
  * - Себестоимость, СПП%, %выкупа, ДРР%, Налог% — редактируемые
@@ -20,19 +20,20 @@ use App\Domains\Wildberries\Tariffs\CommissionCalculator;
 class WildberriesUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
 {
     private WildberriesTariffs $tariffs;
+
     private CommissionCalculator $commissions;
 
     public function __construct()
     {
-        $this->tariffs = new WildberriesTariffs();
-        $this->commissions = new CommissionCalculator();
+        $this->tariffs = new WildberriesTariffs;
+        $this->commissions = new CommissionCalculator;
     }
 
     /**
      * Рассчитать юнит-экономику
-     * 
-     * @param CalculationInput $input Входные данные
-     * @param array $options Дополнительные параметры (spp_percent, warehouse_coef и т.д.)
+     *
+     * @param  CalculationInput  $input  Входные данные
+     * @param  array  $options  Дополнительные параметры (spp_percent, warehouse_coef и т.д.)
      */
     public function calculate(CalculationInput $input, array $options = []): UnitEconomicsResult
     {
@@ -60,16 +61,16 @@ class WildberriesUnitEconomicsCalculator implements UnitEconomicsCalculatorInter
         $costPrice = $input->costPrice ?? 0; // Себестоимость
 
         // === РАССЧИТЫВАЕМЫЕ ПОЛЯ ===
-        
+
         // Наценка, x = цена / себестоимость
         $markupMultiplier = $costPrice > 0 ? round($price / $costPrice, 2) : 0;
-        
+
         // СПП на WB финансирует маркетплейс, а не продавец: он НЕ уменьшает выручку.
         // Поэтому выручка, комиссия и сумма к перечислению считаются от действующей
-        // цены ($price). Цена покупателя (что реально платит покупатель) —
-        // информационная: цена до СПП (oldPrice = зачёркнутая = card.wb.ru basic,
-        // от неё и измерен СПП) × (1 - СПП%). В P&L не участвует.
-        $sppBasePrice = max(0.0, (float) ($input->oldPrice ?? $price));
+        // цены ($price). Цена покупателя информационная: действующая цена продавца
+        // × (1 - СПП%). oldPrice — зачёркнутая цена до скидки продавца и к базе
+        // СПП не относится.
+        $sppBasePrice = max(0.0, (float) $price);
         $customerPrice = $sppBasePrice > 0 ? $sppBasePrice * (1 - $sppPercent / 100) : $price;
 
         // Комиссия маркетплейса — от действующей цены (СПП её не уменьшает)
@@ -79,7 +80,7 @@ class WildberriesUnitEconomicsCalculator implements UnitEconomicsCalculatorInter
 
         // СПП, ₽ — абсолютная скидка покупателю (от цены до СПП), информационно
         $sppAmount = max(0.0, $sppBasePrice - $customerPrice);
-        
+
         // Тарифная логистика WB. В официальных box tariffs base/liter уже приходят
         // с учётом boxDeliveryCoefExpr / boxDeliveryMarketplaceCoefExpr.
         $tariffLogistics = $usesOwnDelivery
@@ -108,13 +109,13 @@ class WildberriesUnitEconomicsCalculator implements UnitEconomicsCalculatorInter
         $baseLogistics = ($usesOfficialWarehouseCoef && $warehouseCoefForCalculation > 0)
             ? $tariffLogistics / $warehouseCoefForCalculation
             : $tariffLogistics;
-        
+
         // КС, ₽ = базовая логистика × (КС - 1) — надбавка к логистике от КС
         $warehouseCoefAmount = $baseLogistics * ($warehouseCoefForCalculation - 1);
-        
+
         // ИЛ, ₽ = базовая логистика × КС × (ИЛ - 1) — надбавка/скидка от ИЛ
         $localizationAmount = $baseLogistics * $warehouseCoefForCalculation * ($localizationIndexForCalculation - 1);
-        
+
         $wbDiscountBasePrice = max(0.0, (float) ($input->oldPrice ?? $price));
         $salesDistributionAmount = $usesOwnDelivery
             ? 0.0
@@ -132,14 +133,14 @@ class WildberriesUnitEconomicsCalculator implements UnitEconomicsCalculatorInter
             : $this->tariffs->calculateReturnLogisticsCost($volumeInLiters, $weight, [
                 'tariff_breakdown' => $input->tariffBreakdown,
             ]);
-        
+
         // Ожидаемые возвраты = обр.логистика × (100 - %выкупа) / 100
         $returnRate = (100 - $redemptionRate) / 100;
         $expectedReturnCost = $returnLogistics * $returnRate;
-        
+
         // Эффективная логистика = логистика + ожид.возвраты
         $effectiveLogistics = $logistics + $expectedReturnCost;
-        
+
         // Хранение (если есть данные о днях хранения)
         $daysInStock = $options['days_in_stock'] ?? 30;
         $storageCost = $input->storageCost ?? $this->tariffs->calculateStorageCost($volumeInLiters, $daysInStock, [
@@ -156,13 +157,13 @@ class WildberriesUnitEconomicsCalculator implements UnitEconomicsCalculatorInter
         $acquiring = $price * ($acquiringRate / 100);
 
         // === ИТОГОВЫЕ РАСЧЁТЫ ===
-        
+
         // Всего затрат (без себестоимости)
         $marketplaceCosts = $commission + $logistics + $expectedReturnCost + $storageCost + $acceptanceCost + $penaltyCost + $acquiring;
-        
+
         // Всего затрат, % = затраты / цена × 100
         $totalExpensesPercent = $price > 0 ? ($marketplaceCosts / $price) * 100 : 0;
-        
+
         // ДРР, ₽ = цена × ДРР%
         $drrAmount = $price * ($drrPercent / 100);
 
@@ -178,7 +179,7 @@ class WildberriesUnitEconomicsCalculator implements UnitEconomicsCalculatorInter
 
         // Чистая прибыль = на р/с − себестоимость − налог (ДРР уже в «На РС»)
         $netProfit = $toSettlementAccount - $costPrice - $taxAmount;
-        
+
         // Маржа, % = чистая прибыль / цена × 100
         $marginPercent = $price > 0 ? ($netProfit / $price) * 100 : 0;
 

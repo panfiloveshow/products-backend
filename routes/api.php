@@ -28,6 +28,7 @@ use App\Http\Controllers\Api\UnitEconomicsController;
 use App\Http\Controllers\Api\UzumExtensionController;
 use App\Http\Controllers\Api\WbBarcodeCostController;
 use App\Http\Controllers\Api\WbWebhookController;
+use App\Http\Controllers\Api\WildberriesSppSyncController;
 use App\Http\Controllers\Api\WorkSpaceController;
 use Illuminate\Support\Facades\Route;
 
@@ -380,6 +381,15 @@ Route::prefix('unit-economics')->middleware('sellico.permission')->group(functio
         ->name('unit-economics.comparison');
     Route::get('/stats', [UnitEconomicsCacheController::class, 'stats'])
         ->name('unit-economics.stats');
+
+    Route::post('/integrations/{integrationId}/spp-sync', [WildberriesSppSyncController::class, 'start'])
+        ->whereNumber('integrationId')
+        ->middleware('integration.access')
+        ->name('unit-economics.spp-sync.start');
+    Route::get('/integrations/{integrationId}/spp-sync', [WildberriesSppSyncController::class, 'status'])
+        ->whereNumber('integrationId')
+        ->middleware('integration.access')
+        ->name('unit-economics.spp-sync.status');
 
     Route::get('/commissions/{marketplace}', [UnitEconomicsCacheController::class, 'commissions'])
         ->whereIn('marketplace', ['wildberries', 'ozon', 'yandex_market', 'uzum'])
