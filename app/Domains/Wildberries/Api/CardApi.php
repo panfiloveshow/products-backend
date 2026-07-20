@@ -9,9 +9,10 @@ use Illuminate\Support\Facades\Log;
  * Публичный API карточек Wildberries (card.wb.ru).
  *
  * Используется для получения «витринного» СПП (скидки постоянного покупателя)
- * по артикулу (nmId): СПП% = (1 - product / basic) * 100, где
- *  - basic   — цена после скидки продавца (зачёркнутая),
- *  - product — цена для покупателя (после СПП).
+ * по артикулу (nmId): СПП% = (1 - product / sellerPrice) * 100, где
+ * sellerPrice приходит из официального Prices API, а product — фактическая
+ * витринная цена покупателя. Поле card.wb.ru `basic` — зачёркнутая цена до
+ * скидки продавца, поэтому использовать его как базу СПП нельзя.
  *
  * Эндпоинт неофициальный и без авторизации. Цена возвращается только для товаров
  * в наличии. Все ошибки гасятся (возвращаем пустой результат / пропускаем nmId),
@@ -34,9 +35,9 @@ class CardApi
      * Получить витринный СПП по списку nmId.
      *
      * @param  array<int|string>  $nmIds
-     * @return array<string,float>  map [nmId => spp%]
+     * @return array<string,float> map [nmId => spp%]
      */
-    public function getSppByNmIds(array $nmIds): array
+    public function getSppByNmIds(array $nmIds, array $sellerPricesByNmId = []): array
     {
         $nmIds = array_values(array_unique(array_filter(
             array_map('strval', $nmIds),
@@ -66,6 +67,12 @@ class CardApi
                         'count' => count($chunk),
                     ]);
 
+                    // 403 обычно блокирует весь исходящий IP, а не конкретный nmId.
+                    // Не отправляем ещё десятки заведомо бесполезных запросов.
+                    if ($response->status() === 403) {
+                        break;
+                    }
+
                     continue;
                 }
 
@@ -77,15 +84,24 @@ class CardApi
 
                     // Цена лежит в sizes[0].price (в копейках).
                     $price = $product['sizes'][0]['price'] ?? null;
-                    $basic = $price['basic'] ?? null;       // после скидки продавца
-                    $buyer = $price['product'] ?? null;     // цена покупателя (после СПП)
+                    $basic = $price['basic'] ?? null;
+                    $buyer = $price['product'] ?? null;     // цена покупателя (после СПП), коп.
+                    $sellerPrice = $sellerPricesByNmId[$nmId] ?? null; // руб.
 
-                    if (! is_numeric($basic) || ! is_numeric($buyer) || (float) $basic <= 0) {
+                    if (! is_numeric($buyer)) {
                         // Нет в наличии / нет цены — СПП недоступен.
                         continue;
                     }
 
-                    $spp = round((1 - (float) $buyer / (float) $basic) * 100, 2);
+                    $baseRub = is_numeric($sellerPrice) && (float) $sellerPrice > 0
+                        ? (float) $sellerPrice
+                        : (is_numeric($basic) ? (float) $basic / 100 : 0.0);
+                    if ($baseRub <= 0) {
+                        continue;
+                    }
+
+                    $buyerRub = (float) $buyer / 100;
+                    $spp = round((1 - $buyerRub / $baseRub) * 100, 2);
                     $result[$nmId] = max(0.0, $spp);
                 }
             } catch (\Throwable $e) {

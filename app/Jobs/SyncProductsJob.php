@@ -253,6 +253,13 @@ class SyncProductsJob implements ShouldBeUnique, ShouldQueue
 
             $this->syncProductsLimit($limitsSync);
 
+            // WB has an extra inventory -> storage-fees hop before the full
+            // unit-economics sync. A delayed/failed storage job must not leave
+            // the page on the previous price after products were refreshed.
+            // Rebuild the projection from fresh Product data immediately; the
+            // full sync after storage fees will enrich and rebuild it again.
+            $this->dispatchWildberriesPriceCacheRefresh();
+
             // Автоматически запускаем синхронизацию остатков после товаров (через сервис: lock + дедуп)
             $credentials = $this->syncLog->credentials ?? [];
             if (! empty($credentials)) {
@@ -717,6 +724,20 @@ class SyncProductsJob implements ShouldBeUnique, ShouldQueue
                 'error' => $e->getMessage(),
             ]);
         }
+    }
+
+    private function dispatchWildberriesPriceCacheRefresh(): void
+    {
+        if ($this->syncLog->marketplace !== 'wildberries' || ! $this->syncLog->integration_id) {
+            return;
+        }
+
+        RecalculateUnitEconomicsCacheJob::dispatch((int) $this->syncLog->integration_id)
+            ->onQueue('unit-economics');
+
+        Log::info('UnitEconomics cache refresh dispatched after WB products sync', [
+            'integration_id' => $this->syncLog->integration_id,
+        ]);
     }
 
     public function failed(\Throwable $exception): void

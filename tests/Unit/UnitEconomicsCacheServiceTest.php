@@ -8,12 +8,49 @@ use App\Domains\UnitEconomics\DTO\UnitEconomicsResult;
 use App\Domains\UnitEconomics\UnitEconomicsOrchestrator;
 use App\Domains\Wildberries\UnitEconomics\WildberriesUnitEconomicsCalculator;
 use App\Models\Product;
+use App\Models\UnitEconomics;
 use App\Services\UnitEconomicsCacheService;
 use App\Services\UnitEconomicsService;
 use PHPUnit\Framework\TestCase;
 
 class UnitEconomicsCacheServiceTest extends TestCase
 {
+    public function test_fresh_product_price_wins_over_stale_unit_economics_price(): void
+    {
+        $service = new UnitEconomicsCacheService(
+            $this->createMock(UnitEconomicsOrchestrator::class)
+        );
+        $method = new \ReflectionMethod(UnitEconomicsCacheService::class, 'resolvePriceForCalculation');
+
+        $price = $method->invoke(
+            $service,
+            new Product(['price' => 1490]),
+            [],
+            [],
+            new UnitEconomics(['price' => 1290])
+        );
+
+        $this->assertSame(1490.0, $price);
+    }
+
+    public function test_marketplace_actual_price_still_wins_over_product_price(): void
+    {
+        $service = new UnitEconomicsCacheService(
+            $this->createMock(UnitEconomicsOrchestrator::class)
+        );
+        $method = new \ReflectionMethod(UnitEconomicsCacheService::class, 'resolvePriceForCalculation');
+
+        $price = $method->invoke(
+            $service,
+            new Product(['price' => 1490]),
+            ['actual_price' => 1190],
+            [],
+            new UnitEconomics(['price' => 1290])
+        );
+
+        $this->assertSame(1190.0, $price);
+    }
+
     public function test_real_order_clusters_keep_markup_fields_from_delivery_profile(): void
     {
         $service = new UnitEconomicsCacheService(
@@ -376,7 +413,7 @@ class UnitEconomicsCacheServiceTest extends TestCase
         $this->assertSame(0.0, $result->metadata['localization_amount']);
     }
 
-    public function test_wildberries_logistics_adds_sales_distribution_index_to_price_before_wb_discount(): void
+    public function test_wildberries_logistics_ignores_disabled_sales_distribution_index(): void
     {
         $calculator = new WildberriesUnitEconomicsCalculator();
 
@@ -410,9 +447,9 @@ class UnitEconomicsCacheServiceTest extends TestCase
 
         $this->assertSame(40.0, $result->metadata['base_logistics']);
         $this->assertSame(12.0, $result->metadata['localization_amount']);
-        $this->assertSame(1.15, $result->metadata['sales_distribution_index']);
-        $this->assertSame(13.8, $result->metadata['sales_distribution_amount']);
-        $this->assertSame(85.8, $result->costs->logistics);
+        $this->assertSame(0.0, $result->metadata['sales_distribution_index']);
+        $this->assertSame(0.0, $result->metadata['sales_distribution_amount']);
+        $this->assertSame(72.0, $result->costs->logistics);
     }
 
     public function test_wildberries_fbs_uses_marketplace_box_tariff_fields(): void

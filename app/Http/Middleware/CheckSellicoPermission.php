@@ -68,6 +68,8 @@ class CheckSellicoPermission
         'unit-economics.cache-stats'       => 'unit_economics.view',
         'unit-economics.freshness'         => 'unit_economics.view',
         'unit-economics.export.excel'      => 'unit_economics.view',
+        'unit-economics.spp-sync.start'    => 'products.sync.execute',
+        'unit-economics.spp-sync.status'   => 'unit_economics.view',
         'unit-economics.rfbs-tariffs.show' => 'unit_economics.tariffs.view',
         'unit-economics.rfbs-tariffs.update' => 'unit_economics.settings.edit',
 
