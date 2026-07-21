@@ -306,10 +306,18 @@ class ProductsApi implements ProductsApiInterface
                 // брали min(marketing, action) и занижали цену (напр. A65: витрина 668,
                 // action 420 → показывали 420, экономика уходила в ложный минус).
                 $actionPrice = (float) ($actionPrices[(int) ($item['product_id'] ?? 0)] ?? 0);
-                $promoPrice = ($marketingSellerPrice > 0 && $marketingSellerPrice < $price)
-                    ? $marketingSellerPrice
-                    : (($actionPrice > 0 && $actionPrice < $price) ? $actionPrice : 0.0);
-                $actualPrice = $promoPrice > 0 ? $promoPrice : $price;
+                if ($marketingSellerPrice > 0) {
+                    // Когда поле заполнено, это действующая цена продавца на витрине.
+                    // Не подменяем её ценой участия из другой/будущей акции.
+                    $actualPrice = $marketingSellerPrice;
+                    $priceSource = 'marketing_seller_price';
+                } elseif ($actionPrice > 0 && $actionPrice < $price) {
+                    $actualPrice = $actionPrice;
+                    $priceSource = 'action_price';
+                } else {
+                    $actualPrice = $price;
+                    $priceSource = 'seller_price';
+                }
 
                 // Определяем, участвует ли товар в акции
                 $isInPromotion = $actualPrice < $price;
@@ -324,6 +332,7 @@ class ProductsApi implements ProductsApiInterface
                     'min_price' => (float) ($priceData['min_price'] ?? 0),
                     'marketing_seller_price' => $marketingSellerPrice, // Цена с акцией
                     'actual_price' => $actualPrice,              // Действующая цена (с учётом акций)
+                    'price_source' => $priceSource,
                     'is_in_promotion' => $isInPromotion,         // Участвует в акции
                     'promotion_discount' => $promotionDiscount,  // Процент скидки
                     'price_indexes' => $priceIndexes,

@@ -408,8 +408,18 @@ class SyncUnitEconomicsCommand extends Command
 
                     // Получаем актуальные цены (включая акционные marketing_seller_price)
                     $productPrices = $ozonService->getProductPrices();
+                    $priceObservedAt = now()->utc()->toIso8601String();
+                    foreach ($productPrices as &$productPrice) {
+                        $productPrice['price_observed_at'] = $priceObservedAt;
+                    }
+                    unset($productPrice);
+
+                    // Цена Ozon обновляется чаще карточки товара. Сохраняем живую цену
+                    // сразу в Product/ozon_data, чтобы любой последующий cache rebuild
+                    // использовал тот же источник, что и расчёт юнит-экономики.
+                    $persistedPriceCount = $this->persistOzonCurrentPrices($products, $productPrices);
                     $promotionCount = count(array_filter($productPrices, fn ($p) => $p['is_in_promotion'] ?? false));
-                    $this->info('  Цены: '.count($productPrices).' товаров, '.$promotionCount.' в акциях');
+                    $this->info('  Цены: '.count($productPrices).' товаров, '.$promotionCount.' в акциях; сохранено '.$persistedPriceCount);
 
                     try {
                         $ozonPricingStrategyBySku = $this->mapOzonPriceIndexesBySku($productPrices);
@@ -1467,6 +1477,72 @@ class SyncUnitEconomicsCommand extends Command
         return $productIdsBySku;
     }
 
+    /**
+     * Сохраняет действующую цену Ozon в канонический Product и в ozon_data.
+     *
+     * SyncUnitEconomicsCommand получает цены из /v5/product/info/prices, но раньше
+     * использовал их только при расчёте UnitEconomics. Cache rebuild затем снова
+     * читал устаревший Product.price, поэтому маржа менялась, а цена на странице — нет.
+     * Обновляем те же экземпляры Product, которые участвуют в текущем расчёте, чтобы
+     * последующие enrich/saveQuietly не затёрли свежие price metadata.
+     *
+     * @param  Collection<int, Product>  $products
+     * @param  array<string, array<string, mixed>>  $productPrices
+     */
+    private function persistOzonCurrentPrices(Collection $products, array $productPrices): int
+    {
+        $persisted = 0;
+
+        foreach ($products as $product) {
+            if ($product->marketplace !== 'ozon') {
+                continue;
+            }
+
+            $priceData = $productPrices[(string) $product->sku] ?? null;
+            if (! is_array($priceData)) {
+                continue;
+            }
+
+            $actualPrice = (float) ($priceData['actual_price']
+                ?? $priceData['marketing_seller_price']
+                ?? $priceData['price']
+                ?? 0);
+            if ($actualPrice <= 0) {
+                continue;
+            }
+
+            $basePrice = (float) ($priceData['price'] ?? $actualPrice);
+            $oldPrice = (float) ($priceData['old_price'] ?? 0);
+            $ozonData = is_array($product->ozon_data ?? null) ? $product->ozon_data : [];
+            $ozonData = array_merge($ozonData, [
+                'price' => $basePrice,
+                'actual_price' => $actualPrice,
+                'marketing_seller_price' => (float) ($priceData['marketing_seller_price'] ?? 0),
+                'old_price' => $oldPrice,
+                'min_price' => (float) ($priceData['min_price'] ?? 0),
+                'is_in_promotion' => (bool) ($priceData['is_in_promotion'] ?? false),
+                'promotion_discount' => (float) ($priceData['promotion_discount'] ?? 0),
+                'price_source' => $priceData['price_source'] ?? 'product_info_prices',
+                'price_observed_at' => $priceData['price_observed_at'] ?? now()->utc()->toIso8601String(),
+                'price_indexes' => $priceData['price_indexes'] ?? ($ozonData['price_indexes'] ?? []),
+                'price_index_color' => $priceData['price_index_color'] ?? null,
+                'price_index_label' => $priceData['price_index_label'] ?? null,
+                'price_index_value' => $priceData['price_index_value'] ?? null,
+                'competitor_price' => $priceData['competitor_price'] ?? null,
+                'competitor_price_source' => $priceData['competitor_price_source'] ?? null,
+            ]);
+
+            $product->forceFill([
+                'price' => $actualPrice,
+                'old_price' => $oldPrice > $actualPrice ? $oldPrice : null,
+                'ozon_data' => $ozonData,
+            ])->saveQuietly();
+            $persisted++;
+        }
+
+        return $persisted;
+    }
+
     private function mapOzonPricingStrategyBySku(array $productIdsBySku, array $pricingStrategyByProductId): array
     {
         $bySku = [];
@@ -2229,6 +2305,13 @@ class SyncUnitEconomicsCommand extends Command
                 $data['marketing_seller_price'] = $productPriceData['marketing_seller_price']
                     ?? $commissions['marketing_seller_price']
                     ?? null; // Цена с акцией (из API)
+                $data['actual_price'] = $price;
+                $data['price_source'] = $productPriceData['price_source']
+                    ?? $ozonData['price_source']
+                    ?? 'product';
+                $data['price_observed_at'] = $productPriceData['price_observed_at']
+                    ?? $ozonData['price_observed_at']
+                    ?? null;
 
                 $pricingStrategy = $this->buildOzonPriceCompetitivenessData($price, $ozonPricingStrategyData);
                 if ($pricingStrategy !== null) {

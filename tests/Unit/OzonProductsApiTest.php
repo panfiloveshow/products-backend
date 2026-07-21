@@ -53,6 +53,7 @@ class OzonProductsApiTest extends TestCase
         $result = $api->getPrices();
 
         $this->assertSame(1600.0, $result['3-02/4011']['actual_price']);
+        $this->assertSame('marketing_seller_price', $result['3-02/4011']['price_source']);
         $this->assertSame('RED', $result['3-02/4011']['price_index_color']);
         $this->assertSame('Невыгодный', $result['3-02/4011']['price_index_label']);
         // Биндинговый индекс = сравнение с самым дешёвым конкурентом (external, 652 ₽ →
