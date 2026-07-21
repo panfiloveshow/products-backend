@@ -76,6 +76,7 @@ class OzonActionPricesTest extends TestCase
         $prices = $api->getPrices();
 
         $this->assertSame(300.0, $prices['3-02/3516']['actual_price']);
+        $this->assertSame('action_price', $prices['3-02/3516']['price_source']);
         $this->assertTrue($prices['3-02/3516']['is_in_promotion']);
         $this->assertSame(50.0, $prices['3-02/3516']['promotion_discount']);
         $this->assertSame(600.0, $prices['3-02/3516']['price']);
@@ -110,6 +111,7 @@ class OzonActionPricesTest extends TestCase
         $prices = $api->getPrices();
 
         $this->assertSame(668.0, $prices['A65']['actual_price']);
+        $this->assertSame('marketing_seller_price', $prices['A65']['price_source']);
         $this->assertTrue($prices['A65']['is_in_promotion']);
     }
 
@@ -132,6 +134,7 @@ class OzonActionPricesTest extends TestCase
         $prices = $api->getPrices();
 
         $this->assertSame(500.0, $prices['SKU-1']['actual_price']);
+        $this->assertSame('seller_price', $prices['SKU-1']['price_source']);
         $this->assertFalse($prices['SKU-1']['is_in_promotion']);
     }
 }

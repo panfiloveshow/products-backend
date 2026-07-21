@@ -1113,19 +1113,65 @@ class UnitEconomicsCacheService
         array $commissions,
         ?UnitEconomics $existingUE
     ): float {
-        foreach ([
-            $marketplaceData['actual_price'] ?? null,
-            $marketplaceData['marketing_seller_price'] ?? null,
-            $commissions['actual_price'] ?? null,
-            $product->price,
-            $existingUE?->price,
-        ] as $candidate) {
+        $existingMarketplaceData = is_array($existingUE?->marketplace_data ?? null)
+            ? $existingUE->marketplace_data
+            : [];
+
+        // Ozon UnitEconomics получает действующую цену напрямую из price API при
+        // каждом синке. Product historically обновлялся отдельным каталоговым синком
+        // и мог хранить базовую/предыдущую цену. Для остальных маркетплейсов сохраняем
+        // прежний приоритет свежего Product.price (важно, в частности, для WB).
+        if ($product->marketplace === 'ozon') {
+            $productObservedAt = $this->priceObservationTimestamp($marketplaceData);
+            $unitEconomicsObservedAt = $this->priceObservationTimestamp($existingMarketplaceData);
+            $productPriceIsNewer = $productObservedAt !== null
+                && ($unitEconomicsObservedAt === null || $productObservedAt > $unitEconomicsObservedAt);
+
+            $productCandidates = [
+                $marketplaceData['actual_price'] ?? null,
+                $marketplaceData['marketing_seller_price'] ?? null,
+                $commissions['actual_price'] ?? null,
+            ];
+            $unitEconomicsCandidates = [
+                $existingMarketplaceData['actual_price'] ?? null,
+                $existingMarketplaceData['marketing_seller_price'] ?? null,
+                $existingUE?->price,
+            ];
+
+            $candidates = [
+                ...($productPriceIsNewer ? $productCandidates : $unitEconomicsCandidates),
+                ...($productPriceIsNewer ? $unitEconomicsCandidates : $productCandidates),
+                $product->price,
+            ];
+        } else {
+            $candidates = [
+                $marketplaceData['actual_price'] ?? null,
+                $marketplaceData['marketing_seller_price'] ?? null,
+                $commissions['actual_price'] ?? null,
+                $product->price,
+                $existingUE?->price,
+            ];
+        }
+
+        foreach ($candidates as $candidate) {
             if (is_numeric($candidate) && (float) $candidate > 0) {
                 return (float) $candidate;
             }
         }
 
         return 0.0;
+    }
+
+    private function priceObservationTimestamp(array $marketplaceData): ?int
+    {
+        $observedAt = $marketplaceData['price_observed_at'] ?? null;
+        if (! is_string($observedAt) || trim($observedAt) === '') {
+            return null;
+        }
+
+        $timestamp = strtotime($observedAt);
+
+        return $timestamp === false ? null : $timestamp;
     }
 
     /**

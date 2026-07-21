@@ -24,7 +24,7 @@ class UnitEconomicsCacheServiceTest extends TestCase
 
         $price = $method->invoke(
             $service,
-            new Product(['price' => 1490]),
+            new Product(['marketplace' => 'wildberries', 'price' => 1490]),
             [],
             [],
             new UnitEconomics(['price' => 1290])
@@ -49,6 +49,102 @@ class UnitEconomicsCacheServiceTest extends TestCase
         );
 
         $this->assertSame(1190.0, $price);
+    }
+
+    public function test_ozon_live_unit_economics_price_wins_over_stale_product_price(): void
+    {
+        $service = new UnitEconomicsCacheService(
+            $this->createMock(UnitEconomicsOrchestrator::class)
+        );
+        $method = new \ReflectionMethod(UnitEconomicsCacheService::class, 'resolvePriceForCalculation');
+
+        $price = $method->invoke(
+            $service,
+            new Product(['marketplace' => 'ozon', 'price' => 2000]),
+            [],
+            [],
+            new UnitEconomics([
+                'price' => 1700,
+                'marketplace_data' => ['marketing_seller_price' => 1700],
+            ])
+        );
+
+        $this->assertSame(1700.0, $price);
+    }
+
+    public function test_ozon_live_unit_economics_price_is_used_when_promotion_raises_price(): void
+    {
+        $service = new UnitEconomicsCacheService(
+            $this->createMock(UnitEconomicsOrchestrator::class)
+        );
+        $method = new \ReflectionMethod(UnitEconomicsCacheService::class, 'resolvePriceForCalculation');
+
+        $price = $method->invoke(
+            $service,
+            new Product(['marketplace' => 'ozon', 'price' => 10300]),
+            [],
+            [],
+            new UnitEconomics([
+                'price' => 11151,
+                'marketplace_data' => ['marketing_seller_price' => 11151],
+            ])
+        );
+
+        $this->assertSame(11151.0, $price);
+    }
+
+    public function test_ozon_newly_observed_product_price_survives_partial_unit_economics_sync(): void
+    {
+        $service = new UnitEconomicsCacheService(
+            $this->createMock(UnitEconomicsOrchestrator::class)
+        );
+        $method = new \ReflectionMethod(UnitEconomicsCacheService::class, 'resolvePriceForCalculation');
+
+        $price = $method->invoke(
+            $service,
+            new Product(['marketplace' => 'ozon', 'price' => 1700]),
+            [
+                'actual_price' => 1700,
+                'price_observed_at' => '2026-07-21T06:30:00+00:00',
+            ],
+            [],
+            new UnitEconomics([
+                'price' => 2000,
+                'marketplace_data' => [
+                    'marketing_seller_price' => 2000,
+                    'price_observed_at' => '2026-07-21T02:24:00+00:00',
+                ],
+            ])
+        );
+
+        $this->assertSame(1700.0, $price);
+    }
+
+    public function test_ozon_newer_unit_economics_observation_wins_over_product_metadata(): void
+    {
+        $service = new UnitEconomicsCacheService(
+            $this->createMock(UnitEconomicsOrchestrator::class)
+        );
+        $method = new \ReflectionMethod(UnitEconomicsCacheService::class, 'resolvePriceForCalculation');
+
+        $price = $method->invoke(
+            $service,
+            new Product(['marketplace' => 'ozon', 'price' => 2000]),
+            [
+                'actual_price' => 2000,
+                'price_observed_at' => '2026-07-21T02:24:00+00:00',
+            ],
+            [],
+            new UnitEconomics([
+                'price' => 1700,
+                'marketplace_data' => [
+                    'marketing_seller_price' => 1700,
+                    'price_observed_at' => '2026-07-21T06:30:00+00:00',
+                ],
+            ])
+        );
+
+        $this->assertSame(1700.0, $price);
     }
 
     public function test_real_order_clusters_keep_markup_fields_from_delivery_profile(): void
