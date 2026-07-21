@@ -67,6 +67,8 @@ return [
 
     'timezone' => 'UTC',
 
+    'release' => env('APP_RELEASE', 'unknown'),
+
     /*
     |--------------------------------------------------------------------------
     | Application Locale Configuration

@@ -2,21 +2,25 @@
 
 namespace App\Services;
 
+use App\Domains\Ozon\Tariffs\OzonPricingMatrix;
+use App\Domains\Ozon\Tariffs\OzonRfbsTariffMatrix;
+use App\Domains\Ozon\UnitEconomics\RedemptionSource;
+use App\Domains\UnitEconomics\DTO\CalculationInput;
+use App\Domains\UnitEconomics\DTO\UnitEconomicsResult;
+use App\Domains\UnitEconomics\UnitEconomicsOrchestrator;
 use App\Jobs\RecalculateUnitEconomicsCacheJob;
 use App\Jobs\RecalculateUnitEconomicsForSkuJob;
 use App\Models\Integration;
 use App\Models\InventoryWarehouse;
-use App\Models\OzonSupplyFixation;
 use App\Models\OzonSkuDeliveryProfile;
+use App\Models\OzonSupplyFixation;
 use App\Models\Product;
 use App\Models\UnitEconomics;
 use App\Models\UnitEconomicsCache;
 use App\Models\UnitEconomicsSettings;
 use App\Models\WildberriesTariffSnapshot;
-use App\Domains\Ozon\Tariffs\OzonPricingMatrix;
-use App\Domains\Ozon\Tariffs\OzonRfbsTariffMatrix;
-use App\Domains\UnitEconomics\UnitEconomicsOrchestrator;
-use App\Domains\UnitEconomics\DTO\CalculationInput;
+use App\Services\Ozon\OzonLocalityService;
+use App\Services\UnitEconomics\MarketplacePriceResolver;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
@@ -24,52 +28,68 @@ use Illuminate\Support\Facades\Log;
 
 /**
  * Сервис для управления кэшем юнит-экономики
- * 
+ *
  * Отвечает за:
  * - Пересчёт кэша для товаров
  * - Обновление при изменении настроек
  * - Массовый пересчёт при синхронизации
- * 
+ *
  * Использует новую доменную архитектуру (app/Domains/)
  */
 class UnitEconomicsCacheService
 {
     private UnitEconomicsOrchestrator $orchestrator;
+
     private ?UnitEconomicsService $legacyCalculator;
+
     /** @var array<int, Integration> */
     private array $integrationCache = [];
+
     /** @var array<string, ?UnitEconomics> */
     private array $unitEconomicsCache = [];
+
     /** @var array<string, float> */
     private array $warehouseCoefficientCache = [];
+
     /** @var array<string, ?UnitEconomicsSettings> */
     private array $settingsCache = [];
+
     /** @var array<int, array{box_by_warehouse: array<string, WildberriesTariffSnapshot>, box_fallback: ?WildberriesTariffSnapshot, return: array}> */
     private array $wildberriesTariffSnapshotCache = [];
+
     /** @var array<int, float> КС магазина по фактическим остаткам (дефолт для товаров без остатка) */
     private array $integrationStockWeightedCoefCache = [];
+
     /** @var array<string, array>|null Per-SKU locality data from real orders (batch-loaded) */
     private ?array $localityCache = null;
+
     /** @var array<string, ?OzonSkuDeliveryProfile> ключ integration|sku|SCHEME — прогревается чанком (убирает N+1) */
     private array $deliveryProfileCache = [];
+
     /** @var array<int, ?OzonSkuDeliveryProfile> fallback-профиль интеграции (любой с cluster_profile) */
     private array $integrationFallbackProfileCache = [];
+
     /** @var array<string, ?OzonSupplyFixation> ключ integration|sku — активная фиксация, прогревается чанком */
     private array $supplyFixationCache = [];
+
     /** @var int|null Seller-level FBO orders in last 7 days (cached per integration) */
     private ?int $sellerFboOrders7DaysCache = null;
 
+    private MarketplacePriceResolver $priceResolver;
+
     public function __construct(
         UnitEconomicsOrchestrator $orchestrator,
-        ?UnitEconomicsService $legacyCalculator = null
+        ?UnitEconomicsService $legacyCalculator = null,
+        ?MarketplacePriceResolver $priceResolver = null
     ) {
         $this->orchestrator = $orchestrator;
         $this->legacyCalculator = $legacyCalculator;
+        $this->priceResolver = $priceResolver ?? new MarketplacePriceResolver;
     }
 
     /**
      * Пересчитать кэш для одного товара
-     * 
+     *
      * Использует реальную схему товара (Product.fulfillment_type):
      * - FBO: только FBO
      * - FBS: только FBS
@@ -81,20 +101,20 @@ class UnitEconomicsCacheService
         $this->forgetUnitEconomicsCache($product->integration_id, $product->sku);
         $schemes = $this->getSchemesForProduct($product);
         $results = [];
-        
+
         foreach ($schemes as $scheme) {
             $results[$scheme] = $this->calculateAndCache($product, $scheme);
         }
-        
+
         return $results;
     }
-    
+
     /**
      * Получить схемы для конкретного товара на основе его fulfillment_type
-     * 
+     *
      * WB схемы: FBO, FBS, DBS, EDBS, DBW
      * Для WB всегда рассчитываем все 5 схем, чтобы продавец мог сравнить
-     * 
+     *
      * Ozon схемы: FBO, FBS, RFBS, EXPRESS
      * Для Ozon рассчитываем по реальной схеме товара
      */
@@ -104,19 +124,19 @@ class UnitEconomicsCacheService
         if ($product->marketplace === 'wildberries') {
             return ['FBO', 'FBS', 'DBS', 'EDBS', 'DBW'];
         }
-        
+
         $productScheme = $product->fulfillment_type;
-        
+
         // Если схема не определена — используем все схемы маркетплейса
         if (empty($productScheme)) {
             return $this->getSchemesForMarketplace($product->marketplace);
         }
-        
+
         // MIXED — товар на разных типах складов, рассчитываем все активные схемы
         if ($productScheme === 'MIXED') {
             return $this->getSchemesForMarketplace($product->marketplace);
         }
-        
+
         // Конкретная схема (FBO, FBS, RFBS, EXPRESS)
         return [strtoupper($productScheme)];
     }
@@ -141,20 +161,20 @@ class UnitEconomicsCacheService
         ) {
             $this->primeOzonSkuLocality($product);
         }
-        
+
         // Получаем настройки пользователя
         $settings = $this->getSettingsCached($integrationId, $sku);
-        
+
         // Собираем данные для расчёта через новый DTO
         $inputData = $this->prepareCalculationInput($product, $settings, $fulfillmentType);
         $input = CalculationInput::fromArray($inputData);
-        
+
         // Выполняем расчёт через новый оркестратор
         $result = $this->orchestrator->calculate($input);
-        
+
         // Конвертируем результат в формат кэша
         $cacheData = $this->convertResultToCacheData($product, $settings, $result, $inputData);
-        
+
         // Сохраняем в кэш
         $cache = UnitEconomicsCache::updateOrCreate(
             [
@@ -164,13 +184,13 @@ class UnitEconomicsCacheService
             ],
             $cacheData
         );
-        
+
         return $cache;
     }
 
     /**
      * Пересчитать кэш для всей интеграции
-     * 
+     *
      * 1. Удаляет старый кэш для данной интеграции
      * 2. Пересчитывает данные на основе актуальных товаров из products
      * 3. Сохраняет новый кэш в unit_economics_cache
@@ -185,7 +205,7 @@ class UnitEconomicsCacheService
         $this->integrationFallbackProfileCache = [];
         $this->supplyFixationCache = [];
         $integration = $this->getIntegrationCached($integrationId);
-        if (!$integration) {
+        if (! $integration) {
             return ['error' => 'Integration not found'];
         }
 
@@ -206,7 +226,7 @@ class UnitEconomicsCacheService
 
         // Batch-загрузка per-SKU locality из реальных заказов (Ozon)
         if ($integration->marketplace === 'ozon') {
-            $localityService = app(\App\Services\Ozon\OzonLocalityService::class);
+            $localityService = app(OzonLocalityService::class);
             $this->localityCache = $localityService->resolveIntegrationLocality($integrationId);
             Log::info('Locality data loaded for integration', [
                 'integration_id' => $integrationId,
@@ -296,7 +316,7 @@ class UnitEconomicsCacheService
 
         foreach (array_unique(array_filter(array_map('strval', $skus))) as $sku) {
             RecalculateUnitEconomicsForSkuJob::dispatch($integrationId, $sku)
-            ->onQueue('unit-economics');
+                ->onQueue('unit-economics');
         }
     }
 
@@ -336,7 +356,7 @@ class UnitEconomicsCacheService
 
     private function primeOzonSkuLocality(Product $product): void
     {
-        $localityService = app(\App\Services\Ozon\OzonLocalityService::class);
+        $localityService = app(OzonLocalityService::class);
         $locality = $localityService->resolveSkuLocality(
             (int) $product->integration_id,
             (string) $product->sku
@@ -446,7 +466,7 @@ class UnitEconomicsCacheService
         // вечно перекрывал свежий postings_28d. Это был баг: cache 2099/black1
         // отдавал ord=3 из старого sync, хотя новый postings за 28д показывал 2.
         // Список «свежих» источников централизован в RedemptionSource::isFresh().
-        $apiSourceEnum = \App\Domains\Ozon\UnitEconomics\RedemptionSource::fromStringSafe($apiSource);
+        $apiSourceEnum = RedemptionSource::fromStringSafe($apiSource);
         $apiIsFresh = $apiSource !== null && $apiSourceEnum->isFresh();
 
         if ($settings?->redemption_rate_override !== null) {
@@ -585,7 +605,7 @@ class UnitEconomicsCacheService
             // Seller-level total FBO orders in 7 days (Ozon rule applies per-seller, not per-SKU)
             // Подсчёт из реальных postings — inventory_warehouses.sales_7_days ненадёжен
             if (! isset($this->sellerFboOrders7DaysCache)) {
-                $localityService = app(\App\Services\Ozon\OzonLocalityService::class);
+                $localityService = app(OzonLocalityService::class);
                 $this->sellerFboOrders7DaysCache = $localityService->countSellerFboOrders7Days($product->integration_id);
             }
             $sales7Days = $this->sellerFboOrders7DaysCache;
@@ -738,11 +758,6 @@ class UnitEconomicsCacheService
             $existingUE
         );
 
-        $marketingPrice = (float) ($marketplaceData['marketing_seller_price'] ?? 0);
-        if ($marketingPrice > 0 && $marketingPrice < $actualPrice) {
-            $actualPrice = $marketingPrice;
-        }
-
         $sppPercent = 0.0;
         $warehouseCoefficient = 1.0;
         $localizationIndex = 1.0;
@@ -847,7 +862,7 @@ class UnitEconomicsCacheService
                 ?? $product->volume_weight
                 ?? (($lengthCm * $widthCm * $heightCm) / 5000)
             );
-            $rfbsTariff = (new OzonRfbsTariffMatrix())->resolve(
+            $rfbsTariff = (new OzonRfbsTariffMatrix)->resolve(
                 (float) $actualPrice,
                 $weightKg,
                 $volumeWeightKg,
@@ -1004,7 +1019,7 @@ class UnitEconomicsCacheService
             'shipping_cluster_name' => $activeFixation['shipping_cluster_name'] ?? null,
             'destination_cluster_id' => $dominantClusterId ?? $marketplaceData['destination_cluster_id'] ?? null,
             'destination_cluster_name' => $marketplaceData['destination_cluster_name']
-                ?? ($dominantClusterId !== null && !empty($clustersSummary)
+                ?? ($dominantClusterId !== null && ! empty($clustersSummary)
                     ? collect($clustersSummary)->firstWhere('cluster_id', $dominantClusterId)['cluster_name'] ?? null
                     : null),
             'fixation_applied' => $activeFixation['fixation_applied'] ?? null,
@@ -1113,79 +1128,26 @@ class UnitEconomicsCacheService
         array $commissions,
         ?UnitEconomics $existingUE
     ): float {
-        $existingMarketplaceData = is_array($existingUE?->marketplace_data ?? null)
-            ? $existingUE->marketplace_data
-            : [];
-
-        // Ozon UnitEconomics получает действующую цену напрямую из price API при
-        // каждом синке. Product historically обновлялся отдельным каталоговым синком
-        // и мог хранить базовую/предыдущую цену. Для остальных маркетплейсов сохраняем
-        // прежний приоритет свежего Product.price (важно, в частности, для WB).
-        if ($product->marketplace === 'ozon') {
-            $productObservedAt = $this->priceObservationTimestamp($marketplaceData);
-            $unitEconomicsObservedAt = $this->priceObservationTimestamp($existingMarketplaceData);
-            $productPriceIsNewer = $productObservedAt !== null
-                && ($unitEconomicsObservedAt === null || $productObservedAt > $unitEconomicsObservedAt);
-
-            $productCandidates = [
-                $marketplaceData['actual_price'] ?? null,
-                $marketplaceData['marketing_seller_price'] ?? null,
-                $commissions['actual_price'] ?? null,
-            ];
-            $unitEconomicsCandidates = [
-                $existingMarketplaceData['actual_price'] ?? null,
-                $existingMarketplaceData['marketing_seller_price'] ?? null,
-                $existingUE?->price,
-            ];
-
-            $candidates = [
-                ...($productPriceIsNewer ? $productCandidates : $unitEconomicsCandidates),
-                ...($productPriceIsNewer ? $unitEconomicsCandidates : $productCandidates),
-                $product->price,
-            ];
-        } else {
-            $candidates = [
-                $marketplaceData['actual_price'] ?? null,
-                $marketplaceData['marketing_seller_price'] ?? null,
-                $commissions['actual_price'] ?? null,
-                $product->price,
-                $existingUE?->price,
-            ];
-        }
-
-        foreach ($candidates as $candidate) {
-            if (is_numeric($candidate) && (float) $candidate > 0) {
-                return (float) $candidate;
-            }
-        }
-
-        return 0.0;
-    }
-
-    private function priceObservationTimestamp(array $marketplaceData): ?int
-    {
-        $observedAt = $marketplaceData['price_observed_at'] ?? null;
-        if (! is_string($observedAt) || trim($observedAt) === '') {
-            return null;
-        }
-
-        $timestamp = strtotime($observedAt);
-
-        return $timestamp === false ? null : $timestamp;
+        return $this->priceResolver->resolve(
+            $product,
+            $marketplaceData,
+            $commissions,
+            $existingUE
+        );
     }
 
     /**
      * Конвертировать результат расчёта в формат кэша
      */
     private function convertResultToCacheData(
-        Product $product, 
-        ?UnitEconomicsSettings $settings, 
-        \App\Domains\UnitEconomics\DTO\UnitEconomicsResult $result,
+        Product $product,
+        ?UnitEconomicsSettings $settings,
+        UnitEconomicsResult $result,
         array $inputData
     ): array {
         $costs = $result->costs;
         $extra = $inputData['_extra'] ?? [];
-        
+
         // Рассчитываем дополнительные метрики
         $price = $result->price;
         $drrPercent = $extra['drr_percent'] ?? 0;
@@ -1207,13 +1169,13 @@ class UnitEconomicsCacheService
             + $effectiveVatAmount
             + ($metaDrrAmount === null ? $drrAmount : 0)
             + ($metaTaxAmount === null ? $taxAmount : 0);
-        
+
         // Корректируем чистую прибыль
         $netProfit = $result->revenue - $totalCosts;
         $marginPercent = $price > 0 ? ($netProfit / $price) * 100 : 0;
         $markupPercent = $costs->costPrice > 0 ? round($price / $costs->costPrice, 2) : 0;
         $roiPercent = $costs->getProductCosts() > 0 ? (($netProfit / $costs->getProductCosts()) * 100) : 0;
-        
+
         $length = (float) ($inputData['length'] ?? 0);
         $width = (float) ($inputData['width'] ?? 0);
         $height = (float) ($inputData['height'] ?? 0);
@@ -1390,19 +1352,35 @@ class UnitEconomicsCacheService
     private function calculateDeliveryCoefficient(int $avgDeliveryTimeHours): float
     {
         // Таблица коэффициентов Ozon
-        if ($avgDeliveryTimeHours <= 14) return 1.0;
-        if ($avgDeliveryTimeHours <= 24) return 1.04;
-        if ($avgDeliveryTimeHours <= 36) return 1.12;
-        if ($avgDeliveryTimeHours <= 48) return 1.20;
-        if ($avgDeliveryTimeHours <= 60) return 1.32;
-        if ($avgDeliveryTimeHours <= 72) return 1.40;
-        if ($avgDeliveryTimeHours <= 84) return 1.48;
+        if ($avgDeliveryTimeHours <= 14) {
+            return 1.0;
+        }
+        if ($avgDeliveryTimeHours <= 24) {
+            return 1.04;
+        }
+        if ($avgDeliveryTimeHours <= 36) {
+            return 1.12;
+        }
+        if ($avgDeliveryTimeHours <= 48) {
+            return 1.20;
+        }
+        if ($avgDeliveryTimeHours <= 60) {
+            return 1.32;
+        }
+        if ($avgDeliveryTimeHours <= 72) {
+            return 1.40;
+        }
+        if ($avgDeliveryTimeHours <= 84) {
+            return 1.48;
+        }
+
         return 1.80;
     }
 
     /**
      * Подготовить данные для расчёта (LEGACY - для обратной совместимости)
      * Берём данные из существующей записи UnitEconomics (там актуальные данные после синхронизации)
+     *
      * @deprecated Используйте prepareCalculationInput
      */
     private function prepareCalculationData(Product $product, ?UnitEconomicsSettings $settings, string $fulfillmentType): array
@@ -1410,10 +1388,10 @@ class UnitEconomicsCacheService
         $ozonData = $product->ozon_data ?? [];
         $commissions = $ozonData['commissions'] ?? [];
         $redemption = $ozonData['redemption'] ?? [];
-        
+
         // Получаем существующую запись UnitEconomics (там актуальные данные)
         $existingUE = $this->getUnitEconomicsCached($product->integration_id, $product->sku, null);
-        
+
         // Определяем комиссию по схеме
         // ПРИОРИТЕТ: ozon_data.commissions (актуальные из API товаров) > UnitEconomics > дефолт
         $schemeKey = strtolower($fulfillmentType);
@@ -1421,53 +1399,53 @@ class UnitEconomicsCacheService
         if ($schemeKey === 'realfbs' || $schemeKey === 'dbs') {
             $schemeKey = 'rfbs';
         }
-        
+
         // Берём комиссию для конкретной схемы, fallback на FBS, затем FBO
-        $commissionPercent = $commissions[$schemeKey]['percent'] 
+        $commissionPercent = $commissions[$schemeKey]['percent']
             ?? $commissions['fbs']['percent']
-            ?? $commissions['fbo']['percent'] 
+            ?? $commissions['fbo']['percent']
             ?? $existingUE?->commission_percent
             ?? 15;
-        
+
         // Процент выкупа: переопределение пользователя > UnitEconomics > ozon_data > 100
-        $redemptionRate = $settings?->redemption_rate_override 
+        $redemptionRate = $settings?->redemption_rate_override
             ?? $existingUE?->redemption_rate
-            ?? $redemption['redemption_rate'] 
+            ?? $redemption['redemption_rate']
             ?? 100;
-        
+
         // Время доставки и коэффициент из UnitEconomics
         $avgDeliveryTimeHours = $existingUE?->avg_delivery_time_hours ?? 29;
-        
+
         // Габариты
-        $volumeLiters = $product->volume_liters 
+        $volumeLiters = $product->volume_liters
             ?? $existingUE?->volume_liters
-            ?? ($product->depth && $product->width && $product->height 
-                ? ($product->depth * $product->width * $product->height) / 1000000 
+            ?? ($product->depth && $product->width && $product->height
+                ? ($product->depth * $product->width * $product->height) / 1000000
                 : 1);
-        
+
         // Себестоимость: настройки пользователя (если > 0) > UnitEconomics > 0
-        $costPrice = ($settings?->cost_price && $settings->cost_price > 0) 
-            ? $settings->cost_price 
+        $costPrice = ($settings?->cost_price && $settings->cost_price > 0)
+            ? $settings->cost_price
             : ($existingUE?->cost_price ?? 0);
-        
+
         // Актуальная цена с учётом акций (marketing_seller_price):
         // 1. ozon_data['actual_price'] — уже рассчитан с учётом акций
         // 2. ozon_data['marketing_seller_price'] — цена с акцией из API
         // 3. ozon_data['commissions']['actual_price'] — в commissions (старый формат)
         // 4. UnitEconomics->price — там сохраняется актуальная цена
         // 5. Product->price — fallback
-        $actualPrice = $ozonData['actual_price'] 
+        $actualPrice = $ozonData['actual_price']
             ?? $ozonData['marketing_seller_price']
-            ?? $commissions['actual_price'] 
-            ?? $existingUE?->price 
+            ?? $commissions['actual_price']
+            ?? $existingUE?->price
             ?? $product->price;
-        
+
         // Если marketing_seller_price меньше actual_price — используем его (акция)
         $marketingPrice = (float) ($ozonData['marketing_seller_price'] ?? 0);
         if ($marketingPrice > 0 && $marketingPrice < $actualPrice) {
             $actualPrice = $marketingPrice;
         }
-        
+
         return [
             'price' => (float) $actualPrice,
             'cost_price' => (float) $costPrice,
@@ -1502,19 +1480,19 @@ class UnitEconomicsCacheService
         // Получаем информацию об акциях
         // Приоритет: UnitEconomics (синхронизируется из API) > ozon_data > commissions
         $existingUE = $this->getUnitEconomicsCached($product->integration_id, $product->sku, $fulfillmentType);
-        
+
         $ozonData = $product->ozon_data ?? [];
         $commissions = $ozonData['commissions'] ?? [];
-        
-        $isInPromotion = $existingUE?->is_in_promotion 
-            ?? $ozonData['is_in_promotion'] 
-            ?? $commissions['is_in_promotion'] 
+
+        $isInPromotion = $existingUE?->is_in_promotion
+            ?? $ozonData['is_in_promotion']
+            ?? $commissions['is_in_promotion']
             ?? false;
-        $promotionDiscount = $existingUE?->promotion_discount 
-            ?? $ozonData['promotion_discount'] 
-            ?? $commissions['promotion_discount'] 
+        $promotionDiscount = $existingUE?->promotion_discount
+            ?? $ozonData['promotion_discount']
+            ?? $commissions['promotion_discount']
             ?? 0;
-        
+
         return [
             'product_id' => $product->id,
             'product_name' => $product->name,
@@ -1582,7 +1560,7 @@ class UnitEconomicsCacheService
 
     /**
      * Получить схемы для маркетплейса
-     * 
+     *
      * WB схемы:
      * - FBW/FBO: Склад WB (логистика WB, хранение WB)
      * - FBS: Ваш склад, логистика WB
@@ -1615,9 +1593,9 @@ class UnitEconomicsCacheService
                 ->get()
                 ->keyBy('fulfillment_type')
                 ->toArray();
-            
+
             $totalProducts = Product::where('integration_id', $integrationId)->count();
-            
+
             return [
                 'total_products' => $totalProducts,
                 'schemes' => $stats,
@@ -1775,11 +1753,11 @@ class UnitEconomicsCacheService
             $clusterNameKey = $this->normalizeClusterKey($cluster['cluster_name'] ?? null);
 
             if ($clusterId !== null) {
-                $lookup['id:' . $clusterId] = $cluster;
+                $lookup['id:'.$clusterId] = $cluster;
             }
 
             if ($clusterNameKey !== null) {
-                $lookup['name:' . $clusterNameKey] = $cluster;
+                $lookup['name:'.$clusterNameKey] = $cluster;
             }
         }
 
@@ -1789,13 +1767,13 @@ class UnitEconomicsCacheService
     private function findOzonClusterMatch(array $cluster, array $lookup): array
     {
         $clusterId = isset($cluster['cluster_id']) && $cluster['cluster_id'] !== '' ? (string) $cluster['cluster_id'] : null;
-        if ($clusterId !== null && isset($lookup['id:' . $clusterId])) {
-            return $lookup['id:' . $clusterId];
+        if ($clusterId !== null && isset($lookup['id:'.$clusterId])) {
+            return $lookup['id:'.$clusterId];
         }
 
         $clusterNameKey = $this->normalizeClusterKey($cluster['cluster_name'] ?? null);
-        if ($clusterNameKey !== null && isset($lookup['name:' . $clusterNameKey])) {
-            return $lookup['name:' . $clusterNameKey];
+        if ($clusterNameKey !== null && isset($lookup['name:'.$clusterNameKey])) {
+            return $lookup['name:'.$clusterNameKey];
         }
 
         return [];
@@ -1821,14 +1799,14 @@ class UnitEconomicsCacheService
      * (FBS/DBW/DBS/EDBS) — по складам продавца. Иначе у FBW-товара в КС подмешивались
      * бы FBS-склады (и наоборот) — пользователь видел бы чужой коэффициент.
      *
-     * @param string $sku SKU товара
-     * @param string $marketplace Маркетплейс
-     * @param string $scheme Схема работы (FBW/FBS/DBW/...) — для фильтра складов
+     * @param  string  $sku  SKU товара
+     * @param  string  $marketplace  Маркетплейс
+     * @param  string  $scheme  Схема работы (FBW/FBS/DBW/...) — для фильтра складов
      * @return float Средний КС (1.0 = 100%, 1.4 = 140%)
      */
     private function getAverageWarehouseCoefficient(int $integrationId, string $sku, string $marketplace, string $scheme = ''): float
     {
-        $cacheKey = $integrationId . '|' . $marketplace . '|' . $sku . '|' . strtoupper($scheme);
+        $cacheKey = $integrationId.'|'.$marketplace.'|'.$sku.'|'.strtoupper($scheme);
         if (array_key_exists($cacheKey, $this->warehouseCoefficientCache)) {
             return $this->warehouseCoefficientCache[$cacheKey];
         }
@@ -1850,13 +1828,14 @@ class UnitEconomicsCacheService
 
         if ($warehouses->isEmpty()) {
             $this->warehouseCoefficientCache[$cacheKey] = 1.0;
+
             return 1.0; // По умолчанию 100%
         }
-        
+
         // Склады с остатками — взвешенное среднее
-        $warehousesWithStock = $warehouses->filter(fn($w) => $w->quantity > 0);
+        $warehousesWithStock = $warehouses->filter(fn ($w) => $w->quantity > 0);
         $totalQuantity = $warehousesWithStock->sum('quantity');
-        
+
         if ($totalQuantity > 0) {
             $weightedSum = 0;
             foreach ($warehousesWithStock as $wh) {
@@ -1864,10 +1843,12 @@ class UnitEconomicsCacheService
                 $weightedSum += $coef * $wh->quantity;
             }
             $this->warehouseCoefficientCache[$cacheKey] = $weightedSum / $totalQuantity;
+
             return $this->warehouseCoefficientCache[$cacheKey];
         }
 
         $this->warehouseCoefficientCache[$cacheKey] = 1.0;
+
         return 1.0;
     }
 
@@ -1905,6 +1886,7 @@ class UnitEconomicsCacheService
                 return (float) $v / 100;
             }
         }
+
         return null;
     }
 
@@ -1982,6 +1964,7 @@ class UnitEconomicsCacheService
                     return (float) $v / 100;
                 }
             }
+
             return null;
         };
 
@@ -2161,6 +2144,7 @@ class UnitEconomicsCacheService
                     return (float) $v / 100;
                 }
             }
+
             return null;
         };
 
@@ -2282,6 +2266,7 @@ class UnitEconomicsCacheService
         foreach ($snapshots as $snapshot) {
             if ($snapshot->tariff_type === 'return' && $returnPayload === []) {
                 $returnPayload = is_array($snapshot->payload) ? $snapshot->payload : [];
+
                 continue;
             }
 
@@ -2295,6 +2280,7 @@ class UnitEconomicsCacheService
                         $acceptanceDeliveryByWarehouse[$name] = (float) $raw;
                     }
                 }
+
                 continue;
             }
 
@@ -2367,23 +2353,23 @@ class UnitEconomicsCacheService
      */
     private function loadWildberriesCommissionBySubject(int $integrationId): array
     {
-        if (\Illuminate\Support\Facades\DB::connection()->getDriverName() !== 'pgsql') {
+        if (DB::connection()->getDriverName() !== 'pgsql') {
             return [];
         }
 
-        $subjectIds = \Illuminate\Support\Facades\DB::table('products')
+        $subjectIds = DB::table('products')
             ->where('integration_id', $integrationId)
             ->where('marketplace', 'wildberries')
             ->whereRaw("wb_data->>'subjectID' IS NOT NULL AND wb_data->>'subjectID' <> ''")
             ->distinct()
-            ->pluck(\Illuminate\Support\Facades\DB::raw("wb_data->>'subjectID' as sid"))
+            ->pluck(DB::raw("wb_data->>'subjectID' as sid"))
             ->all();
 
         if ($subjectIds === []) {
             return [];
         }
 
-        $rows = \Illuminate\Support\Facades\DB::table('wildberries_tariff_snapshots')
+        $rows = DB::table('wildberries_tariff_snapshots')
             ->selectRaw('DISTINCT ON (subject_id) subject_id, payload')
             ->where('integration_id', $integrationId)
             ->where('tariff_type', 'commission')
@@ -2529,12 +2515,13 @@ class UnitEconomicsCacheService
         }
 
         $this->integrationCache[$integrationId] = Integration::find($integrationId);
+
         return $this->integrationCache[$integrationId];
     }
 
     private function getUnitEconomicsCached(int $integrationId, string $sku, ?string $fulfillmentType): ?UnitEconomics
     {
-        $key = $integrationId . '|' . $sku . '|' . ($fulfillmentType ? strtoupper($fulfillmentType) : '');
+        $key = $integrationId.'|'.$sku.'|'.($fulfillmentType ? strtoupper($fulfillmentType) : '');
         if (array_key_exists($key, $this->unitEconomicsCache)) {
             return $this->unitEconomicsCache[$key];
         }
@@ -2546,6 +2533,7 @@ class UnitEconomicsCacheService
         }
 
         $this->unitEconomicsCache[$key] = $query->first();
+
         return $this->unitEconomicsCache[$key];
     }
 
@@ -2560,7 +2548,7 @@ class UnitEconomicsCacheService
 
     private function getSettingsCached(int $integrationId, string $sku): ?UnitEconomicsSettings
     {
-        $key = $integrationId . '|' . $sku;
+        $key = $integrationId.'|'.$sku;
         if (array_key_exists($key, $this->settingsCache)) {
             return $this->settingsCache[$key];
         }
@@ -2575,12 +2563,13 @@ class UnitEconomicsCacheService
     private function forgetUnitEconomicsCache(int $integrationId, string $sku, ?string $fulfillmentType = null): void
     {
         if ($fulfillmentType !== null) {
-            $key = $integrationId . '|' . $sku . '|' . strtoupper($fulfillmentType);
+            $key = $integrationId.'|'.$sku.'|'.strtoupper($fulfillmentType);
             unset($this->unitEconomicsCache[$key]);
+
             return;
         }
 
-        $prefix = $integrationId . '|' . $sku . '|';
+        $prefix = $integrationId.'|'.$sku.'|';
         foreach (array_keys($this->unitEconomicsCache) as $key) {
             if (str_starts_with($key, $prefix)) {
                 unset($this->unitEconomicsCache[$key]);
@@ -2590,7 +2579,7 @@ class UnitEconomicsCacheService
 
     private function forgetSettingsCache(int $integrationId, string $sku): void
     {
-        $key = $integrationId . '|' . $sku;
+        $key = $integrationId.'|'.$sku;
         unset($this->settingsCache[$key]);
     }
 
@@ -2601,7 +2590,7 @@ class UnitEconomicsCacheService
         Cache::forget("ue_actual_scheme_{$integrationId}_{$marketplace}");
 
         foreach ($schemes as $scheme) {
-            Cache::forget("ue_stats_{$integrationId}_{$marketplace}_" . strtoupper($scheme));
+            Cache::forget("ue_stats_{$integrationId}_{$marketplace}_".strtoupper($scheme));
         }
     }
 
