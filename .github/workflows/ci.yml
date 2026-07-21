@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  critical-tests:
+    name: critical-tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      APP_ENV: testing
+      APP_KEY: base64:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+      CACHE_STORE: array
+      DB_CONNECTION: sqlite
+      DB_DATABASE: ':memory:'
+      QUEUE_CONNECTION: sync
+      SESSION_DRIVER: array
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          extensions: mbstring, pdo_sqlite, sqlite3, intl, gd, zip
+          coverage: none
+          tools: composer:v2
+
+      - name: Cache Composer packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.composer/cache/files
+          key: composer-${{ runner.os }}-${{ hashFiles('composer.lock') }}
+          restore-keys: composer-${{ runner.os }}-
+
+      - name: Validate dependencies
+        run: composer validate --strict --no-check-publish
+
+      - name: Install dependencies
+        run: composer install --no-interaction --prefer-dist --no-progress
+
+      - name: Check PHP syntax
+        run: find app routes config database/migrations tests -name '*.php' -print0 | xargs -0 -n1 php -l
+
+      - name: Run price and unit-economics regression tests
+        run: >-
+          php -d memory_limit=512M artisan test
+          tests/Unit/MarketplacePriceResolverTest.php
+          tests/Unit/UnitEconomicsCacheServiceTest.php
+          tests/Unit/OzonCurrentPricePersistenceTest.php
+          tests/Unit/SyncUnitEconomicsCommandExitCodeTest.php
+          tests/Feature/UnitEconomicsPriceIntegrityTest.php
+          tests/Feature/UnitEconomicsCacheConsistencyTest.php
+          tests/Feature/HealthEndpointTest.php
+
+      - name: Report dependency vulnerabilities
+        continue-on-error: true
+        run: composer audit --locked --no-interaction

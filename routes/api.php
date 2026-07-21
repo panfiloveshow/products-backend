@@ -40,6 +40,7 @@ use Illuminate\Support\Facades\Route;
 Route::get('/health', fn () => response()->json([
     'status' => 'ok',
     'service' => 'products-backend',
+    'release' => config('app.release'),
     'time' => now()->toIso8601String(),
 ]))->name('health');
 
