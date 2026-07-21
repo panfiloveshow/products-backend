@@ -77,4 +77,40 @@ class UnitEconomicsPriceIntegrityTest extends TestCase
         $this->assertTrue($healthy['healthy']);
         $this->assertSame([], $healthy['issues']);
     }
+
+    public function test_ignores_archived_zero_stock_card_but_flags_sellable_card_without_price_once(): void
+    {
+        $integration = Integration::create([
+            'id' => 902,
+            'name' => 'WB integrity test',
+            'marketplace' => 'wildberries',
+            'credentials' => ['api_key' => 'test'],
+            'is_active' => true,
+        ]);
+        Product::create([
+            'sku' => 'WB-ARCHIVED',
+            'name' => 'Archived card',
+            'marketplace' => 'wildberries',
+            'integration_id' => $integration->id,
+            'price' => null,
+            'stock' => 0,
+        ]);
+        Product::create([
+            'sku' => 'WB-SELLABLE',
+            'name' => 'Sellable card',
+            'marketplace' => 'wildberries',
+            'integration_id' => $integration->id,
+            'price' => null,
+            'stock' => 3,
+        ]);
+
+        $report = $this->app->make(UnitEconomicsPriceIntegrityService::class)
+            ->inspectIntegration($integration, maxAgeMinutes: 0);
+
+        $missingSources = collect($report['issues'])->where('type', 'missing_price_source');
+
+        $this->assertCount(1, $missingSources);
+        $this->assertSame('WB-SELLABLE', $missingSources->first()['sku']);
+        $this->assertSame('FBO', $missingSources->first()['scheme']);
+    }
 }

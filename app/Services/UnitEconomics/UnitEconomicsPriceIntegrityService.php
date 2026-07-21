@@ -58,6 +58,7 @@ class UnitEconomicsPriceIntegrityService
 
         $issues = [];
         $staleSkus = [];
+        $missingPriceSkus = [];
         $schemes = $this->schemesForMarketplace($integration->marketplace);
 
         foreach ($products as $product) {
@@ -78,8 +79,14 @@ class UnitEconomicsPriceIntegrityService
                 );
                 $pricesByScheme[$scheme] = $resolved['price'];
                 $cache = $cacheByScheme->get($key);
+                $priceRequired = $this->priceIsRequired($product, $cache);
 
-                if ($resolved['price'] <= 0) {
+                if (
+                    $resolved['price'] <= 0
+                    && ! isset($missingPriceSkus[$product->sku])
+                    && $priceRequired
+                ) {
+                    $missingPriceSkus[$product->sku] = true;
                     $issues[] = $this->issue(
                         'missing_price_source',
                         $product,
@@ -112,7 +119,8 @@ class UnitEconomicsPriceIntegrityService
                 }
 
                 if (
-                    ! isset($staleSkus[$product->sku])
+                    $resolved['price'] > 0
+                    && ! isset($staleSkus[$product->sku])
                     && $this->isStale($resolved['observed_timestamp'], $maxAgeMinutes)
                 ) {
                     $staleSkus[$product->sku] = true;
@@ -213,6 +221,15 @@ class UnitEconomicsPriceIntegrityService
 
         return $observedTimestamp === null
             || $observedTimestamp < now()->subMinutes($maxAgeMinutes)->getTimestamp();
+    }
+
+    private function priceIsRequired(Product $product, ?UnitEconomicsCache $cache): bool
+    {
+        // WB оставляет в каталоге архивные карточки без цены и без остатка.
+        // Нулевая цена у такой карточки ожидаема и не должна превращать монитор
+        // в постоянную ложную аварию. Но продаваемая карточка или потеря ранее
+        // известной cache-цены остаются критичной проблемой.
+        return (int) $product->stock > 0 || (float) ($cache?->price ?? 0) > 0;
     }
 
     private function marketplaceData(Product $product): array
