@@ -1,1 +1,2 @@
-*/10 * * * * www-data cd /var/www/products-backend && php artisan ue:price-integrity --marketplace=ozon,wildberries --max-age-minutes=2880 --repair --fail-on-drift --log >> storage/logs/ue-price-integrity.log 2>&1
+*/10 * * * * www-data cd /var/www/products-backend && php artisan ue:price-integrity --marketplace=ozon --max-age-minutes=2880 --repair --fail-on-drift --log >> storage/logs/ue-price-integrity.log 2>&1
+5-59/10 * * * * www-data cd /var/www/products-backend && php artisan ue:price-integrity --marketplace=wildberries --max-age-minutes=0 --repair --fail-on-drift --log >> storage/logs/ue-price-integrity.log 2>&1
