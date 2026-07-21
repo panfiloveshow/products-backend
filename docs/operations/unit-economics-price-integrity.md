@@ -18,8 +18,14 @@
 Продовый cron запускает проверку каждые 10 минут:
 
 ```bash
-php artisan ue:price-integrity --marketplace=ozon,wildberries --max-age-minutes=2880 --repair --fail-on-drift --log
+php artisan ue:price-integrity --marketplace=ozon --max-age-minutes=2880 --repair --fail-on-drift --log
+php artisan ue:price-integrity --marketplace=wildberries --max-age-minutes=0 --repair --fail-on-drift --log
 ```
+
+Для Ozon проверяется и возраст `price_observed_at`. Исторические WB-данные не
+всегда содержат отдельное время наблюдения цены, поэтому для WB этот критерий
+отключён: там проверяются сама действующая цена и согласованность кэша, а общую
+свежесть синхронизации контролирует существующий `ue:sanity-check`.
 
 Проверка ловит:
 
