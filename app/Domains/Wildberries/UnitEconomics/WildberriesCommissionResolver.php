@@ -28,11 +28,12 @@ final class WildberriesCommissionResolver
             'DBW' => 'dbw',
             default => 'fbo',
         };
+        // DBS и DBW у WB — одна колонка комиссии «Витрина/Курьер WB» (kgvpSupplier).
         $apiScheme = match ($scheme) {
             'FBS' => 'fbs',
             'EDBS' => 'fbs_express',
-            'DBS' => 'pickup',
-            'DBW' => 'booking',
+            'DBS' => 'dbs',
+            'DBW' => 'dbs',
             default => 'fbo',
         };
 

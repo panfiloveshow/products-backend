@@ -450,13 +450,15 @@ class WildberriesMarketplace implements LegacyMarketplaceInterface, MarketplaceI
         $commissionData = $commissionData ?: [];
         $fbo = (float) ($commissionData['fbo'] ?? 15.0);
         $fbs = (float) ($commissionData['fbs'] ?? $fbo);
+        // У WB «Витрина (DBS)» и «Курьер WB (DBW)» — одна колонка комиссии.
+        $dbs = (float) ($commissionData['dbs'] ?? $fbs);
 
         return [
             'fbo' => ['percent' => $fbo, 'category' => $category],
             'fbs' => ['percent' => $fbs, 'category' => $category],
             'edbs' => ['percent' => (float) ($commissionData['fbs_express'] ?? $fbs), 'category' => $category],
-            'dbs' => ['percent' => (float) ($commissionData['pickup'] ?? $fbs), 'category' => $category],
-            'dbw' => ['percent' => (float) ($commissionData['booking'] ?? $fbs), 'category' => $category],
+            'dbs' => ['percent' => $dbs, 'category' => $category],
+            'dbw' => ['percent' => $dbs, 'category' => $category],
             'paid_storage' => ['percent' => (float) ($commissionData['paid_storage'] ?? 0.0), 'category' => $category],
         ];
     }
