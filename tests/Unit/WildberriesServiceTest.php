@@ -170,8 +170,11 @@ class WildberriesServiceTest extends TestCase
             'common-api.wildberries.ru/api/v1/tariffs/commission*' => Http::response([
                 'report' => [[
                     'subjectID' => 333,
-                    'kgvpMarketplace' => 12,
-                    'kgvpSupplier' => 10,
+                    // Семантика WB: paidStorageKgvp = «Склад WB» (FBW/FBO),
+                    // kgvpMarketplace = «Маркетплейс» (FBS), kgvpSupplier = «Витрина/Курьер WB» (DBS/DBW).
+                    'paidStorageKgvp' => 25.5,
+                    'kgvpMarketplace' => 30,
+                    'kgvpSupplier' => 4.5,
                     'kgvpSupplierExpress' => 3,
                     'kgvpPickup' => 8,
                     'kgvpBooking' => 7,
@@ -187,9 +190,12 @@ class WildberriesServiceTest extends TestCase
         $this->assertSame(1800.0, $bySku['BAR-M']['price']);
         $this->assertSame('111:BAR-S', $bySku['BAR-S']['marketplace_id']);
         $this->assertSame('111:BAR-M', $bySku['BAR-M']['marketplace_id']);
-        $this->assertSame(3.0, $bySku['BAR-M']['wb_data']['commissions_by_scheme']['edbs']['percent']);
-        $this->assertSame(8.0, $bySku['BAR-M']['wb_data']['commissions_by_scheme']['dbs']['percent']);
-        $this->assertSame(7.0, $bySku['BAR-M']['wb_data']['commissions_by_scheme']['dbw']['percent']);
+        $schemes = $bySku['BAR-M']['wb_data']['commissions_by_scheme'];
+        $this->assertSame(25.5, $schemes['fbo']['percent']);
+        $this->assertSame(30.0, $schemes['fbs']['percent']);
+        $this->assertSame(3.0, $schemes['edbs']['percent']);
+        $this->assertSame(4.5, $schemes['dbs']['percent']);
+        $this->assertSame(4.5, $schemes['dbw']['percent']);
     }
 
     public function test_domain_products_api_does_not_rescan_cards_for_dimensions_by_default(): void

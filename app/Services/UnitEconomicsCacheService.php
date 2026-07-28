@@ -2408,7 +2408,7 @@ class UnitEconomicsCacheService
         }
 
         // scheme-ключ ЮЭ → ключ в raw снапшота (тот же маппинг, что делает синк товаров).
-        $rawKeyByScheme = ['fbo' => 'fbo', 'fbs' => 'fbs', 'edbs' => 'fbs_express', 'dbs' => 'pickup', 'dbw' => 'booking'];
+        $rawKeyByScheme = ['fbo' => 'fbo', 'fbs' => 'fbs', 'edbs' => 'fbs_express', 'dbs' => 'dbs', 'dbw' => 'dbs'];
         foreach ([$schemeKey, 'fbs', 'fbo'] as $key) {
             $rawKey = $rawKeyByScheme[$key] ?? null;
             if ($rawKey !== null && isset($raw[$rawKey]) && is_numeric($raw[$rawKey])) {

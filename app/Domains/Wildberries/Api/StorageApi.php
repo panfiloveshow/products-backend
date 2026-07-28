@@ -258,9 +258,13 @@ class StorageApi
                 $subjectId = $item['subjectID'] ?? null;
                 if (!$subjectId) continue;
                 
+                // Семантика полей WB обманчива: paidStorageKgvp — комиссия «Склад WB»
+                // (FBW/FBO), kgvpMarketplace — схема «Маркетплейс» (FBS),
+                // kgvpSupplier — «Витрина (DBS)/Курьер WB (DBW)», kgvpPickup — C&C.
                 $commissions[$subjectId] = [
-                    'fbo' => (float)($item['kgvpMarketplace'] ?? 15.0),
-                    'fbs' => (float)($item['kgvpSupplier'] ?? 15.0),
+                    'fbo' => (float)($item['paidStorageKgvp'] ?? $item['kgvpMarketplace'] ?? 15.0),
+                    'fbs' => (float)($item['kgvpMarketplace'] ?? 15.0),
+                    'dbs' => (float)($item['kgvpSupplier'] ?? 15.0),
                     'fbs_express' => (float)($item['kgvpSupplierExpress'] ?? 3.0),
                     'pickup' => (float)($item['kgvpPickup'] ?? 15.0),
                     'booking' => (float)($item['kgvpBooking'] ?? 15.0),
@@ -279,6 +283,7 @@ class StorageApi
             $commissions['default'] = [
                 'fbo' => 15.0,
                 'fbs' => 15.0,
+                'dbs' => 15.0,
                 'fbs_express' => 3.0,
                 'pickup' => 15.0,
                 'booking' => 15.0,
@@ -314,12 +319,13 @@ class StorageApi
                 }
 
                 foreach (['fbo', 'fbs', 'edbs', 'dbs', 'dbw'] as $scheme) {
+                    // DBS и DBW у WB — одна колонка комиссии «Витрина/Курьер WB».
                     $sourceKey = match ($scheme) {
                         'fbo' => 'fbo',
                         'fbs' => 'fbs',
                         'edbs' => 'fbs_express',
-                        'dbs' => 'pickup',
-                        'dbw' => 'booking',
+                        'dbs' => 'dbs',
+                        'dbw' => 'dbs',
                     };
 
                     $snapshots[] = [
@@ -451,6 +457,7 @@ class StorageApi
             'default' => [
                 'fbo' => 15.0,
                 'fbs' => 15.0,
+                'dbs' => 15.0,
                 'fbs_express' => 3.0,
                 'pickup' => 15.0,
                 'booking' => 15.0,

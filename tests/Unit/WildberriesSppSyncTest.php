@@ -244,15 +244,15 @@ class WildberriesSppSyncTest extends TestCase
             'fbo' => 48,
             'fbs' => 45,
             'fbs_express' => 3,
-            'pickup' => 44.5,
-            'booking' => 44,
+            'dbs' => 44.5,
         ];
 
         $this->assertSame(48.0, WildberriesCommissionResolver::resolve([], $commission, 'FBO'));
         $this->assertSame(45.0, WildberriesCommissionResolver::resolve([], $commission, 'FBS'));
         $this->assertSame(3.0, WildberriesCommissionResolver::resolve([], $commission, 'EDBS'));
+        // DBS и DBW у WB — одна колонка комиссии «Витрина/Курьер WB»
         $this->assertSame(44.5, WildberriesCommissionResolver::resolve([], $commission, 'DBS'));
-        $this->assertSame(44.0, WildberriesCommissionResolver::resolve([], $commission, 'DBW'));
+        $this->assertSame(44.5, WildberriesCommissionResolver::resolve([], $commission, 'DBW'));
     }
 
     public function test_commission_resolver_prefers_live_snapshot_and_reports_fallback_source(): void

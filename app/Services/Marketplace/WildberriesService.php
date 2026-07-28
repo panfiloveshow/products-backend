@@ -456,13 +456,15 @@ class WildberriesService implements MarketplaceInterface
         $commissionData = $commissionData ?: [];
         $fbo = (float) ($commissionData['fbo'] ?? 15.0);
         $fbs = (float) ($commissionData['fbs'] ?? $fbo);
+        // У WB «Витрина (DBS)» и «Курьер WB (DBW)» — одна колонка комиссии.
+        $dbs = (float) ($commissionData['dbs'] ?? $fbs);
 
         return [
             'fbo' => ['percent' => $fbo],
             'fbs' => ['percent' => $fbs],
             'edbs' => ['percent' => (float) ($commissionData['fbs_express'] ?? $fbs)],
-            'dbs' => ['percent' => (float) ($commissionData['pickup'] ?? $fbs)],
-            'dbw' => ['percent' => (float) ($commissionData['booking'] ?? $fbs)],
+            'dbs' => ['percent' => $dbs],
+            'dbw' => ['percent' => $dbs],
             'paid_storage' => ['percent' => (float) ($commissionData['paid_storage'] ?? 0.0)],
         ];
     }
@@ -999,9 +1001,13 @@ class WildberriesService implements MarketplaceInterface
                     continue;
                 }
 
+                // Семантика полей WB обманчива: paidStorageKgvp — комиссия «Склад WB»
+                // (FBW/FBO), kgvpMarketplace — схема «Маркетплейс» (FBS),
+                // kgvpSupplier — «Витрина (DBS)/Курьер WB (DBW)», kgvpPickup — C&C.
                 $result[(string) $subjectId] = [
-                    'fbo' => (float) ($item['kgvpMarketplace'] ?? 15.0),
-                    'fbs' => (float) ($item['kgvpSupplier'] ?? 15.0),
+                    'fbo' => (float) ($item['paidStorageKgvp'] ?? $item['kgvpMarketplace'] ?? 15.0),
+                    'fbs' => (float) ($item['kgvpMarketplace'] ?? 15.0),
+                    'dbs' => (float) ($item['kgvpSupplier'] ?? 15.0),
                     'fbs_express' => (float) ($item['kgvpSupplierExpress'] ?? $item['kgvpSupplier'] ?? 15.0),
                     'pickup' => (float) ($item['kgvpPickup'] ?? $item['kgvpSupplier'] ?? 15.0),
                     'booking' => (float) ($item['kgvpBooking'] ?? $item['kgvpSupplier'] ?? 15.0),
