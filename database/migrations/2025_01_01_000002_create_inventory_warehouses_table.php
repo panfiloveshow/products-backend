@@ -28,7 +28,7 @@ return new class extends Migration
             $table->index('marketplace');
             $table->index('stock_status');
 
-            // ponytail: FK sku → products.sku не создаём. products.sku уникален только
+            // Примечание: FK sku → products.sku не создаём. products.sku уникален только
             // в паре (marketplace, sku, integration_id), поэтому на проде этого FK нет,
             // а sqlite-схема тестов с ним ломала любую вставку ("foreign key mismatch").
         });

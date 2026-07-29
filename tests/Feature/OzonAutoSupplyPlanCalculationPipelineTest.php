@@ -144,6 +144,7 @@ class OzonAutoSupplyPlanCalculationPipelineTest extends TestCase
 
         $snapshot = PlanningFactSnapshot::query()->where('auto_supply_plan_id', $plan->id)->firstOrFail();
         $this->assertSame($effective, $snapshot->params_json['effective']);
+        $this->assertSame(64, strlen((string) $snapshot->summary_json['params_hash']));
     }
 
     public function test_budget_limit_is_never_exceeded(): void

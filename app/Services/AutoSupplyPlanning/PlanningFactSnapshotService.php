@@ -141,8 +141,12 @@ class PlanningFactSnapshotService
             $payload['facts_freshness'] ?? [],
             ['registry' => $registry]
         );
+        $previousSummary = is_array($snapshot->summary_json) ? $snapshot->summary_json : [];
         $summary = array_merge($payload['summary'] ?? [], [
             'stage' => 'completed',
+            // params_hash пишут start() и recordEffectiveParams(); без переноса
+            // он терялся здесь, и снимок нельзя было сверить по параметрам.
+            'params_hash' => $previousSummary['params_hash'] ?? null,
             'facts_hash' => $registry['hash'] ?? null,
             'demand_hash' => $this->hash($payload['demand_facts'] ?? []),
             'stock_hash' => $this->hash($payload['stock_facts'] ?? []),
