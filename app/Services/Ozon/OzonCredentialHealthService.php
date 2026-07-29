@@ -102,7 +102,13 @@ class OzonCredentialHealthService
         $result = $this->assess($integration);
         $checkedAt = now();
 
-        if ($probe && ($result['usable'] ?? false) && $integration->marketplace === 'ozon') {
+        // Пробуем живой запрос всегда, когда есть чем: раньше условие требовало
+        // usable=true, а сохранённый invalid как раз даёт usable=false — статус
+        // залипал навсегда, потому что переспросить Ozon было уже некому.
+        // Пропускаем только случаи, когда пробовать нечем.
+        $nothingToProbeWith = in_array($result['status'] ?? null, ['missing', 'expired'], true);
+
+        if ($probe && $integration->marketplace === 'ozon' && ! $nothingToProbeWith) {
             try {
                 // /v3/product/list принимает фильтр видимости и не требует
                 // идентификаторов товара. Родственный /v3/product/info/list
