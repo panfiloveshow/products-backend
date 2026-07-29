@@ -1825,6 +1825,34 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
             ],
         ]);
 
+        // Параметры, которые расчёт применил на самом деле: часть запрошенных
+        // зажимается горизонтом, часть приходит из SupplySettings, часть
+        // принудительно нормализуется. Без этого effective_params_json был бы
+        // просто копией requested и не давал воспроизвести результат.
+        app(PlanningFactSnapshotService::class)->recordEffectiveParams($plan, [
+            'horizon_days' => $horizonDays,
+            'min_cover_days' => $minCoverDays,
+            'target_cover_days' => $planDefaultTargetDays,
+            'max_cover_days' => $maxCoverDays,
+            'max_cover_days_clamped_by_horizon' => $maxCoverDaysClamped,
+            'safety_stock_days' => $minSafetyDays,
+            'lead_time_days' => $leadTimeDays,
+            'turnover_limit_days' => $turnoverLimitDays,
+            'analysis_period_days' => $analysisPeriodDays,
+            'include_in_transit' => $includeInTransit,
+            'skip_negative_profit' => $skipNegativeProfit,
+            'budget_limit' => $budgetLimit > 0 ? $budgetLimit : null,
+            'ozon_qty_anchor' => $ozonQtyAnchor,
+            'ozon_qty_anchor_requested' => $requestedOzonQtyAnchor,
+            'promo_mode' => $promoMode,
+            'demand_seasonality_multiplier' => $seasonalityMultiplier,
+            'trend_multiplier' => $trendMultiplier,
+            'settings_source' => $settings ? 'supply_settings' : 'defaults',
+            'safety_stock_sigma_lead_time' => $ssSigmaLtEnabled,
+            'safety_stock_service_level_z' => $ssServiceLevelZ,
+            'selected_cluster_ids' => $selectedOzonClusterIds,
+        ]);
+
         app(PlanningFactSnapshotService::class)->complete($plan, [
             'facts_freshness' => $factsFreshness,
             'planning_sources' => $planningFactSources,
@@ -2219,8 +2247,8 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
                 ->join('supplies', 'supply_items.supply_id', '=', 'supplies.id')
                 ->where('supplies.integration_id', $integrationId)
                 ->whereIn('supplies.status', $statuses)
-                ->selectRaw('supply_items.sku, supplies.warehouse_name, SUM(supply_items.planned_qty) as qty')
-                ->groupBy('supply_items.sku', 'supplies.warehouse_name')
+                ->selectRaw('supply_items.sku, supplies.cluster_id, supplies.warehouse_name, SUM(supply_items.planned_qty) as qty')
+                ->groupBy('supply_items.sku', 'supplies.cluster_id', 'supplies.warehouse_name')
                 ->get();
         } catch (\Throwable) {
             return [];
@@ -2228,17 +2256,26 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
 
         $result = [];
         foreach ($rows as $row) {
-            if (! $row->warehouse_name) {
-                continue;
+            // Поставки, материализованные из автоплана, знают свой кластер, но не склад.
+            // Читаем cluster_id напрямую, иначе собственный товар в пути не учитывается
+            // и следующий план закажет его повторно.
+            $clusterId = is_numeric($row->cluster_id) ? (int) $row->cluster_id : null;
+
+            if ($clusterId === null) {
+                if (! $row->warehouse_name) {
+                    continue;
+                }
+
+                $normalizedName = OzonWarehouseCluster::normalizeWarehouseName((string) $row->warehouse_name);
+                $cluster = $clusterMapping[$normalizedName] ?? null;
+                if ($cluster === null) {
+                    continue;
+                }
+
+                $clusterId = (int) $cluster['cluster_id'];
             }
 
-            $normalizedName = OzonWarehouseCluster::normalizeWarehouseName((string) $row->warehouse_name);
-            $cluster = $clusterMapping[$normalizedName] ?? null;
-            if ($cluster === null) {
-                continue;
-            }
-
-            $key = (string) $row->sku . '|' . (int) $cluster['cluster_id'];
+            $key = (string) $row->sku . '|' . $clusterId;
             $result[$key] = ($result[$key] ?? 0) + (int) $row->qty;
         }
 
