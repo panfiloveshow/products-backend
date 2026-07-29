@@ -7,7 +7,7 @@ use Illuminate\Database\Eloquent\Model;
 
 class SellerWarehouseStock extends Model
 {
-    use HasFactory;
+    use HasFactory, Traits\BelongsToCurrentWorkspaceThroughIntegration;
 
     protected $fillable = [
         'integration_id',

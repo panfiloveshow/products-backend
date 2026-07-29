@@ -49,4 +49,55 @@ return [
         // Целевой уровень сервиса (z-фактор). 1.65 ≈ 95%, 1.28 ≈ 90%, 1.96 ≈ 97.5%.
         'service_level_z' => (float) env('AUTOPLAN_SS_SERVICE_LEVEL_Z', 1.65),
     ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | SLA источников фактов
+    |--------------------------------------------------------------------------
+    | Блокирующие источники должны быть не старше SLA на момент валидации.
+    | Ограничения и экономика показываются как предупреждения: отсутствие файла
+    | ограничений не должно останавливать прямую FBO-поставку, а неизвестная
+    | себестоимость исключает строку из profit-режима, но не из anti-OOS.
+    */
+    'freshness_sla_hours' => [
+        'products' => (int) env('AUTOPLAN_SLA_PRODUCTS_HOURS', 24),
+        'inventory' => (int) env('AUTOPLAN_SLA_INVENTORY_HOURS', 18),
+        'demand' => (int) env('AUTOPLAN_SLA_DEMAND_HOURS', 18),
+        'economics' => (int) env('AUTOPLAN_SLA_ECONOMICS_HOURS', 48),
+        'constraints' => (int) env('AUTOPLAN_SLA_CONSTRAINTS_HOURS', 48),
+        'supplies' => (int) env('AUTOPLAN_SLA_SUPPLIES_HOURS', 24),
+    ],
+
+    'versions' => [
+        'engine' => 'ozon-v2',
+        'forecast' => 'forecast-2.0.0',
+        'allocation' => 'allocation-2.0.0',
+        'adapter' => 'ozon-seller-fbo-2.0.0',
+    ],
+
+    'execution' => [
+        'queue' => env('AUTOPLAN_EXECUTION_QUEUE', 'ozon-supply-execution'),
+        'draft_attempts' => (int) env('AUTOPLAN_DRAFT_ATTEMPTS', 4),
+        'retry_after_seconds' => (int) env('AUTOPLAN_DRAFT_RETRY_AFTER', 90),
+        'status_poll_minutes' => (int) env('AUTOPLAN_STATUS_POLL_MINUTES', 15),
+        'status_poll_enabled' => (bool) env('AUTOPLAN_STATUS_POLL_ENABLED', true),
+    ],
+
+    'facts' => [
+        // Полный контур: products → inventory/sales → unit economics плюс
+        // postings/supplies/constraints/credential health.
+        'refresh_enabled' => (bool) env('AUTOPLAN_FACT_REFRESH_ENABLED', true),
+        'refresh_cron' => env('AUTOPLAN_FACT_REFRESH_CRON', '17 2,10,18 * * *'),
+        'queue' => env('AUTOPLAN_FACT_REFRESH_QUEUE', 'ozon-fact-refresh'),
+    ],
+
+    'credential_notifications' => [
+        'enabled' => (bool) env('AUTOPLAN_CREDENTIAL_NOTIFICATIONS_ENABLED', true),
+        'schedule_time' => env('AUTOPLAN_CREDENTIAL_NOTIFICATIONS_TIME', '08:00'),
+    ],
+
+    'plan_fact' => [
+        'schedule_enabled' => (bool) env('PLAN_ACCURACY_SCHEDULE', true),
+        'schedule_time' => env('PLAN_ACCURACY_SCHEDULE_TIME', '06:00'),
+    ],
 ];

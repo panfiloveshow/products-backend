@@ -63,6 +63,7 @@ class AutoSupplyPlanUpdateLineTest extends TestCase
         // Правим агрегат 50 → 60.
         $this->putJson("/api/auto-supply-plans/{$plan->id}/lines/{$shownLineId}", [
             'qty_rounded' => 60,
+            'reason' => 'Проверка агрегированного ручного изменения',
         ])
             ->assertOk()
             ->assertJsonPath('data.old_qty', 50)
@@ -80,7 +81,20 @@ class AutoSupplyPlanUpdateLineTest extends TestCase
             ->assertJsonPath('data.total', 1)
             ->assertJsonPath('data.data.0.qty_rounded', 60);
 
-        // Экспорт Ozon (группировка по offer_id, SUM qty_rounded) = введённое значение.
+        // Ручное изменение сбрасывает утверждение: экспорт старой версии запрещён.
+        $this->get("/api/auto-supply-plans/{$plan->id}/export/ozon")
+            ->assertStatus(409);
+
+        // Этот тест проверяет только согласованность агрегата и файла, поэтому
+        // фиксируем завершённое повторное утверждение текущей версии как fixture.
+        $plan->update([
+            'business_status' => AutoSupplyPlan::BUSINESS_STATUS_APPROVED,
+            'approved_at' => now(),
+            'approval_fingerprint' => hash('sha256', "approved-test-version:{$plan->id}:60"),
+        ]);
+
+        // После повторного утверждения экспорт Ozon (SUM по offer_id)
+        // содержит ровно введённое пользователем количество.
         $content = $this->get("/api/auto-supply-plans/{$plan->id}/export/ozon")
             ->assertOk()
             ->streamedContent();
@@ -138,6 +152,7 @@ class AutoSupplyPlanUpdateLineTest extends TestCase
 
         $this->putJson("/api/auto-supply-plans/{$plan->id}/lines/{$shownLineId}", [
             'qty_rounded' => 60,
+            'reason' => 'Проверка кратности после ручного изменения',
         ])->assertOk()->assertJsonPath('data.plan_total_qty', 60);
 
         // Сумма точно сохранена, и каждая строка кратна pack=5.

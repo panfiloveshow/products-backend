@@ -475,7 +475,7 @@ class OzonService implements MarketplaceInterface
     }
 
     /**
-     * Продажи по SKU и складу через /v2/posting/fbo/list за последние N дней.
+     * Продажи по SKU и складу через /v3/posting/fbo/list за последние N дней.
      * Возвращает [offer_id => [warehouse_id_hash => [warehouse_name, sales_30_days, avg_daily_sales, ...]]]
      */
     public function getSalesBySkuAndWarehouse(int $days = 28): array
@@ -493,7 +493,7 @@ class OzonService implements MarketplaceInterface
                 $response = Http::withHeaders([
                     'Client-Id' => $this->clientId,
                     'Api-Key'   => $this->apiKey,
-                ])->post("{$this->baseUrl}/v2/posting/fbo/list", [
+                ])->post("{$this->baseUrl}/v3/posting/fbo/list", [
                     'dir'    => 'ASC',
                     'filter' => [
                         'since'  => $since,
@@ -515,7 +515,12 @@ class OzonService implements MarketplaceInterface
                     break;
                 }
 
-                $postings = $response->json()['result'] ?? [];
+                $payload = $response->json();
+                $postings = $payload['result']['postings']
+                    ?? $payload['postings']
+                    ?? $payload['result']
+                    ?? [];
+                $postings = is_array($postings) ? $postings : [];
 
                 foreach ($postings as $posting) {
                     $whName = $posting['analytics_data']['warehouse_name'] ?? '';

@@ -66,8 +66,12 @@ class AutoSupplyPlanWorkspaceAccessTest extends TestCase
         // должны отказать (403), но порядок защищает план на случай регресса.
         $endpoints = [
             ['POST', '/calculate'],
+            ['POST', '/approve'],
+            ['POST', '/materialize-supplies'],
+            ['GET', '/execution'],
             ['GET', '/accuracy'],
             ['GET', '/lines'],
+            ['GET', '/compare'],
             ['GET', '/simulate?offer_id=OFF-A'],
             ['GET', '/clusters'],
             ['PUT', '/lines/1'],

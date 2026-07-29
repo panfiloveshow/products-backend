@@ -23,12 +23,27 @@ class WbWebhookController extends Controller
     public function status(Request $request): JsonResponse
     {
         $request->validate(['integration_id' => 'required|integer']);
+        $integrationId = (int) $request->integration_id;
+        $access = $this->integrationAccess->ensureAccessibleIntegration($request, $integrationId);
+        if (! ($access['success'] ?? false)) {
+            return response()->json([
+                'message' => $access['message'] ?? 'Нет доступа к интеграции',
+            ], $access['status'] ?? 403);
+        }
 
-        $config = WbWebhookConfig::where('integration_id', $request->integration_id)->first();
+        $config = WbWebhookConfig::where('integration_id', $integrationId)->first();
 
         return response()->json([
             'message' => 'OK',
-            'data'    => $config ?? ['integration_id' => $request->integration_id, 'is_active' => false],
+            'data'    => $config
+                ? [
+                    'integration_id' => $config->integration_id,
+                    'webhook_url' => $config->webhook_url,
+                    'is_active' => $config->is_active,
+                    'last_event_at' => $config->last_event_at,
+                    'events_count' => $config->events_count,
+                ]
+                : ['integration_id' => $integrationId, 'is_active' => false],
         ]);
     }
 
@@ -89,7 +104,11 @@ class WbWebhookController extends Controller
                 $config->update(['is_active' => true]);
                 return response()->json([
                     'message' => 'Вебхук успешно зарегистрирован',
-                    'data'    => $config,
+                    'data'    => [
+                        'integration_id' => $config->integration_id,
+                        'webhook_url' => $config->webhook_url,
+                        'is_active' => true,
+                    ],
                 ]);
             }
 
@@ -232,8 +251,15 @@ class WbWebhookController extends Controller
     public function deactivate(Request $request): JsonResponse
     {
         $request->validate(['integration_id' => 'required|integer']);
+        $integrationId = (int) $request->integration_id;
+        $access = $this->integrationAccess->ensureAccessibleIntegration($request, $integrationId);
+        if (! ($access['success'] ?? false)) {
+            return response()->json([
+                'message' => $access['message'] ?? 'Нет доступа к интеграции',
+            ], $access['status'] ?? 403);
+        }
 
-        WbWebhookConfig::where('integration_id', $request->integration_id)
+        WbWebhookConfig::where('integration_id', $integrationId)
             ->update(['is_active' => false]);
 
         return response()->json(['message' => 'Вебхук деактивирован']);

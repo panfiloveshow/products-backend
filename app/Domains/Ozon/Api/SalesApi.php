@@ -195,7 +195,9 @@ class SalesApi
                                 'warehouse_name' => $whName,
                                 'sales_7_days' => 0,
                                 'sales_14_days' => 0,
+                                'sales_28_days' => 0,
                                 'sales_30_days' => 0,
+                                'sales_56_days' => 0,
                                 'daily_units' => [],
                             ];
                         }
@@ -214,8 +216,14 @@ class SalesApi
                             if ($postingDate->gte($now->copy()->subDays(14)->startOfDay())) {
                                 $rawUnits[$offerId][$warehouseId]['sales_14_days'] += $qty;
                             }
+                            if ($postingDate->gte($now->copy()->subDays(28)->startOfDay())) {
+                                $rawUnits[$offerId][$warehouseId]['sales_28_days'] += $qty;
+                            }
                             if ($postingDate->gte($now->copy()->subDays(30)->startOfDay())) {
                                 $rawUnits[$offerId][$warehouseId]['sales_30_days'] += $qty;
+                            }
+                            if ($postingDate->gte($now->copy()->subDays(56)->startOfDay())) {
+                                $rawUnits[$offerId][$warehouseId]['sales_56_days'] += $qty;
                             }
                         }
                     }
@@ -233,21 +241,27 @@ class SalesApi
 
                     $sales7 = (int) ($data['sales_7_days'] ?? 0);
                     $sales14 = (int) ($data['sales_14_days'] ?? 0);
+                    $sales28 = (int) ($data['sales_28_days'] ?? 0);
                     $sales30 = (int) ($data['sales_30_days'] ?? 0);
+                    $sales56 = (int) ($data['sales_56_days'] ?? 0);
 
                     // If Ozon stops returning posting dates, keep the old proportional
                     // fallback but mark it as low-quality through empty active_days.
-                    if ($sales7 === 0 && $sales14 === 0 && $sales30 === 0 && $units > 0 && empty($data['daily_units'])) {
+                    if ($sales7 === 0 && $sales14 === 0 && $sales28 === 0 && $sales30 === 0 && $sales56 === 0 && $units > 0 && empty($data['daily_units'])) {
                         $sales7 = (int) round($units * 7 / $days);
                         $sales14 = (int) round($units * 14 / $days);
+                        $sales28 = (int) round($units * 28 / $days);
                         $sales30 = (int) round($units * 30 / $days);
+                        $sales56 = (int) round($units * 56 / $days);
                     }
 
                     $result[$offerId][$warehouseId] = [
                         'warehouse_name'      => $data['warehouse_name'],
                         'sales_7_days'        => $sales7,
                         'sales_14_days'       => $sales14,
+                        'sales_28_days'       => $sales28,
                         'sales_30_days'       => $sales30,
+                        'sales_56_days'       => $sales56,
                         'avg_daily_sales'     => $avgDaily,
                         'ordered_units_total' => $units,
                         'active_days' => $shapeStats['active_days'],

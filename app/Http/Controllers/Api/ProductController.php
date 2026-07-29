@@ -270,7 +270,12 @@ class ProductController extends Controller
             // Валидация credentials в зависимости от маркетплейса
             $rules = match ($marketplace) {
                 'wildberries' => ['api_key' => 'required|string'],
-                'ozon' => ['client_id' => 'required|string', 'api_key' => 'required|string'],
+                'ozon' => [
+                    'client_id' => 'nullable|string|required_with:api_key',
+                    'api_key' => 'nullable|string|required_without_all:oauth_access_token,access_token',
+                    'oauth_access_token' => 'nullable|string|required_without_all:api_key,access_token',
+                    'access_token' => 'nullable|string',
+                ],
                 'yandex', 'yandex_market' => ['token' => 'required|string', 'campaign_id' => 'required|string'],
                 default => [],
             };
@@ -283,6 +288,8 @@ class ProductController extends Controller
                 'ozon' => [
                     'client_id' => $request->input('client_id'),
                     'api_key' => $request->input('api_key'),
+                    'oauth_access_token' => $request->input('oauth_access_token')
+                        ?: $request->input('access_token'),
                 ],
                 'yandex', 'yandex_market' => [
                     'token' => $request->input('token'),
@@ -671,6 +678,9 @@ class ProductController extends Controller
             'token' => $integrationData['token'] ?? null,
             'campaign_id' => $integrationData['campaign_id'] ?? null,
             'business_id' => $integrationData['business_id'] ?? null,
+            'oauth_access_token' => $integrationData['oauth_access_token']
+                ?? $integrationData['access_token']
+                ?? null,
         ];
 
         if (! is_array($credentials)) {
@@ -685,7 +695,7 @@ class ProductController extends Controller
 
     private function hasMarketplaceCredentials(array $credentials): bool
     {
-        foreach (['api_key', 'client_id', 'token', 'campaign_id', 'business_id'] as $key) {
+        foreach (['api_key', 'oauth_access_token', 'access_token', 'client_id', 'token', 'campaign_id', 'business_id'] as $key) {
             if (! empty($credentials[$key])) {
                 return true;
             }

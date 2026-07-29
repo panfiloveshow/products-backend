@@ -15,7 +15,9 @@ class PostingEnrichmentReader
 {
     public function queryForPeriod(int $integrationId, Carbon $from, Carbon $to, ?string $sku = null): Builder
     {
-        return OzonOrderUnitEconomics::query()
+        // Reader используется доверенными расчётами с обязательным
+        // integrationId. Не наследуем HTTP tenant-context в queue/console.
+        return OzonOrderUnitEconomics::withoutGlobalScope('current_workspace')
             ->where('integration_id', $integrationId)
             ->whereBetween('order_date', [$from->toDateTimeString(), $to->toDateTimeString()])
             ->when($sku !== null, fn (Builder $q) => $q->where('sku', $sku));
@@ -23,7 +25,7 @@ class PostingEnrichmentReader
 
     public function hasFreshData(int $integrationId, Carbon $asOf): bool
     {
-        return OzonOrderUnitEconomics::query()
+        return OzonOrderUnitEconomics::withoutGlobalScope('current_workspace')
             ->where('integration_id', $integrationId)
             ->where('updated_at', '>=', $asOf->copy()->subHours(24))
             ->exists();

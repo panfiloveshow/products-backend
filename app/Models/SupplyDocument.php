@@ -14,7 +14,7 @@ use Illuminate\Database\Eloquent\Relations\BelongsTo;
  */
 class SupplyDocument extends Model
 {
-    use HasFactory;
+    use HasFactory, Traits\BelongsToCurrentWorkspaceThroughSupply;
 
     // Типы документов
     public const TYPE_PACKAGE_LABEL = 'package_label';       // Этикетка грузоместа

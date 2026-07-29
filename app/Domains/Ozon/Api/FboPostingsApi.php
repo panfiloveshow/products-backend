@@ -40,11 +40,21 @@ class FboPostingsApi
 
         Log::info('Ozon FBO postings/list', [
             'filter' => $filter,
-            'count' => count($response['result']['postings'] ?? $response['result'] ?? []),
+            'count' => count(
+                $response['result']['postings']
+                    ?? $response['postings']
+                    ?? $response['result']
+                    ?? []
+            ),
         ]);
 
         return [
-            'postings' => $response['result']['postings'] ?? $response['result'] ?? [],
+            'postings' => $response['result']['postings']
+                ?? $response['postings']
+                ?? $response['result']
+                ?? [],
+            'cursor' => $response['result']['cursor'] ?? $response['cursor'] ?? null,
+            'has_next' => (bool) ($response['result']['has_next'] ?? $response['has_next'] ?? false),
         ];
     }
 

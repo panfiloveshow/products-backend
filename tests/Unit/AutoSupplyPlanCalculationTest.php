@@ -57,7 +57,6 @@ class AutoSupplyPlanCalculationTest extends TestCase
     {
         $job = new CalculateAutoSupplyPlanJob('test-plan-id');
         $method = (new ReflectionClass($job))->getMethod('analysisPeriodDays');
-        $method->setAccessible(true);
 
         $this->assertSame(28, $method->invoke($job, ['analysis_period_days' => 28], 60));
         $this->assertSame(56, $method->invoke($job, ['analysis_period_days' => 56], 30));
@@ -69,13 +68,96 @@ class AutoSupplyPlanCalculationTest extends TestCase
     {
         $job = new CalculateAutoSupplyPlanJob('test-plan-id');
         $method = (new ReflectionClass($job))->getMethod('effectiveOzonQtyAnchor');
-        $method->setAccessible(true);
 
         $this->assertSame('internal', $method->invoke($job, 'ozon', 'ozon'));
         $this->assertSame('internal', $method->invoke($job, 'max', 'ozon'));
         $this->assertSame('internal', $method->invoke($job, 'average', 'ozon'));
         $this->assertSame('internal', $method->invoke($job, 'internal', 'ozon'));
         $this->assertSame('internal', $method->invoke($job, 'ozon', 'wildberries'));
+    }
+
+    public function test_shadow_report_compares_real_legacy_ewma_with_v2_without_affecting_plan(): void
+    {
+        $job = new CalculateAutoSupplyPlanJob('test-plan-id');
+        $method = (new ReflectionClass($job))->getMethod('buildLegacyV2ShadowReport');
+        $report = $method->invoke($job, [[
+            'sku' => 'SKU-1',
+            'cluster_id' => 101,
+            'sales_7_days' => 70,
+            'sales_14_days' => 100,
+            'sales_30_days' => 150,
+            'demand_daily' => 8,
+            'current_stock' => 10,
+            'in_transit' => 5,
+            'qty_rounded' => 100,
+            'is_excluded' => false,
+            'explain_json' => json_encode([
+                'inputs' => ['target_cover_days' => 21, 'pack_multiple' => 6],
+            ]),
+        ]], $this->service);
+
+        $this->assertFalse($report['affects_plan']);
+        $this->assertSame(1, $report['lines_compared']);
+        $this->assertSame(132, $report['legacy_qty_total']);
+        $this->assertSame(100, $report['v2_qty_total']);
+        $this->assertSame(-32, $report['qty_total_delta']);
+        $this->assertSame(1, $report['qty_direction']['legacy_higher']);
+        $this->assertEqualsWithDelta(6.75, $report['largest_differences'][0]['legacy_daily_demand'], 0.001);
+    }
+
+    public function test_snapshot_line_facts_preserve_demand_stock_supply_and_economics(): void
+    {
+        $job = new CalculateAutoSupplyPlanJob('test-plan-id');
+        $method = (new ReflectionClass($job))->getMethod('buildSnapshotLineFacts');
+        $facts = $method->invoke($job, [[
+            'sku' => 'SKU-1',
+            'offer_id' => 'OFF-1',
+            'cluster_id' => 101,
+            'warehouse_id' => 'cluster:101',
+            'sales_7_days' => 14,
+            'sales_14_days' => 24,
+            'sales_30_days' => 45,
+            'demand_daily' => 2.5,
+            'current_stock' => 10,
+            'in_transit' => 3,
+            'qty_recommended' => 20,
+            'qty_rounded' => 18,
+            'original_qty_rounded' => 18,
+            'is_excluded' => false,
+            'cost_price' => 100,
+            'supply_cost_estimate' => 1800,
+            'expected_revenue' => 3000,
+            'expected_profit' => 700,
+            'roi_percent' => 38.89,
+            'source_hash' => str_repeat('a', 64),
+            'explain_json' => json_encode([
+                'inputs' => [
+                    'demand_source' => 'posting_fbo_v3',
+                    'analysis_period_days' => 56,
+                    'target_cover_days' => 21,
+                    'lead_time_days' => 7,
+                    'pack_multiple' => 6,
+                ],
+                'math' => [
+                    'safety_stock' => 5,
+                    'needed_before_caps' => 21,
+                    'needed_after_caps' => 18,
+                    'caps_applied' => ['max_cover_days'],
+                ],
+                'confidence' => [
+                    'confidence_level' => 'good',
+                    'confidence_reasons' => [],
+                    'sources' => ['stock' => 'analytics_stocks', 'economics' => 'unit_economics'],
+                ],
+                'reason' => 'replenishment',
+            ]),
+        ]]);
+
+        $this->assertSame('posting_fbo_v3', $facts['demand'][0]['demand_source']);
+        $this->assertSame(10, $facts['stock'][0]['current_stock']);
+        $this->assertSame(18, $facts['supply'][0]['qty_rounded']);
+        $this->assertSame(['max_cover_days'], $facts['supply'][0]['caps_applied']);
+        $this->assertSame(1800.0, $facts['economics'][0]['supply_cost_estimate']);
     }
 
     // === 3.2 Базовые формулы ===
@@ -313,6 +395,30 @@ class AutoSupplyPlanCalculationTest extends TestCase
 
         $this->assertEqualsWithDelta(10.0, $result['daily_demand'], 0.01);
         $this->assertSame('posting_fbo_v3', $result['source']);
+    }
+
+    public function test_ozon_posting_demand_uses_weighted_7_28_56_windows(): void
+    {
+        $result = $this->service->shapeOzonPostingDemand([
+            'avg_daily_sales' => 10,
+            'sales_7_days' => 140,   // 20/day
+            'sales_14_days' => 210,
+            'sales_28_days' => 280,  // 10/day
+            'sales_30_days' => 300,
+            'sales_56_days' => 280,  // 5/day
+            'ordered_units_total' => 560,
+            'winsorized_avg_daily_sales' => 30,
+            'active_days' => 40,
+            'peak_day_units' => 15,
+            'peak_share' => 0.02,
+            'median_nonzero_daily_units' => 10,
+        ]);
+
+        // 0.5×10 + 0.3×20 + 0.2×5 = 12.
+        $this->assertEqualsWithDelta(12.0, $result['daily_demand'], 0.0001);
+        $this->assertEqualsWithDelta(12.0, $result['weighted_window_demand'], 0.0001);
+        $this->assertSame(10.0, $result['recent_28_avg']);
+        $this->assertSame(5.0, $result['recent_56_avg']);
     }
 
     public function test_ozon_posting_demand_shape_caps_suspected_promo_spike(): void
@@ -574,6 +680,29 @@ class AutoSupplyPlanCalculationTest extends TestCase
     public function test_abc_priority_c_for_low_revenue(): void
     {
         $this->assertEquals('C', $this->service->calculateAbcPriority(10000));
+    }
+
+    public function test_abc_classes_are_based_on_cumulative_contribution_margin_share(): void
+    {
+        $classes = $this->service->classifyAbcByContribution([
+            'SKU-A' => 80,
+            'SKU-B' => 15,
+            'SKU-C' => 5,
+        ]);
+
+        $this->assertSame('A', $classes['SKU-A']);
+        $this->assertSame('B', $classes['SKU-B']);
+        $this->assertSame('C', $classes['SKU-C']);
+    }
+
+    public function test_abc_classes_fall_back_to_revenue_when_contribution_is_unknown(): void
+    {
+        $classes = $this->service->classifyAbcByContribution(
+            ['SKU-A' => 0, 'SKU-B' => 0, 'SKU-C' => 0],
+            ['SKU-A' => 80, 'SKU-B' => 15, 'SKU-C' => 5]
+        );
+
+        $this->assertSame(['SKU-A' => 'A', 'SKU-B' => 'B', 'SKU-C' => 'C'], $classes);
     }
 
     public function test_abc_target_days_without_settings(): void

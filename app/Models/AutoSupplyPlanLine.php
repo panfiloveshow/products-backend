@@ -5,6 +5,7 @@ namespace App\Models;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
+use Illuminate\Database\Eloquent\Relations\HasMany;
 
 class AutoSupplyPlanLine extends Model
 {
@@ -30,6 +31,9 @@ class AutoSupplyPlanLine extends Model
         'not_recommended_reason',
         'not_recommended_reason_label',
         'planning_decision',
+        'review_status',
+        'candidate_quantity',
+        'candidate_economics',
     ];
 
     protected $fillable = [
@@ -54,6 +58,13 @@ class AutoSupplyPlanLine extends Model
         'destination_type',
         'qty_recommended',
         'qty_rounded',
+        'original_qty_rounded',
+        'is_excluded',
+        'manual_comment',
+        'manual_override_json',
+        'manual_updated_by',
+        'manual_updated_at',
+        'source_hash',
         'current_stock',
         'in_transit',
         'sales_7_days',
@@ -100,6 +111,11 @@ class AutoSupplyPlanLine extends Model
         'cost_price' => 'decimal:2',
         'qty_recommended' => 'decimal:2',
         'qty_rounded' => 'integer',
+        'original_qty_rounded' => 'integer',
+        'is_excluded' => 'boolean',
+        'manual_override_json' => 'array',
+        'manual_updated_by' => 'integer',
+        'manual_updated_at' => 'datetime',
         'current_stock' => 'integer',
         'in_transit' => 'integer',
         'sales_7_days' => 'integer',
@@ -143,6 +159,16 @@ class AutoSupplyPlanLine extends Model
     public function product(): BelongsTo
     {
         return $this->belongsTo(Product::class, 'sku', 'sku');
+    }
+
+    public function supplyItems(): HasMany
+    {
+        return $this->hasMany(SupplyItem::class, 'auto_supply_plan_line_id');
+    }
+
+    public function adjustments(): HasMany
+    {
+        return $this->hasMany(AutoSupplyPlanAdjustment::class, 'auto_supply_plan_line_id');
     }
 
     public function isHighRisk(): bool
@@ -191,20 +217,13 @@ class AutoSupplyPlanLine extends Model
         ));
     }
 
-    /**
-     * ВНИМАНИЕ (известная неточность на агрегированной строке).
-     * Для Ozon строка в lines/show — это агрегат группы (sku, cluster_id):
-     * current_stock/in_transit суммируются (SUM), а explain_json берётся как
-     * MIN(explain_json) одной складской строки кластера (см. aggregatedPlanLinesQuery).
-     * Поэтому quantity_explanation / deficit_qty / surplus_qty ниже считают спрос
-     * (daily_demand, min/target_cover_days) по ОДНОЙ строке, но остаток — по всему
-     * кластеру → разбивка противоречит qty_rounded. Для одиночной строки (один склад
-     * в кластере, WB) всё согласовано. Корректный фикс требует агрегировать входы
-     * спроса на уровне группы в aggregatedPlanLinesQuery (см. заметку проекта
-     * autosupply_aggregated_line_explain_mismatch).
-     */
     public function getQuantityExplanationAttribute(): array
     {
+        $aggregated = $this->explain_json['aggregated_quantity_explanation'] ?? null;
+        if (is_array($aggregated)) {
+            return $aggregated;
+        }
+
         return [
             'daily_demand' => $this->explain_json['inputs']['daily_demand'] ?? $this->demand_daily,
             'target_cover_days' => $this->explain_json['inputs']['target_cover_days'] ?? null,
@@ -283,7 +302,9 @@ class AutoSupplyPlanLine extends Model
             return null;
         }
 
-        return $this->explain_json['confidence']['fallbacks'][0]
+        return $this->explain_json['not_recommended_reason']
+            ?? $this->explain_json['optimizer_rejection']['reason']
+            ?? $this->explain_json['confidence']['fallbacks'][0]
             ?? $this->explain_json['confidence']['confidence_reasons'][0]
             ?? null;
     }
@@ -310,6 +331,44 @@ class AutoSupplyPlanLine extends Model
                 is_array($scoreBasis) ? $scoreBasis : []
             )),
         ];
+    }
+
+    public function getReviewStatusAttribute(): string
+    {
+        if ($this->is_excluded) {
+            return $this->not_recommended_reason ? 'blocked' : 'excluded';
+        }
+
+        if ($this->manual_updated_at !== null) {
+            return 'manually_modified';
+        }
+
+        if (in_array($this->confidence, ['low', 'bad', 'warning'], true)) {
+            return 'review_required';
+        }
+
+        return 'recommended';
+    }
+
+    public function getCandidateQuantityAttribute(): int
+    {
+        return (int) (
+            $this->explain_json['optimizer_rejection']['candidate_qty']
+            ?? $this->original_qty_rounded
+            ?? $this->qty_rounded
+        );
+    }
+
+    public function getCandidateEconomicsAttribute(): array
+    {
+        return is_array($this->explain_json['optimizer_rejection']['candidate_economics'] ?? null)
+            ? $this->explain_json['optimizer_rejection']['candidate_economics']
+            : [
+                'supply_cost_estimate' => $this->supply_cost_estimate,
+                'expected_revenue' => $this->expected_revenue,
+                'expected_profit' => $this->expected_profit,
+                'roi_percent' => $this->roi_percent,
+            ];
     }
 
     private function labelForReason(?string $reason): ?string

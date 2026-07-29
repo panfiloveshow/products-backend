@@ -7,7 +7,7 @@ use Illuminate\Database\Eloquent\Model;
 
 class OzonFinanceTransaction extends Model
 {
-    use HasFactory;
+    use HasFactory, Traits\BelongsToCurrentWorkspaceThroughIntegration;
 
     public const OP_DIRECT_FLOW_LOGISTIC = 'MarketplaceServiceItemDirectFlowLogistic';
     public const OP_DELIVERY_TO_CUSTOMER = 'MarketplaceServiceItemDeliveryToCustomer';

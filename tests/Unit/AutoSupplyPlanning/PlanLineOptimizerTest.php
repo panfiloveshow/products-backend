@@ -25,6 +25,13 @@ class PlanLineOptimizerTest extends TestCase
         $this->assertSame('HIGH-ROI', $result['lines'][0]['sku']);
         $this->assertSame(1, $result['summary']['budget_skipped_lines']);
         $this->assertSame(90.0, $result['summary']['budget_used']);
+        $this->assertCount(1, $result['rejected_lines']);
+        $this->assertSame('LOW-ROI', $result['rejected_lines'][0]['sku']);
+        $this->assertSame(0, $result['rejected_lines'][0]['qty_rounded']);
+        $this->assertTrue($result['rejected_lines'][0]['is_excluded']);
+        $rejectedExplain = json_decode($result['rejected_lines'][0]['explain_json'], true);
+        $this->assertSame('budget_limit', $rejectedExplain['optimizer_rejection']['reason']);
+        $this->assertSame(10, $rejectedExplain['optimizer_rejection']['candidate_qty']);
     }
 
     public function test_budget_limit_selects_best_combination_not_only_first_expensive_line(): void
@@ -67,6 +74,11 @@ class PlanLineOptimizerTest extends TestCase
 
         $this->assertCount(1, $result['lines']);
         $this->assertSame('GOOD', $result['lines'][0]['sku']);
+        $this->assertCount(1, $result['rejected_lines']);
+        $this->assertSame('negative_profit', json_decode(
+            $result['rejected_lines'][0]['explain_json'],
+            true
+        )['optimizer_rejection']['reason']);
         $this->assertSame(1, $result['summary']['negative_profit_skipped_lines']);
         $this->assertSame(1, $result['summary']['skipped_by_reason']['negative_profit']);
     }
@@ -528,6 +540,37 @@ class PlanLineOptimizerTest extends TestCase
         $this->assertSame(55, $audit['quantity_guard_reduced_qty']);
         $this->assertTrue($audit['top_selected'][0]['quantity_guard_applied']);
         $this->assertSame(55, $audit['top_selected'][0]['quantity_guard_reduced_by_qty']);
+    }
+
+    public function test_seller_stock_blocked_candidate_stays_visible_but_cannot_be_executed(): void
+    {
+        $plan = new AutoSupplyPlan([
+            'mode' => AutoSupplyPlan::MODE_BALANCED,
+            'params' => ['planning_mode' => AutoSupplyPlan::MODE_BALANCED],
+        ]);
+        $line = $this->line('NO-SELLER-STOCK', qty: 0);
+        $line['original_qty_rounded'] = 24;
+        $line['is_excluded'] = true;
+        $line['explain_json'] = json_encode([
+            'not_recommended_reason' => 'seller_stock_unavailable',
+            'math' => [
+                'seller_stock_constraint' => [
+                    'applied' => true,
+                    'blocked' => true,
+                    'qty_before' => 24,
+                    'qty_after' => 0,
+                ],
+            ],
+        ]);
+
+        $result = (new PlanLineOptimizer())->optimize([$line], $plan);
+
+        $this->assertCount(0, $result['lines']);
+        $this->assertCount(1, $result['rejected_lines']);
+        $this->assertSame(24, $result['rejected_lines'][0]['original_qty_rounded']);
+        $this->assertSame(0, $result['rejected_lines'][0]['qty_rounded']);
+        $this->assertTrue($result['rejected_lines'][0]['is_excluded']);
+        $this->assertSame(1, $result['summary']['skipped_by_reason']['seller_stock_unavailable']);
     }
 
 

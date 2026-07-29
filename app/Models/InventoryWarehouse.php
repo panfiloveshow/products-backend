@@ -10,7 +10,7 @@ use Illuminate\Database\Eloquent\Relations\HasMany;
 
 class InventoryWarehouse extends Model
 {
-    use HasFactory, HasUuids;
+    use HasFactory, HasUuids, Traits\BelongsToCurrentWorkspaceThroughIntegration;
 
     protected $keyType = 'string';
     public $incrementing = false;

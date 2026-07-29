@@ -13,7 +13,7 @@ class LocalizationIndexExclusionsTest extends TestCase
         $service = new LocalizationIndexService();
 
         $salesByRegion = [
-            // A: FBW-only, доля локализации 40% → КТР 1.30, КРП 2.10
+            // A: FBW-only, доля локализации 40% → КТР 1.35.
             '100' => ['total' => 10, 'local' => 4, 'excluded_fbs' => 0],
             // B: FBS 60% > 35% → весь артикул исключение (КТР 1.00, КРП 0)
             '200' => ['total' => 10, 'local' => 5, 'excluded_fbs' => 6],
@@ -34,8 +34,8 @@ class LocalizationIndexExclusionsTest extends TestCase
 
         // A — обычный расчёт по таблице
         $this->assertEqualsWithDelta(40.0, $byArticle['100']['localization_rate'], 0.001);
-        $this->assertEqualsWithDelta(1.30, $byArticle['100']['ktr'], 0.001);
-        $this->assertEqualsWithDelta(2.10, $byArticle['100']['krp'], 0.001);
+        $this->assertEqualsWithDelta(1.35, $byArticle['100']['ktr'], 0.001);
+        $this->assertEqualsWithDelta(0.00, $byArticle['100']['krp'], 0.001);
         $this->assertFalse($byArticle['100']['fully_excluded']);
 
         // B — исключён по правилу 35%
@@ -56,13 +56,12 @@ class LocalizationIndexExclusionsTest extends TestCase
         $this->assertEqualsWithDelta(0.50, $byArticle['400']['ktr'], 0.001);
 
         // Средневзвешенный ИЛ:
-        // A 10*1.30=13.0; B 10*1.00=10.0; C 5*1.00=5.0; D 8*0.50 + 2*1.00=6.0
-        // Σ=34.0 / 35 = 0.9714 → 0.97
-        $this->assertEqualsWithDelta(0.97, $result['localization_index'], 0.001);
+        // A 10*1.35=13.5; B 10*1.00=10.0; C 5*1.00=5.0; D 8*0.50 + 2*1.00=6.0
+        // Σ=34.5 / 35 = 0.9857 → 0.99
+        $this->assertEqualsWithDelta(0.99, $result['localization_index'], 0.001);
 
-        // Средневзвешенный ИРП:
-        // A 10*2.10=21.0; остальные 0 → 21 / 35 = 0.60
-        $this->assertEqualsWithDelta(0.60, $result['sales_distribution_index'], 0.001);
+        // КРП в действующей тарифной таблице отключён.
+        $this->assertEqualsWithDelta(0.00, $result['sales_distribution_index'], 0.001);
     }
 
     public function test_no_exclusions_matches_plain_weighted_average(): void
@@ -71,13 +70,13 @@ class LocalizationIndexExclusionsTest extends TestCase
 
         // Без FBS и КГТ поведение совпадает со старым (local/total).
         $salesByRegion = [
-            '100' => ['total' => 10, 'local' => 8, 'excluded_fbs' => 0], // 80% → 0.80
+            '100' => ['total' => 10, 'local' => 8, 'excluded_fbs' => 0], // 80% → 0.85
         ];
 
         $result = $service->aggregateIndices($salesByRegion, []);
 
         $this->assertEqualsWithDelta(80.0, $result['ktr_by_article']['100']['localization_rate'], 0.001);
-        $this->assertEqualsWithDelta(0.80, $result['localization_index'], 0.001);
+        $this->assertEqualsWithDelta(0.85, $result['localization_index'], 0.001);
     }
 
     public function test_is_product_oversized_thresholds(): void

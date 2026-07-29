@@ -471,6 +471,61 @@ class AutoSupplyPlanService
     }
 
     /**
+     * ABC по доле contribution margin, а не по абсолютным порогам выручки.
+     *
+     * A покрывает первые 80% положительной маржи, B — следующие 15%,
+     * C — хвост. Если маржа недоступна, детерминированно используем выручку.
+     *
+     * @param array<string, float|int> $contributionBySku
+     * @param array<string, float|int> $fallbackRevenueBySku
+     * @return array<string, string>
+     */
+    public function classifyAbcByContribution(
+        array $contributionBySku,
+        array $fallbackRevenueBySku = []
+    ): array {
+        $positive = array_map(
+            static fn ($value): float => max(0.0, (float) $value),
+            $contributionBySku
+        );
+        $source = array_sum($positive) > self::EPS
+            ? $positive
+            : array_map(
+                static fn ($value): float => max(0.0, (float) $value),
+                $fallbackRevenueBySku
+            );
+
+        $allSkus = array_values(array_unique(array_merge(
+            array_keys($contributionBySku),
+            array_keys($fallbackRevenueBySku)
+        )));
+        foreach ($allSkus as $sku) {
+            $source[(string) $sku] ??= 0.0;
+        }
+
+        uksort($source, static function (string|int $left, string|int $right) use ($source): int {
+            $byValue = $source[$right] <=> $source[$left];
+
+            return $byValue !== 0 ? $byValue : strcmp((string) $left, (string) $right);
+        });
+
+        $total = array_sum($source);
+        $cumulative = 0.0;
+        $classes = [];
+        foreach ($source as $sku => $value) {
+            $shareBefore = $total > self::EPS ? $cumulative / $total : 1.0;
+            $classes[(string) $sku] = match (true) {
+                $shareBefore < 0.80 => 'A',
+                $shareBefore < 0.95 => 'B',
+                default => 'C',
+            };
+            $cumulative += $value;
+        }
+
+        return $classes;
+    }
+
+    /**
      * Получить target_cover_days по ABC-приоритету из SupplySettings.
      * Если настроек нет — используем дефолты из плана.
      */
@@ -565,7 +620,8 @@ class AutoSupplyPlanService
         // Корректировка на тренд (±20% макс). Для фактического спроса из
         // postings/отчёта не усиливаем положительный тренд: промо-всплеск уже
         // находится внутри факта и не должен получать второй аплифт.
-        $trustedObservedSource = in_array($source, ['posting_fbo_v3', 'ozon_order_report'], true);
+        $trustedObservedSource = str_starts_with($source, 'posting_fbo_v3')
+            || $source === 'ozon_order_report';
         if (! $trustedObservedSource || $salesTrend !== 'growing') {
             $baseDemand = $this->adjustDemandByTrend($baseDemand, $salesTrend, $salesTrendPercent);
         }
@@ -719,7 +775,9 @@ class AutoSupplyPlanService
         $periodAvg = max(0.0, (float) ($postingData['avg_daily_sales'] ?? 0));
         $recent7 = max(0.0, ((float) ($postingData['sales_7_days'] ?? 0)) / 7);
         $recent14 = max(0.0, ((float) ($postingData['sales_14_days'] ?? 0)) / 14);
+        $recent28 = max(0.0, ((float) ($postingData['sales_28_days'] ?? 0)) / 28);
         $recent30 = max(0.0, ((float) ($postingData['sales_30_days'] ?? 0)) / 30);
+        $recent56 = max(0.0, ((float) ($postingData['sales_56_days'] ?? 0)) / 56);
         $winsorized = max(0.0, (float) ($postingData['winsorized_avg_daily_sales'] ?? $periodAvg));
         $orderedUnits = (int) ($postingData['ordered_units_total'] ?? 0);
         $peakDayUnits = (int) ($postingData['peak_day_units'] ?? 0);
@@ -759,7 +817,14 @@ class AutoSupplyPlanService
             $reasons[] = 'post_promo_cooldown';
         }
 
-        $demand = $periodAvg;
+        // Каноническое ядро v2: 28 дней дают устойчивую базу, 7 — свежий
+        // сигнал, 56 — защиту от короткого случайного окна.
+        $weightedWindowDemand = (
+            0.50 * ($recent28 > 0 ? $recent28 : ($recent30 > 0 ? $recent30 : $periodAvg))
+            + 0.30 * ($recent7 > 0 ? $recent7 : $periodAvg)
+            + 0.20 * ($recent56 > 0 ? $recent56 : $periodAvg)
+        );
+        $demand = $weightedWindowDemand > 0 ? $weightedWindowDemand : $periodAvg;
         if ($winsorized > 0) {
             $demand = min($demand, max($winsorized, $recent7));
         }
@@ -811,7 +876,10 @@ class AutoSupplyPlanService
             'period_avg' => round($periodAvg, 4),
             'recent_7_avg' => round($recent7, 4),
             'recent_14_avg' => round($recent14, 4),
+            'recent_28_avg' => round($recent28, 4),
             'recent_30_avg' => round($recent30, 4),
+            'recent_56_avg' => round($recent56, 4),
+            'weighted_window_demand' => round($weightedWindowDemand, 4),
             'winsorized_avg' => round($winsorized, 4),
             'peak_day_units' => $peakDayUnits,
             'peak_share' => round($peakShare, 4),
@@ -1142,14 +1210,15 @@ class AutoSupplyPlanService
             }
 
             $api = new SalesApi(OzonClient::fromIntegration($integration));
-            $byWarehouse = $api->getSalesBySkuAndWarehouse($days, $productIdToOfferId);
+            $historyDays = max(56, $days);
+            $byWarehouse = $api->getSalesBySkuAndWarehouse($historyDays, $productIdToOfferId);
             $byCluster = [];
             $byOffer = [];
 
             foreach ($byWarehouse as $offerId => $warehouseRows) {
                 foreach ($warehouseRows as $warehouseId => $row) {
                     $units = (int) ($row['ordered_units_total'] ?? 0);
-                    $this->accumulateOzonDemand($byOffer[$offerId], $row, $units, $days);
+                    $this->accumulateOzonDemand($byOffer[$offerId], $row, $units, $historyDays);
 
                     $warehouseName = (string) ($row['warehouse_name'] ?? $warehouseId);
                     $normalizedName = OzonWarehouseCluster::normalizeWarehouseName($warehouseName);
@@ -1160,7 +1229,7 @@ class AutoSupplyPlanService
                     }
 
                     $clusterId = (string) $cluster['cluster_id'];
-                    $this->accumulateOzonDemand($byCluster[$offerId][$clusterId], $row, $units, $days, [
+                    $this->accumulateOzonDemand($byCluster[$offerId][$clusterId], $row, $units, $historyDays, [
                         'cluster_id' => (int) $cluster['cluster_id'],
                         'cluster_name' => $cluster['cluster_name'] ?? null,
                         'region' => $cluster['region'] ?? null,
@@ -1170,7 +1239,8 @@ class AutoSupplyPlanService
 
             \Illuminate\Support\Facades\Log::info('AutoSupplyPlanService: Ozon posting demand loaded', [
                 'integration_id' => $integration->id,
-                'days' => $days,
+                'days' => $historyDays,
+                'requested_days' => $days,
                 'offer_ids' => count($byOffer),
                 'cluster_offer_ids' => count($byCluster),
             ]);
@@ -1180,7 +1250,8 @@ class AutoSupplyPlanService
                 'by_cluster' => $byCluster,
                 'by_offer' => $byOffer,
                 'source' => 'posting_fbo_v3',
-                'days' => $days,
+                'days' => $historyDays,
+                'requested_days' => $days,
             ];
         } catch (\Throwable $e) {
             \Illuminate\Support\Facades\Log::warning('AutoSupplyPlanService: Ozon posting demand failed', [
@@ -1197,7 +1268,9 @@ class AutoSupplyPlanService
         $target ??= array_merge([
             'sales_7_days' => 0,
             'sales_14_days' => 0,
+            'sales_28_days' => 0,
             'sales_30_days' => 0,
+            'sales_56_days' => 0,
             'ordered_units_total' => 0,
             'avg_daily_sales' => 0.0,
             'winsorized_units_total' => 0.0,
@@ -1210,7 +1283,9 @@ class AutoSupplyPlanService
 
         $target['sales_7_days'] += (int) ($row['sales_7_days'] ?? round($units * 7 / max($days, 1)));
         $target['sales_14_days'] += (int) ($row['sales_14_days'] ?? round($units * 14 / max($days, 1)));
+        $target['sales_28_days'] += (int) ($row['sales_28_days'] ?? round($units * 28 / max($days, 1)));
         $target['sales_30_days'] += (int) ($row['sales_30_days'] ?? round($units * 30 / max($days, 1)));
+        $target['sales_56_days'] += (int) ($row['sales_56_days'] ?? round($units * 56 / max($days, 1)));
         $target['ordered_units_total'] += $units;
         $target['avg_daily_sales'] = round($target['ordered_units_total'] / max($days, 1), 4);
         $target['winsorized_units_total'] += (float) ($row['winsorized_units_total'] ?? $units);

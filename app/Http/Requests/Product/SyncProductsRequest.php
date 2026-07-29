@@ -23,8 +23,10 @@ class SyncProductsRequest extends BaseFormRequest
                 'api_key' => 'required|string',
             ],
             'ozon' => [
-                'client_id' => 'required|string',
-                'api_key' => 'required|string',
+                'client_id' => 'nullable|string|required_with:api_key',
+                'api_key' => 'nullable|string|required_without_all:oauth_access_token,access_token',
+                'oauth_access_token' => 'nullable|string|required_without_all:api_key,access_token',
+                'access_token' => 'nullable|string',
             ],
             'yandex_market' => [
                 'token' => 'required|string',
@@ -41,6 +43,7 @@ class SyncProductsRequest extends BaseFormRequest
             'integration_id.exists' => 'Интеграция не найдена',
             'api_key.required' => 'API ключ обязателен',
             'client_id.required' => 'Client ID обязателен',
+            'oauth_access_token.required_without_all' => 'Укажите OAuth access token или API key Ozon',
             'token.required' => 'Токен обязателен',
             'campaign_id.required' => 'Campaign ID обязателен',
         ];

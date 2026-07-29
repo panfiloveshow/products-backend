@@ -114,13 +114,43 @@ if (filter_var(env('MP_CONSTRAINTS_SCHEDULE', false), FILTER_VALIDATE_BOOLEAN)) 
 
 // Оценка точности планов через горизонт N дней (этап 2, план-факт). Раз в сутки
 // ставит в очередь EvaluatePlanAccuracyJob для созревших готовых планов.
-// По умолчанию ВЫКЛЮЧЕНО: включить PLAN_ACCURACY_SCHEDULE=true (см. caveat про schedule:run ниже).
-if (filter_var(env('PLAN_ACCURACY_SCHEDULE', false), FILTER_VALIDATE_BOOLEAN)) {
+// Включено по умолчанию: без ежедневной сверки коммерческий контур не
+// накапливает WAPE/bias и не может улучшать следующие планы.
+if ((bool) config('autoplanning.plan_fact.schedule_enabled', true)) {
     \Illuminate\Support\Facades\Schedule::command('plan:evaluate-accuracy')
-        ->dailyAt('06:00')
+        ->dailyAt((string) config('autoplanning.plan_fact.schedule_time', '06:00'))
         ->withoutOverlapping()
         ->appendOutputTo(storage_path('logs/plan-accuracy.log'))
         ->name('plan.evaluate-accuracy');
+}
+
+// Жизненный цикл Ozon-поставок автоплана: после создания черновика/заявки
+// подтягиваем текущий state, слот и факт приёмки. В отличие от тяжёлых синков
+// обрабатываются только активные локальные поставки.
+if ((bool) config('autoplanning.execution.status_poll_enabled', true)) {
+    \Illuminate\Support\Facades\Schedule::job(new \App\Jobs\SyncSupplyStatusesJob())
+        ->everyFifteenMinutes()
+        ->withoutOverlapping()
+        ->name('autoplanning.ozon-supply-statuses');
+}
+
+// Полный refresh фактов Ozon, без которого readiness быстро становится stale.
+// Команда только ставит idempotent jobs в очереди; внешние вызовы выполняются
+// воркерами с unique locks и штатными retry/backoff.
+if ((bool) config('autoplanning.facts.refresh_enabled', true)) {
+    \Illuminate\Support\Facades\Schedule::command('autoplanning:refresh-ozon-facts')
+        ->cron((string) config('autoplanning.facts.refresh_cron', '17 2,10,18 * * *'))
+        ->withoutOverlapping()
+        ->appendOutputTo(storage_path('logs/autoplanning-ozon-facts.log'))
+        ->name('autoplanning.ozon-facts-refresh');
+}
+
+// In-product уведомления о credentials Ozon: 30/14/7/1 день и истечение.
+if ((bool) config('autoplanning.credential_notifications.enabled', true)) {
+    \Illuminate\Support\Facades\Schedule::job(new \App\Jobs\GenerateAlertsJob())
+        ->dailyAt((string) config('autoplanning.credential_notifications.schedule_time', '08:00'))
+        ->withoutOverlapping()
+        ->name('autoplanning.ozon-credential-alerts');
 }
 
 // Sanity-check unit_economics_cache запускается через системный cron

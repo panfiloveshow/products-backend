@@ -34,7 +34,7 @@ class WarehousesApi
     public function getInTransitBySku(): array
     {
         try {
-            $response = $this->client->post('/v2/posting/fbo/list', [
+            $response = $this->client->post('/v3/posting/fbo/list', [
                 'dir' => 'ASC',
                 'filter' => [
                     'status' => 'delivering',
@@ -48,7 +48,11 @@ class WarehousesApi
             ]);
 
             $result = [];
-            foreach ($response['result']['postings'] ?? [] as $posting) {
+            $postings = $response['result']['postings']
+                ?? $response['postings']
+                ?? $response['result']
+                ?? [];
+            foreach (is_array($postings) ? $postings : [] as $posting) {
                 foreach ($posting['products'] ?? [] as $product) {
                     $sku = $product['offer_id'] ?? null;
                     if (!$sku) continue;

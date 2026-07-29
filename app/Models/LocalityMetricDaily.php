@@ -7,7 +7,7 @@ use Illuminate\Database\Eloquent\Model;
 
 class LocalityMetricDaily extends Model
 {
-    use HasFactory;
+    use HasFactory, Traits\BelongsToCurrentWorkspaceThroughIntegration;
 
     public const CONFIDENCE_LOW = 'low';
     public const CONFIDENCE_MEDIUM = 'medium';

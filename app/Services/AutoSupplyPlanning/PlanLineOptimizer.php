@@ -8,7 +8,11 @@ class PlanLineOptimizer
 {
     /**
      * @param list<array<string, mixed>> $lines
-     * @return array{lines:list<array<string, mixed>>, summary:array<string, mixed>}
+     * @return array{
+     *     lines:list<array<string, mixed>>,
+     *     rejected_lines:list<array<string, mixed>>,
+     *     summary:array<string, mixed>
+     * }
      */
     public function optimize(array $lines, AutoSupplyPlan $plan, array $context = []): array
     {
@@ -23,12 +27,22 @@ class PlanLineOptimizer
         )));
 
         $candidates = [];
+        $rejected = [];
         $skippedByReason = [];
         $candidateAudit = [];
         $quantityGuardCappedLines = 0;
         $quantityGuardReducedQty = 0;
 
         foreach ($lines as $line) {
+            $preExplain = $this->decodeExplain($line);
+            $preRejectedReason = (string) ($preExplain['not_recommended_reason'] ?? '');
+            if (! empty($line['is_excluded']) && $preRejectedReason === 'seller_stock_unavailable') {
+                $skippedByReason[$preRejectedReason] = ($skippedByReason[$preRejectedReason] ?? 0) + 1;
+                $candidateAudit[] = $this->candidateAuditRow($line, 'отсечено', $preRejectedReason);
+                $rejected[] = $line;
+                continue;
+            }
+
             $line = $this->enrichCandidate($line, $mode, $context);
             $explainAfterEnrichment = $this->decodeExplain($line);
             $optimizerQuantityGuard = is_array($explainAfterEnrichment['optimizer_quantity_guard'] ?? null)
@@ -42,6 +56,7 @@ class PlanLineOptimizer
             if ($skipNegativeProfit && (float) ($line['expected_profit'] ?? 0) < 0) {
                 $skippedByReason['negative_profit'] = ($skippedByReason['negative_profit'] ?? 0) + 1;
                 $candidateAudit[] = $this->candidateAuditRow($line, 'отсечено', 'negative_profit');
+                $rejected[] = $this->markRejected($line, 'negative_profit');
                 continue;
             }
 
@@ -72,6 +87,7 @@ class PlanLineOptimizer
             foreach ($budgetSkippedCandidates as $line) {
                 $skippedByReason['budget_limit'] = ($skippedByReason['budget_limit'] ?? 0) + 1;
                 $budgetSkippedRows[] = $this->candidateAuditRow($line, 'отсечено', 'budget_limit');
+                $rejected[] = $this->markRejected($line, 'budget_limit');
             }
 
             foreach ($selectedCandidates as $line) {
@@ -111,6 +127,11 @@ class PlanLineOptimizer
 
             return $line;
         }, $selected);
+        $rejected = array_map(static function (array $line): array {
+            unset($line['_planning_score'], $line['_planning_reason']);
+
+            return $line;
+        }, $rejected);
 
         $funnelStages = $this->buildFunnelStages(
             sourceCandidatesTotal: $sourceCandidatesTotal,
@@ -127,6 +148,7 @@ class PlanLineOptimizer
 
         return [
             'lines' => $selected,
+            'rejected_lines' => $rejected,
             'summary' => [
                 'mode' => $mode,
                 'candidates_total' => count($lines),
@@ -395,6 +417,57 @@ class PlanLineOptimizer
             'not_recommended_negative_profit' => 'Строка выбрана с предупреждением: экономика отрицательная, проверьте маржу перед поставкой.',
             default => 'Строка выбрана системой: её балл прошёл фильтры бюджета, экономики и приоритета.',
         };
+        $line['explain_json'] = $this->encodeExplain($explain);
+
+        return $line;
+    }
+
+    /**
+     * Сохраняет отсечённого кандидата для review-экрана, но делает его
+     * неисполняемым по умолчанию. Исходное количество и экономика остаются
+     * в explain_json, поэтому пользователь видит причину решения и может
+     * осознанно переопределить её с обязательным audit reason.
+     *
+     * @param array<string, mixed> $line
+     * @return array<string, mixed>
+     */
+    private function markRejected(array $line, string $reason): array
+    {
+        $explain = $this->decodeExplain($line);
+        $candidateQty = max(0, (int) ($line['qty_rounded'] ?? 0));
+        $candidateEconomics = [
+            'supply_cost_estimate' => isset($line['supply_cost_estimate'])
+                ? round((float) $line['supply_cost_estimate'], 2)
+                : null,
+            'expected_revenue' => isset($line['expected_revenue'])
+                ? round((float) $line['expected_revenue'], 2)
+                : null,
+            'expected_profit' => isset($line['expected_profit'])
+                ? round((float) $line['expected_profit'], 2)
+                : null,
+            'roi_percent' => isset($line['roi_percent'])
+                ? round((float) $line['roi_percent'], 2)
+                : null,
+        ];
+
+        $explain['not_recommended_reason'] = $reason;
+        $explain['optimizer_rejection'] = [
+            'reason' => $reason,
+            'candidate_qty' => $candidateQty,
+            'candidate_economics' => $candidateEconomics,
+            'decision_ru' => match ($reason) {
+                'budget_limit' => 'Строка не вошла в текущий бюджет. Она сохранена для проверки и ручного переопределения.',
+                'negative_profit' => 'Строка исключена из-за отрицательной ожидаемой прибыли. Для включения требуется ручная причина.',
+                default => 'Строка не рекомендована автоматическим отбором и требует ручной проверки.',
+            },
+        ];
+        $explain['planning_decision']['selected'] = false;
+        $explain['planning_decision']['rejection_reason'] = $reason;
+        $explain['planning_decision']['decision_ru'] = $explain['optimizer_rejection']['decision_ru'];
+
+        $line['original_qty_rounded'] = $candidateQty;
+        $line['qty_rounded'] = 0;
+        $line['is_excluded'] = true;
         $line['explain_json'] = $this->encodeExplain($explain);
 
         return $line;

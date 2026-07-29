@@ -9,12 +9,13 @@ use Illuminate\Database\Eloquent\Relations\HasMany;
 
 class Supplier extends Model
 {
-    use HasFactory, HasUuids;
+    use HasFactory, HasUuids, Traits\BelongsToCurrentWorkspace;
 
     protected $keyType = 'string';
     public $incrementing = false;
 
     protected $fillable = [
+        'workspace_id',
         'name',
         'address',
         'phone',
@@ -24,6 +25,7 @@ class Supplier extends Model
     ];
 
     protected $casts = [
+        'workspace_id' => 'integer',
         'metadata' => 'array',
     ];
 

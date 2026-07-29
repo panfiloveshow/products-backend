@@ -2,17 +2,48 @@
 
 namespace App\Services\AutoSupplyPlanning;
 
+use App\Services\Spreadsheet\SafeSpreadsheetReader;
 use Illuminate\Http\UploadedFile;
-use PhpOffice\PhpSpreadsheet\IOFactory;
+use Illuminate\Support\Facades\Log;
 
 class MarketplaceConstraintFileParser
 {
+    private const MAX_ROWS = 50001;
+    private const MAX_COLUMNS = 64;
+    private const MAX_FILE_BYTES = 15 * 1024 * 1024;
+
+    private SafeSpreadsheetReader $safeReader;
+
+    public function __construct(?SafeSpreadsheetReader $safeReader = null)
+    {
+        $this->safeReader = $safeReader ?? new SafeSpreadsheetReader;
+    }
+
     /**
      * @return array<string, mixed>
      */
     public function parse(UploadedFile|string $file, string $marketplace): array
     {
-        $rows = $this->readRows($file);
+        try {
+            $rows = $this->readRows($file);
+        } catch (\InvalidArgumentException $exception) {
+            return [
+                'success' => false,
+                'message' => $exception->getMessage(),
+                'errors' => [$exception->getMessage()],
+            ];
+        } catch (\Throwable $exception) {
+            Log::warning('Marketplace constraint file rejected', [
+                'error' => $exception->getMessage(),
+            ]);
+
+            return [
+                'success' => false,
+                'message' => 'Не удалось безопасно прочитать файл ограничений',
+                'errors' => ['Проверьте формат и размер файла'],
+            ];
+        }
+
         if ($rows === []) {
             return [
                 'success' => false,
@@ -229,53 +260,15 @@ class MarketplaceConstraintFileParser
      */
     private function readRows(UploadedFile|string $file): array
     {
-        $path = $file instanceof UploadedFile ? $file->getRealPath() : $file;
-        $name = $file instanceof UploadedFile ? $file->getClientOriginalName() : $file;
-        $extension = strtolower(pathinfo($name, PATHINFO_EXTENSION));
-
-        if (in_array($extension, ['xlsx', 'xls'], true)) {
-            $spreadsheet = IOFactory::load($path);
-            $sheet = $spreadsheet->getActiveSheet();
-
-            return array_values(array_filter(
-                $sheet->toArray(null, true, true, false),
-                fn (array $row): bool => ! $this->isRawBlankRow($row)
-            ));
-        }
-
-        $content = file_get_contents($path);
-        if ($content === false || trim($content) === '') {
-            return [];
-        }
-
-        $delimiter = $this->detectDelimiter($content);
-        $handle = fopen($path, 'rb');
-        if ($handle === false) {
-            return [];
-        }
-
-        $rows = [];
-        while (($row = fgetcsv($handle, 0, $delimiter)) !== false) {
-            if (! $this->isRawBlankRow($row)) {
-                $rows[] = $row;
-            }
-        }
-        fclose($handle);
-
-        return $rows;
-    }
-
-    private function detectDelimiter(string $content): string
-    {
-        $firstLine = strtok($content, "\n") ?: $content;
-        $scores = [
-            ';' => substr_count($firstLine, ';'),
-            ',' => substr_count($firstLine, ','),
-            "\t" => substr_count($firstLine, "\t"),
-        ];
-        arsort($scores);
-
-        return (string) array_key_first($scores);
+        return array_values(array_filter(
+            $this->safeReader->read(
+                $file,
+                self::MAX_ROWS,
+                self::MAX_COLUMNS,
+                self::MAX_FILE_BYTES
+            ),
+            fn (array $row): bool => ! $this->isRawBlankRow($row)
+        ));
     }
 
     private function normalizeHeader(string $header): string

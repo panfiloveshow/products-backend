@@ -8,7 +8,7 @@ use Illuminate\Database\Eloquent\Model;
 
 class SyncLog extends Model
 {
-    use HasFactory, HasUuids;
+    use HasFactory, HasUuids, Traits\BelongsToCurrentWorkspaceThroughIntegration;
 
     protected $keyType = 'string';
     public $incrementing = false;

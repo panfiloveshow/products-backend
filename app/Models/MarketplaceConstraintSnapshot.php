@@ -13,6 +13,8 @@ use Illuminate\Database\Eloquent\Relations\BelongsTo;
  */
 class MarketplaceConstraintSnapshot extends Model
 {
+    use Traits\BelongsToCurrentWorkspaceThroughIntegration;
+
     protected $fillable = [
         'integration_id',
         'marketplace',

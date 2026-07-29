@@ -15,6 +15,7 @@ use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Schema;
 
 class CostPriceController extends Controller
 {
@@ -34,7 +35,7 @@ class CostPriceController extends Controller
     public function upload(Request $request): JsonResponse
     {
         $request->validate([
-            'file' => 'required|file|max:10240',
+            'file' => 'required|file|max:10240|mimes:xlsx,xls,csv,txt',
         ]);
 
         $file = $request->file('file');
@@ -45,7 +46,6 @@ class CostPriceController extends Controller
             return response()->json([
                 'success' => false,
                 'error' => $result['error'] ?? 'Ошибка при разборе файла',
-                'details' => $result['details'] ?? null,
             ], 422);
         }
 
@@ -513,7 +513,11 @@ class CostPriceController extends Controller
                         })
                         ->update(['cost_price' => $costPrice]);
 
-                    $this->syncFinancialCostPrice($settingsSkus->all(), $costPrice);
+                    $this->syncFinancialCostPrice(
+                        $settingsSkus->all(),
+                        $costPrice,
+                        (int) $product->integration_id
+                    );
                 }
 
                 $updated += $products->unique('id')->count();
@@ -657,11 +661,20 @@ class CostPriceController extends Controller
     /**
      * @param  list<string>  $articles
      */
-    private function syncFinancialCostPrice(array $articles, float $costPrice): void
+    private function syncFinancialCostPrice(array $articles, float $costPrice, int $integrationId): void
     {
         try {
+            if (! Schema::connection('financial')->hasColumn('products', 'integration_id')) {
+                Log::warning('Financial dashboard cost_price sync skipped: tenant key is absent', [
+                    'integration_id' => $integrationId,
+                ]);
+
+                return;
+            }
+
             DB::connection('financial')
                 ->table('products')
+                ->where('integration_id', $integrationId)
                 ->whereIn('article', $articles)
                 ->update(['cost_price' => $costPrice]);
         } catch (\Throwable $e) {

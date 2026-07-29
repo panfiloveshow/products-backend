@@ -15,7 +15,7 @@ use Illuminate\Database\Eloquent\SoftDeletes;
  */
 class Supply extends Model
 {
-    use HasFactory, SoftDeletes;
+    use HasFactory, SoftDeletes, Traits\BelongsToCurrentWorkspaceThroughIntegration;
 
     // Статусы поставки
     public const STATUS_DRAFT = 'draft';
@@ -51,6 +51,7 @@ class Supply extends Model
         'integration_id',
         'crm_number',
         'ozon_supply_id',
+        'ozon_order_id',
         'ozon_draft_id',
         'supply_type',
         'supply_method',
@@ -88,6 +89,11 @@ class Supply extends Model
         'created_by',
         'responsible_id',
         'supply_plan_id',
+        'auto_supply_plan_id',
+        'auto_supply_plan_execution_id',
+        'execution_step',
+        'execution_error',
+        'external_last_synced_at',
         'comment',
         'meta',
         'ozon_response',
@@ -115,6 +121,7 @@ class Supply extends Model
         'acceptance_discrepancies' => 'array',
         'meta' => 'array',
         'ozon_response' => 'array',
+        'external_last_synced_at' => 'datetime',
     ];
 
     protected static function boot()
@@ -156,6 +163,16 @@ class Supply extends Model
     public function supplyPlan(): BelongsTo
     {
         return $this->belongsTo(SupplyPlan::class);
+    }
+
+    public function autoSupplyPlan(): BelongsTo
+    {
+        return $this->belongsTo(AutoSupplyPlan::class);
+    }
+
+    public function autoSupplyPlanExecution(): BelongsTo
+    {
+        return $this->belongsTo(AutoSupplyPlanExecution::class);
     }
 
     public function createdBy(): BelongsTo
@@ -259,6 +276,8 @@ class Supply extends Model
             'new_value' => $newStatus,
             ...$eventData ?? [],
         ]);
+
+        $this->syncAutoSupplyPlanBusinessStatus();
     }
 
     protected function updateStatusTimestamp(string $status): void
@@ -277,6 +296,48 @@ class Supply extends Model
 
         if ($field && !$this->$field) {
             $this->update([$field => now()]);
+        }
+    }
+
+    public function syncAutoSupplyPlanBusinessStatus(): void
+    {
+        $plan = $this->autoSupplyPlan;
+        if ($plan === null) {
+            return;
+        }
+
+        $statuses = $plan->supplies()->pluck('status');
+        if ($statuses->isEmpty()) {
+            return;
+        }
+
+        $allIn = fn (array $allowed): bool => $statuses->every(
+            fn (string $status): bool => in_array($status, $allowed, true)
+        );
+
+        $businessStatus = match (true) {
+            $allIn([self::STATUS_CANCELLED]) => AutoSupplyPlan::BUSINESS_STATUS_CANCELLED,
+            $allIn([self::STATUS_CLOSED, self::STATUS_CANCELLED]) => AutoSupplyPlan::BUSINESS_STATUS_RECONCILED,
+            $allIn([
+                self::STATUS_ACCEPTED_PARTIAL,
+                self::STATUS_ACCEPTED_FULL,
+                self::STATUS_CLOSED,
+                self::STATUS_CANCELLED,
+            ]) => AutoSupplyPlan::BUSINESS_STATUS_RECEIVED,
+            $statuses->contains(fn (string $status): bool => in_array($status, [
+                self::STATUS_SHIPPED,
+                self::STATUS_IN_TRANSIT,
+                self::STATUS_AT_WAREHOUSE,
+                self::STATUS_ACCEPTED_PARTIAL,
+                self::STATUS_ACCEPTED_FULL,
+            ], true)) => AutoSupplyPlan::BUSINESS_STATUS_IN_TRANSIT,
+            $statuses->contains(fn (string $status): bool => $status !== self::STATUS_DRAFT)
+                => AutoSupplyPlan::BUSINESS_STATUS_EXECUTING,
+            default => AutoSupplyPlan::BUSINESS_STATUS_APPROVED,
+        };
+
+        if ($plan->business_status !== $businessStatus) {
+            $plan->update(['business_status' => $businessStatus]);
         }
     }
 

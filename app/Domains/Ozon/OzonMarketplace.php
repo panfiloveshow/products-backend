@@ -55,8 +55,11 @@ class OzonMarketplace implements MarketplaceInterface
     {
         $clientId = $credentials['client_id'] ?? config('services.ozon.client_id');
         $apiKey = $credentials['api_key'] ?? config('services.ozon.api_key');
+        $accessToken = $credentials['oauth_access_token']
+            ?? $credentials['access_token']
+            ?? config('services.ozon.access_token');
 
-        $this->client = new OzonClient($clientId, $apiKey);
+        $this->client = new OzonClient($clientId, $apiKey, $accessToken);
         $this->products = new ProductsApi($this->client);
         $this->inventory = new InventoryApi($this->client);
         $this->sales = new SalesApi($this->client);

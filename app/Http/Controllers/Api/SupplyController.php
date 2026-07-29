@@ -5,6 +5,7 @@ namespace App\Http\Controllers\Api;
 use App\Domains\Ozon\OzonMarketplace;
 use App\Http\Controllers\Controller;
 use App\Models\Integration;
+use App\Models\Shipment;
 use App\Models\Supply;
 use App\Models\SupplyAnalytics;
 use App\Models\SupplyRecommendation;
@@ -720,7 +721,7 @@ class SupplyController extends Controller
     {
         $supply = Supply::findOrFail($id);
 
-        if ($supply->status !== Supply::STATUS_DRAFT) {
+        if ($supply->status !== Supply::STATUS_DRAFT && ! $supply->ozon_draft_id) {
             return response()->json([
                 'success' => false,
                 'message' => 'Черновик уже создан или поставка в неподходящем статусе',
@@ -735,8 +736,11 @@ class SupplyController extends Controller
                 'data' => [
                     'draft_id' => $result['draft_id'],
                     'supply' => $supply->fresh(),
+                    'idempotent' => (bool) ($result['idempotent'] ?? false),
                 ],
-                'message' => 'Черновик создан в Ozon',
+                'message' => ($result['idempotent'] ?? false)
+                    ? 'Черновик Ozon уже был создан ранее'
+                    : 'Черновик создан в Ozon',
             ]);
 
         } catch (\Exception $e) {
@@ -817,6 +821,33 @@ class SupplyController extends Controller
             ]);
 
         } catch (\Exception $e) {
+            return response()->json([
+                'success' => false,
+                'message' => $e->getMessage(),
+            ], 422);
+        }
+    }
+
+    public function reschedule(Request $request, int $id): JsonResponse
+    {
+        $validated = $request->validate([
+            'timeslot_id' => 'required|string',
+        ]);
+        $supply = Supply::findOrFail($id);
+
+        try {
+            $result = $this->supplyService->rescheduleTimeslot(
+                $supply,
+                $validated['timeslot_id'],
+                $request->user()?->id
+            );
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Слот поставки изменён',
+                'data' => ['supply' => $supply->fresh(), 'ozon' => $result],
+            ]);
+        } catch (\Throwable $e) {
             return response()->json([
                 'success' => false,
                 'message' => $e->getMessage(),
@@ -2001,13 +2032,14 @@ class SupplyController extends Controller
         $validated = $request->validate([
             'shipment_id' => 'required|string',
         ]);
+        $shipment = Shipment::query()->findOrFail((string) $validated['shipment_id']);
 
         $slot = WarehouseSlot::query()
             ->where('id', $slotId)
             ->orWhere('external_slot_id', $slotId)
             ->firstOrFail();
 
-        if (! $slot->book((string) $validated['shipment_id'])) {
+        if (! $slot->book((string) $shipment->id)) {
             return response()->json([
                 'message' => 'Слот недоступен для бронирования',
             ], 422);
@@ -2030,6 +2062,16 @@ class SupplyController extends Controller
             ->where('id', $slotId)
             ->orWhere('external_slot_id', $slotId)
             ->firstOrFail();
+
+        $ownsBooking = ($slot->booked_by_shipment_id === null && $slot->booked_by_supply_id === null)
+            || ($slot->booked_by_shipment_id !== null
+                && Shipment::query()->whereKey($slot->booked_by_shipment_id)->exists())
+            || ($slot->booked_by_supply_id !== null
+                && Supply::query()->whereKey($slot->booked_by_supply_id)->exists());
+
+        if (! $ownsBooking) {
+            abort(403, 'Слот забронирован другим workspace');
+        }
 
         $slot->release();
 

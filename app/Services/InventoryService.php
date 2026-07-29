@@ -498,7 +498,9 @@ class InventoryService
 
     public function getOverallStats(): array
     {
-        return Cache::remember('inventory_overall_stats', 60, fn () => [
+        $workspaceId = \App\Support\CurrentWorkspace::id() ?? 0;
+
+        return Cache::remember("inventory_overall_stats:{$workspaceId}", 60, fn () => [
             'total_products' => Product::count(),
             'total_warehouses' => InventoryWarehouse::distinct('warehouse_id')->count(),
             'total_stock' => InventoryWarehouse::sum('quantity'),

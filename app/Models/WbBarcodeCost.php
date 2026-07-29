@@ -6,6 +6,8 @@ use Illuminate\Database\Eloquent\Model;
 
 class WbBarcodeCost extends Model
 {
+    use Traits\BelongsToCurrentWorkspaceThroughIntegration;
+
     protected $table = 'wb_barcode_costs';
 
     protected $fillable = [

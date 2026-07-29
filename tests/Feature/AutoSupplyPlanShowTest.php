@@ -927,14 +927,7 @@ class AutoSupplyPlanShowTest extends TestCase
         $confirmationToken = $preview->json('data.confirmation_token');
 
         $applier = Mockery::mock(LocalityDraftApplier::class);
-        $applier->shouldReceive('applyBatch')
-            ->once()
-            ->withArgs(function (Integration $passedIntegration, array $items, int $clusterId) use ($integration) {
-                return $passedIntegration->id === $integration->id
-                    && $clusterId === 1
-                    && $items === [['sku' => 111, 'quantity' => 5]];
-            })
-            ->andReturn(['success' => true, 'draft_id' => 'draft-1', 'error' => null]);
+        $applier->shouldNotReceive('applyBatch');
         $this->app->instance(LocalityDraftApplier::class, $applier);
 
         $response = $this->postJson("/api/auto-supply-plans/{$plan->id}/create-cluster-drafts", [
@@ -942,18 +935,10 @@ class AutoSupplyPlanShowTest extends TestCase
             'confirmation_text' => 'СОЗДАТЬ ЧЕРНОВИКИ OZON',
         ]);
 
-        $response->assertOk()
-            ->assertJsonPath('data.drafts.0.cluster_id', '1')
-            ->assertJsonPath('data.safe_flow', 'preview_confirmed')
-            ->assertJsonPath('data.confirmation_checked', true)
-            ->assertJsonPath('data.preview_fingerprint_verified', true)
-            ->assertJsonPath('data.safety_checks_passed', true)
-            ->assertJsonPath('data.acceptance_audit.1.title_ru', 'Вызов Ozon разрешён после подтверждения')
-            ->assertJsonPath('data.acceptance_audit.2.status', 'passed')
-            ->assertJsonPath('data.acceptance_audit.3.title_ru', 'Контрольная подпись preview совпала')
-            ->assertJsonPath('data.acceptance_audit.7.title_ru', 'Создание прошло через safe-flow')
-            ->assertJsonCount(1, 'data.drafts')
-            ->assertJsonCount(0, 'data.errors');
+        $response->assertStatus(409)
+            ->assertJsonPath('error', 'canonical_prerequisites_required')
+            ->assertJsonPath('data.required_business_status', AutoSupplyPlan::BUSINESS_STATUS_APPROVED)
+            ->assertJsonPath('data.approval_check.errors.0.code', 'validation_required');
     }
 
     public function test_create_cluster_drafts_rejects_changed_plan_after_preview(): void
@@ -1323,16 +1308,7 @@ class AutoSupplyPlanShowTest extends TestCase
             ->assertJsonPath('data.safe_flow_contract.payload_requirements.2.current_value', 777002);
 
         $applier = Mockery::mock(LocalityDraftApplier::class);
-        $applier->shouldReceive('applyBatch')
-            ->once()
-            ->withArgs(function (Integration $passedIntegration, array $items, int $clusterId, array $options) use ($integration) {
-                return $passedIntegration->id === $integration->id
-                    && $clusterId === 154
-                    && $items === [['sku' => 444, 'quantity' => 5]]
-                    && $options['supply_method'] === 'crossdock'
-                    && $options['drop_off_point_warehouse_id'] === 777002;
-            })
-            ->andReturn(['success' => true, 'draft_id' => 'draft-cross-override', 'error' => null, 'supply_method' => 'crossdock']);
+        $applier->shouldNotReceive('applyBatch');
         $this->app->instance(LocalityDraftApplier::class, $applier);
 
         $response = $this->postJson("/api/auto-supply-plans/{$plan->id}/create-cluster-drafts", [
@@ -1341,11 +1317,9 @@ class AutoSupplyPlanShowTest extends TestCase
             'drop_off_point_warehouse_id' => 777002,
         ]);
 
-        $response->assertOk()
-            ->assertJsonPath('data.safe_flow', 'preview_confirmed')
-            ->assertJsonPath('data.supply_method', 'crossdock')
-            ->assertJsonPath('data.drop_off_point_warehouse_id', 777002)
-            ->assertJsonPath('data.drafts.0.drop_off_point_warehouse_id', 777002);
+        $response->assertStatus(409)
+            ->assertJsonPath('error', 'canonical_prerequisites_required')
+            ->assertJsonPath('data.required_business_status', AutoSupplyPlan::BUSINESS_STATUS_APPROVED);
     }
 
     public function test_crossdock_create_rejects_dropoff_point_changed_after_preview(): void
@@ -1465,16 +1439,7 @@ class AutoSupplyPlanShowTest extends TestCase
             ->assertJsonPath('data.safe_flow_contract.payload_requirements.2.current_value', 777001);
 
         $applier = Mockery::mock(LocalityDraftApplier::class);
-        $applier->shouldReceive('applyBatch')
-            ->once()
-            ->withArgs(function (Integration $passedIntegration, array $items, int $clusterId, array $options) use ($integration) {
-                return $passedIntegration->id === $integration->id
-                    && $clusterId === 154
-                    && $items === [['sku' => 333, 'quantity' => 5]]
-                    && $options['supply_method'] === 'crossdock'
-                    && $options['drop_off_point_warehouse_id'] === 777001;
-            })
-            ->andReturn(['success' => true, 'draft_id' => 'draft-cross-1', 'error' => null, 'supply_method' => 'crossdock']);
+        $applier->shouldNotReceive('applyBatch');
         $this->app->instance(LocalityDraftApplier::class, $applier);
 
         $response = $this->postJson("/api/auto-supply-plans/{$plan->id}/create-cluster-drafts", [
@@ -1482,12 +1447,9 @@ class AutoSupplyPlanShowTest extends TestCase
             'confirmation_text' => $preview->json('data.confirmation_phrase'),
         ]);
 
-        $response->assertOk()
-            ->assertJsonPath('data.safe_flow', 'preview_confirmed')
-            ->assertJsonPath('data.supply_method', 'crossdock')
-            ->assertJsonPath('data.drop_off_point_warehouse_id', 777001)
-            ->assertJsonPath('data.drafts.0.supply_method', 'crossdock')
-            ->assertJsonPath('data.drafts.0.drop_off_point_warehouse_id', 777001);
+        $response->assertStatus(409)
+            ->assertJsonPath('error', 'canonical_prerequisites_required')
+            ->assertJsonPath('data.required_business_status', AutoSupplyPlan::BUSINESS_STATUS_APPROVED);
     }
 
     public function test_show_summary_financials_match_line_aggregates(): void

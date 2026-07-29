@@ -14,7 +14,7 @@ use Illuminate\Database\Eloquent\SoftDeletes;
  */
 class SupplyRecommendation extends Model
 {
-    use HasFactory, SoftDeletes;
+    use HasFactory, SoftDeletes, Traits\BelongsToCurrentWorkspaceThroughIntegration;
 
     public const STATE_NEW = 'new';
     public const STATE_ACCEPTED = 'accepted';

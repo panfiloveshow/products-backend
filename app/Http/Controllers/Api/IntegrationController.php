@@ -10,6 +10,7 @@ use App\Models\SyncLog;
 use App\Services\IntegrationAccessService;
 use App\Services\LimitsSyncService;
 use App\Services\Ozon\OzonPerformanceApiService;
+use App\Services\Ozon\OzonCredentialHealthService;
 use App\Services\ProductService;
 use App\Services\SellicoApiService;
 use App\Support\ActivityLogger;
@@ -81,7 +82,12 @@ class IntegrationController extends Controller
     /**
      * Проверка статуса интеграции (валидность токена, принадлежность workspace)
      */
-    public function checkStatus(int $id, Request $request, IntegrationAccessService $integrationAccessService): JsonResponse
+    public function checkStatus(
+        int $id,
+        Request $request,
+        IntegrationAccessService $integrationAccessService,
+        OzonCredentialHealthService $ozonCredentials
+    ): JsonResponse
     {
         $resolution = $integrationAccessService->ensureAccessibleIntegration($request, $id);
         if (! ($resolution['success'] ?? false)) {
@@ -93,35 +99,42 @@ class IntegrationController extends Controller
 
         $integration = $resolution['integration'];
 
-        $validationStatus = 'valid';
-        $validationError = null;
-        $lastCheckedAt = now();
-
         $workspaceId = $request->header('X-Sellico-Workspace')
             ?? $request->header('X-Workspace-Id')
             ?? $request->input('workspace');
 
         // Проверка принадлежности workspace
         if ($integration->work_space_id !== null && $workspaceId && (int) $integration->work_space_id !== (int) $workspaceId) {
-            $validationStatus = 'workspace_mismatch';
-            $validationError = 'Интеграция принадлежит другому workspace';
+            return response()->json([
+                'success' => false,
+                'message' => 'Интеграция принадлежит другому workspace',
+            ], 403);
         }
 
-        $integration->update([
-            'last_validation_at' => $lastCheckedAt,
-            'last_validation_status' => $validationStatus,
-            'last_validation_error' => $validationError,
-        ]);
+        $health = $integration->marketplace === 'ozon'
+            ? $ozonCredentials->check($integration, probe: true)
+            : [
+                'status' => 'valid',
+                'health' => 'healthy',
+                'message' => 'Интеграция готова.',
+                'checked_at' => now()->toIso8601String(),
+            ];
 
         return response()->json([
             'success' => true,
             'data' => [
                 'integration_id' => $id,
-                'validation_status' => $validationStatus,
-                'validation_error' => $validationError,
-                'last_checked_at' => $lastCheckedAt->toIso8601String(),
+                'validation_status' => $health['status'],
+                'validation_error' => ($health['status'] ?? null) === 'valid' ? null : $health['message'],
+                'last_checked_at' => $health['checked_at'],
                 'work_space_id' => $integration->work_space_id,
                 'marketplace' => $integration->marketplace,
+                'credential_type' => $health['credential_type'] ?? $integration->credential_type,
+                'credential_health' => $health['health'],
+                'credentials_expires_at' => $integration->credentials_expires_at?->toIso8601String(),
+                'days_until_expiry' => $health['days_until_expiry'] ?? null,
+                'notification_threshold_days' => $health['notification_threshold_days'] ?? null,
+                'usable' => $health['usable'] ?? true,
             ],
         ]);
     }
@@ -153,6 +166,12 @@ class IntegrationController extends Controller
             'name' => $validated['name'],
             'marketplace' => $validated['marketplace'],
             'credentials' => $validated['credentials'],
+            'credential_type' => ! empty($validated['credentials']['oauth_access_token'])
+                ? 'oauth'
+                : 'api_key',
+            'credentials_expires_at' => $validated['credentials']['expires_at'] ?? null,
+            'credential_scopes' => $validated['credentials']['scopes'] ?? null,
+            'credential_health' => 'unknown',
             'is_active' => true,
             'auto_sync_enabled' => $validated['auto_sync_enabled'] ?? true,
             'sync_interval_hours' => $validated['sync_interval_hours'] ?? 6,
@@ -195,6 +214,19 @@ class IntegrationController extends Controller
         $validated = $request->validated();
         // Защита от mass-assignment: не даём переписать integration_id / work_space_id через update.
         unset($validated['id'], $validated['work_space_id'], $validated['integration_id']);
+
+        if (isset($validated['credentials'])) {
+            $validated['credentials'] = array_merge(
+                $integration->getDecryptedCredentials(),
+                $validated['credentials']
+            );
+            $validated['credential_type'] = ! empty($validated['credentials']['oauth_access_token'])
+                ? 'oauth'
+                : 'api_key';
+            $validated['credentials_expires_at'] = $validated['credentials']['expires_at'] ?? null;
+            $validated['credential_scopes'] = $validated['credentials']['scopes'] ?? null;
+            $validated['credential_health'] = 'unknown';
+        }
 
         $integration->update($validated);
 
@@ -948,6 +980,11 @@ class IntegrationController extends Controller
             'last_validation_at' => $integration->last_validation_at,
             'last_validation_status' => $integration->last_validation_status,
             'last_validation_error' => $detailed ? $integration->last_validation_error : null,
+            'credential_type' => $integration->credential_type,
+            'credential_health' => $integration->credential_health,
+            'credentials_expires_at' => $integration->credentials_expires_at,
+            'credential_scopes' => $integration->credential_scopes,
+            'credential_last_checked_at' => $integration->credential_last_checked_at,
         ];
 
         if ($detailed) {
@@ -975,11 +1012,13 @@ class IntegrationController extends Controller
                 break;
 
             case 'ozon':
-                if (empty($credentials['client_id'])) {
-                    $errors[] = 'client_id обязателен для Ozon';
-                }
-                if (empty($credentials['api_key'])) {
-                    $errors[] = 'api_key обязателен для Ozon';
+                if (empty($credentials['oauth_access_token'])) {
+                    if (empty($credentials['client_id'])) {
+                        $errors[] = 'client_id обязателен для Ozon при авторизации по API key';
+                    }
+                    if (empty($credentials['api_key'])) {
+                        $errors[] = 'api_key или oauth_access_token обязателен для Ozon';
+                    }
                 }
                 break;
 

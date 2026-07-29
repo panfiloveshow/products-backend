@@ -55,27 +55,50 @@ class OzonPostingsBuyoutCalculatorTest extends TestCase
 
     private function createPostingItems(int $integrationId, string $sku, string $status, int $quantity): void
     {
-        $postingId = (string) Str::uuid();
+        for ($index = 0; $index < $quantity; $index++) {
+            $postingId = (string) Str::uuid();
+            $postingItemId = (string) Str::uuid();
+            $postingNumber = (string) Str::uuid();
 
-        DB::table('postings')->insert([
-            'id' => $postingId,
-            'integration_id' => (string) $integrationId,
-            'marketplace' => 'ozon',
-            'posting_number' => (string) Str::uuid(),
-            'status' => $status,
-            'in_process_at' => now()->subDay(),
-            'created_at' => now(),
-            'updated_at' => now(),
-        ]);
+            DB::table('postings')->insert([
+                'id' => $postingId,
+                'integration_id' => (string) $integrationId,
+                'marketplace' => 'ozon',
+                'posting_number' => $postingNumber,
+                'status' => $status,
+                'in_process_at' => now()->subDay(),
+                'created_at' => now(),
+                'updated_at' => now(),
+            ]);
 
-        DB::table('posting_items')->insert([
-            'id' => (string) Str::uuid(),
-            'posting_id' => $postingId,
-            'sku' => $sku,
-            'name' => 'Test item',
-            'quantity' => $quantity,
-            'created_at' => now(),
-            'updated_at' => now(),
-        ]);
+            DB::table('posting_items')->insert([
+                'id' => $postingItemId,
+                'posting_id' => $postingId,
+                'sku' => $sku,
+                'name' => 'Test item',
+                'quantity' => 1,
+                'created_at' => now(),
+                'updated_at' => now(),
+            ]);
+
+            DB::table('ozon_order_unit_economics')->insert([
+                'integration_id' => $integrationId,
+                'posting_id' => $postingId,
+                'posting_item_id' => $postingItemId,
+                'posting_number' => $postingNumber,
+                'sku' => $sku,
+                'offer_id' => $sku,
+                'order_date' => now()->subDay(),
+                'sale_price' => 1000,
+                'base_logistics_tariff' => 100,
+                'non_local_markup_percent' => 0,
+                'non_local_markup_amount' => 0,
+                'markup_applied' => false,
+                'calculation_mode' => 'factual',
+                'calculation_confidence' => 'high',
+                'created_at' => now(),
+                'updated_at' => now(),
+            ]);
+        }
     }
 }

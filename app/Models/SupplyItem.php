@@ -11,7 +11,7 @@ use Illuminate\Database\Eloquent\Relations\BelongsTo;
  */
 class SupplyItem extends Model
 {
-    use HasFactory;
+    use HasFactory, Traits\BelongsToCurrentWorkspaceThroughSupply;
 
     public const STATUS_PENDING = 'pending';
     public const STATUS_PICKING = 'picking';
@@ -23,6 +23,7 @@ class SupplyItem extends Model
 
     protected $fillable = [
         'supply_id',
+        'auto_supply_plan_line_id',
         'product_id',
         'sku',
         'ozon_product_id',
@@ -70,6 +71,11 @@ class SupplyItem extends Model
     public function product(): BelongsTo
     {
         return $this->belongsTo(Product::class);
+    }
+
+    public function autoSupplyPlanLine(): BelongsTo
+    {
+        return $this->belongsTo(AutoSupplyPlanLine::class);
     }
 
     public function recommendation(): BelongsTo

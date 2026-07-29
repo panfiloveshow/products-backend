@@ -8,12 +8,13 @@ use Illuminate\Database\Eloquent\Model;
 
 class ShipmentRecommendation extends Model
 {
-    use HasFactory, HasUuids;
+    use HasFactory, HasUuids, Traits\BelongsToCurrentWorkspaceThroughIntegration;
 
     protected $keyType = 'string';
     public $incrementing = false;
 
     protected $fillable = [
+        'integration_id',
         'priority',
         'title',
         'description',
@@ -29,6 +30,7 @@ class ShipmentRecommendation extends Model
     ];
 
     protected $casts = [
+        'integration_id' => 'integer',
         'critical_items' => 'array',
         'recommended_items' => 'array',
         'total_cost' => 'decimal:2',
