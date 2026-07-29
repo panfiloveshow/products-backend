@@ -33,14 +33,19 @@ Backend/API реализованы 29 июля 2026 года:
 - план-факт WAPE/weighted bias, accepted/rejected, OOS days, excess cover, manual override outcome и причины расхождений;
 - 41 route автопланирования, tenant/permission-проверки и фоновые расписания refresh/tracking/plan-fact/credential alerts.
 
-Финальная локальная регрессия: `619 passed`, `3252 assertions`, `0 failed`;
-`git diff --check`, `composer validate`, route registration и scheduler registration проходят.
+Локальная регрессия после аудита покрытия: `663 tests`, `3365 assertions`, `0 failed`;
+`git diff --check`, `composer validate` и route registration проходят.
 
-Ограничения репозитория и внешние production-gates:
+Ограничения и внешние production-gates:
 
-- в репозитории нет frontend приложения продукта, поэтому физическая реализация экранов выполняется в frontend-репозитории по готовому API-контракту;
+- экраны продукта живут в отдельном frontend-репозитории `placesales_front` и выложены на sellico.ru;
+- на проде не настроены `schedule:run` и воркеры очередей `ozon-fact-refresh`/`ozon-supply-execution` — до этого автопланирование не исполняется;
 - живой вызов `draft → timeslot → supply order → supply get` требует выделенного Ozon-кабинета, реальных credentials и явного разрешения на создание заявки;
 - продуктовые beta-метрики и p95 подтверждаются только нагрузочным прогоном и реальными циклами поставки.
+
+Известные расхождения кода с формулами этого документа (зафиксированы тестами):
+lead time влияет на количество только через страховой запас, а OOS-коррекция
+применяется к агрегированному спросу, а не к каждому окну 7/28/56.
 
 Полная матрица покрытия: [ozon-auto-planning-implementation-coverage-2026-07-29.md](ozon-auto-planning-implementation-coverage-2026-07-29.md).
 Контракт для экранов: [ozon-auto-planning-ui-api-contract-2026-07-29.md](ozon-auto-planning-ui-api-contract-2026-07-29.md).
