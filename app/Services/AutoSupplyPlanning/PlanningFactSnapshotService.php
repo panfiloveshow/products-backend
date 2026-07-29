@@ -88,6 +88,41 @@ class PlanningFactSnapshotService
         return $snapshot;
     }
 
+    /**
+     * Зафиксировать параметры, которые расчёт применил фактически.
+     *
+     * @param array<string, mixed> $effectiveParams
+     */
+    public function recordEffectiveParams(AutoSupplyPlan $plan, array $effectiveParams): void
+    {
+        $plan->forceFill(['effective_params_json' => $effectiveParams])->save();
+
+        if (! $plan->snapshot_id) {
+            return;
+        }
+
+        $snapshot = PlanningFactSnapshot::query()->find($plan->snapshot_id);
+        if ($snapshot === null) {
+            return;
+        }
+
+        $params = is_array($snapshot->params_json) ? $snapshot->params_json : [];
+        $params['effective'] = $effectiveParams;
+
+        $snapshot->update([
+            'params_json' => $params,
+            'summary_json' => array_merge(
+                is_array($snapshot->summary_json) ? $snapshot->summary_json : [],
+                [
+                    'params_hash' => $this->hash([
+                        'requested' => $params['requested'] ?? [],
+                        'effective' => $effectiveParams,
+                    ]),
+                ]
+            ),
+        ]);
+    }
+
     public function complete(AutoSupplyPlan $plan, array $payload): ?PlanningFactSnapshot
     {
         $snapshot = $plan->snapshot_id

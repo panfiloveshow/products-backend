@@ -2596,48 +2596,9 @@ class SuppliesApi implements SuppliesApiInterface
     // ДОПОЛНИТЕЛЬНЫЕ МЕТОДЫ ДЛЯ РАБОТЫ С ЗАЯВКАМИ
     // ========================================================================
 
-    /**
-     * Получить подробную информацию о заявке на поставку
-     * 
-     * POST /v2/supply-order/get
-     * 
-     * @param string $supplyId ID заявки на поставку
-     * @return array Детальная информация о заявке
-     */
-    public function getSupplyOrderDetails(string $supplyId): array
-    {
-        $response = $this->client->post('/v2/supply-order/get', [
-            'supply_id' => $supplyId,
-        ]);
-
-        if (!$response) {
-            return [];
-        }
-
-        $result = $response['result'] ?? $response;
-        
-        return [
-            'supply_id' => $result['supply_id'] ?? $supplyId,
-            'status' => $result['status'] ?? null,
-            'created_at' => $result['created_at'] ?? null,
-            'updated_at' => $result['updated_at'] ?? null,
-            'warehouse_id' => $result['warehouse_id'] ?? null,
-            'warehouse_name' => $result['warehouse_name'] ?? null,
-            'timeslot' => $result['timeslot'] ?? null,
-            'items' => array_map(fn($item) => [
-                'sku' => $item['sku'] ?? null,
-                'offer_id' => $item['offer_id'] ?? null,
-                'name' => $item['name'] ?? null,
-                'quantity' => $item['quantity'] ?? 0,
-                'accepted_quantity' => $item['accepted_quantity'] ?? null,
-                'rejected_quantity' => $item['rejected_quantity'] ?? null,
-            ], $result['items'] ?? []),
-            'total_items' => $result['total_items'] ?? 0,
-            'total_quantity' => $result['total_quantity'] ?? 0,
-            'pass' => $result['pass'] ?? null,
-            'cargoes_count' => $result['cargoes_count'] ?? 0,
-        ];
-    }
+    // ponytail: getSupplyOrderDetails() на POST /v2/supply-order/get удалён.
+    // Вызывающих не было, а трекинг читает заявки через getSupplyOrdersDetails()
+    // на /v3/supply-order/get — держать рядом мёртвый v2-путь опасно.
 
     /**
      * Получить зоны размещения товаров по SKU перед поставкой
