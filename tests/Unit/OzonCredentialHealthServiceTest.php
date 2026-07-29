@@ -109,6 +109,46 @@ class OzonCredentialHealthServiceTest extends TestCase
         $this->assertSame('warning', $result['severity']);
     }
 
+    /**
+     * Регрессия: сохранённый invalid давал usable=false, а пробник запускался
+     * только при usable=true — статус залипал навсегда и интеграцию нельзя
+     * было вернуть в строй даже с рабочими ключами.
+     */
+    public function test_previously_invalid_credentials_recover_after_successful_probe(): void
+    {
+        Http::preventStrayRequests();
+        Http::fake(['*/v3/product/list' => Http::response(['result' => ['items' => []]], 200)]);
+
+        $integration = $this->workingIntegration();
+        $integration->forceFill(['credential_health' => 'invalid'])->save();
+
+        $this->assertFalse(app(OzonCredentialHealthService::class)->assess($integration)['usable']);
+
+        $result = app(OzonCredentialHealthService::class)->check($integration);
+
+        $this->assertSame('valid', $result['status']);
+        $this->assertTrue($result['usable']);
+        $this->assertSame('healthy', $integration->fresh()->credential_health);
+    }
+
+    public function test_missing_credentials_are_not_probed(): void
+    {
+        Http::preventStrayRequests();
+        Http::fake(['*' => Http::response([], 200)]);
+
+        $integration = Integration::factory()->ozon()->create([
+            'id' => random_int(100000, 999999),
+            'work_space_id' => 96,
+            'credentials' => [],
+            'credential_health' => 'unknown',
+        ]);
+
+        $result = app(OzonCredentialHealthService::class)->check($integration);
+
+        $this->assertSame('missing', $result['status']);
+        Http::assertNothingSent();
+    }
+
     private function workingIntegration(): Integration
     {
         return Integration::factory()->ozon()->create([
