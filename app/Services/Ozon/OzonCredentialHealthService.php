@@ -104,12 +104,20 @@ class OzonCredentialHealthService
 
         if ($probe && ($result['usable'] ?? false) && $integration->marketplace === 'ozon') {
             try {
+                // /v3/product/list принимает фильтр видимости и не требует
+                // идентификаторов товара. Родственный /v3/product/info/list
+                // отвечает 400 «use either offer_id or product_id or sku»,
+                // и раньше это принималось за отзыв ключей.
                 $response = OzonClient::fromIntegration($integration)->post(
-                    '/v3/product/info/list',
+                    '/v3/product/list',
                     ['filter' => ['visibility' => 'ALL'], 'limit' => 1]
                 );
 
-                if ($response === null || ($response['_error'] ?? false)) {
+                $httpStatus = (int) ($response['_http_status'] ?? 0);
+                $rejectedByOzon = in_array($httpStatus, [401, 403], true);
+                $probeFailed = $response === null || ($response['_error'] ?? false);
+
+                if ($rejectedByOzon) {
                     $result = array_merge($result, [
                         'status' => 'invalid',
                         'health' => 'invalid',
@@ -119,6 +127,21 @@ class OzonCredentialHealthService
                             $response['message']
                             ?? data_get($response, 'error.message')
                             ?? 'Ozon отклонил credentials.'
+                        ),
+                    ]);
+                } elseif ($probeFailed) {
+                    // Любая другая ошибка — проблема запроса или самого Ozon.
+                    // Считать её отзывом ключей нельзя: это глушит весь синк
+                    // фактов и блокирует утверждение планов.
+                    $result = array_merge($result, [
+                        'status' => 'unavailable',
+                        'health' => 'unavailable',
+                        'usable' => (bool) ($result['usable'] ?? false),
+                        'severity' => 'warning',
+                        'message' => 'Проверка Ozon не удалась: '.(string) (
+                            $response['message']
+                            ?? data_get($response, 'error.message')
+                            ?? 'неизвестная ошибка'
                         ),
                     ]);
                 } elseif (($result['status'] ?? null) !== 'expiring') {
