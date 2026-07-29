@@ -7,7 +7,7 @@ use Illuminate\Database\Eloquent\Model;
 
 class LocalityMetricClusterDaily extends Model
 {
-    use HasFactory;
+    use HasFactory, Traits\BelongsToCurrentWorkspaceThroughIntegration;
 
     protected $table = 'locality_metrics_cluster_daily';
 

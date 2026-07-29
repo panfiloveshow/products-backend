@@ -60,12 +60,21 @@ class EvaluatePlanAccuracyJob implements ShouldQueue
             $evaluations[] = $attrs;
         }
 
-        $plan->forceFill(['accuracy_json' => $reconciler->aggregate($evaluations)])->save();
+        $updates = ['accuracy_json' => $reconciler->aggregate($evaluations)];
+        $hasSupplies = $plan->supplies()->exists();
+        $allSuppliesTerminal = $hasSupplies && ! $plan->supplies()
+            ->whereNotIn('status', ['accepted_partial', 'accepted_full', 'closed', 'cancelled'])
+            ->exists();
+        if ($allSuppliesTerminal) {
+            $updates['business_status'] = AutoSupplyPlan::BUSINESS_STATUS_RECONCILED;
+        }
+        $plan->forceFill($updates)->save();
 
         Log::info('EvaluatePlanAccuracyJob: план оценён', [
             'plan_id' => $plan->id,
             'lines' => count($evaluations),
             'mape' => $plan->accuracy_json['mape'] ?? null,
+            'wape' => $plan->accuracy_json['wape'] ?? null,
         ]);
     }
 }

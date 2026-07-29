@@ -15,7 +15,7 @@ class ShipmentService
     public function create(array $data): Shipment
     {
         return DB::transaction(function () use ($data) {
-            $supplier = Supplier::find($data['supplier_id']);
+            $supplier = Supplier::findOrFail($data['supplier_id']);
 
             $shipment = Shipment::create([
                 'name' => $data['name'],

@@ -3,6 +3,7 @@
 namespace App\Services;
 
 use App\Models\Integration;
+use App\Support\CurrentWorkspace;
 use Illuminate\Database\QueryException;
 use Illuminate\Http\Request;
 
@@ -43,23 +44,37 @@ class IntegrationAccessService
         ?string $expectedMarketplace = null
     ): array {
         $workspaceId = $this->extractWorkspaceId($request);
+        $workspaceBypass = $workspaceId === null
+            && ! app()->environment('production')
+            && config('services.sellico.skip_permission_check', false);
+
+        if ($workspaceId === null && ! $workspaceBypass) {
+            return [
+                'success' => false,
+                'status' => 401,
+                'message' => 'Workspace не прошёл проверку доступа',
+            ];
+        }
+
         $expectedMarketplace = $expectedMarketplace
             ? $this->normalizeMarketplace($expectedMarketplace)
             : null;
 
-        $integration = Integration::find($integrationId);
+        $integration = Integration::withoutGlobalScope('current_workspace')->find($integrationId);
 
         if ($integration) {
-            $workspaceCheck = $this->validateWorkspaceAccess($integration, $workspaceId);
-            if ($workspaceCheck !== null) {
-                $refreshedIntegration = $this->refreshIntegrationFromRemote($request, $integrationId, $expectedMarketplace, $workspaceId);
-                if ($refreshedIntegration !== null) {
-                    $integration = $refreshedIntegration;
-                    $workspaceCheck = $this->validateWorkspaceAccess($integration, $workspaceId);
-                }
-
+            if (! $workspaceBypass) {
+                $workspaceCheck = $this->validateWorkspaceAccess($integration, $workspaceId);
                 if ($workspaceCheck !== null) {
-                    return $workspaceCheck;
+                    $refreshedIntegration = $this->refreshIntegrationFromRemote($request, $integrationId, $expectedMarketplace, $workspaceId);
+                    if ($refreshedIntegration !== null) {
+                        $integration = $refreshedIntegration;
+                        $workspaceCheck = $this->validateWorkspaceAccess($integration, $workspaceId);
+                    }
+
+                    if ($workspaceCheck !== null) {
+                        return $workspaceCheck;
+                    }
                 }
             }
 
@@ -119,7 +134,7 @@ class IntegrationAccessService
             $credentials = [];
         }
 
-        $integration = Integration::find($integrationId) ?? new Integration;
+        $integration = Integration::withoutGlobalScope('current_workspace')->find($integrationId) ?? new Integration;
         $integration->fill([
             'id' => $integrationId,
             'work_space_id' => $remoteWorkspaceId ?: $workspaceId,
@@ -142,11 +157,13 @@ class IntegrationAccessService
         } catch (QueryException $exception) {
             // Параллельный запрос мог успеть создать интеграцию между find() и save().
             if ($this->isDuplicateIntegrationKey($exception, $integrationId)) {
-                $integration = Integration::find($integrationId);
+                $integration = Integration::withoutGlobalScope('current_workspace')->find($integrationId);
                 if ($integration) {
-                    $workspaceCheck = $this->validateWorkspaceAccess($integration, $workspaceId);
-                    if ($workspaceCheck !== null) {
-                        return $workspaceCheck;
+                    if (! $workspaceBypass) {
+                        $workspaceCheck = $this->validateWorkspaceAccess($integration, $workspaceId);
+                        if ($workspaceCheck !== null) {
+                            return $workspaceCheck;
+                        }
                     }
 
                     return [
@@ -171,7 +188,11 @@ class IntegrationAccessService
     private function validateWorkspaceAccess(Integration $integration, ?int $workspaceId): ?array
     {
         if (! $workspaceId) {
-            return null;
+            return [
+                'success' => false,
+                'status' => 401,
+                'message' => 'Workspace не прошёл проверку доступа',
+            ];
         }
 
         if ($integration->work_space_id !== null && (int) $integration->work_space_id !== $workspaceId) {
@@ -191,11 +212,27 @@ class IntegrationAccessService
 
     private function extractWorkspaceId(Request $request): ?int
     {
+        $trustedWorkspaceId = CurrentWorkspace::id($request);
+        if ($trustedWorkspaceId !== null) {
+            return $trustedWorkspaceId;
+        }
+
+        // Прямые unit-тесты и переиспользование сервиса вне route middleware:
+        // заголовок принимается только в non-production. В production tenant
+        // должен быть предварительно подтверждён CheckSellicoPermission.
+        if (app()->environment('production')) {
+            return null;
+        }
+
         $workspaceId = $request->header('X-Sellico-Workspace')
             ?? $request->header('X-Workspace-Id')
             ?? $request->input('workspace');
 
-        return $workspaceId ? (int) $workspaceId : null;
+        $workspaceId = filter_var($workspaceId, FILTER_VALIDATE_INT, [
+            'options' => ['min_range' => 1],
+        ]);
+
+        return $workspaceId === false ? null : $workspaceId;
     }
 
     private function extractToken(Request $request): ?string
@@ -264,7 +301,7 @@ class IntegrationAccessService
             $credentials = [];
         }
 
-        $integration = Integration::find($integrationId) ?? new Integration;
+        $integration = Integration::withoutGlobalScope('current_workspace')->find($integrationId) ?? new Integration;
         $integration->fill([
             'id' => $integrationId,
             'work_space_id' => $remoteWorkspaceId ?: $workspaceId,

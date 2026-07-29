@@ -192,7 +192,7 @@ class PostingService
         $limit = 1000;
 
         do {
-            $response = $marketplace->getClient()->post('/v2/posting/fbo/list', [
+            $response = $marketplace->getClient()->post('/v3/posting/fbo/list', [
                 'dir' => 'DESC',
                 'filter' => [
                     'since' => $since,
@@ -206,7 +206,11 @@ class PostingService
                 ],
             ]);
 
-            $postings = $response['result'] ?? [];
+            $postings = $response['result']['postings']
+                ?? $response['postings']
+                ?? $response['result']
+                ?? [];
+            $postings = is_array($postings) ? $postings : [];
 
             DB::beginTransaction();
             try {
@@ -866,7 +870,7 @@ class PostingService
      * Освежить статусы «в пути» постингов Ozon за окно $windowDays.
      *
      * Ozon-виджет «Выкупы за 28 дней» иногда уже считает delivering-заказ
-     * выкупленным, хотя в /v2/posting/fbo/list он ещё delivering. Чтобы
+     * выкупленным, хотя в /v3/posting/fbo/list он ещё delivering. Чтобы
      * максимально приблизиться к виджету, перед расчётом выкупа точечно
      * перезапрашиваем каждый висящий постинг через /v2/posting/fbo/get
      * (или /v3/posting/fbs/get) и обновляем статус.

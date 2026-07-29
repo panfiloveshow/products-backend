@@ -204,7 +204,12 @@ class InventoryController extends Controller
         if (empty($credentials)) {
             $rules = match ($marketplace) {
                 'wildberries' => ['api_key' => 'required|string'],
-                'ozon' => ['client_id' => 'required|string', 'api_key' => 'required|string'],
+                'ozon' => [
+                    'client_id' => 'nullable|string|required_with:api_key',
+                    'api_key' => 'nullable|string|required_without_all:oauth_access_token,access_token',
+                    'oauth_access_token' => 'nullable|string|required_without_all:api_key,access_token',
+                    'access_token' => 'nullable|string',
+                ],
                 'yandex_market' => ['token' => 'required|string', 'campaign_id' => 'required|string'],
                 default => [],
             };
@@ -216,6 +221,8 @@ class InventoryController extends Controller
                 'ozon' => [
                     'client_id' => $request->input('client_id'),
                     'api_key' => $request->input('api_key'),
+                    'oauth_access_token' => $request->input('oauth_access_token')
+                        ?: $request->input('access_token'),
                 ],
                 'yandex_market' => [
                     'token' => $request->input('token'),

@@ -23,21 +23,30 @@ class GenerateShipmentRecommendationsJob implements ShouldQueue
     {
         Log::info("Starting shipment recommendations generation");
 
-        $criticalProducts = InventoryWarehouse::where('stock_status', 'critical')
+        $criticalByIntegration = InventoryWarehouse::where('stock_status', 'critical')
             ->get()
-            ->groupBy('sku');
+            ->filter(fn (InventoryWarehouse $warehouse): bool => (int) $warehouse->integration_id > 0)
+            ->groupBy('integration_id');
 
-        if ($criticalProducts->isEmpty()) {
+        if ($criticalByIntegration->isEmpty()) {
             Log::info("No critical products found");
             return;
         }
 
+        foreach ($criticalByIntegration as $integrationId => $warehouses) {
+            $this->generateForIntegration((int) $integrationId, $warehouses->groupBy('sku'));
+        }
+    }
+
+    private function generateForIntegration(int $integrationId, $criticalProducts): void
+    {
         // Оптимизация H8: раньше на каждый SKU делался Product::where('sku')->first()
         // + отдельный запрос ->unitEconomics()->latest()->value() → 2 запроса на SKU.
         // Теперь грузим Product + последний UnitEconomics одним прогоном.
         $skus = $criticalProducts->keys()->filter()->unique()->values()->all();
 
         $productsBySku = Product::query()
+            ->where('integration_id', $integrationId)
             ->whereIn('sku', $skus)
             ->get()
             ->keyBy('sku');
@@ -45,9 +54,11 @@ class GenerateShipmentRecommendationsJob implements ShouldQueue
         // Последняя запись unit_economics на SKU — через DB max(id).
         $latestCostPrice = \Illuminate\Support\Facades\DB::table('unit_economics')
             ->select('sku', 'cost_price')
-            ->whereIn('id', function ($q) use ($skus) {
+            ->where('integration_id', $integrationId)
+            ->whereIn('id', function ($q) use ($skus, $integrationId) {
                 $q->selectRaw('MAX(id)')
                     ->from('unit_economics')
+                    ->where('integration_id', $integrationId)
                     ->whereIn('sku', $skus)
                     ->groupBy('sku');
             })
@@ -94,6 +105,7 @@ class GenerateShipmentRecommendationsJob implements ShouldQueue
         }
 
         $existingRecommendation = ShipmentRecommendation::active()
+            ->where('integration_id', $integrationId)
             ->where('priority', 'urgent')
             ->first();
 
@@ -107,6 +119,7 @@ class GenerateShipmentRecommendationsJob implements ShouldQueue
             ]);
         } else {
             ShipmentRecommendation::create([
+                'integration_id' => $integrationId,
                 'priority' => 'urgent',
                 'title' => 'Срочная поставка критических товаров',
                 'description' => 'Обнаружены товары с критически низкими остатками. Рекомендуется срочно создать поставку.',
@@ -121,6 +134,7 @@ class GenerateShipmentRecommendationsJob implements ShouldQueue
         }
 
         Log::info("Shipment recommendations generated", [
+            'integration_id' => $integrationId,
             'critical_items' => count($criticalItems),
             'total_cost' => $totalCost,
         ]);

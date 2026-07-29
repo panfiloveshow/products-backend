@@ -2,6 +2,7 @@
 
 namespace App\Http\Middleware;
 
+use App\Support\CurrentWorkspace;
 use Closure;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Cache;
@@ -52,6 +53,12 @@ class CheckSellicoPermission
         'products.cost-price.upload'   => 'products.edit',
         'products.cost-price.bulk'     => 'products.edit',
         'products.cost-price.template' => 'products.view',
+        'workspaces.limits-external.show'  => 'products.view',
+        'workspaces.limits-external.store' => 'products.edit',
+        'workspaces.limits-external.sync'  => 'products.edit',
+        'wb-webhook.status'            => 'products.view',
+        'wb-webhook.register'          => 'products.edit',
+        'wb-webhook.deactivate'        => 'products.edit',
 
         // Юнит-экономика
         'unit-economics.index'             => 'unit_economics.view',
@@ -77,12 +84,18 @@ class CheckSellicoPermission
         'auto-supply-plans.index'        => 'auto_supply.view',
         'auto-supply-plans.show'         => 'auto_supply.view',
         'auto-supply-plans.lines'        => 'auto_supply.view',
+        'auto-supply-plans.compare'      => 'auto_supply.view',
+        'auto-supply-plans.lines.bulk'   => 'auto_supply.create',
+        'auto-supply-plans.adjustments'  => 'auto_supply.view',
         'auto-supply-plans.accuracy'     => 'auto_supply.view',
+        'auto-supply-plans.plan-fact'    => 'auto_supply.view',
         'auto-supply-plans.clusters'     => 'auto_supply.view',
-        'auto-supply-plans.lines.update' => 'auto_supply.view',
+        'auto-supply-plans.lines.update' => 'auto_supply.create',
+        'auto-supply-plans.lines.patch'  => 'auto_supply.create',
         'auto-supply-plans.capabilities' => 'auto_supply.view',
         'auto-supply-plans.warehouses'   => 'auto_supply.view',
         'auto-supply-plans.data-health'  => 'auto_supply.view',
+        'auto-supply-plans.refresh-data' => 'products.sync.execute',
         'auto-supply-plans.constraints.index' => 'auto_supply.view',
         'auto-supply-plans.constraints.preview' => 'auto_supply.create',
         'auto-supply-plans.constraints.sync' => 'auto_supply.create',
@@ -91,7 +104,13 @@ class CheckSellicoPermission
         'auto-supply-plans.store'        => 'auto_supply.create',
         'auto-supply-plans.destroy'      => 'auto_supply.delete',
         'auto-supply-plans.calculate'    => 'auto_supply.calculate',
-        'auto-supply-plans.fix-ktr-baseline' => 'auto_supply.view',
+        'auto-supply-plans.validate'     => 'auto_supply.calculate',
+        'auto-supply-plans.approve'      => 'auto_supply.create',
+        'auto-supply-plans.materialize-supplies' => 'auto_supply.create',
+        'auto-supply-plans.execution'    => 'auto_supply.view',
+        'auto-supply-plans.execute'      => 'auto_supply.create',
+        'auto-supply-plans.executions.retry' => 'auto_supply.create',
+        'auto-supply-plans.fix-ktr-baseline' => 'auto_supply.calculate',
         'auto-supply-plans.export'       => 'auto_supply.export',
         'auto-supply-plans.export.xlsx'  => 'auto_supply.export',
         'auto-supply-plans.export.csv'   => 'auto_supply.export',
@@ -146,18 +165,18 @@ class CheckSellicoPermission
         'shipments.recommendations'        => 'auto_supply.view',
         'shipments.stats'                  => 'auto_supply.view',
         'shipments.store'                  => 'auto_supply.create',
-        'shipments.update'                 => 'auto_supply.view',
+        'shipments.update'                 => 'auto_supply.create',
         'shipments.destroy'                => 'auto_supply.delete',
         'shipments.createFromRecommendation' => 'auto_supply.create',
-        'shipments.addItem'                => 'auto_supply.view',
-        'shipments.updateItem'             => 'auto_supply.view',
-        'shipments.removeItem'             => 'auto_supply.view',
-        'shipments.submit'                 => 'auto_supply.view',
-        'shipments.approve'                => 'auto_supply.view',
-        'shipments.reject'                 => 'auto_supply.view',
-        'shipments.send'                   => 'auto_supply.view',
-        'shipments.deliver'                => 'auto_supply.view',
-        'shipments.bookSlot'               => 'auto_supply.view',
+        'shipments.addItem'                => 'auto_supply.create',
+        'shipments.updateItem'             => 'auto_supply.create',
+        'shipments.removeItem'             => 'auto_supply.delete',
+        'shipments.submit'                 => 'auto_supply.create',
+        'shipments.approve'                => 'auto_supply.create',
+        'shipments.reject'                 => 'auto_supply.delete',
+        'shipments.send'                   => 'auto_supply.create',
+        'shipments.deliver'                => 'auto_supply.create',
+        'shipments.bookSlot'               => 'auto_supply.create',
         'shipments.export'                 => 'auto_supply.export',
         'shipments.export.csv'             => 'auto_supply.export',
 
@@ -168,24 +187,24 @@ class CheckSellicoPermission
         'supply-recommendations.stats'       => 'auto_supply.view',
         'supply-recommendations.generate'    => 'auto_supply.calculate',
         'supply-recommendations.apply'       => 'auto_supply.create',
-        'supply-recommendations.dismiss'     => 'auto_supply.view',
+        'supply-recommendations.dismiss'     => 'auto_supply.delete',
 
         // Планы поставок
         'supply-plans.index'     => 'auto_supply.view',
         'supply-plans.show'      => 'auto_supply.view',
         'supply-plans.store'     => 'auto_supply.create',
-        'supply-plans.update'    => 'auto_supply.view',
+        'supply-plans.update'    => 'auto_supply.create',
         'supply-plans.destroy'   => 'auto_supply.delete',
         'supply-plans.calculate' => 'auto_supply.calculate',
         'supply-plans.approve'   => 'auto_supply.create',
-        'supply-plans.cancel'    => 'auto_supply.view',
+        'supply-plans.cancel'    => 'auto_supply.delete',
 
         // Слоты складов
         'warehouse-slots.index'      => 'auto_supply.view',
         'warehouse-slots.warehouses' => 'auto_supply.view',
-        'warehouse-slots.sync'       => 'auto_supply.view',
+        'warehouse-slots.sync'       => 'auto_supply.calculate',
         'warehouse-slots.book'       => 'auto_supply.create',
-        'warehouse-slots.release'    => 'auto_supply.view',
+        'warehouse-slots.release'    => 'auto_supply.delete',
 
         // Ozon FBO supplies
         'supplies.index'                                  => 'auto_supply.view',
@@ -194,7 +213,7 @@ class CheckSellicoPermission
         'supplies.store-manual'                           => 'auto_supply.create',
         'supplies.stats'                                  => 'auto_supply.view',
         'supplies.settings.index'                         => 'auto_supply.view',
-        'supplies.settings.update'                        => 'auto_supply.view',
+        'supplies.settings.update'                        => 'auto_supply.create',
         'supplies.analytics'                              => 'auto_supply.view',
         'supplies.clusters'                               => 'auto_supply.view',
         'supplies.cluster-products'                       => 'auto_supply.view',
@@ -202,17 +221,18 @@ class CheckSellicoPermission
         'supplies.set-cluster-delivery-method'            => 'auto_supply.create',
         'supplies.set-cluster-warehouse'                  => 'auto_supply.create',
         'supplies.slots'                                  => 'auto_supply.view',
-        'supplies.sync-slots'                             => 'auto_supply.view',
+        'supplies.sync-slots'                             => 'auto_supply.calculate',
         'supplies.products-for-supply'                    => 'auto_supply.view',
         'supplies.create-with-slot'                       => 'auto_supply.create',
         'supplies.create-draft'                           => 'auto_supply.create',
         'supplies.timeslots'                              => 'auto_supply.view',
         'supplies.book-slot'                              => 'auto_supply.create',
-        'supplies.start-preparing'                        => 'auto_supply.view',
-        'supplies.ready-to-ship'                          => 'auto_supply.view',
-        'supplies.ship'                                   => 'auto_supply.view',
-        'supplies.cancel'                                 => 'auto_supply.view',
-        'supplies.sync-status'                            => 'auto_supply.view',
+        'supplies.reschedule'                             => 'auto_supply.create',
+        'supplies.start-preparing'                        => 'auto_supply.create',
+        'supplies.ready-to-ship'                          => 'auto_supply.create',
+        'supplies.ship'                                   => 'auto_supply.create',
+        'supplies.cancel'                                 => 'auto_supply.delete',
+        'supplies.sync-status'                            => 'auto_supply.calculate',
         'supplies.events'                                 => 'auto_supply.view',
         'supplies.recommendations.index'                  => 'auto_supply.view',
         'supplies.recommendations.map'                    => 'auto_supply.view',
@@ -221,16 +241,16 @@ class CheckSellicoPermission
         'supplies.recommendations.by-sku'                 => 'auto_supply.view',
         'supplies.recommendations.summary'                => 'auto_supply.view',
         'supplies.recommendations.accept'                 => 'auto_supply.create',
-        'supplies.recommendations.reject'                 => 'auto_supply.view',
-        'supplies.recommendations.postpone'               => 'auto_supply.view',
+        'supplies.recommendations.reject'                 => 'auto_supply.delete',
+        'supplies.recommendations.postpone'               => 'auto_supply.create',
         'supplies.packages.index'                         => 'auto_supply.view',
         'supplies.packages.store'                         => 'auto_supply.create',
         'supplies.packages.show'                          => 'auto_supply.view',
-        'supplies.packages.update'                        => 'auto_supply.view',
+        'supplies.packages.update'                        => 'auto_supply.create',
         'supplies.packages.destroy'                       => 'auto_supply.delete',
         'supplies.packages.add-item'                      => 'auto_supply.create',
         'supplies.packages.remove-item'                   => 'auto_supply.delete',
-        'supplies.packages.pack'                          => 'auto_supply.view',
+        'supplies.packages.pack'                          => 'auto_supply.create',
         'supplies.packages.auto-pack'                     => 'auto_supply.calculate',
         'supplies.packages.summary'                       => 'auto_supply.view',
         'supplies.documents.index'                        => 'auto_supply.view',
@@ -243,15 +263,15 @@ class CheckSellicoPermission
         // Ozon FBS postings
         'postings.index'          => 'auto_supply.view',
         'postings.statistics'     => 'auto_supply.view',
-        'postings.sync'           => 'auto_supply.view',
+        'postings.sync'           => 'auto_supply.calculate',
         'postings.show'           => 'auto_supply.view',
-        'postings.assemble'       => 'auto_supply.view',
-        'postings.pack'           => 'auto_supply.view',
-        'postings.ship'           => 'auto_supply.view',
-        'postings.cancel'         => 'auto_supply.view',
+        'postings.assemble'       => 'auto_supply.create',
+        'postings.pack'           => 'auto_supply.create',
+        'postings.ship'           => 'auto_supply.create',
+        'postings.cancel'         => 'auto_supply.delete',
         'postings.label'          => 'auto_supply.export',
         'postings.bulk-labels'    => 'auto_supply.export',
-        'postings.bulk-ship'      => 'auto_supply.view',
+        'postings.bulk-ship'      => 'auto_supply.create',
         'postings.act.create'     => 'auto_supply.export',
         'postings.act.download'   => 'auto_supply.export',
         'postings.cancel-reasons' => 'auto_supply.view',
@@ -279,10 +299,10 @@ class CheckSellicoPermission
 
         // Отчёты Ozon
         'ozon-reports.index'           => 'unit_economics.view',
-        'ozon-reports.upload'          => 'unit_economics.view',
+        'ozon-reports.upload'          => 'unit_economics.settings.edit',
         'ozon-reports.summary'         => 'unit_economics.view',
         'ozon-reports.warehouseSales'  => 'unit_economics.view',
-        'ozon-reports.destroy'         => 'unit_economics.view',
+        'ozon-reports.destroy'         => 'unit_economics.settings.edit',
 
         // Locality Engine (Ozon FBO — встроен в юнит-экономику)
         'locality.overview'                        => 'unit_economics.view',
@@ -298,7 +318,7 @@ class CheckSellicoPermission
         'locality.recommendations.draftPreview'    => 'unit_economics.view',
         'locality.recommendations.draftCreate'     => 'unit_economics.edit',
         'locality.reconciliation'                  => 'unit_economics.view',
-        'locality.recompute'                       => 'unit_economics.view',
+        'locality.recompute'                       => 'unit_economics.settings.edit',
     ];
 
     /**
@@ -333,7 +353,15 @@ class CheckSellicoPermission
                 ]);
             } else {
                 Log::debug('CheckSellicoPermission: проверка прав пропущена через skip_permission_check (non-production)');
-                return $next($request);
+                $workspace = $request->header('X-Sellico-Workspace')
+                    ?? $request->header('X-Workspace-Id')
+                    ?? $request->input('workspace');
+
+                if ($workspace === null || $workspace === '') {
+                    return $next($request);
+                }
+
+                return $this->continueInWorkspace($request, $next, $workspace);
             }
         }
 
@@ -360,7 +388,11 @@ class CheckSellicoPermission
             ?? $request->header('X-Workspace-Id')
             ?? $request->input('workspace');
 
-        if (!$token || !$workspace) {
+        $workspaceId = filter_var($workspace, FILTER_VALIDATE_INT, [
+            'options' => ['min_range' => 1],
+        ]);
+
+        if (!$token || $workspaceId === false) {
             Log::warning('CheckSellicoPermission: missing credentials', [
                 'route'         => $routeName,
                 'permission'    => $permission,
@@ -375,6 +407,7 @@ class CheckSellicoPermission
         }
 
         // Кешируем токен пользователя по workspace_id — используется CLI-синком для доступа к API
+        $workspace = (string) $workspaceId;
         Cache::put("workspace_user_token:{$workspace}", $token, now()->addHours(22));
 
         $tokenHash = md5($token);
@@ -401,7 +434,7 @@ class CheckSellicoPermission
                     'permission' => $permission,
                     'workspace'  => $workspace,
                 ]);
-                return $next($request);
+                return $this->continueInWorkspace($request, $next, $workspaceId);
             }
 
             Log::error('CheckSellicoPermission: CRM недоступен и нет grace-кэша — блокируем запрос', [
@@ -433,7 +466,23 @@ class CheckSellicoPermission
             ], 403);
         }
 
-        return $next($request);
+        return $this->continueInWorkspace($request, $next, $workspaceId);
+    }
+
+    /**
+     * Tenant-контекст живёт ровно один HTTP-запрос. Это важно для long-lived
+     * workers (Octane) и тестового kernel, где объект request может пережить
+     * выполнение middleware и иначе повлиять на следующий запрос.
+     */
+    private function continueInWorkspace(Request $request, Closure $next, mixed $workspaceId): Response
+    {
+        CurrentWorkspace::bind($request, $workspaceId);
+
+        try {
+            return $next($request);
+        } finally {
+            CurrentWorkspace::forget($request);
+        }
     }
 
     /**

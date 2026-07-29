@@ -69,10 +69,23 @@ class ProductService
      */
     public function computedStockExpression(string $inventoryAlias = 'inventory_totals'): string
     {
-        $wbJsonSum = "COALESCE((SELECT SUM((elem->>'quantity')::numeric) "
-            ."FROM json_array_elements("
-            ."CASE WHEN json_typeof(products.wb_data->'stock_warehouses') = 'array' "
-            ."THEN products.wb_data->'stock_warehouses' ELSE '[]'::json END) AS elem), 0)";
+        $wbJsonSum = match (DB::getDriverName()) {
+            'sqlite' => "COALESCE((SELECT SUM(CAST(json_extract(elem.value, '$.quantity') AS REAL)) "
+                ."FROM json_each(CASE "
+                ."WHEN json_valid(products.wb_data) "
+                ."THEN CASE WHEN json_type(products.wb_data, '$.stock_warehouses') = 'array' "
+                ."THEN json_extract(products.wb_data, '$.stock_warehouses') ELSE '[]' END "
+                ."ELSE '[]' END) AS elem), 0)",
+            'mysql', 'mariadb' => "COALESCE((SELECT SUM(elem.quantity) "
+                ."FROM JSON_TABLE(CASE "
+                ."WHEN JSON_TYPE(JSON_EXTRACT(products.wb_data, '$.stock_warehouses')) = 'ARRAY' "
+                ."THEN JSON_EXTRACT(products.wb_data, '$.stock_warehouses') ELSE JSON_ARRAY() END, "
+                ."'$[*]' COLUMNS(quantity DECIMAL(18, 4) PATH '$.quantity')) AS elem), 0)",
+            default => "COALESCE((SELECT SUM((elem->>'quantity')::numeric) "
+                ."FROM json_array_elements("
+                ."CASE WHEN json_typeof(products.wb_data->'stock_warehouses') = 'array' "
+                ."THEN products.wb_data->'stock_warehouses' ELSE '[]'::json END) AS elem), 0)",
+        };
 
         return "CASE WHEN products.marketplace = 'wildberries' "
             ."THEN {$wbJsonSum} "
@@ -82,7 +95,8 @@ class ProductService
     public function getProductsStats(array $filters = []): array
     {
         $statsVersion = Cache::get('products_stats_version', 1);
-        $cacheKey = 'products_stats_'.$statsVersion.'_'.md5(json_encode($filters));
+        $workspaceId = \App\Support\CurrentWorkspace::id() ?? 0;
+        $cacheKey = 'products_stats_'.$workspaceId.'_'.$statsVersion.'_'.md5(json_encode($filters));
 
         return Cache::remember($cacheKey, 60, function () use ($filters) {
             $query = Product::query();

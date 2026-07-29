@@ -8,7 +8,7 @@ use Illuminate\Database\Eloquent\Relations\BelongsTo;
 
 class OzonOrderUnitEconomics extends Model
 {
-    use HasFactory;
+    use HasFactory, Traits\BelongsToCurrentWorkspaceThroughIntegration;
 
     protected $table = 'ozon_order_unit_economics';
 

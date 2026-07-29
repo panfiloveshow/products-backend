@@ -2636,7 +2636,10 @@ class OzonPerformanceApiService
         $metaBySku = [];
         $nameToOfferIds = [];
 
-        Product::query()
+        // Внутренний расчёт уже жёстко ограничен integration_id. Он может
+        // запускаться из очереди или команды после HTTP-запроса, поэтому не
+        // должен зависеть от оставшегося request tenant-context.
+        Product::withoutGlobalScope('current_workspace')
             ->where('integration_id', $integrationId)
             ->where('marketplace', 'ozon')
             ->select(['sku', 'vendor_code', 'name', 'category', 'marketplace_id', 'ozon_data'])

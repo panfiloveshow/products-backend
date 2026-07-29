@@ -7,6 +7,8 @@ use App\Http\Requests\AutoSupplyPlan\StoreAutoSupplyPlanRequest;
 use App\Jobs\CalculateAutoSupplyPlanJob;
 use App\Models\AutoSupplyConstraintFile;
 use App\Models\AutoSupplyPlan;
+use App\Models\AutoSupplyPlanAdjustment;
+use App\Models\AutoSupplyPlanExecution;
 use App\Models\AutoSupplyPlanLine;
 use App\Models\InventoryWarehouse;
 use App\Models\Integration;
@@ -18,12 +20,20 @@ use App\Models\Product;
 use App\Services\AutoSupplyPlanning\MarketplaceConstraintFileParser;
 use App\Services\AutoSupplyPlanning\MarketplaceConstraintSyncService;
 use App\Services\AutoSupplyPlanning\MarketplacePlanningCapabilityService;
+use App\Services\AutoSupplyPlanning\AutoSupplyPlanExecutionService;
+use App\Services\AutoSupplyPlanning\DataFreshnessRegistry;
 use App\Services\AutoSupplyPlanning\OzonCrossdockDropOffPointService;
+use App\Services\AutoSupplyPlanning\OzonPlanMaterializationService;
+use App\Services\AutoSupplyPlanning\OzonPlanValidationService;
+use App\Services\AutoSupplyPlanning\OzonPlanningFactRefreshService;
 use App\Services\AutoSupplyPlanning\PlanningReadinessChecklistService;
 use App\Services\IntegrationAccessService;
 use App\Services\LimitsSyncService;
+use Carbon\CarbonImmutable;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Pagination\LengthAwarePaginator;
+use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Validator;
 use PhpOffice\PhpSpreadsheet\Spreadsheet;
@@ -87,6 +97,8 @@ class AutoSupplyPlanController extends Controller
             }
 
             $query->where('integration_id', $integrationAccess['integration']->id);
+        } else {
+            $query->whereIn('integration_id', Integration::query()->select('id'));
         }
 
         if ($request->filled('status')) {
@@ -264,7 +276,7 @@ class AutoSupplyPlanController extends Controller
     {
         $validated = $request->validate([
             'integration_id' => 'required|integer',
-            'file' => 'required|file|mimes:csv,txt,xlsx,xls|max:51200',
+            'file' => 'required|file|mimes:csv,txt,xlsx,xls|max:15360',
         ]);
 
         $integrationAccess = $this->integrationAccessService
@@ -639,16 +651,37 @@ class AutoSupplyPlanController extends Controller
     {
         $plan = $this->authorizedPlan($request, $id);
 
-        // Удаляем старые строки
-        $plan->lines()->delete();
-        $plan->update([
-            'status' => AutoSupplyPlan::STATUS_PENDING,
-            'error_message' => null,
-            'data_quality_score' => null,
-            'data_quality_json' => null,
-            'total_lines' => 0,
-            'total_qty' => 0,
-        ]);
+        $blocked = \DB::transaction(function () use ($plan): bool {
+            $lockedPlan = AutoSupplyPlan::query()->lockForUpdate()->findOrFail($plan->id);
+            if ($lockedPlan->supplies()->exists()) {
+                return true;
+            }
+
+            // Удаляем старые строки только после блокировки версии плана.
+            $lockedPlan->lines()->delete();
+            $lockedPlan->update([
+                'status' => AutoSupplyPlan::STATUS_PENDING,
+                'business_status' => AutoSupplyPlan::BUSINESS_STATUS_DRAFT,
+                'approved_at' => null,
+                'approved_by' => null,
+                'approval_fingerprint' => null,
+                'materialized_at' => null,
+                'error_message' => null,
+                'data_quality_score' => null,
+                'data_quality_json' => null,
+                'total_lines' => 0,
+                'total_qty' => 0,
+            ]);
+
+            return false;
+        });
+
+        if ($blocked) {
+            return response()->json([
+                'message' => 'Нельзя пересчитать план, по которому уже созданы поставки. Создайте новый план.',
+                'error' => 'plan_already_materialized',
+            ], 409);
+        }
 
         CalculateAutoSupplyPlanJob::dispatch($plan->id);
 
@@ -656,6 +689,179 @@ class AutoSupplyPlanController extends Controller
             'message' => 'Пересчёт запущен',
             'data' => $plan->fresh()->load('integration'),
         ]);
+    }
+
+    /**
+     * POST /api/auto-supply-plans/{id}/approve
+     */
+    public function approve(
+        Request $request,
+        string $id,
+        OzonPlanMaterializationService $service
+    ): JsonResponse {
+        $plan = $this->authorizedPlan($request, $id);
+        $check = $service->approvalCheck($plan);
+
+        if (! $check['allowed']) {
+            return response()->json([
+                'message' => 'План нельзя утвердить, пока не устранены блокирующие ошибки.',
+                'error' => 'approval_blocked',
+                'data' => ['approval_check' => $check],
+            ], 422);
+        }
+
+        $approved = $service->approve($plan, $this->requestUserId($request));
+
+        return response()->json([
+            'message' => 'План Ozon утверждён',
+            'data' => [
+                'plan' => $approved,
+                'approval_check' => $check,
+            ],
+        ]);
+    }
+
+    /**
+     * POST /api/auto-supply-plans/{id}/validate
+     */
+    public function validatePlan(
+        Request $request,
+        string $id,
+        OzonPlanValidationService $service
+    ): JsonResponse {
+        $plan = $this->authorizedPlan($request, $id);
+        $validation = $service->validate($plan);
+
+        return response()->json([
+            'message' => $validation['allowed']
+                ? 'План прошёл проверку и готов к утверждению'
+                : 'План заблокирован проверкой',
+            'data' => [
+                'plan' => $plan->fresh(),
+                'validation' => $validation,
+            ],
+        ], $validation['allowed'] ? 200 : 422);
+    }
+
+    /**
+     * POST /api/auto-supply-plans/{id}/materialize-supplies
+     *
+     * Создаёт только локальные Supply/SupplyItem. Вызов Ozon Seller API
+     * выполняется отдельным явным действием в модуле поставок.
+     */
+    public function materializeSupplies(
+        Request $request,
+        string $id,
+        OzonPlanMaterializationService $service
+    ): JsonResponse {
+        $plan = $this->authorizedPlan($request, $id);
+        $result = $service->materialize($plan, $this->requestUserId($request));
+        $status = $result['created_count'] > 0 ? 201 : 200;
+
+        return response()->json([
+            'message' => $result['created_count'] > 0
+                ? 'Локальные поставки Ozon созданы'
+                : 'Поставки уже были созданы ранее, дубли не добавлены',
+            'data' => [
+                'plan' => $result['plan'],
+                'supplies' => $result['supplies'],
+                'created_count' => $result['created_count'],
+                'idempotent' => $result['created_count'] === 0,
+                'external_api_called' => false,
+            ],
+        ], $status);
+    }
+
+    /**
+     * GET /api/auto-supply-plans/{id}/execution
+     */
+    public function execution(
+        Request $request,
+        string $id,
+        OzonPlanMaterializationService $service
+    ): JsonResponse {
+        $plan = $this->authorizedPlan($request, $id, [
+            'supplies.items',
+            'executions.supplies.items',
+        ]);
+
+        return response()->json([
+            'message' => 'OK',
+            'data' => [
+                'plan' => $plan,
+                'approval_check' => $service->approvalCheck($plan),
+                'supplies' => $plan->supplies,
+                'executions' => $plan->executions,
+            ],
+        ]);
+    }
+
+    /**
+     * POST /api/auto-supply-plans/{id}/execute
+     */
+    public function executePlan(
+        Request $request,
+        string $id,
+        AutoSupplyPlanExecutionService $service
+    ): JsonResponse {
+        $validated = $request->validate([
+            'idempotency_key' => 'required|string|min:8|max:120',
+            'confirmation_text' => 'required|string',
+            'auto_book_timeslot' => 'sometimes|boolean',
+            'timeslot_preferences' => 'sometimes|array',
+            'timeslot_preferences.target_date' => 'sometimes|date',
+            'timeslot_preferences.weekdays' => 'sometimes|array',
+            'timeslot_preferences.weekdays.*' => 'integer|min:1|max:7',
+            'timeslot_preferences.time_from' => 'sometimes|date_format:H:i',
+            'timeslot_preferences.time_to' => 'sometimes|date_format:H:i',
+        ]);
+        $plan = $this->authorizedPlan($request, $id);
+        $result = $service->start(
+            $plan,
+            $validated['idempotency_key'],
+            $validated['confirmation_text'],
+            $this->requestUserId($request),
+            $validated
+        );
+
+        return response()->json([
+            'message' => $result['created']
+                ? 'Исполнение поставок Ozon поставлено в очередь'
+                : 'Операция с таким ключом уже существует',
+            'data' => [
+                'execution' => $result['execution'],
+                'idempotent' => ! $result['created'],
+                'confirmation_phrase' => AutoSupplyPlanExecutionService::CONFIRMATION_PHRASE,
+            ],
+        ], $result['created'] ? 202 : 200);
+    }
+
+    /**
+     * POST /api/auto-supply-plans/{id}/executions/{executionId}/retry
+     */
+    public function retryExecution(
+        Request $request,
+        string $id,
+        string $executionId,
+        AutoSupplyPlanExecutionService $service
+    ): JsonResponse {
+        $plan = $this->authorizedPlan($request, $id);
+        $validated = $request->validate([
+            'confirmed_no_external_draft' => 'sometimes|boolean',
+        ]);
+        $execution = AutoSupplyPlanExecution::query()
+            ->where('auto_supply_plan_id', $plan->id)
+            ->findOrFail($executionId);
+
+        return response()->json([
+            'message' => 'Повторная попытка поставлена в очередь',
+            'data' => [
+                'execution' => $service->retry(
+                    $execution,
+                    (bool) ($validated['confirmed_no_external_draft'] ?? false)
+                ),
+            ],
+        ], 202);
     }
 
     /**
@@ -673,7 +879,7 @@ class AutoSupplyPlanController extends Controller
                 'sku', 'cluster_id', 'warehouse_id', 'horizon_days',
                 'forecast_demand_qty', 'actual_sales_qty', 'abs_pct_error', 'bias_pct',
                 'planned_qty', 'accepted_qty', 'rejected_qty', 'acceptance_rate',
-                'status', 'evaluated_at',
+                'status', 'details_json', 'evaluated_at',
             ]);
 
         return response()->json([
@@ -694,6 +900,24 @@ class AutoSupplyPlanController extends Controller
     public function lines(Request $request, string $id): JsonResponse
     {
         $plan = $this->authorizedPlan($request, $id);
+        $request->validate([
+            'risk_level' => 'nullable|string|in:low,med,medium,high,critical',
+            'offer_id' => 'nullable|string|max:255',
+            'priority' => 'nullable|string|in:low,medium,high,critical',
+            'cluster_id' => 'nullable|string|max:64',
+            'is_excluded' => 'nullable|boolean',
+            'missing_cost' => 'nullable|boolean',
+            'negative_profit' => 'nullable|boolean',
+            'urgent_oos' => 'nullable|boolean',
+            'blocked' => 'nullable|boolean',
+            'low_confidence' => 'nullable|boolean',
+            'new_product' => 'nullable|boolean',
+            'budget_cut' => 'nullable|boolean',
+            'manually_modified' => 'nullable|boolean',
+            'min_qty' => 'nullable|integer|min:0',
+            'search' => 'nullable|string|max:255',
+            'per_page' => 'nullable|integer|min:1|max:200',
+        ]);
 
         $query = $this->planLinesQueryForSelectedClusters($plan);
 
@@ -704,6 +928,62 @@ class AutoSupplyPlanController extends Controller
         if ($request->filled('offer_id')) {
             $query->where('offer_id', $request->input('offer_id'));
         }
+        if ($request->filled('priority')) {
+            $query->where('priority', $request->input('priority'));
+        }
+        if ($request->filled('cluster_id')) {
+            $query->where('cluster_id', (string) $request->input('cluster_id'));
+        }
+        if ($request->has('is_excluded')) {
+            $query->where('is_excluded', $request->boolean('is_excluded'));
+        }
+        if ($request->boolean('missing_cost')) {
+            $query->whereNull('cost_price');
+        }
+        if ($request->boolean('negative_profit')) {
+            $query->where('expected_profit', '<', 0);
+        }
+        if ($request->boolean('urgent_oos')) {
+            $urgentUntil = CarbonImmutable::now()->addDays(7)->toDateString();
+            $query->where(function ($inner) use ($urgentUntil) {
+                $inner->whereIn('risk_level', ['high', 'critical'])
+                    ->orWhere(function ($dateQuery) use ($urgentUntil) {
+                        $dateQuery->whereNotNull('oos_date')
+                            ->where('oos_date', '<=', $urgentUntil);
+                    });
+            });
+        }
+        if ($request->boolean('blocked')) {
+            $query->where(function ($inner) {
+                $inner->where('is_excluded', true)
+                    ->orWhereNull('cost_price')
+                    ->orWhere('expected_profit', '<', 0)
+                    ->orWhereIn('explain_json->confidence->confidence_level', ['low', 'bad']);
+            });
+        }
+        if ($request->boolean('low_confidence')) {
+            $query->whereIn('explain_json->confidence->confidence_level', ['low', 'bad', 'warning']);
+        }
+        if ($request->boolean('new_product')) {
+            $query->where('explain_json->inputs->supply_type', 'new_warehouse');
+        }
+        if ($request->boolean('budget_cut')) {
+            $query->where('explain_json->optimizer_rejection->reason', 'budget_limit');
+        }
+        if ($request->boolean('manually_modified')) {
+            $query->whereNotNull('manual_updated_at');
+        }
+        if ($request->filled('min_qty')) {
+            $query->where('qty_rounded', '>=', max(0, (int) $request->input('min_qty')));
+        }
+        if ($request->filled('search')) {
+            $search = trim((string) $request->input('search'));
+            $query->where(function ($inner) use ($search) {
+                $inner->where('sku', 'like', '%' . $search . '%')
+                    ->orWhere('offer_id', 'like', '%' . $search . '%')
+                    ->orWhere('product_name', 'like', '%' . $search . '%');
+            });
+        }
 
         $perPage = $request->input('per_page', 50);
         $lines = $this->paginateAggregatedPlanLines($plan, $query, (int) $perPage);
@@ -711,7 +991,343 @@ class AutoSupplyPlanController extends Controller
         return response()->json([
             'message' => 'OK',
             'data' => $lines,
+            'review' => [
+                'business_status' => $plan->business_status,
+                'validation' => $plan->validation_json,
+                'manual_adjustments_count' => $plan->adjustments()->count(),
+                'excluded_lines_count' => $plan->lines()->where('is_excluded', true)->count(),
+                'missing_cost_lines_count' => $plan->lines()->whereNull('cost_price')->count(),
+                'negative_profit_lines_count' => $plan->lines()->where('expected_profit', '<', 0)->count(),
+                'budget_cut_lines_count' => $plan->lines()
+                    ->where('explain_json->optimizer_rejection->reason', 'budget_limit')
+                    ->count(),
+                'manual_lines_count' => $plan->lines()->whereNotNull('manual_updated_at')->count(),
+                'low_confidence_lines_count' => $plan->lines()
+                    ->whereIn('explain_json->confidence->confidence_level', ['low', 'bad', 'warning'])
+                    ->count(),
+            ],
         ]);
+    }
+
+    public function adjustments(Request $request, string $id): JsonResponse
+    {
+        $plan = $this->authorizedPlan($request, $id);
+        $items = $plan->adjustments()
+            ->with('line:id,sku,offer_id,cluster_id,cluster_name')
+            ->orderByDesc('created_at')
+            ->paginate(max(1, min(100, (int) $request->input('per_page', 50))));
+
+        return response()->json(['message' => 'OK', 'data' => $items]);
+    }
+
+    /**
+     * GET /api/auto-supply-plans/{id}/compare
+     *
+     * Сравнивает текущий review-план с явно выбранным или предыдущим готовым
+     * планом той же интеграции. Сравнение выполняется в каноническом разрезе
+     * SKU × кластер и учитывает исключённые/ручные строки.
+     */
+    public function compare(Request $request, string $id): JsonResponse
+    {
+        $plan = $this->authorizedPlan($request, $id);
+        $validated = $request->validate([
+            'with_plan_id' => 'nullable|uuid',
+            'page' => 'nullable|integer|min:1',
+            'per_page' => 'nullable|integer|min:1|max:200',
+            'changed_only' => 'nullable|boolean',
+        ]);
+
+        if (! empty($validated['with_plan_id'])) {
+            $other = $this->authorizedPlan($request, (string) $validated['with_plan_id']);
+        } else {
+            $other = AutoSupplyPlan::query()
+                ->where('integration_id', $plan->integration_id)
+                ->where('marketplace', $plan->marketplace)
+                ->where('status', AutoSupplyPlan::STATUS_READY)
+                ->where('id', '!=', $plan->id)
+                ->where('created_at', '<=', $plan->created_at)
+                ->orderByDesc('created_at')
+                ->first();
+        }
+
+        if ($other === null) {
+            return response()->json([
+                'message' => 'Предыдущий готовый план для сравнения не найден.',
+                'error' => 'comparison_plan_not_found',
+            ], 404);
+        }
+        if ((int) $other->integration_id !== (int) $plan->integration_id
+            || $other->marketplace !== $plan->marketplace) {
+            return response()->json([
+                'message' => 'Сравнивать можно только планы одной интеграции и маркетплейса.',
+                'error' => 'comparison_scope_mismatch',
+            ], 422);
+        }
+
+        $current = $this->comparisonMap($plan);
+        $previous = $this->comparisonMap($other);
+        $keys = array_values(array_unique(array_merge(array_keys($current), array_keys($previous))));
+        $rows = collect($keys)->map(function (string $key) use ($current, $previous): array {
+            $now = $current[$key] ?? null;
+            $before = $previous[$key] ?? null;
+            $qtyNow = (int) ($now['effective_qty'] ?? 0);
+            $qtyBefore = (int) ($before['effective_qty'] ?? 0);
+            $costNow = (float) ($now['effective_cost'] ?? 0);
+            $costBefore = (float) ($before['effective_cost'] ?? 0);
+            $change = match (true) {
+                $before === null => 'added',
+                $now === null => 'removed',
+                $qtyNow > $qtyBefore => 'increased',
+                $qtyNow < $qtyBefore => 'decreased',
+                ($now['review_status'] ?? null) !== ($before['review_status'] ?? null) => 'status_changed',
+                default => 'unchanged',
+            };
+
+            return [
+                'key' => $key,
+                'sku' => $now['sku'] ?? $before['sku'],
+                'offer_id' => $now['offer_id'] ?? $before['offer_id'],
+                'product_name' => $now['product_name'] ?? $before['product_name'],
+                'cluster_id' => $now['cluster_id'] ?? $before['cluster_id'],
+                'cluster_name' => $now['cluster_name'] ?? $before['cluster_name'],
+                'change' => $change,
+                'previous' => $before,
+                'current' => $now,
+                'delta' => [
+                    'qty' => $qtyNow - $qtyBefore,
+                    'supply_cost' => round($costNow - $costBefore, 2),
+                    'demand_daily' => round(
+                        (float) ($now['demand_daily'] ?? 0) - (float) ($before['demand_daily'] ?? 0),
+                        4
+                    ),
+                    'stock' => (int) ($now['current_stock'] ?? 0) - (int) ($before['current_stock'] ?? 0),
+                    'in_transit' => (int) ($now['in_transit'] ?? 0) - (int) ($before['in_transit'] ?? 0),
+                ],
+            ];
+        });
+
+        if ($request->boolean('changed_only')) {
+            $rows = $rows->where('change', '!=', 'unchanged')->values();
+        }
+        $rows = $rows->sortByDesc(fn (array $row): int => abs((int) $row['delta']['qty']))->values();
+
+        $page = max(1, (int) ($validated['page'] ?? 1));
+        $perPage = max(1, min(200, (int) ($validated['per_page'] ?? 50)));
+        $paginator = new LengthAwarePaginator(
+            $rows->forPage($page, $perPage)->values(),
+            $rows->count(),
+            $perPage,
+            $page,
+            ['path' => $request->url(), 'query' => $request->query()]
+        );
+        $summary = [
+            'rows_total' => $rows->count(),
+            'changed_rows' => $rows->where('change', '!=', 'unchanged')->count(),
+            'added_rows' => $rows->where('change', 'added')->count(),
+            'removed_rows' => $rows->where('change', 'removed')->count(),
+            'increased_rows' => $rows->where('change', 'increased')->count(),
+            'decreased_rows' => $rows->where('change', 'decreased')->count(),
+            'previous_total_qty' => array_sum(array_column($previous, 'effective_qty')),
+            'current_total_qty' => array_sum(array_column($current, 'effective_qty')),
+            'previous_total_supply_cost' => round(array_sum(array_column($previous, 'effective_cost')), 2),
+            'current_total_supply_cost' => round(array_sum(array_column($current, 'effective_cost')), 2),
+        ];
+        $summary['delta_qty'] = $summary['current_total_qty'] - $summary['previous_total_qty'];
+        $summary['delta_supply_cost'] = round(
+            $summary['current_total_supply_cost'] - $summary['previous_total_supply_cost'],
+            2
+        );
+
+        return response()->json([
+            'message' => 'Сравнение планов построено',
+            'data' => [
+                'current_plan_id' => $plan->id,
+                'previous_plan_id' => $other->id,
+                'summary' => $summary,
+                'rows' => $paginator,
+            ],
+        ]);
+    }
+
+    /**
+     * @return array<string, array<string, mixed>>
+     */
+    private function comparisonMap(AutoSupplyPlan $plan): array
+    {
+        return $this->planLinesQueryForSelectedClusters($plan)
+            ->get()
+            ->groupBy(fn (AutoSupplyPlanLine $line): string => implode('|', [
+                $line->sku,
+                $plan->marketplace === 'ozon' ? ($line->cluster_id ?? 'no-cluster') : 'all',
+            ]))
+            ->map(function (Collection $lines): array {
+                /** @var AutoSupplyPlanLine $first */
+                $first = $lines->first();
+                $active = $lines->reject(fn (AutoSupplyPlanLine $line): bool => (bool) $line->is_excluded);
+                $levels = $lines->pluck('confidence')->filter()->all();
+                $confidence = 'good';
+                foreach ($levels as $level) {
+                    $confidence = $this->worstConfidenceLevel($confidence, (string) $level);
+                }
+
+                return [
+                    'sku' => $first->sku,
+                    'offer_id' => $first->offer_id,
+                    'product_name' => $first->product_name,
+                    'cluster_id' => $first->cluster_id,
+                    'cluster_name' => $first->cluster_name,
+                    'effective_qty' => (int) $active->sum('qty_rounded'),
+                    'candidate_qty' => (int) $lines->sum('candidate_quantity'),
+                    'effective_cost' => round((float) $active->sum('supply_cost_estimate'), 2),
+                    'demand_daily' => round((float) $lines->sum('demand_daily'), 4),
+                    'current_stock' => (int) $lines->sum('current_stock'),
+                    'in_transit' => (int) $lines->sum('in_transit'),
+                    'confidence' => $confidence,
+                    'review_status' => $active->isEmpty()
+                        ? 'blocked'
+                        : ($lines->contains(fn (AutoSupplyPlanLine $line): bool => $line->manual_updated_at !== null)
+                            ? 'manually_modified'
+                            : 'recommended'),
+                    'manually_modified' => $lines->contains(
+                        fn (AutoSupplyPlanLine $line): bool => $line->manual_updated_at !== null
+                    ),
+                    'not_recommended_reasons' => $lines->pluck('not_recommended_reason')->filter()->unique()->values()->all(),
+                ];
+            })
+            ->all();
+    }
+
+    public function bulkUpdateLines(Request $request, string $id): JsonResponse
+    {
+        $plan = $this->authorizedPlan($request, $id);
+        $validated = $request->validate([
+            'line_ids' => 'required|array|min:1|max:500',
+            'line_ids.*' => 'integer|distinct',
+            'action' => 'required|string|in:exclude,include,set_quantity,multiply_quantity,minimum_quantity,maximum_quantity',
+            'quantity' => 'required_if:action,set_quantity,minimum_quantity,maximum_quantity|nullable|integer|min:0',
+            'multiplier' => 'required_if:action,multiply_quantity|nullable|numeric|min:0|max:10',
+            'reason' => 'required|string|max:1000',
+            'comment' => 'nullable|string|max:2000',
+        ]);
+        $userId = $this->requestUserId($request);
+
+        $result = \DB::transaction(function () use ($plan, $validated, $userId): ?array {
+            $lockedPlan = AutoSupplyPlan::query()->lockForUpdate()->findOrFail($plan->id);
+            if ($lockedPlan->supplies()->exists()) {
+                return null;
+            }
+
+            $anchors = $lockedPlan->lines()
+                ->whereIn('id', array_map('intval', $validated['line_ids']))
+                ->lockForUpdate()
+                ->get();
+            if ($anchors->count() !== count($validated['line_ids'])) {
+                abort(422, 'Часть строк не принадлежит этому плану');
+            }
+            $groups = $anchors
+                ->mapWithKeys(function (AutoSupplyPlanLine $anchor) use ($lockedPlan): array {
+                    $key = $anchor->sku . '|' . (
+                        $lockedPlan->marketplace === 'ozon'
+                            ? ($anchor->cluster_id ?? 'no-cluster')
+                            : 'all'
+                    );
+
+                    return [$key => [
+                        'anchor' => $anchor,
+                        'lines' => $this->aggregatedSiblingLines($lockedPlan, $anchor),
+                    ]];
+                });
+            $affectedSourceLines = 0;
+
+            foreach ($groups as $group) {
+                /** @var AutoSupplyPlanLine $anchor */
+                $anchor = $group['anchor'];
+                /** @var Collection<int, AutoSupplyPlanLine> $siblings */
+                $siblings = $group['lines'];
+                $affectedSourceLines += $siblings->count();
+                $oldQty = (int) $siblings->sum('qty_rounded');
+                $oldExcluded = $siblings->every(
+                    fn (AutoSupplyPlanLine $sibling): bool => (bool) $sibling->is_excluded
+                );
+                $old = [
+                    'qty_rounded' => $oldQty,
+                    'is_excluded' => $oldExcluded,
+                ];
+                $newQty = match ($validated['action']) {
+                    'set_quantity' => (int) $validated['quantity'],
+                    'multiply_quantity' => (int) round(
+                        $oldQty * (float) $validated['multiplier']
+                    ),
+                    'minimum_quantity' => max($oldQty, (int) $validated['quantity']),
+                    'maximum_quantity' => min($oldQty, (int) $validated['quantity']),
+                    default => $oldQty,
+                };
+                $excluded = match ($validated['action']) {
+                    'exclude' => true,
+                    'include' => false,
+                    'set_quantity', 'multiply_quantity', 'minimum_quantity', 'maximum_quantity' => $newQty > 0
+                        ? false
+                        : $oldExcluded,
+                    default => $oldExcluded,
+                };
+
+                if (in_array($validated['action'], [
+                    'set_quantity',
+                    'multiply_quantity',
+                    'minimum_quantity',
+                    'maximum_quantity',
+                ], true)) {
+                    $this->redistributeQtyAcrossLines($siblings, $newQty);
+                }
+                foreach ($siblings as $sibling) {
+                    $sibling->update([
+                        'is_excluded' => $excluded,
+                        'manual_comment' => $validated['comment'] ?? $sibling->manual_comment,
+                        'manual_override_json' => [
+                            'action' => $validated['action'],
+                            'aggregate_qty_rounded' => $newQty,
+                            'is_excluded' => $excluded,
+                            'reason' => $validated['reason'],
+                        ],
+                        'manual_updated_by' => $userId,
+                        'manual_updated_at' => now(),
+                    ]);
+                }
+                AutoSupplyPlanAdjustment::query()->create([
+                    'auto_supply_plan_id' => $lockedPlan->id,
+                    'auto_supply_plan_line_id' => $anchor->id,
+                    'user_id' => $userId,
+                    'action' => $validated['action'],
+                    'old_values_json' => $old,
+                    'new_values_json' => [
+                        'qty_rounded' => $newQty,
+                        'is_excluded' => $excluded,
+                    ],
+                    'reason' => $validated['reason'],
+                ]);
+            }
+
+            $review = $this->refreshPlanAfterManualChange($lockedPlan);
+
+            return [
+                'updated_count' => $groups->count(),
+                'affected_source_lines_count' => $affectedSourceLines,
+                'total_qty' => $review['total_qty'],
+                'total_supply_cost' => $review['total_supply_cost'],
+                'budget_limit' => $review['budget_limit'],
+                'budget_overrun' => $review['budget_overrun'],
+                'business_status' => $review['business_status'],
+            ];
+        });
+
+        if ($result === null) {
+            return response()->json([
+                'message' => 'Нельзя изменить план, по которому уже созданы поставки.',
+                'error' => 'plan_already_materialized',
+            ], 409);
+        }
+
+        return response()->json(['message' => 'Строки обновлены', 'data' => $result]);
     }
 
     /**
@@ -769,15 +1385,15 @@ class AutoSupplyPlanController extends Controller
         $lines = $this->paginateAggregatedPlanLines($plan, $linesQuery, (int) $perPage);
 
         // Финансовые агрегаты
-        $allLines = $this->planLinesQueryForSelectedClusters($plan);
+        $allLines = $this->planLinesQueryForSelectedClusters($plan)->where('is_excluded', false);
         $totalSupplyCost = (float) $allLines->sum('supply_cost_estimate');
-        $totalExpectedRevenue = (float) $this->planLinesQueryForSelectedClusters($plan)->sum('expected_revenue');
-        $totalExpectedProfit = (float) $this->planLinesQueryForSelectedClusters($plan)->sum('expected_profit');
-        $totalLostRevenueDaily = (float) $this->planLinesQueryForSelectedClusters($plan)->sum('lost_revenue_daily');
-        $avgRoi = (float) $this->planLinesQueryForSelectedClusters($plan)->whereNotNull('roi_percent')->avg('roi_percent');
-        $avgTurnover = (float) $this->planLinesQueryForSelectedClusters($plan)->whereNotNull('turnover_days')->avg('turnover_days');
+        $totalExpectedRevenue = (float) $this->planLinesQueryForSelectedClusters($plan)->where('is_excluded', false)->sum('expected_revenue');
+        $totalExpectedProfit = (float) $this->planLinesQueryForSelectedClusters($plan)->where('is_excluded', false)->sum('expected_profit');
+        $totalLostRevenueDaily = (float) $this->planLinesQueryForSelectedClusters($plan)->where('is_excluded', false)->sum('lost_revenue_daily');
+        $avgRoi = (float) $this->planLinesQueryForSelectedClusters($plan)->where('is_excluded', false)->whereNotNull('roi_percent')->avg('roi_percent');
+        $avgTurnover = (float) $this->planLinesQueryForSelectedClusters($plan)->where('is_excluded', false)->whereNotNull('turnover_days')->avg('turnover_days');
         $scopedTotalLines = (int) $this->planLinesQueryForSelectedClusters($plan)->count();
-        $scopedTotalQty = (int) $this->planLinesQueryForSelectedClusters($plan)->sum('qty_rounded');
+        $scopedTotalQty = (int) $this->planLinesQueryForSelectedClusters($plan)->where('is_excluded', false)->sum('qty_rounded');
 
         // Приоритет breakdown
         $priorityBreakdown = [
@@ -1036,9 +1652,19 @@ class AutoSupplyPlanController extends Controller
     private function paginateAggregatedPlanLines(AutoSupplyPlan $plan, $query, int $perPage)
     {
         $warehouseBreakdownMap = $this->buildWarehouseBreakdownMap($plan);
+        $aggregatedExplainMap = $this->buildAggregatedExplainMap($plan, clone $query);
         $paginator = $this->aggregatedPlanLinesQuery($plan, $query)->paginate($perPage);
-        $paginator->getCollection()->transform(function (AutoSupplyPlanLine $line) use ($plan, $warehouseBreakdownMap) {
-            return $this->normalizeAggregatedPlanLine($plan, $line, $warehouseBreakdownMap);
+        $paginator->getCollection()->transform(function (AutoSupplyPlanLine $line) use (
+            $plan,
+            $warehouseBreakdownMap,
+            $aggregatedExplainMap
+        ) {
+            return $this->normalizeAggregatedPlanLine(
+                $plan,
+                $line,
+                $warehouseBreakdownMap,
+                $aggregatedExplainMap
+            );
         });
 
         return $paginator;
@@ -1067,6 +1693,32 @@ class AutoSupplyPlanController extends Controller
         $explainSelect = $driver === 'pgsql'
             ? 'MIN(explain_json::text) as explain_json'
             : 'MIN(explain_json) as explain_json';
+        $isExcludedSelect = $driver === 'pgsql'
+            ? 'BOOL_AND(is_excluded) as is_excluded'
+            : 'MIN(is_excluded) as is_excluded';
+        $riskSelect = "CASE MAX(CASE risk_level
+            WHEN 'critical' THEN 4
+            WHEN 'high' THEN 3
+            WHEN 'med' THEN 2
+            WHEN 'medium' THEN 2
+            ELSE 1 END)
+            WHEN 4 THEN 'critical'
+            WHEN 3 THEN 'high'
+            WHEN 2 THEN 'med'
+            ELSE 'low' END as risk_level";
+        $prioritySelect = "CASE MAX(CASE priority
+            WHEN 'critical' THEN 4
+            WHEN 'high' THEN 3
+            WHEN 'medium' THEN 2
+            ELSE 1 END)
+            WHEN 4 THEN 'critical'
+            WHEN 3 THEN 'high'
+            WHEN 2 THEN 'medium'
+            ELSE 'low' END as priority";
+        $demandSelect = $isOzon ? 'SUM(demand_daily) as demand_daily' : 'MAX(demand_daily) as demand_daily';
+        $averageDemandSelect = $isOzon
+            ? 'SUM(avg_daily_sales) as avg_daily_sales, SUM(ewma_daily_sales) as ewma_daily_sales'
+            : 'MAX(avg_daily_sales) as avg_daily_sales, MAX(ewma_daily_sales) as ewma_daily_sales';
 
         return $query
             ->selectRaw("
@@ -1091,14 +1743,13 @@ class AutoSupplyPlanController extends Controller
                 SUM(sales_7_days) as sales_7_days,
                 SUM(sales_14_days) as sales_14_days,
                 SUM(sales_30_days) as sales_30_days,
-                MAX(avg_daily_sales) as avg_daily_sales,
-                MAX(ewma_daily_sales) as ewma_daily_sales,
-                MAX(demand_daily) as demand_daily,
-                MAX(cover_days_before) as cover_days_before,
+                {$averageDemandSelect},
+                {$demandSelect},
+                MIN(cover_days_before) as cover_days_before,
                 MAX(cover_days_after) as cover_days_after,
-                MAX(oos_date) as oos_date,
-                MAX(risk_level) as risk_level,
-                MAX(priority) as priority,
+                MIN(oos_date) as oos_date,
+                {$riskSelect},
+                {$prioritySelect},
                 MAX(priority_score) as priority_score,
                 MAX(sales_trend) as sales_trend,
                 MAX(sales_trend_percent) as sales_trend_percent,
@@ -1112,17 +1763,22 @@ class AutoSupplyPlanController extends Controller
                 SUM(storage_cost_daily) as storage_cost_daily,
                 SUM(storage_cost_monthly) as storage_cost_monthly,
                 SUM(lost_revenue_daily) as lost_revenue_daily,
+                SUM(original_qty_rounded) as original_qty_rounded,
+                {$isExcludedSelect},
+                MAX(manual_comment) as manual_comment,
+                MAX(manual_updated_at) as manual_updated_at,
                 {$explainSelect}
             ")
             ->when($isOzon, fn ($q) => $q->groupBy('sku', 'cluster_id'), fn ($q) => $q->groupBy('sku'))
-            ->orderByRaw("CASE MAX(risk_level) WHEN 'high' THEN 0 WHEN 'med' THEN 1 ELSE 2 END")
+            ->orderByRaw("MAX(CASE risk_level WHEN 'critical' THEN 4 WHEN 'high' THEN 3 WHEN 'med' THEN 2 WHEN 'medium' THEN 2 ELSE 1 END) DESC")
             ->orderByRaw('SUM(qty_rounded) DESC');
     }
 
     private function normalizeAggregatedPlanLine(
         AutoSupplyPlan $plan,
         AutoSupplyPlanLine $line,
-        array $warehouseBreakdownMap = []
+        array $warehouseBreakdownMap = [],
+        array $aggregatedExplainMap = []
     ): AutoSupplyPlanLine
     {
         if ($plan->marketplace !== 'ozon') {
@@ -1130,6 +1786,20 @@ class AutoSupplyPlanController extends Controller
         }
 
         $key = $line->sku . '|' . ($line->cluster_id ?? 'no-cluster');
+        if (isset($aggregatedExplainMap[$key])) {
+            $aggregate = $aggregatedExplainMap[$key];
+            $explain = is_array($line->explain_json) ? $line->explain_json : [];
+            $explain['aggregated_quantity_explanation'] = $aggregate['quantity_explanation'];
+            $explain['aggregated_sources'] = $aggregate['sources'];
+            $explain['confidence'] = array_merge(
+                is_array($explain['confidence'] ?? null) ? $explain['confidence'] : [],
+                $aggregate['confidence']
+            );
+            $line->setAttribute('explain_json', $explain);
+            $line->setAttribute('demand_daily', $aggregate['demand_daily']);
+            $line->setAttribute('cover_days_before', $aggregate['cover_days_before']);
+            $line->setAttribute('cover_days_after', $aggregate['cover_days_after']);
+        }
         if (isset($warehouseBreakdownMap[$key])) {
             $line->setAttribute('warehouse_breakdown', $warehouseBreakdownMap[$key]);
         } else {
@@ -1155,6 +1825,114 @@ class AutoSupplyPlanController extends Controller
         }
 
         return $line;
+    }
+
+    /**
+     * Строит согласованное объяснение для показанной строки Ozon
+     * (SKU × кластер). Это устраняет старую ошибку, когда SQL суммировал
+     * остатки, но explain_json случайно брался только у одной дочерней строки.
+     *
+     * @return array<string, array<string, mixed>>
+     */
+    private function buildAggregatedExplainMap(AutoSupplyPlan $plan, $query): array
+    {
+        if ($plan->marketplace !== 'ozon') {
+            return [];
+        }
+
+        $map = [];
+        foreach ($query->get() as $line) {
+            $key = $line->sku . '|' . ($line->cluster_id ?? 'no-cluster');
+            $explain = is_array($line->explain_json) ? $line->explain_json : [];
+            $inputs = is_array($explain['inputs'] ?? null) ? $explain['inputs'] : [];
+            $math = is_array($explain['math'] ?? null) ? $explain['math'] : [];
+            $confidence = is_array($explain['confidence'] ?? null) ? $explain['confidence'] : [];
+            $level = (string) ($confidence['confidence_level'] ?? 'good');
+
+            $map[$key] ??= [
+                'source_lines' => 0,
+                'demand_daily' => 0.0,
+                'stock_now' => 0,
+                'in_transit' => 0,
+                'qty_rounded' => 0,
+                'target_cover_days' => 0.0,
+                'safety_stock' => 0.0,
+                'needed_before_caps' => 0.0,
+                'needed_after_caps' => 0.0,
+                'caps_applied' => [],
+                'confidence_level' => 'good',
+                'confidence_reasons' => [],
+                'demand_sources' => [],
+            ];
+
+            $map[$key]['source_lines']++;
+            $map[$key]['demand_daily'] += max(0.0, (float) ($inputs['daily_demand'] ?? $line->demand_daily ?? 0));
+            $map[$key]['stock_now'] += max(0, (int) $line->current_stock);
+            $map[$key]['in_transit'] += max(0, (int) $line->in_transit);
+            $map[$key]['qty_rounded'] += max(0, (int) $line->qty_rounded);
+            $map[$key]['target_cover_days'] = max(
+                $map[$key]['target_cover_days'],
+                (float) ($inputs['target_cover_days'] ?? 0)
+            );
+            $map[$key]['safety_stock'] += max(0.0, (float) ($math['safety_stock'] ?? 0));
+            $map[$key]['needed_before_caps'] += max(0.0, (float) ($math['needed_before_caps'] ?? 0));
+            $map[$key]['needed_after_caps'] += max(0.0, (float) ($math['needed_after_caps'] ?? 0));
+            $map[$key]['caps_applied'] = array_values(array_unique(array_merge(
+                $map[$key]['caps_applied'],
+                array_values(array_filter((array) ($math['caps_applied'] ?? [])))
+            )));
+            $map[$key]['confidence_reasons'] = array_values(array_unique(array_merge(
+                $map[$key]['confidence_reasons'],
+                array_values(array_filter((array) ($confidence['confidence_reasons'] ?? [])))
+            )));
+            $map[$key]['confidence_level'] = $this->worstConfidenceLevel(
+                $map[$key]['confidence_level'],
+                $level
+            );
+            if (! empty($inputs['demand_source'])) {
+                $map[$key]['demand_sources'][] = (string) $inputs['demand_source'];
+            }
+        }
+
+        foreach ($map as $key => $aggregate) {
+            $dailyDemand = round((float) $aggregate['demand_daily'], 4);
+            $availableBefore = (int) $aggregate['stock_now'] + (int) $aggregate['in_transit'];
+            $availableAfter = $availableBefore + (int) $aggregate['qty_rounded'];
+            $map[$key] = [
+                'demand_daily' => $dailyDemand,
+                'cover_days_before' => $dailyDemand > 0 ? round($availableBefore / $dailyDemand, 2) : null,
+                'cover_days_after' => $dailyDemand > 0 ? round($availableAfter / $dailyDemand, 2) : null,
+                'quantity_explanation' => [
+                    'aggregation_scope' => 'sku_cluster',
+                    'source_lines' => (int) $aggregate['source_lines'],
+                    'daily_demand' => $dailyDemand,
+                    'target_cover_days' => round((float) $aggregate['target_cover_days'], 2),
+                    'safety_stock' => round((float) $aggregate['safety_stock'], 2),
+                    'stock_now' => (int) $aggregate['stock_now'],
+                    'in_transit' => (int) $aggregate['in_transit'],
+                    'needed_before_caps' => round((float) $aggregate['needed_before_caps'], 2),
+                    'needed_after_caps' => round((float) $aggregate['needed_after_caps'], 2),
+                    'qty_rounded' => (int) $aggregate['qty_rounded'],
+                    'caps_applied' => $aggregate['caps_applied'],
+                ],
+                'confidence' => [
+                    'confidence_level' => $aggregate['confidence_level'],
+                    'confidence_reasons' => $aggregate['confidence_reasons'],
+                ],
+                'sources' => [
+                    'demand' => array_values(array_unique($aggregate['demand_sources'])),
+                ],
+            ];
+        }
+
+        return $map;
+    }
+
+    private function worstConfidenceLevel(string $left, string $right): string
+    {
+        $rank = ['good' => 0, 'warning' => 1, 'low' => 2, 'bad' => 3];
+
+        return ($rank[$right] ?? 1) > ($rank[$left] ?? 1) ? $right : $left;
     }
 
     private function buildWarehouseBreakdownMap(AutoSupplyPlan $plan): array
@@ -1336,7 +2114,10 @@ class AutoSupplyPlanController extends Controller
      * GET /api/auto-supply-plans/data-health?integration_id=X
      * Lightweight freshness metadata for the plan details screen.
      */
-    public function dataHealth(Request $request): JsonResponse
+    public function dataHealth(
+        Request $request,
+        DataFreshnessRegistry $registry
+    ): JsonResponse
     {
         $request->validate([
             'integration_id' => 'required|integer',
@@ -1354,42 +2135,52 @@ class AutoSupplyPlanController extends Controller
         /** @var Integration $integration */
         $integration = $integrationAccess['integration'];
 
-        $inventoryLastUpdated = InventoryWarehouse::query()
-            ->where('integration_id', $integration->id)
-            ->where('marketplace', $integration->marketplace)
-            ->max('last_updated');
-
-        $constraintSnapshot = MarketplaceConstraintSnapshot::query()
-            ->where('integration_id', $integration->id)
-            ->where('marketplace', $integration->marketplace)
-            ->orderByDesc('synced_at')
-            ->first();
-
-        $constraintSummary = is_array($constraintSnapshot?->summary_json) ? $constraintSnapshot->summary_json : [];
-
         return response()->json([
             'message' => 'OK',
-            'data' => [
-                'integration_id' => $integration->id,
-                'marketplace' => $integration->marketplace,
-                'freshness' => [
-                    'inventory_warehouses_last_updated' => $inventoryLastUpdated,
-                    'last_inventory_sync_completed_at' => null,
-                    'marketplace_constraints_synced_at' => $constraintSnapshot?->synced_at?->toIso8601String(),
-                ],
-                'marketplace_constraints' => [
-                    'available' => $constraintSnapshot !== null,
-                    'source' => $constraintSnapshot !== null ? 'api_sync' : null,
-                    'sync_status' => $constraintSnapshot?->sync_status,
-                    'is_fresh' => $constraintSnapshot?->isUsable() ?? false,
-                    'synced_at' => $constraintSnapshot?->synced_at?->toIso8601String(),
-                    'warehouses_total' => $constraintSummary['warehouses_total'] ?? null,
-                    'warehouses_available' => $constraintSummary['warehouses_available'] ?? null,
-                    'warehouses_blocked' => $constraintSummary['warehouses_blocked'] ?? null,
-                ],
-                'ozon_delivery_analytics_cache_active' => null,
-            ],
+            'data' => $registry->inspect($integration),
         ]);
+    }
+
+    /**
+     * POST /api/auto-supply-plans/refresh-data
+     * Кнопка «Обновить данные» запускает весь pipeline фактов Ozon.
+     */
+    public function refreshData(
+        Request $request,
+        OzonPlanningFactRefreshService $refresh
+    ): JsonResponse {
+        $validated = $request->validate([
+            'integration_id' => 'required|integer',
+        ]);
+
+        $integrationAccess = $this->integrationAccessService
+            ->ensureAccessibleIntegration($request, (int) $validated['integration_id']);
+
+        if (! ($integrationAccess['success'] ?? false)) {
+            return response()->json([
+                'message' => $integrationAccess['message'] ?? 'Интеграция не найдена',
+            ], $integrationAccess['status'] ?? 404);
+        }
+
+        /** @var Integration $integration */
+        $integration = $integrationAccess['integration'];
+        if ($integration->marketplace !== 'ozon') {
+            return response()->json([
+                'message' => 'Полный pipeline этой команды реализован только для Ozon.',
+            ], 422);
+        }
+
+        try {
+            return response()->json([
+                'message' => 'Полное обновление данных Ozon поставлено в очередь.',
+                'data' => $refresh->queue($integration),
+            ], 202);
+        } catch (\Throwable $e) {
+            return response()->json([
+                'message' => 'Не удалось запустить обновление данных.',
+                'error' => $e->getMessage(),
+            ], 422);
+        }
     }
 
     /**
@@ -1898,124 +2689,51 @@ class AutoSupplyPlanController extends Controller
             ], 409);
         }
 
-        $groups = $this->clusterDraftLinesQuery($plan)
-            ->when($this->selectedPlanClusterIds($plan) !== [], function ($query) use ($plan) {
-                $query->whereIn('cluster_id', $this->selectedPlanClusterIds($plan));
-            })
-            ->get()
-            ->groupBy('cluster_id');
-
-        if ($groups->isEmpty()) {
+        // Legacy endpoint оставлен для совместимости старого интерфейса, но
+        // исполнение теперь проходит только через канонические Supply,
+        // журнал AutoSupplyPlanExecution и очередь с rate limit.
+        $canonicalCheck = app(OzonPlanMaterializationService::class)->approvalCheck($plan);
+        if (! $canonicalCheck['allowed']
+            || $plan->business_status !== AutoSupplyPlan::BUSINESS_STATUS_APPROVED
+            || ! $plan->approval_fingerprint) {
             return response()->json([
-                'message' => 'У плана нет строк поставки с привязкой к кластерам',
-                'error' => 'no_cluster_lines',
-            ], 422);
+                'message' => 'План прошёл legacy-preview, но ещё не готов к безопасному исполнению. Выполните validate и approve.',
+                'error' => 'canonical_prerequisites_required',
+                'data' => [
+                    'approval_check' => $canonicalCheck,
+                    'business_status' => $plan->business_status,
+                    'required_business_status' => AutoSupplyPlan::BUSINESS_STATUS_APPROVED,
+                    'next_actions' => [
+                        'POST /api/auto-supply-plans/' . $plan->id . '/validate',
+                        'POST /api/auto-supply-plans/' . $plan->id . '/approve',
+                        'POST /api/auto-supply-plans/' . $plan->id . '/create-cluster-drafts',
+                    ],
+                ],
+            ], 409);
         }
 
-        $applier = app(\App\Domains\Locality\Recommendation\LocalityDraftApplier::class);
-        $results = ['drafts' => [], 'errors' => []];
-        $supplyMethod = $this->draftSupplyMethod($plan);
-        $dropOffPointWarehouseId = $confirmedDropOffPointWarehouseId ?? $this->draftDropOffPointWarehouseId($plan);
-
-        foreach ($groups as $clusterId => $lines) {
-            $itemsByOzonSku = [];
-            foreach ($lines as $line) {
-                $product = \App\Models\Product::query()
-                    ->where('integration_id', $plan->integration_id)
-                    ->where('sku', $line->sku)
-                    ->first();
-                $ozonSku = $this->resolveOzonSku($product);
-                if ($ozonSku <= 0) {
-                    continue;
-                }
-                $qty = (int) $line->qty_rounded;
-                if ($qty <= 0) {
-                    continue;
-                }
-                $itemsByOzonSku[$ozonSku] = ($itemsByOzonSku[$ozonSku] ?? 0) + $qty;
-            }
-
-            $items = collect($itemsByOzonSku)
-                ->map(fn (int $quantity, int $sku) => ['sku' => $sku, 'quantity' => $quantity])
-                ->values()
-                ->all();
-
-            if (empty($items)) {
-                $results['errors'][] = [
-                    'cluster_id' => (string) $clusterId,
-                    'error' => 'no_items_with_ozon_sku',
-                ];
-                continue;
-            }
-
-            try {
-                $result = $supplyMethod === 'crossdock'
-                    ? $applier->applyBatch($plan->integration, $items, (int) $clusterId, [
-                        'supply_method' => 'crossdock',
-                        'drop_off_point_warehouse_id' => $dropOffPointWarehouseId,
-                    ])
-                    : $applier->applyBatch($plan->integration, $items, (int) $clusterId);
-                if (($result['success'] ?? false) && ($result['draft_id'] ?? null)) {
-                    $results['drafts'][] = [
-                        'cluster_id' => (string) $clusterId,
-                        'cluster_name' => (string) $lines->first()->cluster_name,
-                        'draft_id' => (string) $result['draft_id'],
-                        'supply_method' => $result['supply_method'] ?? $supplyMethod,
-                        'drop_off_point_warehouse_id' => $dropOffPointWarehouseId,
-                        'items_count' => count($items),
-                        'total_qty' => array_sum(array_column($items, 'quantity')),
-                    ];
-                } else {
-                    $results['errors'][] = [
-                        'cluster_id' => (string) $clusterId,
-                        'error' => $result['error'] ?? 'unknown',
-                    ];
-                }
-            } catch (\Throwable $e) {
-                $results['errors'][] = [
-                    'cluster_id' => (string) $clusterId,
-                    'error' => $e->getMessage(),
-                ];
-            }
-
-            usleep(1_000_000); // rate-limit между кластерами
-        }
-
-        // Сохраним результат в план для истории
-        $plan->result_json = array_merge($plan->result_json ?? [], ['cluster_drafts' => $results]);
-        $plan->save();
+        $executionResult = app(AutoSupplyPlanExecutionService::class)->start(
+            $plan,
+            'legacy-preview:' . $confirmationToken,
+            AutoSupplyPlanExecutionService::CONFIRMATION_PHRASE,
+            $this->requestUserId($request),
+            ['auto_book_timeslot' => false]
+        );
         Cache::forget($this->clusterDraftConfirmationCacheKey($plan, $confirmationToken));
 
         return response()->json([
-            'message' => sprintf(
-                'Создано черновиков Ozon: %d из %d кластеров',
-                count($results['drafts']),
-                $groups->count()
-            ),
-            'data' => array_merge($results, [
-                'safe_flow' => 'preview_confirmed',
+            'message' => $executionResult['created']
+                ? 'Создание черновиков Ozon поставлено в очередь'
+                : 'Эта подтверждённая операция уже была запущена',
+            'data' => [
+                'execution' => $executionResult['execution'],
+                'idempotent' => ! $executionResult['created'],
+                'safe_flow' => 'canonical_supply_execution',
                 'confirmation_checked' => true,
                 'preview_fingerprint_verified' => true,
-                'safety_checks_passed' => true,
-                'supply_method' => $supplyMethod,
-                'drop_off_point_warehouse_id' => $dropOffPointWarehouseId,
-                'accepted_at' => now()->toISOString(),
-                'acceptance_audit' => $this->buildClusterDraftAcceptanceAudit(
-                    allowed: true,
-                    stage: 'create',
-                    selectedClusterIds: $this->selectedPlanClusterIds($plan),
-                    previewClusterIds: array_values(array_filter(
-                        array_map(static fn ($clusterId): int => (int) $clusterId, $groups->keys()->all()),
-                        static fn (int $clusterId): bool => $clusterId > 0
-                    )),
-                    supplyMethod: $supplyMethod,
-                    dropOffPointWarehouseId: $dropOffPointWarehouseId,
-                    qualityAllowed: true,
-                    warnings: [],
-                ),
-                'message_ru' => 'Черновики созданы только после предпросмотра и повторной сверки состава плана.',
-            ]),
-        ]);
+                'external_api_called_in_request' => false,
+            ],
+        ], $executionResult['created'] ? 202 : 200);
     }
 
     /**
@@ -2747,8 +3465,25 @@ class AutoSupplyPlanController extends Controller
     public function destroy(Request $request, string $id): JsonResponse
     {
         $plan = $this->authorizedPlan($request, $id);
-        $plan->lines()->delete();
-        $plan->delete();
+
+        $deleted = \DB::transaction(function () use ($plan): bool {
+            $lockedPlan = AutoSupplyPlan::query()->lockForUpdate()->findOrFail($plan->id);
+            if ($lockedPlan->supplies()->exists()) {
+                return false;
+            }
+
+            $lockedPlan->lines()->delete();
+            $lockedPlan->delete();
+
+            return true;
+        });
+
+        if (! $deleted) {
+            return response()->json([
+                'message' => 'Нельзя удалить план, по которому уже созданы поставки.',
+                'error' => 'plan_already_materialized',
+            ], 409);
+        }
 
         return response()->json(['message' => 'План удалён']);
     }
@@ -2765,43 +3500,216 @@ class AutoSupplyPlanController extends Controller
             abort(422, 'План ещё не рассчитан');
         }
 
-        $request->validate([
-            'qty_rounded' => 'required|integer|min:0',
+        $validated = $request->validate([
+            'qty_rounded' => 'sometimes|integer|min:0',
+            'is_excluded' => 'sometimes|boolean',
+            'cluster_id' => 'sometimes|integer|min:1',
+            'cluster_name' => 'nullable|string|max:255',
+            'comment' => 'nullable|string|max:2000',
+            'reason' => 'required|string|max:1000',
         ]);
+        if (! array_key_exists('qty_rounded', $validated)
+            && ! array_key_exists('is_excluded', $validated)
+            && ! array_key_exists('cluster_id', $validated)
+            && ! array_key_exists('comment', $validated)) {
+            abort(422, 'Передайте количество, признак исключения, кластер назначения или комментарий');
+        }
 
-        $line = $this->planLinesQueryForSelectedClusters($plan)->findOrFail($lineId);
-        $newQty = (int) $request->input('qty_rounded');
+        $newQty = array_key_exists('qty_rounded', $validated)
+            ? (int) $validated['qty_rounded']
+            : null;
+        $isExcluded = array_key_exists('is_excluded', $validated)
+            ? (bool) $validated['is_excluded']
+            : null;
+        $targetClusterId = array_key_exists('cluster_id', $validated)
+            ? (string) $validated['cluster_id']
+            : null;
+        $userId = $this->requestUserId($request);
+        $result = \DB::transaction(function () use (
+            $plan,
+            $lineId,
+            $newQty,
+            $isExcluded,
+            $targetClusterId,
+            $validated,
+            $userId
+        ): ?array {
+            $lockedPlan = AutoSupplyPlan::query()->lockForUpdate()->findOrFail($plan->id);
+            if ($lockedPlan->supplies()->exists()) {
+                return null;
+            }
 
-        // Показанная строка — это агрегат SUM(qty_rounded) по группе (sku[, cluster_id]),
-        // см. aggregatedPlanLinesQuery(). Правка только одной MIN(id)-строки оставила бы
-        // остальные строки группы без изменений → план и экспорт разошлись бы с введённым
-        // значением. Поэтому распределяем новое количество по всем строкам группы.
-        $siblings = $this->aggregatedSiblingLines($plan, $line);
-        $oldQty = (int) $siblings->sum('qty_rounded');
+            $line = $this->planLinesQueryForSelectedClusters($lockedPlan)->findOrFail($lineId);
 
-        \DB::transaction(function () use ($siblings, $newQty) {
-            $this->redistributeQtyAcrossLines($siblings, $newQty);
+            // Показанная строка — агрегат SUM(qty_rounded) по группе (sku[, cluster_id]).
+            $siblings = $this->aggregatedSiblingLines($lockedPlan, $line);
+            $oldQty = (int) $siblings->sum('qty_rounded');
+            $oldExcluded = $siblings->every(fn (AutoSupplyPlanLine $sibling): bool => $sibling->is_excluded);
+            $oldClusterId = $line->cluster_id !== null ? (string) $line->cluster_id : null;
+            $targetClusterName = null;
+
+            if ($targetClusterId !== null && $targetClusterId !== $oldClusterId) {
+                if ($lockedPlan->marketplace !== 'ozon') {
+                    abort(422, 'Изменение кластера назначения поддерживается только для Ozon-плана');
+                }
+
+                $targetCluster = OzonWarehouseCluster::query()
+                    ->where('cluster_id', $targetClusterId)
+                    ->first();
+                $clusterAlreadyUsedByPlan = $lockedPlan->lines()
+                    ->where('cluster_id', $targetClusterId)
+                    ->exists();
+                if ($targetCluster === null && ! $clusterAlreadyUsedByPlan) {
+                    abort(422, 'Кластер назначения отсутствует в актуальной карте складов Ozon');
+                }
+
+                $duplicateExists = $lockedPlan->lines()
+                    ->where('sku', $line->sku)
+                    ->where('cluster_id', $targetClusterId)
+                    ->whereNotIn('id', $siblings->pluck('id'))
+                    ->exists();
+                if ($duplicateExists) {
+                    abort(422, 'Для этого товара уже есть строка в выбранном кластере. Измените количество существующей строки.');
+                }
+
+                $targetClusterName = trim((string) ($validated['cluster_name'] ?? ''));
+                if ($targetClusterName === '') {
+                    $targetClusterName = $targetCluster?->cluster_name;
+                }
+                $targetClusterName = $targetClusterName ?: 'Кластер ' . $targetClusterId;
+
+                foreach ($siblings as $sibling) {
+                    $sibling->update([
+                        'cluster_id' => $targetClusterId,
+                        'cluster_name' => $targetClusterName,
+                        'destination_type' => 'cluster',
+                        'destination_id' => 'cluster:' . $targetClusterId,
+                        'destination' => $targetClusterName,
+                        'warehouse_id' => 'cluster:' . $targetClusterId,
+                        'warehouse_name' => $targetClusterName,
+                    ]);
+                }
+
+                $params = is_array($lockedPlan->params) ? $lockedPlan->params : [];
+                $selectedClusters = collect((array) ($params['cluster_ids'] ?? []))
+                    ->map(fn ($clusterId): int => (int) $clusterId)
+                    ->push((int) $targetClusterId);
+                if (
+                    $oldClusterId !== null
+                    && ! $lockedPlan->lines()->where('cluster_id', $oldClusterId)->exists()
+                ) {
+                    $selectedClusters = $selectedClusters->reject(
+                        fn (int $clusterId): bool => $clusterId === (int) $oldClusterId
+                    );
+                }
+                $selectedClusters = $selectedClusters
+                    ->filter(fn (int $clusterId): bool => $clusterId > 0)
+                    ->unique()
+                    ->values()
+                    ->all();
+                $params['cluster_ids'] = $selectedClusters;
+                $lockedPlan->params = $params;
+                $lockedPlan->save();
+            }
+
+            if ($newQty !== null) {
+                $this->redistributeQtyAcrossLines($siblings, $newQty);
+            }
+            foreach ($siblings as $sibling) {
+                $effectiveExcluded = $isExcluded
+                    ?? ($newQty !== null && $newQty > 0 ? false : (bool) $sibling->is_excluded);
+                $sibling->update([
+                    'is_excluded' => $effectiveExcluded,
+                    'manual_comment' => $validated['comment'] ?? $sibling->manual_comment,
+                    'manual_override_json' => array_filter([
+                        'qty_rounded' => $newQty,
+                        'is_excluded' => $isExcluded,
+                        'cluster_id' => $targetClusterId,
+                        'cluster_name' => $targetClusterName,
+                        'reason' => $validated['reason'],
+                    ], static fn ($value): bool => $value !== null),
+                    'manual_updated_by' => $userId,
+                    'manual_updated_at' => now(),
+                ]);
+            }
+
+            AutoSupplyPlanAdjustment::query()->create([
+                'auto_supply_plan_id' => $lockedPlan->id,
+                'auto_supply_plan_line_id' => $line->id,
+                'user_id' => $userId,
+                'action' => $targetClusterId !== null && $targetClusterId !== $oldClusterId
+                    ? 'destination_change'
+                    : ($isExcluded === true
+                        ? 'exclude'
+                        : ($isExcluded === false ? 'include' : ($newQty !== null ? 'quantity_change' : 'comment'))),
+                'old_values_json' => [
+                    'qty_rounded' => $oldQty,
+                    'is_excluded' => $oldExcluded,
+                    'cluster_id' => $oldClusterId,
+                ],
+                'new_values_json' => [
+                    'qty_rounded' => $newQty ?? $oldQty,
+                    'is_excluded' => $isExcluded ?? ($newQty !== null && $newQty > 0 ? false : $oldExcluded),
+                    'cluster_id' => $targetClusterId ?? $oldClusterId,
+                    'cluster_name' => $targetClusterName,
+                ],
+                'reason' => $validated['reason'],
+            ]);
+
+            $review = $this->refreshPlanAfterManualChange($lockedPlan);
+
+            // Возвращаем каноническую строку с агрегированным qty.
+            $fresh = $line->fresh();
+            $fresh->setAttribute('qty_rounded', $newQty ?? $oldQty);
+            $fresh->setAttribute(
+                'is_excluded',
+                $isExcluded ?? ($newQty !== null && $newQty > 0 ? false : $oldExcluded)
+            );
+
+            return [
+                'line' => $fresh,
+                'old_qty' => $oldQty,
+                'new_qty' => $newQty ?? $oldQty,
+                'is_excluded' => $fresh->is_excluded,
+                'old_cluster_id' => $oldClusterId,
+                'new_cluster_id' => $targetClusterId ?? $oldClusterId,
+                'plan_total_qty' => $review['total_qty'],
+                'plan_total_supply_cost' => $review['total_supply_cost'],
+                'budget_overrun' => $review['budget_overrun'],
+            ];
         });
 
-        // Пересчитать total_qty плана
-        $plan->update([
-            'total_qty' => $plan->lines()->sum('qty_rounded'),
-        ]);
-
-        // Возвращаем каноническую строку с агрегированным qty — именно его видит и вводит
-        // пользователь (реальное qty строки в БД — её доля после распределения).
-        $fresh = $line->fresh();
-        $fresh->setAttribute('qty_rounded', $newQty);
+        if ($result === null) {
+            return response()->json([
+                'message' => 'Нельзя изменить план, по которому уже созданы поставки. Создайте новый план.',
+                'error' => 'plan_already_materialized',
+            ], 409);
+        }
 
         return response()->json([
             'message' => 'Количество обновлено',
-            'data' => [
-                'line' => $fresh,
-                'old_qty' => $oldQty,
-                'new_qty' => $newQty,
-                'plan_total_qty' => $plan->fresh()->total_qty,
-            ],
+            'data' => $result,
         ]);
+    }
+
+    private function requestUserId(Request $request): ?int
+    {
+        $userId = $request->user()?->getAuthIdentifier();
+
+        return is_numeric($userId) ? (int) $userId : null;
+    }
+
+    private function assertOzonPlanApprovedForExport(AutoSupplyPlan $plan): void
+    {
+        if (
+            $plan->marketplace === 'ozon'
+            && (
+                $plan->business_status !== AutoSupplyPlan::BUSINESS_STATUS_APPROVED
+                || ! $plan->approval_fingerprint
+            )
+        ) {
+            abort(409, 'Сначала выполните проверку и утвердите текущую версию Ozon-плана');
+        }
     }
 
     /**
@@ -2840,7 +3748,7 @@ class AutoSupplyPlanController extends Controller
         }
 
         if ($count === 1) {
-            $lines[0]->update(['qty_rounded' => $newTotal]);
+            $this->applyManualQuantity($lines[0], $newTotal);
 
             return;
         }
@@ -2891,8 +3799,114 @@ class AutoSupplyPlanController extends Controller
         }
 
         foreach ($lines as $i => $l) {
-            $l->update(['qty_rounded' => $floors[$i] * $unit]);
+            $this->applyManualQuantity($l, $floors[$i] * $unit);
         }
+    }
+
+    private function applyManualQuantity(AutoSupplyPlanLine $line, int $newQty): void
+    {
+        $oldQty = max(0, (int) $line->qty_rounded);
+        $explain = is_array($line->explain_json) ? $line->explain_json : [];
+        $candidate = is_array($explain['optimizer_rejection'] ?? null)
+            ? $explain['optimizer_rejection']
+            : [];
+        $baseQty = $oldQty > 0
+            ? $oldQty
+            : max(0, (int) ($candidate['candidate_qty'] ?? $line->original_qty_rounded ?? 0));
+        $candidateEconomics = is_array($candidate['candidate_economics'] ?? null)
+            ? $candidate['candidate_economics']
+            : [];
+        $ratio = $baseQty > 0 ? $newQty / $baseQty : null;
+
+        $scale = static function (mixed $current, mixed $candidateValue) use ($ratio): ?float {
+            $base = $current !== null ? (float) $current : ($candidateValue !== null ? (float) $candidateValue : null);
+
+            return $base !== null && $ratio !== null ? round($base * $ratio, 2) : null;
+        };
+
+        $cost = $line->cost_price !== null
+            ? round((float) $line->cost_price * $newQty, 2)
+            : $scale($line->supply_cost_estimate, $candidateEconomics['supply_cost_estimate'] ?? null);
+        $dailyDemand = max(0.0, (float) $line->demand_daily);
+        $coverAfter = $dailyDemand > 0
+            ? round(((int) $line->current_stock + (int) $line->in_transit + $newQty) / $dailyDemand, 2)
+            : null;
+
+        $explain['manual_quantity_recalculation'] = [
+            'previous_qty' => $oldQty,
+            'new_qty' => $newQty,
+            'base_qty' => $baseQty,
+            'pack_multiple' => max(1, (int) ($explain['inputs']['pack_multiple'] ?? 1)),
+            'recalculated_at' => now()->toIso8601String(),
+        ];
+
+        $line->update([
+            'qty_rounded' => $newQty,
+            'supply_cost_estimate' => $cost,
+            'expected_revenue' => $scale($line->expected_revenue, $candidateEconomics['expected_revenue'] ?? null),
+            'expected_profit' => $scale($line->expected_profit, $candidateEconomics['expected_profit'] ?? null),
+            'cover_days_after' => $coverAfter,
+            'explain_json' => $explain,
+        ]);
+    }
+
+    /**
+     * Пересчитывает финансовую сводку после ручного review и одновременно
+     * инвалидирует прежнее утверждение/fingerprint.
+     *
+     * @return array<string, int|float|string|null>
+     */
+    private function refreshPlanAfterManualChange(AutoSupplyPlan $plan): array
+    {
+        $active = $plan->lines()->where('is_excluded', false);
+        $totalQty = (int) (clone $active)->sum('qty_rounded');
+        $totalSupplyCost = round((float) (clone $active)->sum('supply_cost_estimate'), 2);
+        $totalExpectedRevenue = round((float) (clone $active)->sum('expected_revenue'), 2);
+        $totalExpectedProfit = round((float) (clone $active)->sum('expected_profit'), 2);
+        $budgetLimit = (float) ($plan->budget_limit ?? 0);
+        $budgetOverrun = $budgetLimit > 0
+            ? round(max(0, $totalSupplyCost - $budgetLimit), 2)
+            : 0.0;
+
+        $result = is_array($plan->result_json) ? $plan->result_json : [];
+        $economics = is_array($result['economics_summary'] ?? null) ? $result['economics_summary'] : [];
+        $selection = is_array($result['selection_summary'] ?? null) ? $result['selection_summary'] : [];
+        $result['economics_summary'] = array_merge($economics, [
+            'total_supply_cost' => $totalSupplyCost,
+            'total_expected_revenue' => $totalExpectedRevenue,
+            'total_expected_profit' => $totalExpectedProfit,
+            'budget_limit' => $budgetLimit > 0 ? $budgetLimit : null,
+            'budget_used' => $budgetLimit > 0 ? $totalSupplyCost : null,
+            'budget_overrun' => $budgetOverrun,
+            'manually_recalculated' => true,
+            'recalculated_at' => now()->toIso8601String(),
+        ]);
+        $result['selection_summary'] = array_merge($selection, [
+            'budget_used' => $budgetLimit > 0 ? $totalSupplyCost : null,
+            'budget_overrun' => $budgetOverrun,
+            'manual_adjustments_count' => $plan->adjustments()->count(),
+        ]);
+
+        $plan->update([
+            'total_qty' => $totalQty,
+            'result_json' => $result,
+            'business_status' => AutoSupplyPlan::BUSINESS_STATUS_REVIEW_REQUIRED,
+            'approved_at' => null,
+            'approved_by' => null,
+            'approval_fingerprint' => null,
+            'materialized_at' => null,
+            'validation_json' => null,
+            'validated_at' => null,
+            'validation_fingerprint' => null,
+        ]);
+
+        return [
+            'total_qty' => $totalQty,
+            'total_supply_cost' => $totalSupplyCost,
+            'budget_limit' => $budgetLimit > 0 ? $budgetLimit : null,
+            'budget_overrun' => $budgetOverrun,
+            'business_status' => AutoSupplyPlan::BUSINESS_STATUS_REVIEW_REQUIRED,
+        ];
     }
 
     /**
@@ -2908,8 +3922,11 @@ class AutoSupplyPlanController extends Controller
         if ($plan->status !== AutoSupplyPlan::STATUS_READY) {
             abort(422, 'План ещё не рассчитан');
         }
+        $this->assertOzonPlanApprovedForExport($plan);
 
-        $lines = $this->planLinesQueryForSelectedClusters($plan)->get();
+        $lines = $this->planLinesQueryForSelectedClusters($plan)
+            ->where('is_excluded', false)
+            ->get();
 
         // Группируем по offer_id
         $grouped = [];
@@ -3078,8 +4095,10 @@ class AutoSupplyPlanController extends Controller
         if ($plan->status !== AutoSupplyPlan::STATUS_READY) {
             abort(422, 'План ещё не рассчитан');
         }
+        $this->assertOzonPlanApprovedForExport($plan);
 
         $lines = $this->planLinesQueryForSelectedClusters($plan)
+            ->where('is_excluded', false)
             ->where('qty_rounded', '>', 0)
             ->get();
 
@@ -3184,8 +4203,10 @@ class AutoSupplyPlanController extends Controller
         if ($plan->status !== AutoSupplyPlan::STATUS_READY) {
             abort(422, 'План ещё не рассчитан');
         }
+        $this->assertOzonPlanApprovedForExport($plan);
 
         $lines = $this->planLinesQueryForSelectedClusters($plan)
+            ->where('is_excluded', false)
             ->where('qty_rounded', '>', 0)
             ->get();
 

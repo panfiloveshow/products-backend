@@ -32,8 +32,12 @@ class StoreIntegrationRequest extends FormRequest
                 'credentials.api_key' => 'required|string',
             ],
             'ozon' => [
-                'credentials.client_id' => 'required|string',
-                'credentials.api_key' => 'required|string',
+                'credentials.client_id' => 'nullable|string|required_without:credentials.oauth_access_token',
+                'credentials.api_key' => 'nullable|string|required_without:credentials.oauth_access_token',
+                'credentials.oauth_access_token' => 'nullable|string|required_without:credentials.api_key',
+                'credentials.expires_at' => 'nullable|date',
+                'credentials.scopes' => 'nullable|array',
+                'credentials.scopes.*' => 'string',
             ],
             'yandex_market' => [
                 'credentials.token' => 'required|string',
@@ -59,6 +63,7 @@ class StoreIntegrationRequest extends FormRequest
             'credentials.required' => 'Credentials обязательны',
             'credentials.api_key.required' => 'API ключ обязателен',
             'credentials.client_id.required' => 'Client ID обязателен',
+            'credentials.oauth_access_token.required_without' => 'Укажите OAuth access token или API key Ozon',
             'credentials.token.required' => 'Токен обязателен',
             'credentials.campaign_id.required' => 'Campaign ID обязателен',
         ];

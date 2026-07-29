@@ -7,6 +7,8 @@ use Illuminate\Database\Eloquent\Relations\BelongsTo;
 
 class AutoSupplyConstraintFile extends Model
 {
+    use Traits\BelongsToCurrentWorkspaceThroughIntegration;
+
     protected $fillable = [
         'integration_id',
         'marketplace',

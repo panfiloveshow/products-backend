@@ -2,6 +2,7 @@
 
 namespace App\Services\Supply;
 
+use App\Exceptions\OzonPreconditionException;
 use App\Domains\Ozon\OzonMarketplace;
 use App\Models\Integration;
 use App\Models\Supply;
@@ -165,6 +166,42 @@ class SupplyService
      */
     public function createOzonDraft(Supply $supply): array
     {
+        $supply->refresh();
+        if ($supply->ozon_draft_id) {
+            return array_merge(
+                is_array($supply->ozon_response) ? $supply->ozon_response : [],
+                [
+                    'draft_id' => (string) $supply->ozon_draft_id,
+                    'idempotent' => true,
+                ]
+            );
+        }
+
+        $previousResponse = is_array($supply->ozon_response) ? $supply->ozon_response : [];
+        $existingOperationId = $previousResponse['operation_id'] ?? null;
+        if ($existingOperationId) {
+            $ozon = OzonMarketplace::fromIntegration($supply->integration);
+            $draftInfo = $ozon->supplies()->getDraftCreateInfo((string) $existingOperationId);
+            $draftId = $this->extractDraftId($draftInfo);
+            $calculationFailed = ($draftInfo['status'] ?? null) === 'CALCULATION_STATUS_FAILED';
+            $result = array_merge($previousResponse, [
+                'draft_id' => $draftId,
+                'operation_id' => (string) $existingOperationId,
+                'draft_info' => $draftInfo,
+                'status' => $draftId ? 'draft' : ($calculationFailed ? 'failed' : 'pending'),
+                'idempotent' => true,
+            ]);
+            $supply->update([
+                'ozon_draft_id' => $draftId,
+                'ozon_response' => $result,
+            ]);
+            if ($draftId) {
+                $supply->updateStatus(Supply::STATUS_DRAFT_OZON);
+            }
+
+            return $result;
+        }
+
         $integration = $supply->integration;
         $ozon = OzonMarketplace::fromIntegration($integration);
 
@@ -187,10 +224,17 @@ class SupplyService
                 'sku' => $ozonSku,
                 'quantity' => $item->planned_qty,
             ];
-        })->toArray();
+        })
+            ->groupBy(fn (array $item): string => (string) $item['sku'])
+            ->map(fn ($sameSkuItems, string $sku): array => [
+                'sku' => (int) $sku,
+                'quantity' => (int) $sameSkuItems->sum('quantity'),
+            ])
+            ->values()
+            ->all();
 
         if (!empty($invalidSkus)) {
-            throw new \RuntimeException('Не удалось определить числовой Ozon SKU для товаров: ' . implode(', ', $invalidSkus));
+            throw new OzonPreconditionException('Не удалось определить числовой Ozon SKU для товаров: ' . implode(', ', $invalidSkus));
         }
 
         $startTime = microtime(true);
@@ -225,17 +269,22 @@ class SupplyService
             $duration = (int) ((microtime(true) - $startTime) * 1000);
 
             // Обновляем поставку
+            $draftId = isset($result['draft_id']) && $result['draft_id'] !== ''
+                ? (string) $result['draft_id']
+                : null;
             $supply->update([
-                'ozon_draft_id' => $result['draft_id'],
+                'ozon_draft_id' => $draftId,
                 'ozon_response' => $result,
             ]);
 
-            $supply->updateStatus(Supply::STATUS_DRAFT_OZON);
+            if ($draftId) {
+                $supply->updateStatus(Supply::STATUS_DRAFT_OZON);
+            }
 
             // Логируем успех
             $supply->logEvent(SupplyEvent::TYPE_DRAFT_CREATED, [
                 'title' => 'Черновик создан в Ozon',
-                'new_value' => $result['draft_id'],
+                'new_value' => $draftId ?: ($result['operation_id'] ?? null),
                 'api_method' => 'POST',
                 'api_endpoint' => "/v1/draft/{$supply->supply_method}/create",
                 'api_response_body' => $result,
@@ -284,10 +333,21 @@ class SupplyService
             throw new \InvalidArgumentException('Сначала создайте черновик в Ozon');
         }
 
+        if (! $supply->warehouse_id) {
+            $this->resolveWarehouseForDraft($supply);
+            $supply->refresh();
+        }
+        if (! $supply->warehouse_id) {
+            throw new \RuntimeException(
+                'Ozon не вернул доступный склад для выбранного кластера черновика.'
+            );
+        }
+
         // Проверяем кэш
         if ($useCache) {
             $cached = TimeslotCache::where('integration_id', $supply->integration_id)
                 ->where('warehouse_id', $supply->warehouse_id)
+                ->forDraft((string) $supply->ozon_draft_id)
                 ->notExpired()
                 ->available()
                 ->upcoming()
@@ -341,20 +401,23 @@ class SupplyService
         $startTime = microtime(true);
 
         try {
-            $slotData = TimeslotCache::where('timeslot_id', $timeslotId)->first();
-
-            $timeslotPayload = null;
-            if ($slotData?->datetime_from && $slotData?->datetime_to) {
-                $timeslotPayload = [
-                    'from' => $slotData->datetime_from->toIso8601String(),
-                    'to' => $slotData->datetime_to->toIso8601String(),
-                ];
-            } elseif ($supply->timeslot_from && $supply->timeslot_to) {
-                $timeslotPayload = [
-                    'from' => $supply->timeslot_from->toIso8601String(),
-                    'to' => $supply->timeslot_to->toIso8601String(),
-                ];
+            $slotData = TimeslotCache::query()
+                ->where('integration_id', $supply->integration_id)
+                ->where('timeslot_id', $timeslotId)
+                ->forDraft((string) $supply->ozon_draft_id)
+                ->forWarehouse((string) $supply->warehouse_id)
+                ->notExpired()
+                ->available()
+                ->first();
+            if (! $slotData?->datetime_from || ! $slotData?->datetime_to) {
+                throw new OzonPreconditionException(
+                    'Слот устарел или не принадлежит этому черновику. Обновите список доступных слотов.'
+                );
             }
+            $timeslotPayload = [
+                'from' => $slotData->datetime_from->toIso8601String(),
+                'to' => $slotData->datetime_to->toIso8601String(),
+            ];
 
             $result = $ozon->supplies()->createSupplyFromDraft(
                 (int) $supply->ozon_draft_id,
@@ -367,13 +430,16 @@ class SupplyService
 
             $duration = (int) ((microtime(true) - $startTime) * 1000);
 
-            $timeslotFrom = $slotData?->datetime_from ?? $supply->timeslot_from;
-            $timeslotTo = $slotData?->datetime_to ?? $supply->timeslot_to;
-            $plannedDeliveryDate = $slotData?->slot_date ?? $supply->planned_delivery_date;
+            $timeslotFrom = $slotData->datetime_from;
+            $timeslotTo = $slotData->datetime_to;
+            $plannedDeliveryDate = $slotData->slot_date;
 
             // Обновляем поставку
             $supply->update([
-                'ozon_supply_id' => $result['supply_order_id'] ?? null,
+                'ozon_order_id' => $result['supply_order_id'] ?? $result['order_id'] ?? null,
+                // Старые записи использовали ozon_supply_id как order_id.
+                'ozon_supply_id' => $supply->ozon_supply_id
+                    ?: ($result['supply_id'] ?? $result['supply_order_id'] ?? $result['order_id'] ?? null),
                 'timeslot_id' => $timeslotId,
                 'timeslot_from' => $timeslotFrom,
                 'timeslot_to' => $timeslotTo,
@@ -387,7 +453,7 @@ class SupplyService
             $supply->logEvent(SupplyEvent::TYPE_SLOT_BOOKED, [
                 'title' => 'Слот забронирован',
                 'new_value' => $timeslotId,
-                'description' => $slotData ? "Дата: {$slotData->slot_date}, время: {$slotData->formatted_time}" : null,
+                'description' => "Дата: {$slotData->slot_date}, время: {$slotData->formatted_time}",
                 'api_response_body' => $result,
                 'api_response_code' => 200,
                 'api_duration_ms' => $duration,
@@ -474,21 +540,69 @@ class SupplyService
      */
     public function syncStatus(Supply $supply): void
     {
-        if (!$supply->ozon_draft_id) {
+        if (! $supply->ozon_order_id && ! $supply->ozon_supply_id && ! $supply->ozon_draft_id) {
             return;
         }
 
         $ozon = OzonMarketplace::fromIntegration($supply->integration);
 
         try {
-            $status = $ozon->supplies()->getSupplyCreateStatus($supply->ozon_draft_id);
+            $orderId = $supply->ozon_order_id ?: $supply->ozon_supply_id;
+            if ($orderId) {
+                $details = $ozon->supplies()->getSupplyOrdersDetails([
+                    (int) $orderId,
+                ]);
+                $order = collect($details['orders'] ?? [])->first(
+                    fn (array $item): bool => (string) ($item['id'] ?? $item['order_id'] ?? '')
+                        === (string) $orderId
+                ) ?? collect($details['orders'] ?? [])->first();
+
+                if (! is_array($order)) {
+                    Log::warning('Ozon supply-order/get returned no matching order', [
+                        'supply_id' => $supply->id,
+                        'ozon_order_id' => $orderId,
+                    ]);
+
+                    return;
+                }
+
+                $remoteSupply = collect($order['supplies'] ?? [])->first(
+                    fn (array $item): bool => (string) ($item['supply_id'] ?? $item['id'] ?? '')
+                        === (string) $supply->ozon_supply_id
+                );
+                $status = $order;
+                $newStatus = $remoteSupply['supply_state']
+                    ?? $remoteSupply['state']
+                    ?? $order['state']
+                    ?? $order['status']
+                    ?? null;
+                $description = $remoteSupply['supply_state_name']
+                    ?? $remoteSupply['state_name']
+                    ?? $order['state_name']
+                    ?? $order['status_name']
+                    ?? null;
+            } else {
+                // До появления supply_order_id проверяем только асинхронное
+                // создание заявки из черновика.
+                $status = $ozon->supplies()->getSupplyCreateStatus((string) $supply->ozon_draft_id);
+                $newStatus = $status['status'] ?? $status['state'] ?? null;
+                $description = $status['status_name'] ?? $status['state_name'] ?? null;
+                $supplyOrderId = $status['supply_order_id']
+                    ?? $status['order_id']
+                    ?? ($status['result']['supply_order_id'] ?? null);
+
+                if ($supplyOrderId) {
+                    $supply->ozon_order_id = (string) $supplyOrderId;
+                }
+            }
 
             $oldStatus = $supply->ozon_status;
-            $newStatus = $status['status'] ?? null;
 
             if ($newStatus && $newStatus !== $oldStatus) {
                 $supply->update([
+                    'ozon_order_id' => $supply->ozon_order_id,
                     'ozon_status' => $newStatus,
+                    'ozon_status_description' => $description,
                     'ozon_response' => $status,
                 ]);
 
@@ -501,7 +615,11 @@ class SupplyService
                     'new_value' => $newStatus,
                     'initiated_by' => 'api',
                 ]);
+            } elseif ($supply->isDirty('ozon_order_id')) {
+                $supply->save();
             }
+
+            $supply->forceFill(['external_last_synced_at' => now()])->save();
 
         } catch (\Exception $e) {
             Log::warning("Failed to sync supply status", [
@@ -518,11 +636,15 @@ class SupplyService
     {
         $statusMap = [
             'DRAFT' => Supply::STATUS_DRAFT_OZON,
+            'DATA_FILLING' => Supply::STATUS_DRAFT_OZON,
             'AWAITING_SLOT' => Supply::STATUS_SLOT_PENDING,
             'SLOT_BOOKED' => Supply::STATUS_SLOT_BOOKED,
             'AWAITING_DELIVER' => Supply::STATUS_READY_TO_SHIP,
+            'READY_TO_SUPPLY' => Supply::STATUS_READY_TO_SHIP,
+            'PROCESSING' => Supply::STATUS_PREPARING,
             'IN_TRANSIT' => Supply::STATUS_IN_TRANSIT,
             'ACCEPTANCE_IN_PROGRESS' => Supply::STATUS_AT_WAREHOUSE,
+            'ACCEPTANCE' => Supply::STATUS_AT_WAREHOUSE,
             'ACCEPTED' => Supply::STATUS_ACCEPTED_FULL,
             'PARTIALLY_ACCEPTED' => Supply::STATUS_ACCEPTED_PARTIAL,
             'CLOSED' => Supply::STATUS_CLOSED,
@@ -536,6 +658,64 @@ class SupplyService
         }
     }
 
+    private function extractDraftId(array $response): ?string
+    {
+        $value = $response['draft_id'] ?? $response['result']['draft_id'] ?? null;
+        if ($value) {
+            return (string) $value;
+        }
+
+        foreach (($response['clusters'] ?? $response['result']['clusters'] ?? []) as $cluster) {
+            if (! empty($cluster['draft_id'])) {
+                return (string) $cluster['draft_id'];
+            }
+        }
+
+        return null;
+    }
+
+    private function resolveWarehouseForDraft(Supply $supply): void
+    {
+        $ozon = OzonMarketplace::fromIntegration($supply->integration);
+        $info = $ozon->supplies()->getDraftInfo((string) $supply->ozon_draft_id);
+        $clusters = $info['clusters'] ?? $info['result']['clusters'] ?? [];
+        $wantedCluster = (string) ($supply->cluster_id ?? '');
+        $fallback = null;
+
+        foreach ($clusters as $cluster) {
+            $clusterId = (string) (
+                $cluster['id']
+                ?? $cluster['cluster_id']
+                ?? $cluster['macrolocal_cluster_id']
+                ?? ''
+            );
+            foreach (($cluster['warehouses'] ?? $cluster['storage_warehouses'] ?? []) as $warehouse) {
+                $available = $warehouse['is_available']
+                    ?? (($warehouse['availability_status']['state'] ?? 'AVAILABLE') === 'AVAILABLE');
+                if (! $available) {
+                    continue;
+                }
+
+                $candidate = [
+                    'warehouse_id' => (string) ($warehouse['id'] ?? $warehouse['warehouse_id'] ?? ''),
+                    'warehouse_name' => $warehouse['name'] ?? $warehouse['warehouse_name'] ?? null,
+                ];
+                if ($candidate['warehouse_id'] === '') {
+                    continue;
+                }
+                $fallback ??= $candidate;
+                if ($wantedCluster !== '' && $clusterId === $wantedCluster) {
+                    $supply->update($candidate);
+                    return;
+                }
+            }
+        }
+
+        if ($fallback !== null) {
+            $supply->update($fallback);
+        }
+    }
+
     /**
      * Отменить поставку
      */
@@ -543,6 +723,29 @@ class SupplyService
     {
         if (!$supply->is_editable) {
             throw new \InvalidArgumentException('Поставку нельзя отменить на текущем этапе');
+        }
+
+        $orderId = $supply->ozon_order_id ?: (
+            $supply->ozon_draft_id ? null : $supply->ozon_supply_id
+        );
+        if ($orderId) {
+            $remote = OzonMarketplace::fromIntegration($supply->integration)
+                ->fboSupplyOrders()
+                ->cancel((int) $orderId);
+            if (! ($remote['success'] ?? false)) {
+                throw new \RuntimeException(
+                    'Ozon не подтвердил отмену поставки: '
+                    . (string) ($remote['error']['message'] ?? $remote['error'] ?? 'неизвестная ошибка')
+                );
+            }
+            $supply->logEvent(SupplyEvent::TYPE_STATUS_CHANGED, [
+                'title' => 'Отмена отправлена в Ozon',
+                'description' => $reason,
+                'api_endpoint' => '/v1/supply-order/cancel',
+                'api_response_body' => $remote,
+                'initiated_by' => $userId ? 'user' : 'system',
+                'user_id' => $userId,
+            ]);
         }
 
         $supply->updateStatus(Supply::STATUS_CANCELLED, [
@@ -558,6 +761,60 @@ class SupplyService
                 'state' => SupplyRecommendation::STATE_NEW,
                 'supply_id' => null,
             ]);
+    }
+
+    public function rescheduleTimeslot(
+        Supply $supply,
+        string $timeslotId,
+        ?int $userId = null
+    ): array {
+        $orderId = $supply->ozon_order_id ?: $supply->ozon_supply_id;
+        if (! $orderId) {
+            throw new \InvalidArgumentException('У поставки ещё нет order_id Ozon');
+        }
+
+        $slot = TimeslotCache::query()
+            ->where('integration_id', $supply->integration_id)
+            ->where('timeslot_id', $timeslotId)
+            ->notExpired()
+            ->available()
+            ->first();
+        if (! $slot?->datetime_from || ! $slot?->datetime_to) {
+            throw new \InvalidArgumentException('Слот устарел. Обновите список доступных слотов.');
+        }
+
+        $result = OzonMarketplace::fromIntegration($supply->integration)
+            ->fboSupplyOrders()
+            ->editTimeslot(
+                (int) $orderId,
+                $slot->datetime_from->toIso8601String(),
+                $slot->datetime_to->toIso8601String()
+            );
+        if (($result['_error'] ?? false) || ($result['success'] ?? true) === false) {
+            throw new \RuntimeException(
+                'Ozon отклонил изменение слота: '
+                . (string) ($result['error']['message'] ?? $result['error'] ?? 'неизвестная ошибка')
+            );
+        }
+
+        $oldSlot = $supply->timeslot_id;
+        $supply->update([
+            'timeslot_id' => $timeslotId,
+            'timeslot_from' => $slot->datetime_from,
+            'timeslot_to' => $slot->datetime_to,
+            'planned_delivery_date' => $slot->slot_date,
+        ]);
+        $supply->logEvent(SupplyEvent::TYPE_SLOT_BOOKED, [
+            'title' => 'Слот поставки изменён',
+            'old_value' => $oldSlot,
+            'new_value' => $timeslotId,
+            'api_endpoint' => '/v1/fbp/order/direct/timeslot/edit',
+            'api_response_body' => $result,
+            'initiated_by' => $userId ? 'user' : 'system',
+            'user_id' => $userId,
+        ]);
+
+        return $result;
     }
 
     /**

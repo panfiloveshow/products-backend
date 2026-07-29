@@ -54,7 +54,7 @@ class LocalityAggregatorShadowDeleteTest extends TestCase
         ]);
 
         // Искусственно состариваем updated_at — shadow-delete должен убить строку.
-        $orphan->update(['updated_at' => $today->copy()->subHour()]);
+        $orphan->forceFill(['updated_at' => $today->copy()->subHour()])->saveQuietly();
 
         // В `ozon_order_unit_economics` ни одной записи за окно: SKU не активен.
         $this->assertSame(
@@ -109,7 +109,7 @@ class LocalityAggregatorShadowDeleteTest extends TestCase
             'estimate_orders_count' => 0,
             'calculation_confidence' => 'low',
         ]);
-        $otherPeriod->update(['updated_at' => $today->copy()->subHour()]);
+        $otherPeriod->forceFill(['updated_at' => $today->copy()->subHour()])->saveQuietly();
 
         app(LocalityAggregator::class)->runDaily($integrationId, $today, 28);
 
@@ -137,7 +137,7 @@ class LocalityAggregatorShadowDeleteTest extends TestCase
 
         $metric = LocalityMetricDaily::where('integration_id', $integrationId)
             ->where('sku', $sku)
-            ->where('snapshot_date', $snapshotDate->toDateString())
+            ->whereDate('snapshot_date', $snapshotDate->toDateString())
             ->where('period_days', 28)
             ->first();
 

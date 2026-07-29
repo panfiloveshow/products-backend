@@ -199,8 +199,14 @@ class ProductServiceTest extends TestCase
      */
     public function test_count_in_stock_products(): void
     {
-        Product::factory()->count(5)->create(['stock' => 10]);
-        Product::factory()->count(3)->create(['stock' => 0]);
+        Product::factory()->count(5)->create([
+            'marketplace' => 'ozon',
+            'stock' => 10,
+        ]);
+        Product::factory()->count(3)->create([
+            'marketplace' => 'ozon',
+            'stock' => 0,
+        ]);
 
         $result = $this->service->getProductsStats();
 

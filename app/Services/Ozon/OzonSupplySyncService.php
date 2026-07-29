@@ -9,7 +9,6 @@ use App\Models\Product;
 use App\Models\Supply;
 use App\Models\SupplyItem;
 use Illuminate\Support\Carbon;
-use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 
@@ -108,12 +107,17 @@ class OzonSupplySyncService
 
             $existing = Supply::query()
                 ->where('integration_id', $integration->id)
-                ->where('ozon_supply_id', $remoteSupplyId)
+                ->where(function ($query) use ($remoteSupplyId, $orderId) {
+                    $query->where('ozon_supply_id', $remoteSupplyId)
+                        ->orWhere('ozon_order_id', (string) $orderId)
+                        ->orWhere('ozon_supply_id', (string) $orderId);
+                })
                 ->first();
 
             $payload = [
                 'integration_id' => $integration->id,
                 'ozon_supply_id' => $remoteSupplyId,
+                'ozon_order_id' => (string) $orderId,
                 'supply_type' => Supply::TYPE_FBO,
                 'supply_method' => Supply::METHOD_DIRECT,
                 'delivery_scheme' => null,
@@ -140,6 +144,7 @@ class OzonSupplySyncService
                     'bundle' => $bundle,
                     'direct_items' => $directItems,
                 ],
+                'external_last_synced_at' => now(),
             ];
 
             DB::beginTransaction();
@@ -159,6 +164,16 @@ class OzonSupplySyncService
                 }
                 $itemsSynced += $this->syncSupplyItems($integration->id, $supply, $items, $remoteSupplyId);
                 $supply->recalculateTotals();
+                $acceptedQty = (int) $supply->items()->sum('accepted_qty');
+                $rejectedQty = (int) $supply->items()->sum('rejected_qty');
+                $supply->update([
+                    'accepted_quantity' => $acceptedQty,
+                    'rejected_quantity' => $rejectedQty,
+                    'acceptance_discrepancies' => $rejectedQty > 0
+                        ? ['rejected_qty' => $rejectedQty, 'source' => 'ozon_supply_items']
+                        : null,
+                ]);
+                $supply->syncAutoSupplyPlanBusinessStatus();
                 DB::commit();
             } catch (\Throwable $e) {
                 DB::rollBack();
@@ -185,35 +200,69 @@ class OzonSupplySyncService
                 ->where('sku', $sku)
                 ->first();
 
-            $row = SupplyItem::query()->updateOrCreate(
-                [
-                    'supply_id' => $supply->id,
-                    'sku' => $sku,
-                ],
-                [
-                    'product_id' => $product?->id,
-                    'ozon_product_id' => (string) ($item['product_id'] ?? $product?->ozon_product_id ?? ''),
+            $ozonProductId = (string) ($item['product_id'] ?? $item['sku'] ?? '');
+            $plannedQty = (int) ($item['quantity'] ?? $item['planned_qty'] ?? 0);
+            $acceptedQty = $this->quantityFrom($item, [
+                'accepted_qty',
+                'accepted_quantity',
+                'fact_quantity',
+                'received_qty',
+            ]);
+            $rejectedQty = $this->quantityFrom($item, [
+                'rejected_qty',
+                'rejected_quantity',
+                'defect_qty',
+            ]);
+            $itemStatus = match (true) {
+                $acceptedQty !== null && $rejectedQty !== null && $acceptedQty > 0 && $rejectedQty > 0
+                    => SupplyItem::STATUS_PARTIAL,
+                $acceptedQty !== null && $plannedQty > 0 && $acceptedQty >= $plannedQty
+                    => SupplyItem::STATUS_ACCEPTED,
+                $rejectedQty !== null && $plannedQty > 0 && $rejectedQty >= $plannedQty
+                    => SupplyItem::STATUS_REJECTED,
+                default => SupplyItem::STATUS_PENDING,
+            };
+            $row = SupplyItem::query()
+                ->where('supply_id', $supply->id)
+                ->where(function ($query) use ($sku, $ozonProductId) {
+                    $query->where('sku', $sku);
+                    if ($ozonProductId !== '') {
+                        $query->orWhere('ozon_product_id', $ozonProductId);
+                    }
+                })
+                ->first();
+            $payload = [
+                    'product_id' => $product?->id ?? $row?->product_id,
+                    'sku' => $row?->sku ?: $sku,
+                    'ozon_product_id' => $ozonProductId !== ''
+                        ? $ozonProductId
+                        : (string) ($product?->ozon_product_id ?? ''),
                     'barcode' => $item['barcode'] ?? $product?->barcode,
                     'product_name' => $item['name'] ?? $item['product_name'] ?? $product?->name,
-                    'planned_qty' => (int) ($item['quantity'] ?? 0),
+                    'planned_qty' => $plannedQty,
                     'packed_qty' => (int) ($item['packed_qty'] ?? 0),
                     'shipped_qty' => (int) ($item['shipped_qty'] ?? ($item['quantity'] ?? 0)),
-                    'accepted_qty' => isset($item['accepted_qty']) ? (int) $item['accepted_qty'] : null,
-                    'rejected_qty' => isset($item['rejected_qty']) ? (int) $item['rejected_qty'] : null,
+                    'accepted_qty' => $acceptedQty,
+                    'rejected_qty' => $rejectedQty,
                     'pack_multiple' => max(1, (int) ($item['pack_multiple'] ?? 1)),
                     'boxes_count' => (int) ($item['boxes_count'] ?? 0),
                     'weight' => $item['weight'] ?? null,
                     'length' => $item['length'] ?? null,
                     'width' => $item['width'] ?? null,
                     'height' => $item['height'] ?? null,
-                    'status' => SupplyItem::STATUS_PENDING,
+                    'status' => $itemStatus,
                     'meta' => [
                         'remote_supply_id' => $remoteSupplyId,
                         'source' => 'ozon_supply_order_bundle',
                         'raw' => $item,
                     ],
-                ]
-            );
+                ];
+
+            if ($row) {
+                $row->update($payload);
+            } else {
+                $row = SupplyItem::query()->create(['supply_id' => $supply->id] + $payload);
+            }
 
             $keepIds[] = $row->id;
             $synced++;
@@ -223,10 +272,25 @@ class OzonSupplySyncService
             SupplyItem::query()
                 ->where('supply_id', $supply->id)
                 ->whereNotIn('id', $keepIds)
+                ->whereNull('auto_supply_plan_line_id')
                 ->delete();
         }
 
         return $synced;
+    }
+
+    /**
+     * @param list<string> $keys
+     */
+    private function quantityFrom(array $item, array $keys): ?int
+    {
+        foreach ($keys as $key) {
+            if (array_key_exists($key, $item) && is_numeric($item[$key])) {
+                return max(0, (int) $item[$key]);
+            }
+        }
+
+        return null;
     }
 
     private function extractBundleItems(array $bundle, array $supplies = []): array

@@ -97,16 +97,16 @@ class LocalityAggregator
                 $skus = $this->aggregateBySku($integrationId, $date, $periodDays, $items);
                 $clusters = $this->aggregateByCluster($integrationId, $date, $periodDays, $items);
 
-                $skuPruned = LocalityMetricDaily::query()
+                $skuPruned = LocalityMetricDaily::withoutGlobalScope('current_workspace')
                     ->where('integration_id', $integrationId)
-                    ->where('snapshot_date', $date->toDateString())
+                    ->whereDate('snapshot_date', $date->toDateString())
                     ->where('period_days', $periodDays)
                     ->where('updated_at', '<', $startedAt)
                     ->delete();
 
-                $clusterPruned = LocalityMetricClusterDaily::query()
+                $clusterPruned = LocalityMetricClusterDaily::withoutGlobalScope('current_workspace')
                     ->where('integration_id', $integrationId)
-                    ->where('snapshot_date', $date->toDateString())
+                    ->whereDate('snapshot_date', $date->toDateString())
                     ->where('period_days', $periodDays)
                     ->where('updated_at', '<', $startedAt)
                     ->delete();
@@ -176,14 +176,19 @@ class LocalityAggregator
                 ->keys()
                 ->first();
 
-            $metric = LocalityMetricDaily::query()->updateOrCreate(
-                [
-                    'integration_id' => $integrationId,
-                    'sku' => (string) $sku,
-                    'snapshot_date' => $date->toDateString(),
-                    'period_days' => $periodDays,
-                ],
-                [
+            $metric = LocalityMetricDaily::withoutGlobalScope('current_workspace')
+                ->where('integration_id', $integrationId)
+                ->where('sku', (string) $sku)
+                ->whereDate('snapshot_date', $date->toDateString())
+                ->where('period_days', $periodDays)
+                ->first();
+            $metric ??= new LocalityMetricDaily([
+                'integration_id' => $integrationId,
+                'sku' => (string) $sku,
+                'snapshot_date' => $date->toDateString(),
+                'period_days' => $periodDays,
+            ]);
+            $metric->fill([
                     'orders_count' => $ordersCount,
                     'local_orders_count' => $share['local'],
                     'non_local_orders_count' => $share['non_local'],
@@ -206,8 +211,8 @@ class LocalityAggregator
                         'actual_overpayment_by_ozon' => round($actualOverpayment, 2),
                         'non_local_orders' => $overpayBreakdown['non_local_orders'],
                     ],
-                ]
-            );
+                ]);
+            $metric->save();
             // updateOrCreate does not bump updated_at when values are identical.
             // Shadow-delete relies on updated_at to mark rows seen in this run.
             $metric->touch();
@@ -263,14 +268,19 @@ class LocalityAggregator
                 ->take(10)
                 ->all();
 
-            $metric = LocalityMetricClusterDaily::query()->updateOrCreate(
-                [
-                    'integration_id' => $integrationId,
-                    'destination_cluster_name' => (string) $clusterName,
-                    'snapshot_date' => $date->toDateString(),
-                    'period_days' => $periodDays,
-                ],
-                [
+            $metric = LocalityMetricClusterDaily::withoutGlobalScope('current_workspace')
+                ->where('integration_id', $integrationId)
+                ->where('destination_cluster_name', (string) $clusterName)
+                ->whereDate('snapshot_date', $date->toDateString())
+                ->where('period_days', $periodDays)
+                ->first();
+            $metric ??= new LocalityMetricClusterDaily([
+                'integration_id' => $integrationId,
+                'destination_cluster_name' => (string) $clusterName,
+                'snapshot_date' => $date->toDateString(),
+                'period_days' => $periodDays,
+            ]);
+            $metric->fill([
                     'destination_cluster_id' => $destClusterId ? (string) $destClusterId : null,
                     'orders_count' => $group->count(),
                     'local_orders_count' => $share['local'],
@@ -286,8 +296,8 @@ class LocalityAggregator
                         'actual_overpayment_by_ozon' => round($actualOverpayment, 2),
                         'non_local_orders' => $overpayBreakdown['non_local_orders'],
                     ],
-                ]
-            );
+                ]);
+            $metric->save();
             // Keep unchanged rows from being pruned by the shadow-delete pass.
             $metric->touch();
             $processed++;

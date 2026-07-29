@@ -4,6 +4,7 @@ namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
 use App\Services\SellicoApiService;
+use App\Support\CurrentWorkspace;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 
@@ -18,6 +19,8 @@ class WorkSpaceController extends Controller
      */
     public function getLimitsExternal(Request $request, int $workspace): JsonResponse
     {
+        CurrentWorkspace::authorize($request, $workspace);
+
         $validated = $request->validate([
             'type' => ['sometimes', 'string', 'in:products,autoplanning'],
         ]);
@@ -38,6 +41,8 @@ class WorkSpaceController extends Controller
      */
     public function storeLimitExternal(Request $request, int $workspace): JsonResponse
     {
+        CurrentWorkspace::authorize($request, $workspace);
+
         $validated = $request->validate([
             'type' => ['required', 'string', 'in:products,autoplanning'],
             'value' => ['required', 'integer', 'min:0'],
@@ -65,6 +70,8 @@ class WorkSpaceController extends Controller
      */
     public function syncLimitExternal(Request $request, int $workspace): JsonResponse
     {
+        CurrentWorkspace::authorize($request, $workspace);
+
         $validated = $request->validate([
             'type' => ['required', 'string', 'in:products,autoplanning'],
             'current_value' => ['required_without:value', 'integer', 'min:0'],

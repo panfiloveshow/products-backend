@@ -11,7 +11,7 @@ use Illuminate\Database\Eloquent\Relations\BelongsTo;
  */
 class SupplySettings extends Model
 {
-    use HasFactory;
+    use HasFactory, Traits\BelongsToCurrentWorkspaceThroughIntegration;
 
     protected $fillable = [
         'integration_id',

@@ -9,12 +9,13 @@ use Illuminate\Database\Eloquent\Relations\BelongsTo;
 
 class InventoryAlert extends Model
 {
-    use HasFactory, HasUuids;
+    use HasFactory, HasUuids, Traits\BelongsToCurrentWorkspaceThroughIntegration;
 
     protected $keyType = 'string';
     public $incrementing = false;
 
     protected $fillable = [
+        'integration_id',
         'sku',
         'warehouse_id',
         'warehouse_name',
@@ -27,6 +28,7 @@ class InventoryAlert extends Model
     ];
 
     protected $casts = [
+        'integration_id' => 'integer',
         'priority' => 'integer',
         'is_resolved' => 'boolean',
         'resolved_at' => 'datetime',

@@ -2,13 +2,23 @@
 
 namespace App\Services;
 
+use App\Services\Spreadsheet\SafeSpreadsheetReader;
 use Illuminate\Http\UploadedFile;
 use Illuminate\Support\Facades\Log;
-use PhpOffice\PhpSpreadsheet\IOFactory;
-use PhpOffice\PhpSpreadsheet\Reader\Exception as ReaderException;
 
 class CostPriceParserService
 {
+    private const MAX_ROWS = 20001;
+    private const MAX_COLUMNS = 64;
+    private const MAX_FILE_BYTES = 10 * 1024 * 1024;
+
+    private SafeSpreadsheetReader $safeReader;
+
+    public function __construct(?SafeSpreadsheetReader $safeReader = null)
+    {
+        $this->safeReader = $safeReader ?? new SafeSpreadsheetReader;
+    }
+
     /**
      * Алиасы для колонки артикула
      */
@@ -72,7 +82,6 @@ class CostPriceParserService
             return [
                 'success' => false,
                 'error' => 'Ошибка при чтении файла',
-                'details' => $e->getMessage(),
             ];
         }
 
@@ -209,22 +218,12 @@ class CostPriceParserService
      */
     private function parseExcel(UploadedFile $file): array
     {
-        $spreadsheet = IOFactory::load($file->getPathname());
-        $worksheet = $spreadsheet->getActiveSheet();
-        
-        $rows = [];
-        foreach ($worksheet->getRowIterator() as $row) {
-            $cellIterator = $row->getCellIterator();
-            $cellIterator->setIterateOnlyExistingCells(false);
-            
-            $rowData = [];
-            foreach ($cellIterator as $cell) {
-                $rowData[] = $cell->getValue();
-            }
-            $rows[] = $rowData;
-        }
-
-        return $rows;
+        return $this->safeReader->read(
+            $file,
+            self::MAX_ROWS,
+            self::MAX_COLUMNS,
+            self::MAX_FILE_BYTES
+        );
     }
 
     /**
@@ -232,46 +231,12 @@ class CostPriceParserService
      */
     private function parseCsv(UploadedFile $file): array
     {
-        $content = file_get_contents($file->getPathname());
-        
-        // Определяем кодировку и конвертируем в UTF-8 если нужно
-        $encoding = mb_detect_encoding($content, ['UTF-8', 'Windows-1251', 'ISO-8859-1'], true);
-        if ($encoding && $encoding !== 'UTF-8') {
-            $content = mb_convert_encoding($content, 'UTF-8', $encoding);
-        }
-        
-        // Убираем BOM если есть
-        $content = preg_replace('/^\xEF\xBB\xBF/', '', $content);
-        
-        // Определяем разделитель по первой строке
-        $firstLine = strtok($content, "\n");
-        $delimiter = $this->detectCsvDelimiter($firstLine);
-        
-        // Парсим CSV
-        $rows = [];
-        $handle = fopen('php://temp', 'r+');
-        fwrite($handle, $content);
-        rewind($handle);
-        
-        while (($row = fgetcsv($handle, 0, $delimiter)) !== false) {
-            $rows[] = $row;
-        }
-        
-        fclose($handle);
-        
-        return $rows;
-    }
-
-    /**
-     * Определение разделителя CSV (точка с запятой или запятая)
-     */
-    private function detectCsvDelimiter(string $line): string
-    {
-        $semicolonCount = substr_count($line, ';');
-        $commaCount = substr_count($line, ',');
-        
-        // Если точек с запятой больше — это русская локаль
-        return $semicolonCount >= $commaCount ? ';' : ',';
+        return $this->safeReader->read(
+            $file,
+            self::MAX_ROWS,
+            self::MAX_COLUMNS,
+            self::MAX_FILE_BYTES
+        );
     }
 
     /**

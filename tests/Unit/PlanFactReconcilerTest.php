@@ -26,6 +26,7 @@ class PlanFactReconcilerTest extends TestCase
 
         Schema::dropIfExists('postings');
         Schema::dropIfExists('posting_items');
+        Schema::dropIfExists('inventory_history');
 
         Schema::create('postings', function (Blueprint $table) {
             $table->uuid('id')->primary();
@@ -46,6 +47,17 @@ class PlanFactReconcilerTest extends TestCase
             $table->string('offer_id')->nullable();
             $table->string('barcode')->nullable();
             $table->unsignedInteger('quantity')->default(1);
+        });
+
+        Schema::create('inventory_history', function (Blueprint $table) {
+            $table->uuid('id')->primary();
+            $table->unsignedBigInteger('integration_id')->nullable();
+            $table->string('sku', 100);
+            $table->string('warehouse_id', 100);
+            $table->date('date');
+            $table->integer('quantity')->nullable();
+            $table->integer('sales')->nullable();
+            $table->timestamps();
         });
 
         Schema::dropIfExists('supplies');
@@ -236,6 +248,58 @@ class PlanFactReconcilerTest extends TestCase
         $this->assertNull($result['acceptance_rate']);
     }
 
+    public function test_plan_fact_tracks_oos_excess_cover_and_manual_override_outcome(): void
+    {
+        [$plan, $line] = $this->makePlanAndLine();
+        $plan->max_cover_days = 10;
+        $line->warehouse_id = 'WH-1';
+        $line->original_qty_rounded = 20;
+        $line->manual_updated_at = Carbon::parse('2026-05-01 12:00:00');
+        $line->manual_override_json = ['qty_rounded' => 30, 'reason' => 'season'];
+        $line->manual_comment = 'Сезонный запас';
+
+        $this->insertPosting('700', 'Москва', '2026-05-03 10:00:00', 14);
+        DB::table('inventory_history')->insert([
+            [
+                'id' => (string) Str::uuid(),
+                'integration_id' => 700,
+                'sku' => 'ART1',
+                'warehouse_id' => 'WH-1',
+                'date' => '2026-05-02',
+                'quantity' => 0,
+                'sales' => 1,
+                'created_at' => now(),
+                'updated_at' => now(),
+            ],
+            [
+                'id' => (string) Str::uuid(),
+                'integration_id' => 700,
+                'sku' => 'ART1',
+                'warehouse_id' => 'WH-1',
+                'date' => '2026-05-14',
+                'quantity' => 30,
+                'sales' => 1,
+                'created_at' => now(),
+                'updated_at' => now(),
+            ],
+        ]);
+
+        $result = (new PlanFactReconciler())->evaluateLine($line, $plan);
+
+        $this->assertSame(1, $result['details_json']['inventory_outcome']['oos_days']);
+        $this->assertSame(30, $result['details_json']['inventory_outcome']['ending_stock']);
+        $this->assertEquals(20.0, $result['details_json']['inventory_outcome']['excess_cover_days']);
+        $this->assertSame('oos_occurred', $result['details_json']['manual_override_outcome']['outcome']);
+        $this->assertContains('oos_during_horizon', $result['details_json']['discrepancy_causes']);
+        $this->assertContains('excess_cover_after_horizon', $result['details_json']['discrepancy_causes']);
+
+        $aggregate = (new PlanFactReconciler())->aggregate([$result]);
+        $this->assertSame(1, $aggregate['oos_days_total']);
+        $this->assertSame(1, $aggregate['lines_with_oos']);
+        $this->assertSame(1, $aggregate['lines_with_excess_cover']);
+        $this->assertSame(1, $aggregate['manual_override_outcomes']['oos_occurred']);
+    }
+
     public function test_aggregate_ignores_insufficient_lines(): void
     {
         $reconciler = new PlanFactReconciler();
@@ -263,5 +327,36 @@ class PlanFactReconcilerTest extends TestCase
         $this->assertNull($agg['mape']);
         $this->assertNull($agg['bias']);
         $this->assertSame(0, $agg['lines_evaluated']);
+    }
+
+    public function test_aggregate_uses_volume_weighted_wape_and_acceptance(): void
+    {
+        $agg = (new PlanFactReconciler())->aggregate([
+            [
+                'status' => PlanLineEvaluation::STATUS_OK,
+                'abs_pct_error' => 50.0,
+                'bias_pct' => 50.0,
+                'forecast_demand_qty' => 150,
+                'actual_sales_qty' => 100,
+                'planned_qty' => 100,
+                'accepted_qty' => 90,
+                'acceptance_rate' => 90.0,
+            ],
+            [
+                'status' => PlanLineEvaluation::STATUS_OK,
+                'abs_pct_error' => 100.0,
+                'bias_pct' => -100.0,
+                'forecast_demand_qty' => 0,
+                'actual_sales_qty' => 10,
+                'planned_qty' => 10,
+                'accepted_qty' => 5,
+                'acceptance_rate' => 50.0,
+            ],
+        ]);
+
+        $this->assertEqualsWithDelta(54.55, $agg['wape'], 0.01);
+        $this->assertEqualsWithDelta(36.36, $agg['weighted_bias'], 0.01);
+        $this->assertEqualsWithDelta(86.36, $agg['acceptance_rate'], 0.01);
+        $this->assertEqualsWithDelta(45.45, $agg['accuracy'], 0.01);
     }
 }

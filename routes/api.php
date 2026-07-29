@@ -123,7 +123,7 @@ Route::prefix('auth')->group(function () {
     Route::get('/workspaces/{workspaceId}/integrations', [AuthController::class, 'integrations'])->middleware('throttle:60,1');
 });
 
-Route::middleware('throttle:60,1')->group(function () {
+Route::middleware(['throttle:60,1', 'sellico.permission'])->group(function () {
     Route::get('/workspaces/{workspace}/limits-external', [WorkSpaceController::class, 'getLimitsExternal'])
         ->whereNumber('workspace')
         ->name('workspaces.limits-external.show');
@@ -338,6 +338,7 @@ Route::prefix('supplies')->middleware('sellico.permission')->group(function () {
     Route::post('/{id}/create-draft', [SupplyController::class, 'createDraft'])->whereNumber('id')->name('supplies.create-draft');
     Route::get('/{id}/timeslots', [SupplyController::class, 'getTimeslots'])->whereNumber('id')->name('supplies.timeslots');
     Route::post('/{id}/book-slot', [SupplyController::class, 'bookSlot'])->whereNumber('id')->name('supplies.book-slot');
+    Route::post('/{id}/reschedule', [SupplyController::class, 'reschedule'])->whereNumber('id')->name('supplies.reschedule');
     Route::post('/{id}/start-preparing', [SupplyController::class, 'startPreparing'])->whereNumber('id')->name('supplies.start-preparing');
     Route::post('/{id}/ready-to-ship', [SupplyController::class, 'markReadyToShip'])->whereNumber('id')->name('supplies.ready-to-ship');
     Route::post('/{id}/ship', [SupplyController::class, 'markShipped'])->whereNumber('id')->name('supplies.ship');
@@ -457,6 +458,7 @@ Route::prefix('auto-supply-plans')->middleware('sellico.permission')->group(func
         ->name('auto-supply-plans.capabilities');
     Route::get('/warehouses', [AutoSupplyPlanController::class, 'warehouses'])->name('auto-supply-plans.warehouses');
     Route::get('/data-health', [AutoSupplyPlanController::class, 'dataHealth'])->name('auto-supply-plans.data-health');
+    Route::post('/refresh-data', [AutoSupplyPlanController::class, 'refreshData'])->name('auto-supply-plans.refresh-data');
     Route::get('/constraints', [AutoSupplyPlanController::class, 'constraintFiles'])
         ->name('auto-supply-plans.constraints.index');
     Route::post('/constraints/preview', [AutoSupplyPlanController::class, 'previewConstraints'])
@@ -475,15 +477,36 @@ Route::prefix('auto-supply-plans')->middleware('sellico.permission')->group(func
         ->name('auto-supply-plans.destroy');
     Route::post('/{id}/calculate', [AutoSupplyPlanController::class, 'calculate'])
         ->name('auto-supply-plans.calculate');
+    Route::post('/{id}/validate', [AutoSupplyPlanController::class, 'validatePlan'])
+        ->name('auto-supply-plans.validate');
+    Route::post('/{id}/approve', [AutoSupplyPlanController::class, 'approve'])
+        ->name('auto-supply-plans.approve');
+    Route::post('/{id}/materialize-supplies', [AutoSupplyPlanController::class, 'materializeSupplies'])
+        ->name('auto-supply-plans.materialize-supplies');
+    Route::get('/{id}/execution', [AutoSupplyPlanController::class, 'execution'])
+        ->name('auto-supply-plans.execution');
+    Route::post('/{id}/execute', [AutoSupplyPlanController::class, 'executePlan'])
+        ->name('auto-supply-plans.execute');
+    Route::post('/{id}/executions/{executionId}/retry', [AutoSupplyPlanController::class, 'retryExecution'])
+        ->name('auto-supply-plans.executions.retry');
     Route::post('/{id}/fix-ktr-baseline', [AutoSupplyPlanController::class, 'fixKtrBaseline'])
         ->name('auto-supply-plans.fix-ktr-baseline');
     Route::get('/{id}/lines', [AutoSupplyPlanController::class, 'lines'])
         ->name('auto-supply-plans.lines');
+    Route::get('/{id}/compare', [AutoSupplyPlanController::class, 'compare'])
+        ->name('auto-supply-plans.compare');
+    Route::post('/{id}/lines/bulk', [AutoSupplyPlanController::class, 'bulkUpdateLines'])
+        ->name('auto-supply-plans.lines.bulk');
+    Route::get('/{id}/adjustments', [AutoSupplyPlanController::class, 'adjustments'])
+        ->name('auto-supply-plans.adjustments');
     Route::get('/{id}/accuracy', [AutoSupplyPlanController::class, 'accuracy'])
         ->name('auto-supply-plans.accuracy');
+    Route::get('/{id}/plan-fact', [AutoSupplyPlanController::class, 'accuracy'])
+        ->name('auto-supply-plans.plan-fact');
     Route::get('/{id}/clusters', [AutoSupplyPlanController::class, 'clusters'])
         ->name('auto-supply-plans.clusters');
     Route::put('/{id}/lines/{lineId}', [AutoSupplyPlanController::class, 'updateLine'])->name('auto-supply-plans.lines.update');
+    Route::patch('/{id}/lines/{lineId}', [AutoSupplyPlanController::class, 'updateLine'])->name('auto-supply-plans.lines.patch');
     Route::get('/{id}/simulate', [AutoSupplyPlanController::class, 'simulate'])
         ->name('auto-supply-plans.simulate');
     Route::get('/{id}/export/ozon', [AutoSupplyPlanController::class, 'exportOzon'])
@@ -581,9 +604,11 @@ Route::prefix('v1/locality')->middleware('sellico.permission')->group(function (
 | WB Webhooks Module
 |--------------------------------------------------------------------------
 */
-Route::get('/wb-webhook/status', [WbWebhookController::class, 'status'])->name('wb-webhook.status');
-Route::post('/wb-webhook/register', [WbWebhookController::class, 'register'])->name('wb-webhook.register');
-Route::post('/wb-webhook/deactivate', [WbWebhookController::class, 'deactivate'])->name('wb-webhook.deactivate');
+Route::middleware('sellico.permission')->group(function () {
+    Route::get('/wb-webhook/status', [WbWebhookController::class, 'status'])->name('wb-webhook.status');
+    Route::post('/wb-webhook/register', [WbWebhookController::class, 'register'])->name('wb-webhook.register');
+    Route::post('/wb-webhook/deactivate', [WbWebhookController::class, 'deactivate'])->name('wb-webhook.deactivate');
+});
 // Публичный роут для приёма событий от WB. Авторизация — через HMAC-подпись
 // внутри контроллера (см. WbWebhookController::isSignatureValid).
 // throttle:300,1 — защита от спам-запросов без подписи (они всё равно получат 401,

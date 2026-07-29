@@ -35,7 +35,11 @@ class SyncSupplyStatusesJob implements ShouldQueue
         try {
             // Получаем активные поставки
             $query = Supply::active()
-                ->whereNotNull('ozon_draft_id');
+                ->where(function ($query) {
+                    $query->whereNotNull('ozon_order_id')
+                        ->orWhereNotNull('ozon_supply_id')
+                        ->orWhereNotNull('ozon_draft_id');
+                });
 
             if ($this->integrationId) {
                 $query->where('integration_id', $this->integrationId);

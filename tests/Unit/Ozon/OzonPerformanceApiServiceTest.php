@@ -3,6 +3,7 @@
 namespace Tests\Unit\Ozon;
 
 use App\Models\Product;
+use App\Models\OzonAdStat;
 use App\Services\Ozon\OzonPerformanceApiService;
 use Illuminate\Foundation\Testing\LazilyRefreshDatabase;
 use Illuminate\Support\Facades\Http;
@@ -223,6 +224,17 @@ class OzonPerformanceApiServiceTest extends TestCase
                 'offer_id' => '3-02/3846',
             ],
         ]);
+        $this->storeCampaignStats(77, [[
+            'SKU' => '2127759756',
+            'Название товара' => 'Чековая лента 80 мм, 45 метров',
+            'Показы' => '1000',
+            'Клики' => '50',
+            'CTR (%)' => '5,0',
+            'Расход' => '222,20',
+            'Заказы' => '6',
+            'Выручка' => '2222,00',
+            'ДРР' => '10,00',
+        ]]);
 
         Http::fake([
             'https://api-performance.ozon.ru/api/client/token' => Http::response([
@@ -278,6 +290,17 @@ class OzonPerformanceApiServiceTest extends TestCase
                 'sku' => '2127759756',
             ],
         ]);
+        $this->storeCampaignStats(78, [[
+            'SKU' => '9999999999',
+            'Название товара' => 'Уникальная чековая лента 80 мм',
+            'Показы' => '100',
+            'Клики' => '7',
+            'CTR (%)' => '7,0',
+            'Расход' => '70,00',
+            'Заказы' => '2',
+            'Выручка' => '700,00',
+            'ДРР' => '10,00',
+        ]]);
 
         Http::fake([
             'https://api-performance.ozon.ru/api/client/token' => Http::response([
@@ -370,6 +393,27 @@ class OzonPerformanceApiServiceTest extends TestCase
         $this->assertStringContainsString('JSON вернул агрегаты', $result['coverage']['campaign_stats_source_error']);
         $this->assertSame(0, $result['coverage']['campaign_product_rows']);
         $this->assertSame(0, $result['coverage']['mapped_campaign_product_rows']);
+    }
+
+    /**
+     * @param array<int, array<string, mixed>> $rows
+     */
+    private function storeCampaignStats(int $integrationId, array $rows): void
+    {
+        OzonAdStat::query()->create([
+            'integration_id' => $integrationId,
+            'date_from' => '2026-05-04',
+            'date_to' => '2026-06-02',
+            'status' => 'ready',
+            'payload' => [
+                'schema_version' => 3,
+                'rows' => $rows,
+                'source' => 'async_report',
+                'totals' => [],
+                'derived' => [],
+            ],
+            'fetched_at' => now(),
+        ]);
     }
 
     public function test_product_statistics_report_generation_uses_rfc3339_dates(): void

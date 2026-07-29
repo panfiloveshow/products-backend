@@ -35,6 +35,10 @@ class UpdateIntegrationRequest extends FormRequest
                 'ozon' => [
                     'credentials.client_id' => 'sometimes|string',
                     'credentials.api_key' => 'sometimes|string',
+                    'credentials.oauth_access_token' => 'sometimes|string',
+                    'credentials.expires_at' => 'nullable|date',
+                    'credentials.scopes' => 'nullable|array',
+                    'credentials.scopes.*' => 'string',
                 ],
                 'yandex_market' => [
                     'credentials.token' => 'sometimes|string',

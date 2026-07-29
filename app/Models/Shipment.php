@@ -10,7 +10,7 @@ use Illuminate\Database\Eloquent\Relations\HasMany;
 
 class Shipment extends Model
 {
-    use HasFactory, HasUuids;
+    use HasFactory, HasUuids, Traits\BelongsToCurrentWorkspace;
 
     protected $keyType = 'string';
     public $incrementing = false;
@@ -24,6 +24,7 @@ class Shipment extends Model
     public const STATUS_REJECTED = 'rejected';
 
     protected $fillable = [
+        'workspace_id',
         'name',
         'status',
         'marketplace',
@@ -53,6 +54,7 @@ class Shipment extends Model
     ];
 
     protected $casts = [
+        'workspace_id' => 'integer',
         'slot' => 'array',
         'marketplace_requirements' => 'array',
         'packaging' => 'array',

@@ -8,7 +8,7 @@ use Illuminate\Database\Eloquent\Relations\HasMany;
 
 class Integration extends Model
 {
-    use HasFactory;
+    use HasFactory, Traits\ScopedToCurrentWorkspace;
 
     // Отключаем auto-increment чтобы использовать ID из Sellico
     public $incrementing = false;
@@ -19,6 +19,11 @@ class Integration extends Model
         'name',
         'marketplace',
         'credentials',
+        'credential_type',
+        'credentials_expires_at',
+        'credential_health',
+        'credential_scopes',
+        'credential_last_checked_at',
         'is_active',
         'auto_sync_enabled',
         'sync_interval_hours',
@@ -41,6 +46,9 @@ class Integration extends Model
 
     protected $casts = [
         'credentials' => 'encrypted:array',
+        'credentials_expires_at' => 'datetime',
+        'credential_scopes' => 'array',
+        'credential_last_checked_at' => 'datetime',
         'settings' => 'array',
         'is_active' => 'boolean',
         'auto_sync_enabled' => 'boolean',
@@ -161,7 +169,10 @@ class Integration extends Model
         $c = $this->credentials ?? [];
         $parts = match ($this->marketplace) {
             'wildberries', 'uzum' => [$c['api_key'] ?? null],
-            'ozon' => [$c['client_id'] ?? null, $c['api_key'] ?? null],
+            'ozon' => [
+                $c['client_id'] ?? null,
+                $c['api_key'] ?? $c['oauth_access_token'] ?? $c['access_token'] ?? null,
+            ],
             'yandex_market', 'yandex' => [$c['token'] ?? null, $c['campaign_id'] ?? null],
             default => [$c['api_key'] ?? $c['token'] ?? null],
         };

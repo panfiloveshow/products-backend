@@ -15,7 +15,7 @@ use Illuminate\Database\Eloquent\Relations\HasMany;
  */
 class SupplyPackage extends Model
 {
-    use HasFactory;
+    use HasFactory, Traits\BelongsToCurrentWorkspaceThroughSupply;
 
     // Типы грузомест
     public const TYPE_BOX = 'box';           // Короб

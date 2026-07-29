@@ -170,7 +170,12 @@ class AuthController extends Controller
         // Валидация в зависимости от маркетплейса
         $rules = match ($marketplace) {
             'wildberries' => ['api_key' => 'required|string'],
-            'ozon' => ['client_id' => 'required|string', 'api_key' => 'required|string'],
+            'ozon' => [
+                'client_id' => 'nullable|string|required_with:api_key',
+                'api_key' => 'nullable|string|required_without_all:oauth_access_token,access_token',
+                'oauth_access_token' => 'nullable|string|required_without_all:api_key,access_token',
+                'access_token' => 'nullable|string',
+            ],
             'yandex_market' => ['token' => 'required|string', 'campaign_id' => 'required|string'],
             default => [],
         };

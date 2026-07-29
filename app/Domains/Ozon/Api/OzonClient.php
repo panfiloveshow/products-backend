@@ -15,17 +15,23 @@ class OzonClient
     
     private string $clientId;
     private string $apiKey;
+    private string $accessToken;
     private int $timeout = 30;
 
-    public function __construct(?string $clientId = null, ?string $apiKey = null)
+    public function __construct(
+        ?string $clientId = null,
+        ?string $apiKey = null,
+        ?string $accessToken = null
+    )
     {
         $this->clientId = $clientId ?? config('services.ozon.client_id') ?? '';
         $this->apiKey = $apiKey ?? config('services.ozon.api_key') ?? '';
+        $this->accessToken = $accessToken ?? config('services.ozon.access_token') ?? '';
     }
 
     public function getClientCacheKey(): string
     {
-        return hash('sha256', $this->clientId);
+        return hash('sha256', $this->clientId . '|' . $this->accessToken);
     }
 
     /**
@@ -36,7 +42,8 @@ class OzonClient
         $credentials = $integration->getDecryptedCredentials();
         return new self(
             $credentials['client_id'] ?? null,
-            $credentials['api_key'] ?? null
+            $credentials['api_key'] ?? null,
+            $credentials['oauth_access_token'] ?? $credentials['access_token'] ?? null
         );
     }
 
@@ -59,6 +66,7 @@ class OzonClient
             'payload_sample' => $this->truncateResponse(json_encode($body), 500),
             'client_id_prefix' => $this->clientId ? substr($this->clientId, 0, 4) . '***' : 'empty',
             'has_api_key' => !empty($this->apiKey),
+            'auth_type' => $this->accessToken !== '' ? 'oauth' : 'api_key',
         ]);
 
         for ($attempt = 1; $attempt <= $maxAttempts; $attempt++) {
@@ -175,6 +183,7 @@ class OzonClient
             'params' => $params,
             'client_id_prefix' => $this->clientId ? substr($this->clientId, 0, 4) . '***' : 'empty',
             'has_api_key' => !empty($this->apiKey),
+            'auth_type' => $this->accessToken !== '' ? 'oauth' : 'api_key',
         ]);
 
         try {
@@ -223,6 +232,14 @@ class OzonClient
      */
     private function getHeaders(): array
     {
+        if ($this->accessToken !== '') {
+            return [
+                'Authorization' => 'Bearer ' . $this->accessToken,
+                'Content-Type' => 'application/json',
+                'Accept' => 'application/json',
+            ];
+        }
+
         return [
             'Client-Id' => $this->clientId,
             'Api-Key' => $this->apiKey,

@@ -4,6 +4,8 @@ namespace App\Jobs;
 
 use App\Models\InventoryAlert;
 use App\Models\InventoryWarehouse;
+use App\Models\Integration;
+use App\Services\Ozon\OzonCredentialHealthService;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
@@ -18,13 +20,14 @@ class GenerateAlertsJob implements ShouldQueue
     public int $tries = 1;
     public int $timeout = 600;
 
-    public function handle(): void
+    public function handle(OzonCredentialHealthService $credentialHealth): void
     {
         Log::info('Starting alerts generation');
 
         $alertsCreated = 0;
         $alertsCreated += $this->generateAlertsForStatus('critical', 10, 'reorder');
         $alertsCreated += $this->generateAlertsForStatus('low', 5, 'monitor');
+        $alertsCreated += $this->generateOzonCredentialAlerts($credentialHealth);
 
         $this->resolveOutdatedAlerts();
 
@@ -53,17 +56,18 @@ class GenerateAlertsJob implements ShouldQueue
         $skus = $warehouses->pluck('sku')->filter()->unique()->all();
         $warehouseIds = $warehouses->pluck('warehouse_id')->filter()->unique()->all();
         $existingKeys = InventoryAlert::query()
+            ->whereIn('integration_id', $warehouses->pluck('integration_id')->filter()->unique()->all())
             ->whereIn('sku', $skus)
             ->whereIn('warehouse_id', $warehouseIds)
             ->where('type', $alertType)
             ->where('is_resolved', false)
-            ->get(['sku', 'warehouse_id'])
-            ->map(fn ($row) => $row->sku.'||'.$row->warehouse_id)
+            ->get(['integration_id', 'sku', 'warehouse_id'])
+            ->map(fn ($row) => $row->integration_id.'||'.$row->sku.'||'.$row->warehouse_id)
             ->flip(); // flip → O(1) проверка через isset
 
         $created = 0;
         foreach ($warehouses as $warehouse) {
-            $key = $warehouse->sku.'||'.$warehouse->warehouse_id;
+            $key = $warehouse->integration_id.'||'.$warehouse->sku.'||'.$warehouse->warehouse_id;
             if (isset($existingKeys[$key])) {
                 continue;
             }
@@ -73,6 +77,7 @@ class GenerateAlertsJob implements ShouldQueue
                 : "Низкий остаток: {$warehouse->quantity} шт. ({$warehouse->days_of_stock} дней) на складе {$warehouse->warehouse_name}";
 
             InventoryAlert::create([
+                'integration_id' => $warehouse->integration_id,
                 'sku' => $warehouse->sku,
                 'warehouse_id' => $warehouse->warehouse_id,
                 'warehouse_name' => $warehouse->warehouse_name,
@@ -96,7 +101,9 @@ class GenerateAlertsJob implements ShouldQueue
      */
     private function resolveOutdatedAlerts(): void
     {
-        $activeAlerts = InventoryAlert::active()->get();
+        $activeAlerts = InventoryAlert::active()
+            ->where('sku', '!=', '__OZON_CREDENTIAL__')
+            ->get();
         if ($activeAlerts->isEmpty()) {
             return;
         }
@@ -106,13 +113,14 @@ class GenerateAlertsJob implements ShouldQueue
 
         // Ключ "{sku}||{warehouse_id}" → stock_status.
         $warehouseStatus = InventoryWarehouse::query()
+            ->whereIn('integration_id', $activeAlerts->pluck('integration_id')->filter()->unique()->all())
             ->whereIn('sku', $skus)
             ->whereIn('warehouse_id', $warehouseIds)
-            ->get(['sku', 'warehouse_id', 'stock_status'])
-            ->mapWithKeys(fn ($row) => [$row->sku.'||'.$row->warehouse_id => $row->stock_status]);
+            ->get(['integration_id', 'sku', 'warehouse_id', 'stock_status'])
+            ->mapWithKeys(fn ($row) => [$row->integration_id.'||'.$row->sku.'||'.$row->warehouse_id => $row->stock_status]);
 
         foreach ($activeAlerts as $alert) {
-            $key = $alert->sku.'||'.$alert->warehouse_id;
+            $key = $alert->integration_id.'||'.$alert->sku.'||'.$alert->warehouse_id;
             $status = $warehouseStatus->get($key);
 
             if ($status === null) {
@@ -129,5 +137,74 @@ class GenerateAlertsJob implements ShouldQueue
                 $alert->resolve();
             }
         }
+    }
+
+    /**
+     * In-product уведомления за 30/14/7/1 день до истечения OAuth/API key.
+     * Одна интеграция имеет не больше одного активного credential-alert:
+     * его приоритет и текст обновляются при переходе к следующему порогу.
+     */
+    private function generateOzonCredentialAlerts(OzonCredentialHealthService $healthService): int
+    {
+        $created = 0;
+        $integrations = Integration::withoutGlobalScopes()
+            ->where('marketplace', 'ozon')
+            ->where('is_active', true)
+            ->get();
+
+        foreach ($integrations as $integration) {
+            $health = $healthService->assess($integration);
+            $status = (string) ($health['status'] ?? 'unknown');
+            $days = $health['days_until_expiry'] ?? null;
+            $needsAlert = ! ($health['usable'] ?? false)
+                || $status === 'expiring'
+                || (is_numeric($days) && (int) $days <= 30);
+            $active = InventoryAlert::withoutGlobalScopes()
+                ->where('integration_id', $integration->id)
+                ->where('sku', '__OZON_CREDENTIAL__')
+                ->where('is_resolved', false)
+                ->first();
+
+            if (! $needsAlert) {
+                $active?->resolve();
+                continue;
+            }
+
+            $daysInt = is_numeric($days) ? (int) $days : null;
+            $priority = match (true) {
+                ! ($health['usable'] ?? false), $daysInt !== null && $daysInt <= 0 => 10,
+                $daysInt !== null && $daysInt <= 1 => 9,
+                $daysInt !== null && $daysInt <= 7 => 8,
+                $daysInt !== null && $daysInt <= 14 => 7,
+                default => 6,
+            };
+            $type = $priority >= 9 ? 'critical' : 'warning';
+            $message = match (true) {
+                $status === 'expired' => 'Доступ Ozon истёк. Переподключите интеграцию, иначе синхронизация и автопланирование заблокированы.',
+                ! ($health['usable'] ?? false) => 'Доступ Ozon недействителен. Переподключите интеграцию.',
+                $daysInt !== null => "Доступ Ozon истекает через {$daysInt} дн. Переподключите интеграцию заранее.",
+                default => 'Проверьте доступ Ozon: срок действия credentials требует внимания.',
+            };
+
+            $attributes = [
+                'warehouse_name' => $integration->name,
+                'type' => $type,
+                'message' => $message,
+                'action' => 'monitor',
+                'priority' => $priority,
+            ];
+            if ($active) {
+                $active->update($attributes);
+            } else {
+                InventoryAlert::withoutGlobalScopes()->create(array_merge($attributes, [
+                    'integration_id' => $integration->id,
+                    'sku' => '__OZON_CREDENTIAL__',
+                    'warehouse_id' => null,
+                ]));
+                $created++;
+            }
+        }
+
+        return $created;
     }
 }

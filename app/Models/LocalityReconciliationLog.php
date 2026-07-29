@@ -7,7 +7,7 @@ use Illuminate\Database\Eloquent\Model;
 
 class LocalityReconciliationLog extends Model
 {
-    use HasFactory;
+    use HasFactory, Traits\BelongsToCurrentWorkspaceThroughIntegration;
 
     public const VERDICT_MATCH = 'match';
     public const VERDICT_DRIFT = 'drift';

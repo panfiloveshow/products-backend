@@ -95,7 +95,7 @@ class SyncProductsJob implements ShouldBeUnique, ShouldQueue
                 : null;
 
             // Создаём сервис маркетплейса с credentials
-            $marketplace = in_array($this->syncLog->marketplace, ['wildberries', 'yandex', 'yandex_market', 'uzum'], true)
+            $marketplace = in_array($this->syncLog->marketplace, ['wildberries', 'ozon', 'yandex', 'yandex_market', 'uzum'], true)
                 ? DomainMarketplaceFactory::create($this->syncLog->marketplace, $credentials, $integration)
                 : MarketplaceFactory::create($this->syncLog->marketplace, $credentials);
             $products = $marketplace->getProducts();

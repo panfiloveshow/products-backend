@@ -17,7 +17,7 @@ use Illuminate\Database\Eloquent\Relations\BelongsTo;
  */
 class UnitEconomicsSettings extends Model
 {
-    use HasFactory;
+    use HasFactory, Traits\BelongsToCurrentWorkspaceThroughIntegration;
 
     protected $table = 'unit_economics_settings';
 

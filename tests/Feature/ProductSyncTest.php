@@ -4,6 +4,7 @@ namespace Tests\Feature;
 
 use App\Models\Integration;
 use App\Models\SyncLog;
+use App\Services\LimitsSyncService;
 use App\Services\ProductService;
 use App\Services\SellicoApiService;
 use Illuminate\Database\Schema\Blueprint;
@@ -30,10 +31,18 @@ class ProductSyncTest extends TestCase
             $table->unsignedInteger('sync_interval_hours')->default(6);
             $table->timestamps();
         });
+
+        Schema::dropIfExists('products');
+        Schema::create('products', function (Blueprint $table) {
+            $table->string('id')->primary();
+            $table->unsignedBigInteger('integration_id')->nullable();
+            $table->timestamps();
+        });
     }
 
     protected function tearDown(): void
     {
+        Schema::dropIfExists('products');
         Schema::dropIfExists('integrations');
 
         parent::tearDown();
@@ -136,6 +145,24 @@ class ProductSyncTest extends TestCase
 
         $this->app->instance(ProductService::class, $productService);
         $this->app->instance(SellicoApiService::class, $sellicoApi);
+        $this->app->instance(LimitsSyncService::class, new class extends LimitsSyncService
+        {
+            public function __construct()
+            {
+            }
+
+            public function ensureLimitAvailable(int $workspaceId, string $type, int $increment = 0): array
+            {
+                return [
+                    'success' => true,
+                    'status' => 200,
+                    'type' => $type,
+                    'current_value' => 0,
+                    'requested_value' => $increment,
+                    'limit' => null,
+                ];
+            }
+        });
 
         $response = $this->withHeader('Authorization', 'Bearer test-token')
             ->postJson('/api/products/sync/ozon', []);

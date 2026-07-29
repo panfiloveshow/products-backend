@@ -7,6 +7,8 @@ use Illuminate\Database\Eloquent\Relations\BelongsTo;
 
 class SupplyAnalytics extends Model
 {
+    use Traits\BelongsToCurrentWorkspaceThroughIntegration;
+
     protected $table = 'supply_analytics';
 
     // Поля соответствуют миграции 2026_01_22_140600_create_supply_analytics_table.

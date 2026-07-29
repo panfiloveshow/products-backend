@@ -3,6 +3,8 @@
 namespace App\Domains\Ozon\Api;
 
 use App\Domains\Marketplace\Contracts\SuppliesApiInterface;
+use App\Exceptions\OzonAmbiguousRemoteStateException;
+use App\Exceptions\OzonPreconditionException;
 
 /**
  * API для работы с поставками Ozon (FBO Supplies)
@@ -806,6 +808,9 @@ class SuppliesApi implements SuppliesApiInterface
         // Используем актуальный эндпоинт /v1/draft/create
         // Пробуем передать cluster_ids как массив int64 (числа)
         $clusterId = (int) ($data['cluster_id'] ?? $data['macrolocal_cluster_id'] ?? 0);
+        if ($clusterId <= 0 || $items === []) {
+            throw new OzonPreconditionException('Для прямого черновика нужны cluster_id и товары.');
+        }
         $body = [
             'cluster_ids' => [$clusterId],
             'items' => $items,
@@ -823,7 +828,7 @@ class SuppliesApi implements SuppliesApiInterface
         ]);
 
         if (!$response || empty($response['operation_id'])) {
-            throw new \RuntimeException(
+            throw new OzonAmbiguousRemoteStateException(
                 'Не удалось создать черновик поставки: ' . 
                 json_encode($response)
             );
@@ -831,29 +836,9 @@ class SuppliesApi implements SuppliesApiInterface
 
         $operationId = $response['operation_id'];
 
-        // Ждём и получаем информацию о созданном черновике
-        // Ozon может обрабатывать запрос несколько секунд
-        $draftInfo = null;
-        $maxAttempts = 5;
-        $attempt = 0;
-        
-        while ($attempt < $maxAttempts) {
-            $attempt++;
-            sleep(2); // Ждём 2 секунды между попытками
-            
-            $draftInfo = $this->getDraftCreateInfo($operationId);
-            $status = $draftInfo['status'] ?? '';
-            
-            // Если статус не IN_PROGRESS — выходим
-            if ($status !== 'CALCULATION_STATUS_IN_PROGRESS') {
-                break;
-            }
-            
-            \Illuminate\Support\Facades\Log::debug('Ozon draft still in progress', [
-                'operation_id' => $operationId,
-                'attempt' => $attempt,
-            ]);
-        }
+        // Создание асинхронное. Делаем один неблокирующий poll; дальнейшее
+        // ожидание выполняет очередь ExecuteOzonSupplyDraftJob.
+        $draftInfo = $this->getDraftCreateInfo($operationId);
         
         \Illuminate\Support\Facades\Log::info('Ozon draft/create/info response', [
             'operation_id' => $operationId,
@@ -900,18 +885,14 @@ class SuppliesApi implements SuppliesApiInterface
             }
         }
 
-        // Если статус FAILED и нет draft_id, выбрасываем исключение с понятным сообщением
-        if ($status === 'CALCULATION_STATUS_FAILED' && !$draftId) {
-            $errorMessage = !empty($errors) 
-                ? implode('; ', array_filter($errors))
-                : 'Не удалось создать черновик в Ozon';
-            throw new \RuntimeException($errorMessage);
-        }
-
         return [
-            'draft_id' => $draftId ?? $operationId,
+            'draft_id' => $draftId,
             'operation_id' => $operationId,
-            'status' => $status === 'CALCULATION_STATUS_SUCCESS' ? 'draft' : 'pending',
+            'status' => match ($status) {
+                'CALCULATION_STATUS_SUCCESS' => 'draft',
+                'CALCULATION_STATUS_FAILED' => 'failed',
+                default => 'pending',
+            },
             'supply_method' => 'direct',
             'macrolocal_cluster_id' => $data['macrolocal_cluster_id'] ?? null,
             'errors' => $errors,
@@ -1144,7 +1125,7 @@ class SuppliesApi implements SuppliesApiInterface
 
     /**
      * Создать заявку на поставку из черновика.
-     * v2: POST /v2/draft/supply/create (selected_cluster_warehouses + supply_type), fallback на v1.
+     * v2: POST /v2/draft/supply/create (selected_cluster_warehouses + supply_type).
      *
      * ВНИМАНИЕ: money-path — создаёт реальную заявку на поставку в Ozon.
      * Перед прод-использованием проверить на тестовой интеграции.
@@ -1157,46 +1138,49 @@ class SuppliesApi implements SuppliesApiInterface
         ?string $warehouseName = null,
         string $supplyType = 'DIRECT'
     ): array {
-        $timeslotBody = $timeslot
-            ? ['from_in_timezone' => $timeslot['from'] ?? '', 'to_in_timezone' => $timeslot['to'] ?? '']
-            : null;
+        $timeslotFrom = trim((string) ($timeslot['from'] ?? ''));
+        $timeslotTo = trim((string) ($timeslot['to'] ?? ''));
+        if ($timeslotFrom === '' || $timeslotTo === '') {
+            throw new OzonPreconditionException(
+                'Для создания заявки Ozon обязателен актуальный интервал поставки from/to.'
+            );
+        }
+        $timeslotBody = [
+            'from_in_timezone' => $timeslotFrom,
+            'to_in_timezone' => $timeslotTo,
+        ];
         $ozonSupplyType = strtoupper($supplyType) === 'CROSSDOCK' ? 'CROSSDOCK' : 'DIRECT';
         $macrolocalClusterId = $this->resolveMacrolocalClusterId($warehouseId, $clusterId, $warehouseName);
 
-        if ($macrolocalClusterId) {
-            $v2Body = [
-                'draft_id' => $draftId,
-                'selected_cluster_warehouses' => [[
-                    'macrolocal_cluster_id' => (int) $macrolocalClusterId,
-                    'storage_warehouse_id' => (int) $warehouseId,
-                ]],
-                'supply_type' => $ozonSupplyType,
-            ];
-            if ($timeslotBody) {
-                $v2Body['timeslot'] = $timeslotBody;
-            }
-
-            \Illuminate\Support\Facades\Log::info('Ozon v2/draft/supply/create request', ['body' => $v2Body]);
-            $response = $this->client->post('/v2/draft/supply/create', $v2Body);
-            \Illuminate\Support\Facades\Log::info('Ozon v2/draft/supply/create response', ['response' => $response]);
-
-            $v2Failed = !$response || !empty($response['_error']) || !empty($response['error_reasons']) || !empty($response['code']);
-            if (!$v2Failed) {
-                return $response ?? [];
-            }
-            \Illuminate\Support\Facades\Log::warning('Ozon v2/draft/supply/create failed → fallback v1', ['response' => $response]);
+        if (! $macrolocalClusterId || $draftId <= 0 || $warehouseId <= 0) {
+            throw new OzonPreconditionException(
+                'Для создания заявки нужны draft_id, storage_warehouse_id и macrolocal_cluster_id.'
+            );
         }
 
-        // Fallback: старый v1-контракт (draft_id + warehouse_id).
-        $body = ['draft_id' => $draftId, 'warehouse_id' => $warehouseId];
-        if ($timeslotBody) {
-            $body['timeslot'] = $timeslotBody;
-        }
-        \Illuminate\Support\Facades\Log::info('Ozon v1/draft/supply/create request (fallback)', ['body' => $body]);
-        $response = $this->client->post('/v1/draft/supply/create', $body);
-        \Illuminate\Support\Facades\Log::info('Ozon v1/draft/supply/create response (fallback)', ['response' => $response]);
+        $body = [
+            'draft_id' => $draftId,
+            'selected_cluster_warehouses' => [[
+                'macrolocal_cluster_id' => (int) $macrolocalClusterId,
+                'storage_warehouse_id' => (int) $warehouseId,
+            ]],
+            'supply_type' => $ozonSupplyType,
+            'timeslot' => $timeslotBody,
+        ];
 
-        return $response ?? [];
+        \Illuminate\Support\Facades\Log::info('Ozon v2/draft/supply/create request', ['body' => $body]);
+        $response = $this->client->post('/v2/draft/supply/create', $body);
+        \Illuminate\Support\Facades\Log::info('Ozon v2/draft/supply/create response', ['response' => $response]);
+
+        if (! $response || ! empty($response['_error']) || ! empty($response['error_reasons']) || ! empty($response['code'])) {
+            // Никакого fallback на другой create endpoint: ответ мог потеряться
+            // после успешного создания, а второй POST дал бы дубль заявки.
+            throw new OzonAmbiguousRemoteStateException(
+                'Ozon не подтвердил создание заявки; требуется сверка кабинета перед повтором.'
+            );
+        }
+
+        return $response;
     }
 
     /**
@@ -1341,6 +1325,11 @@ class SuppliesApi implements SuppliesApiInterface
         if (!empty($pointId)) {
             $body['drop_off_point_warehouse_id'] = (int) $pointId;
         }
+        if (empty($clusterId) || $items === [] || empty($pointId)) {
+            throw new OzonPreconditionException(
+                'Для crossdock-черновика нужны кластер, товары и drop-off point.'
+            );
+        }
 
         \Log::info('Ozon crossdock draft request', [
             'endpoint' => '/v1/draft/create',
@@ -1348,41 +1337,41 @@ class SuppliesApi implements SuppliesApiInterface
             'input_data' => $data,
         ]);
 
-        $response = null;
-        $maxAttempts = 3;
-        for ($attempt = 1; $attempt <= $maxAttempts; $attempt++) {
-            $response = $this->client->post('/v1/draft/create', $body);
-
-            \Log::info('Ozon crossdock draft response', [
-                'attempt' => $attempt,
-                'response' => $response,
-            ]);
-
-            if ($response && !empty($response['result'])) {
-                break;
-            }
-
+        $response = $this->client->post('/v1/draft/create', $body);
+        $operationId = $response['operation_id']
+            ?? $response['result']['operation_id']
+            ?? null;
+        if (! $operationId) {
             $errorMsg = $response['error']['message']
                 ?? $response['message']
                 ?? ($response['error'] ?? 'Unknown error');
             $errorText = is_array($errorMsg) ? json_encode($errorMsg) : (string) $errorMsg;
-
-            if (str_contains(mb_strtolower($errorText), 'rate limit') && $attempt < $maxAttempts) {
-                sleep(1);
-                continue;
-            }
-
-            throw new \RuntimeException(
+            throw new OzonAmbiguousRemoteStateException(
                 'Не удалось создать черновик кросс-док поставки: ' . $errorText
             );
         }
 
+        $draftInfo = $this->getDraftCreateInfo((string) $operationId);
+        $draftId = $draftInfo['draft_id'] ?? null;
+        if (! $draftId) {
+            foreach (($draftInfo['clusters'] ?? []) as $cluster) {
+                if (! empty($cluster['draft_id'])) {
+                    $draftId = $cluster['draft_id'];
+                    break;
+                }
+            }
+        }
+
         return [
-            'draft_id' => (string) ($response['result']['draft_id'] ?? null),
-            'status' => 'draft',
+            'draft_id' => $draftId ? (string) $draftId : null,
+            'operation_id' => (string) $operationId,
+            'status' => $draftId
+                ? 'draft'
+                : (($draftInfo['status'] ?? null) === 'CALCULATION_STATUS_FAILED' ? 'failed' : 'pending'),
             'supply_method' => 'crossdock',
             'delivery_scheme' => $data['delivery_scheme'] ?? 'drop_off',
             'macrolocal_cluster_id' => $data['macrolocal_cluster_id'] ?? null,
+            'draft_info' => $draftInfo,
             'created_at' => now()->toIso8601String(),
         ];
     }

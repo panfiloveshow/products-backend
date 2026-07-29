@@ -22,4 +22,8 @@ class WbWebhookConfig extends Model
         'last_event_at' => 'datetime',
         'events_count'  => 'integer',
     ];
+
+    protected $hidden = [
+        'secret_key',
+    ];
 }

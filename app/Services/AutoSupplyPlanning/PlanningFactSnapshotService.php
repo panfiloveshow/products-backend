@@ -3,6 +3,7 @@
 namespace App\Services\AutoSupplyPlanning;
 
 use App\Models\AutoSupplyPlan;
+use App\Models\Integration;
 use App\Models\PlanningFactSnapshot;
 
 class PlanningFactSnapshotService
@@ -43,6 +44,13 @@ class PlanningFactSnapshotService
 
     public function start(AutoSupplyPlan $plan, array $payload = []): PlanningFactSnapshot
     {
+        $integration = Integration::withoutGlobalScopes()->find($plan->integration_id);
+        $registry = $integration
+            ? app(DataFreshnessRegistry::class)->inspect($integration)
+            : null;
+        $requestedParams = $plan->requested_params_json ?: $this->planParams($plan);
+        $effectiveParams = $plan->effective_params_json ?: $this->planParams($plan);
+
         $snapshot = PlanningFactSnapshot::create([
             'auto_supply_plan_id' => $plan->id,
             'integration_id' => $plan->integration_id,
@@ -50,21 +58,32 @@ class PlanningFactSnapshotService
             'status' => 'building',
             'captured_at' => now(),
             'params_json' => [
-                'mode' => $plan->mode,
-                'horizon_days' => $plan->horizon_days,
-                'min_cover_days' => $plan->min_cover_days,
-                'target_cover_days' => $plan->target_cover_days,
-                'max_cover_days' => $plan->max_cover_days,
-                'safety_stock_days' => $plan->safety_stock_days,
-                'turnover_limit_days' => $plan->turnover_limit_days,
-                'budget_limit' => $plan->budget_limit,
-                'params' => $plan->params,
+                'requested' => $requestedParams,
+                'effective' => $effectiveParams,
+                'versions' => $this->versions($plan),
             ],
+            'facts_freshness_json' => $registry ?? [],
             'constraints_facts_json' => $payload['constraints'] ?? [],
-            'summary_json' => ['stage' => 'started'],
+            'summary_json' => [
+                'stage' => 'started',
+                'facts_hash' => $registry['hash'] ?? null,
+                'params_hash' => $this->hash([
+                    'requested' => $requestedParams,
+                    'effective' => $effectiveParams,
+                ]),
+            ],
         ]);
 
-        $plan->forceFill(['snapshot_id' => $snapshot->id])->save();
+        $plan->forceFill([
+            'snapshot_id' => $snapshot->id,
+            'requested_params_json' => $requestedParams,
+            'effective_params_json' => $effectiveParams,
+            'calculation_engine' => config('autoplanning.versions.engine', 'ozon-v2'),
+            'forecast_version' => config('autoplanning.versions.forecast'),
+            'allocation_version' => config('autoplanning.versions.allocation'),
+            'adapter_version' => config('autoplanning.versions.adapter'),
+            'code_commit' => config('app.commit', env('APP_COMMIT')),
+        ])->save();
 
         return $snapshot;
     }
@@ -79,9 +98,27 @@ class PlanningFactSnapshotService
             $snapshot = $this->start($plan);
         }
 
+        $integration = Integration::withoutGlobalScopes()->find($plan->integration_id);
+        $registry = $integration
+            ? app(DataFreshnessRegistry::class)->inspect($integration)
+            : [];
+        $freshness = array_merge(
+            $payload['facts_freshness'] ?? [],
+            ['registry' => $registry]
+        );
+        $summary = array_merge($payload['summary'] ?? [], [
+            'stage' => 'completed',
+            'facts_hash' => $registry['hash'] ?? null,
+            'demand_hash' => $this->hash($payload['demand_facts'] ?? []),
+            'stock_hash' => $this->hash($payload['stock_facts'] ?? []),
+            'supply_hash' => $this->hash($payload['supply_facts'] ?? []),
+            'economics_hash' => $this->hash($payload['economics_facts'] ?? []),
+            'constraints_hash' => $this->hash($payload['constraints_facts'] ?? []),
+        ]);
+
         $snapshot->update([
             'status' => 'ready',
-            'facts_freshness_json' => $payload['facts_freshness'] ?? [],
+            'facts_freshness_json' => $freshness,
             'planning_sources_json' => $payload['planning_sources'] ?? [],
             'demand_facts_json' => $payload['demand_facts'] ?? [],
             'stock_facts_json' => $payload['stock_facts'] ?? [],
@@ -91,7 +128,7 @@ class PlanningFactSnapshotService
                 $snapshot->constraints_facts_json ?? [],
                 $payload['constraints_facts'] ?? []
             ),
-            'summary_json' => $payload['summary'] ?? [],
+            'summary_json' => $summary,
         ]);
 
         return $snapshot;
@@ -132,5 +169,46 @@ class PlanningFactSnapshotService
         }
 
         return $flags;
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    private function planParams(AutoSupplyPlan $plan): array
+    {
+        return [
+            'mode' => $plan->mode,
+            'horizon_days' => $plan->horizon_days,
+            'min_cover_days' => $plan->min_cover_days,
+            'target_cover_days' => $plan->target_cover_days,
+            'max_cover_days' => $plan->max_cover_days,
+            'safety_stock_days' => $plan->safety_stock_days,
+            'turnover_limit_days' => $plan->turnover_limit_days,
+            'budget_limit' => $plan->budget_limit,
+            'params' => $plan->params,
+        ];
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    private function versions(AutoSupplyPlan $plan): array
+    {
+        return [
+            'engine' => $plan->calculation_engine ?: config('autoplanning.versions.engine'),
+            'forecast' => $plan->forecast_version ?: config('autoplanning.versions.forecast'),
+            'allocation' => $plan->allocation_version ?: config('autoplanning.versions.allocation'),
+            'adapter' => $plan->adapter_version ?: config('autoplanning.versions.adapter'),
+            'algorithm' => $plan->algorithm_version,
+            'code_commit' => $plan->code_commit ?: config('app.commit', env('APP_COMMIT')),
+        ];
+    }
+
+    private function hash(array $payload): string
+    {
+        return hash('sha256', json_encode(
+            $payload,
+            JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR
+        ));
     }
 }

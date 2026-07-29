@@ -41,8 +41,13 @@ class IntegrationAccessTest extends TestCase
         Schema::create('products', function (Blueprint $table) {
             $table->string('id')->primary();
             $table->unsignedBigInteger('integration_id')->nullable();
+            $table->string('sku')->nullable();
+            $table->string('barcode')->nullable();
+            $table->string('vendor_code')->nullable();
             $table->string('marketplace')->nullable();
             $table->string('fulfillment_type')->nullable();
+            $table->integer('stock')->default(0);
+            $table->text('wb_data')->nullable();
             $table->timestamps();
         });
 
