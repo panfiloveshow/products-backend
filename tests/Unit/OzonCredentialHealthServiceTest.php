@@ -61,16 +61,30 @@ class OzonCredentialHealthServiceTest extends TestCase
         Http::assertSent(fn ($request): bool => str_contains($request->url(), '/v3/product/list'));
     }
 
-    public function test_only_auth_rejection_marks_credentials_invalid(): void
+    /**
+     * @dataProvider authRejectionStatuses
+     */
+    public function test_only_auth_rejection_marks_credentials_invalid(int $httpStatus): void
     {
         Http::preventStrayRequests();
-        Http::fake(['*' => Http::response(['code' => 16, 'message' => 'Invalid Api-Key'], 401)]);
+        Http::fake(['*' => Http::response(['code' => 16, 'message' => 'Invalid Api-Key'], $httpStatus)]);
 
         $result = app(OzonCredentialHealthService::class)->check($this->workingIntegration());
 
         $this->assertSame('invalid', $result['status']);
         $this->assertFalse($result['usable']);
         $this->assertSame('critical', $result['severity']);
+    }
+
+    /**
+     * @return array<string, array{int}>
+     */
+    public static function authRejectionStatuses(): array
+    {
+        return [
+            '401 unauthorized' => [401],
+            '403 forbidden' => [403],
+        ];
     }
 
     /**
