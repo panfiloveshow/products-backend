@@ -81,7 +81,17 @@ class SyncSalesJob implements ShouldQueue
             return;
         }
 
-        // Для WB и других: общие продажи по SKU (API не даёт разбивку по складам)
+        // Для WB: разбивка по складам отгрузки из /api/v1/supplier/sales (warehouseName)
+        if ($marketplace === 'wildberries' && method_exists($service, 'getSalesByWarehouse')) {
+            $wbSales = $service->getSalesByWarehouse(30);
+            if (! empty($wbSales)) {
+                $this->syncWildberriesSalesByWarehouse($wbSales, $integrationId, $userToken);
+                return;
+            }
+            Log::info('SyncSalesJob: WB — нет разбивки по складам, fallback на общие продажи');
+        }
+
+        // Для Yandex и других: общие продажи по SKU (API не даёт разбивку по складам)
         if (!method_exists($service, 'getSalesBySku')) {
             Log::info("SyncSalesJob: {$marketplace} не поддерживает getSalesBySku");
             return;
@@ -328,6 +338,115 @@ class SyncSalesJob implements ShouldQueue
                 $updatedWarehouses++;
             }
         }
+    }
+
+    /**
+     * WB: пишет продажи каждого склада отгрузки в его строку inventory_warehouses
+     * (та же модель, что applyOzonWarehouseSales). Итог по SKU — в Product.
+     * Склады SKU без продаж за окно получают честный ноль, а не общий тотал.
+     */
+    private function syncWildberriesSalesByWarehouse(array $bySkuWarehouse, int $integrationId, ?string $userToken = null): void
+    {
+        $updatedProducts = 0;
+        $updatedWarehouses = 0;
+
+        foreach ($bySkuWarehouse as $sku => $warehouseSales) {
+            if (! is_array($warehouseSales) || $warehouseSales === []) {
+                continue;
+            }
+
+            $totalSales30 = 0;
+            $totalAvgDaily = 0.0;
+            $salesByNormalizedName = [];
+            foreach ($warehouseSales as $whName => $wData) {
+                if (! is_array($wData)) {
+                    continue;
+                }
+                $totalSales30 += (int) ($wData['sales_30_days'] ?? 0);
+                $totalAvgDaily += (float) ($wData['avg_daily_sales'] ?? 0);
+                $normalized = self::normalizeWarehouseName((string) $whName);
+                if ($normalized !== '') {
+                    $salesByNormalizedName[$normalized] = $wData;
+                }
+            }
+
+            $product = Product::where('sku', $sku)
+                ->where('marketplace', 'wildberries')
+                ->where('integration_id', $integrationId)
+                ->first();
+
+            if ($product) {
+                $product->sales_28_days = $totalSales30;
+                $product->avg_daily_sales = round($totalAvgDaily, 2);
+                $stock = $product->stock ?? 0;
+                $product->turnover_days = $totalAvgDaily > 0
+                    ? round($stock / $totalAvgDaily, 1)
+                    : ($stock > 0 ? null : 0);
+                $product->save();
+                $updatedProducts++;
+            }
+
+            $warehouses = InventoryWarehouse::where('sku', $sku)
+                ->where('marketplace', 'wildberries')
+                ->where('integration_id', $integrationId)
+                ->get();
+
+            foreach ($warehouses as $warehouse) {
+                $whData = $salesByNormalizedName[self::normalizeWarehouseName((string) ($warehouse->warehouse_name ?? ''))] ?? null;
+                $whQty = (int) ($warehouse->quantity ?? 0);
+
+                if ($whData) {
+                    $whAvgDaily = (float) ($whData['avg_daily_sales'] ?? 0);
+                    $warehouse->sales_7_days = (int) ($whData['sales_7_days'] ?? 0);
+                    $warehouse->sales_14_days = (int) ($whData['sales_14_days'] ?? 0);
+                    $warehouse->sales_30_days = (int) ($whData['sales_30_days'] ?? 0);
+                    $warehouse->sales_28_days = (int) ($whData['sales_30_days'] ?? 0);
+                    $warehouse->average_daily_sales = $whAvgDaily;
+                    if ($whAvgDaily > 0) {
+                        $warehouse->days_of_stock = (int) round($whQty / $whAvgDaily);
+                        $warehouse->turnover_days = round($whQty / $whAvgDaily, 1);
+                    } else {
+                        $warehouse->days_of_stock = $whQty > 0 ? 999 : 0;
+                        $warehouse->turnover_days = $whQty > 0 ? 999 : null;
+                    }
+                } else {
+                    $warehouse->sales_7_days = 0;
+                    $warehouse->sales_14_days = 0;
+                    $warehouse->sales_30_days = 0;
+                    $warehouse->sales_28_days = 0;
+                    $warehouse->average_daily_sales = 0;
+                    $warehouse->days_of_stock = $whQty > 0 ? 999 : 0;
+                    $warehouse->turnover_days = $whQty > 0 ? 999 : null;
+                }
+
+                if (method_exists($warehouse, 'calculateStockStatus')) {
+                    $warehouse->stock_status = $warehouse->calculateStockStatus();
+                }
+                $warehouse->save();
+                $updatedWarehouses++;
+            }
+        }
+
+        Log::info('SyncSalesJob: WB продажи по складам завершено', [
+            'updated_products' => $updatedProducts,
+            'updated_warehouses' => $updatedWarehouses,
+        ]);
+
+        ActivityLogger::forIntegration(
+            $integrationId,
+            'sales_sync_completed',
+            'Синхронизация продаж завершена',
+            "Маркетплейс: wildberries. Обновлено товаров: {$updatedProducts}, складов: {$updatedWarehouses} (по складам)",
+            [
+                'entity_type' => 'integration',
+                'entity_id' => $integrationId,
+                'marketplace' => 'wildberries',
+                'sync_type' => 'sales',
+                'updated_products' => $updatedProducts,
+                'updated_warehouses' => $updatedWarehouses,
+            ],
+            $userToken,
+        );
     }
 
     /**
