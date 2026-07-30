@@ -1555,9 +1555,11 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
         // В FBO продавец физически не может перевозить товар между складами маркетплейса.
         // Эта секция применима только для собственных складов / 3PL-режимов.
         $redistributionSuggestions = [];
-        $redistributionAllowed = ! in_array($marketplace, ['ozon', 'wildberries'], true);
+        // Ozon/WB не перемещают товар между складами/кластерами, но пары «излишек↔дефицит»
+        // остаются обоснованием пересорта: в кластер с излишком не пополняем, дефицит закрывает поставка.
+        $redistributionKind = in_array($marketplace, ['ozon', 'wildberries'], true) ? 'insight' : 'transfer';
 
-        if ($redistributionAllowed) foreach ($deficitMap as $sku => $deficitWarehouses) {
+        foreach ($deficitMap as $sku => $deficitWarehouses) {
             if (empty($surplusMap[$sku])) continue;
 
             // Локальные копии, чтобы уменьшать остатки по мере матчинга
@@ -1591,6 +1593,7 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
                     if ($transferQty <= 0) continue;
 
                     $redistributionSuggestions[] = [
+                        'kind'           => $redistributionKind,
                         'sku'            => $sku,
                         'product_name'   => $product?->name,
                         'from_warehouse' => $surInfo['warehouse_name'],
@@ -1611,6 +1614,12 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
                 unset($surInfo);
             }
             unset($defInfo);
+        }
+
+        // ponytail: топ-60 пар по объёму — иначе на больших магазинах result_json раздувается
+        if (count($redistributionSuggestions) > 60) {
+            usort($redistributionSuggestions, fn ($a, $b) => $b['transfer_qty'] <=> $a['transfer_qty']);
+            $redistributionSuggestions = array_slice($redistributionSuggestions, 0, 60);
         }
 
         $economicsSummary = [
