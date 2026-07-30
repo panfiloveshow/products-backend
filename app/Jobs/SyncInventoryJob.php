@@ -451,6 +451,58 @@ class SyncInventoryJob implements ShouldBeUnique, ShouldQueue
      *
      * @return string 'created'|'updated'|'unchanged'
      */
+    /**
+     * Продажи конкретного склада из карты складов SKU.
+     *
+     * Формы карты: Ozon — [warehouse_id => {warehouse_name, ...}],
+     * WB — [warehouseName => {...}], Yandex — список без складов
+     * (SKU-гранулярность) → возвращаем первый элемент как есть.
+     * null = у SKU есть продажи, но не с этого склада.
+     *
+     * @param array<int|string, mixed> $warehouseSales
+     * @return array<string, mixed>|null
+     */
+    public static function matchWarehouseSales(array $warehouseSales, ?string $warehouseId, ?string $warehouseName): ?array
+    {
+        if (array_is_list($warehouseSales)) {
+            $first = $warehouseSales[0] ?? null;
+            if (is_array($first) && ! array_key_exists('warehouse_name', $first)) {
+                return $first; // Yandex: разбивки по складам нет
+            }
+        }
+
+        $wantedId = ($warehouseId !== null && $warehouseId !== '') ? $warehouseId : null;
+        $wantedName = self::normalizeWarehouseKey((string) $warehouseName);
+
+        foreach ($warehouseSales as $key => $data) {
+            if (! is_array($data)) {
+                continue;
+            }
+            $key = (string) $key;
+            if ($wantedId !== null && $key === $wantedId) {
+                return $data;
+            }
+            if ($wantedName === '') {
+                continue;
+            }
+            foreach ([$key, (string) ($data['warehouse_name'] ?? '')] as $candidate) {
+                if ($candidate !== '' && self::normalizeWarehouseKey($candidate) === $wantedName) {
+                    return $data;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * «Ростов-на-Дону РФЦ» → «РОСТОВНАДОНУРФЦ» (как в SyncSalesJob и OzonWarehouseCluster).
+     */
+    private static function normalizeWarehouseKey(string $name): string
+    {
+        return (string) preg_replace('/[^А-ЯЁA-Z0-9]/u', '', mb_strtoupper($name, 'UTF-8'));
+    }
+
     private function syncInventoryItem(array $stockData, array $salesBySkuWarehouse = []): string
     {
         $integrationId = $this->syncLog->integration_id;
@@ -467,6 +519,8 @@ class SyncInventoryJob implements ShouldBeUnique, ShouldQueue
         $sales14 = null;
         $sales30 = null;
 
+        $salesResolved = false;
+
         if (! empty($salesBySkuWarehouse)) {
             $sku = $stockData['sku'];
             $supplierArticle = $stockData['supplier_article'] ?? $sku;
@@ -476,34 +530,29 @@ class SyncInventoryJob implements ShouldBeUnique, ShouldQueue
                           ?? $salesBySkuWarehouse[(string) $supplierArticle]
                           ?? null;
 
-            if ($allWarehouses) {
-                // avg_daily_sales и sales_* — суммарно по всем складам SKU.
-                // Записываем одинаково на каждый склад, в matrix() используется MAX() для агрегации.
-                $totalAvg = 0;
-                $totalS7 = 0;
-                $totalS14 = 0;
-                $totalS30 = 0;
-                foreach ($allWarehouses as $wData) {
-                    if (is_array($wData)) {
-                        $totalAvg += (float) ($wData['avg_daily_sales'] ?? 0);
-                        $totalS7 += (int) ($wData['sales_7_days'] ?? 0);
-                        $totalS14 += (int) ($wData['sales_14_days'] ?? 0);
-                        $totalS30 += (int) ($wData['sales_30_days'] ?? 0);
-                    }
-                }
-                if ($totalAvg > 0) {
-                    $avgDailySales = round($totalAvg, 4);
-                }
-                if ($totalS7 > 0 || $totalS14 > 0 || $totalS30 > 0) {
-                    $sales7 = $totalS7;
-                    $sales14 = $totalS14;
-                    $sales30 = $totalS30;
-                } elseif ($totalAvg > 0) {
-                    $sales7 = (int) round($totalAvg * 7);
-                    $sales14 = (int) round($totalAvg * 14);
-                    $sales30 = (int) round($totalAvg * 30);
-                }
+            if (is_array($allWarehouses) && $allWarehouses !== []) {
+                // Продажи ЭТОГО склада, а не сумма по всем складам SKU: раньше
+                // тотал писался в каждую строку, кратно завышая спрос склада,
+                // days_of_stock и статусы (и WB-план перезаказывал кратно).
+                $whData = self::matchWarehouseSales(
+                    $allWarehouses,
+                    isset($stockData['warehouse_id']) ? (string) $stockData['warehouse_id'] : null,
+                    isset($stockData['warehouse_name']) ? (string) $stockData['warehouse_name'] : null
+                );
 
+                $salesResolved = true;
+                if ($whData !== null) {
+                    $avgDailySales = round((float) ($whData['avg_daily_sales'] ?? 0), 4);
+                    $sales7 = (int) ($whData['sales_7_days'] ?? 0);
+                    $sales14 = (int) ($whData['sales_14_days'] ?? 0);
+                    $sales30 = (int) ($whData['sales_30_days'] ?? 0);
+                } else {
+                    // SKU продаётся, но не с этого склада — честный ноль вместо чужих продаж.
+                    $avgDailySales = 0;
+                    $sales7 = 0;
+                    $sales14 = 0;
+                    $sales30 = 0;
+                }
             }
         }
 
@@ -543,20 +592,31 @@ class SyncInventoryJob implements ShouldBeUnique, ShouldQueue
             $newData['warehouse_coefficient'] = (float) $stockData['warehouse_coefficient'];
         }
 
-        if ($avgDailySales !== null && (float) $avgDailySales > 0) {
-            $newData['average_daily_sales'] = $avgDailySales;
-            $newData['days_of_stock'] = $daysOfStock;
-            $newData['turnover_days'] = $daysOfStock;
-        }
+        if ($salesResolved) {
+            // Пер-складские продажи разрешены (включая честный ноль) — пишем всегда,
+            // иначе старый размазанный тотал остался бы в строке навсегда.
+            $newData['average_daily_sales'] = (float) ($avgDailySales ?? 0);
+            $newData['days_of_stock'] = $daysOfStock ?? ($qty > 0 ? 999 : 0);
+            $newData['turnover_days'] = $daysOfStock ?? ($qty > 0 ? 999 : null);
+            $newData['sales_7_days'] = (int) ($sales7 ?? 0);
+            $newData['sales_14_days'] = (int) ($sales14 ?? 0);
+            $newData['sales_30_days'] = (int) ($sales30 ?? 0);
+        } else {
+            if ($avgDailySales !== null && (float) $avgDailySales > 0) {
+                $newData['average_daily_sales'] = $avgDailySales;
+                $newData['days_of_stock'] = $daysOfStock;
+                $newData['turnover_days'] = $daysOfStock;
+            }
 
-        if ($sales7 !== null) {
-            $newData['sales_7_days'] = $sales7;
-        }
-        if ($sales14 !== null) {
-            $newData['sales_14_days'] = $sales14;
-        }
-        if ($sales30 !== null) {
-            $newData['sales_30_days'] = $sales30;
+            if ($sales7 !== null) {
+                $newData['sales_7_days'] = $sales7;
+            }
+            if ($sales14 !== null) {
+                $newData['sales_14_days'] = $sales14;
+            }
+            if ($sales30 !== null) {
+                $newData['sales_30_days'] = $sales30;
+            }
         }
 
         if (! $existing) {

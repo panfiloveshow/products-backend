@@ -192,7 +192,8 @@ class SalesApi
 
     /**
      * Продажи по SKU и складу отгрузки (warehouseName из /api/v1/supplier/sales).
-     * Формат для {@see SyncInventoryJob}: при записи в БД метрики суммируются по всем складам одного SKU.
+     * Формат для {@see SyncInventoryJob} / {@see \App\Jobs\SyncSalesJob}: метрики
+     * пишутся в строку КОНКРЕТНОГО склада (матчинг по имени), не суммой по SKU.
      *
      * @return array<string, array<string, array{sales_7_days:int,sales_14_days:int,sales_30_days:int,avg_daily_sales:float}>>
      */
