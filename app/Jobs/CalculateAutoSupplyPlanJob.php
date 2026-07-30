@@ -451,6 +451,11 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
         $budgetSkippedLines = 0;
         $budgetUsed = 0.0;
         $manualReviewLines = 0;
+        // Счётчики отсева кандидатов — сырьё для обоснования «почему план пустой / почему не отправили»
+        $candidatesTotal = 0;
+        $deadStockSkippedLines = 0;
+        $zeroQtySkippedLines = 0;
+        $zeroQtyCoverSum = 0.0;
         $lowConfidenceTrialLines = 0;
         $advertisingDrivenLines = 0;
         $advertisingHighDrrLines = 0;
@@ -704,6 +709,8 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
                 $isDeadStock = true;
             }
 
+            $candidatesTotal++;
+
             // Определяем supply_type
             $supplyType = 'replenishment'; // подпитка (по умолчанию)
             if ($isDeadStock && !$hasCurrentStock && !$hasWarehouseSales) {
@@ -714,6 +721,7 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
 
             // Мёртвый сток — пропускаем (не рекомендуем отгрузку)
             if ($supplyType === 'dead_stock') {
+                $deadStockSkippedLines++;
                 continue;
             }
 
@@ -1327,6 +1335,8 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
 
             // Пропускаем строки с нулевым количеством
             if ($qtyRounded <= 0 && ! $sellerStockBlocked) {
+                $zeroQtySkippedLines++;
+                $zeroQtyCoverSum += max(0.0, (float) $coverBefore);
                 continue;
             }
 
@@ -1666,6 +1676,15 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
         ]);
 
         $resultJson = [
+            'no_supply_needed' => $totalLines === 0,
+            'skip_summary' => [
+                'candidates_total' => $candidatesTotal,
+                'zero_qty_lines' => $zeroQtySkippedLines,
+                'zero_qty_avg_cover_days' => $zeroQtySkippedLines > 0 ? round($zeroQtyCoverSum / $zeroQtySkippedLines, 1) : null,
+                'dead_stock_lines' => $deadStockSkippedLines,
+                'skipped_negative_profit_lines' => $skippedNegativeProfitLines,
+                'budget_skipped_lines' => $budgetSkippedLines,
+            ],
             'redistribution' => $redistributionSuggestions,
             'facts_freshness' => $factsFreshness,
             'demand_granularity' => $demandGranularity,
