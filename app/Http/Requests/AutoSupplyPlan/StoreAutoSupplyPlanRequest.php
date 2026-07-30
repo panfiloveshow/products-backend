@@ -44,8 +44,6 @@ class StoreAutoSupplyPlanRequest extends FormRequest
             'drop_off_point_warehouse_id' => 'nullable|integer|min:1',
             'crossdock_drop_off_point_warehouse_id' => 'nullable|integer|min:1',
 
-            // Ozon-анкер для рекомендуемого количества (internal/ozon/min/max/average)
-            'ozon_qty_anchor' => 'nullable|string|in:internal,ozon,min,max,average',
             'demand_seasonality_multiplier' => 'nullable|numeric|min:0.1|max:5',
             'seasonality_multiplier' => 'nullable|numeric|min:0.1|max:5',
             'trend_multiplier' => 'nullable|numeric|min:0.1|max:5',

@@ -220,7 +220,6 @@ class AutoSupplyPlanController extends Controller
             'drop_off_point_warehouse_id' => $request->input('drop_off_point_warehouse_id', $request->input('crossdock_drop_off_point_warehouse_id')),
 
             // Advanced (используются алгоритмом расчёта — см. CalculateAutoSupplyPlanJob)
-            'ozon_qty_anchor' => $request->input('ozon_qty_anchor'),
             'demand_seasonality_multiplier' => $seasonalityMultiplier,
             'seasonality_multiplier' => $seasonalityMultiplier,
             'trend_multiplier' => $request->input('trend_multiplier'),
@@ -1795,6 +1794,14 @@ class AutoSupplyPlanController extends Controller
                 is_array($explain['confidence'] ?? null) ? $explain['confidence'] : [],
                 $aggregate['confidence']
             );
+            // Аксессоры deficit_qty/surplus_qty читают inputs.daily_demand и
+            // inputs.target_cover_days. После GROUP BY explain_json приходит из
+            // MIN()-строки: спрос одной под-строки против SUM остатков занижал
+            // дефицит и завышал профицит. Подменяем входы агрегатом.
+            $inputs = is_array($explain['inputs'] ?? null) ? $explain['inputs'] : [];
+            $inputs['daily_demand'] = $aggregate['demand_daily'];
+            $inputs['target_cover_days'] = $aggregate['quantity_explanation']['target_cover_days'];
+            $explain['inputs'] = $inputs;
             $line->setAttribute('explain_json', $explain);
             $line->setAttribute('demand_daily', $aggregate['demand_daily']);
             $line->setAttribute('cover_days_before', $aggregate['cover_days_before']);
