@@ -96,6 +96,11 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
         $ozonAdvertisingByOffer = is_array($ozonAdvertisingImpact['by_offer_id'] ?? null)
             ? $ozonAdvertisingImpact['by_offer_id']
             : [];
+        // В остатках Ozon sku может быть и артикулом, и числовым SKU Ozon — ищем по обеим картам,
+        // иначе реклама не привязывается ни к одной строке плана.
+        $ozonAdvertisingByOzonSku = is_array($ozonAdvertisingImpact['by_ozon_sku'] ?? null)
+            ? $ozonAdvertisingImpact['by_ozon_sku']
+            : [];
         $constraintService = app(MarketplaceConstraintService::class);
         $marketplaceNeedFacts = $constraintService->marketplaceNeedFacts($plan, $marketplace);
         $constraintNeedSkus = array_values(array_unique(array_filter(array_map(
@@ -446,6 +451,11 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
         $budgetSkippedLines = 0;
         $budgetUsed = 0.0;
         $manualReviewLines = 0;
+        // Счётчики отсева кандидатов — сырьё для обоснования «почему план пустой / почему не отправили»
+        $candidatesTotal = 0;
+        $deadStockSkippedLines = 0;
+        $zeroQtySkippedLines = 0;
+        $zeroQtyCoverSum = 0.0;
         $lowConfidenceTrialLines = 0;
         $advertisingDrivenLines = 0;
         $advertisingHighDrrLines = 0;
@@ -699,6 +709,8 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
                 $isDeadStock = true;
             }
 
+            $candidatesTotal++;
+
             // Определяем supply_type
             $supplyType = 'replenishment'; // подпитка (по умолчанию)
             if ($isDeadStock && !$hasCurrentStock && !$hasWarehouseSales) {
@@ -709,6 +721,7 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
 
             // Мёртвый сток — пропускаем (не рекомендуем отгрузку)
             if ($supplyType === 'dead_stock') {
+                $deadStockSkippedLines++;
                 continue;
             }
 
@@ -1005,8 +1018,9 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
 
             // --- Финансовые метрики ---
             $offerId = $wh->sku;
-            $advertisingImpact = $marketplace === 'ozon' && isset($ozonAdvertisingByOffer[$offerId]) && is_array($ozonAdvertisingByOffer[$offerId])
-                ? $ozonAdvertisingByOffer[$offerId]
+            $advertisingLookup = $ozonAdvertisingByOffer[$offerId] ?? $ozonAdvertisingByOzonSku[$offerId] ?? null;
+            $advertisingImpact = $marketplace === 'ozon' && is_array($advertisingLookup)
+                ? $advertisingLookup
                 : null;
             $barcode = $product?->barcode;
             $price = $product?->price ?? $ue?->price ?? 0;
@@ -1321,6 +1335,8 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
 
             // Пропускаем строки с нулевым количеством
             if ($qtyRounded <= 0 && ! $sellerStockBlocked) {
+                $zeroQtySkippedLines++;
+                $zeroQtyCoverSum += max(0.0, (float) $coverBefore);
                 continue;
             }
 
@@ -1539,9 +1555,11 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
         // В FBO продавец физически не может перевозить товар между складами маркетплейса.
         // Эта секция применима только для собственных складов / 3PL-режимов.
         $redistributionSuggestions = [];
-        $redistributionAllowed = ! in_array($marketplace, ['ozon', 'wildberries'], true);
+        // Ozon/WB не перемещают товар между складами/кластерами, но пары «излишек↔дефицит»
+        // остаются обоснованием пересорта: в кластер с излишком не пополняем, дефицит закрывает поставка.
+        $redistributionKind = in_array($marketplace, ['ozon', 'wildberries'], true) ? 'insight' : 'transfer';
 
-        if ($redistributionAllowed) foreach ($deficitMap as $sku => $deficitWarehouses) {
+        foreach ($deficitMap as $sku => $deficitWarehouses) {
             if (empty($surplusMap[$sku])) continue;
 
             // Локальные копии, чтобы уменьшать остатки по мере матчинга
@@ -1575,6 +1593,7 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
                     if ($transferQty <= 0) continue;
 
                     $redistributionSuggestions[] = [
+                        'kind'           => $redistributionKind,
                         'sku'            => $sku,
                         'product_name'   => $product?->name,
                         'from_warehouse' => $surInfo['warehouse_name'],
@@ -1595,6 +1614,12 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
                 unset($surInfo);
             }
             unset($defInfo);
+        }
+
+        // ponytail: топ-60 пар по объёму — иначе на больших магазинах result_json раздувается
+        if (count($redistributionSuggestions) > 60) {
+            usort($redistributionSuggestions, fn ($a, $b) => $b['transfer_qty'] <=> $a['transfer_qty']);
+            $redistributionSuggestions = array_slice($redistributionSuggestions, 0, 60);
         }
 
         $economicsSummary = [
@@ -1660,6 +1685,15 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
         ]);
 
         $resultJson = [
+            'no_supply_needed' => $totalLines === 0,
+            'skip_summary' => [
+                'candidates_total' => $candidatesTotal,
+                'zero_qty_lines' => $zeroQtySkippedLines,
+                'zero_qty_avg_cover_days' => $zeroQtySkippedLines > 0 ? round($zeroQtyCoverSum / $zeroQtySkippedLines, 1) : null,
+                'dead_stock_lines' => $deadStockSkippedLines,
+                'skipped_negative_profit_lines' => $skippedNegativeProfitLines,
+                'budget_skipped_lines' => $budgetSkippedLines,
+            ],
             'redistribution' => $redistributionSuggestions,
             'facts_freshness' => $factsFreshness,
             'demand_granularity' => $demandGranularity,
