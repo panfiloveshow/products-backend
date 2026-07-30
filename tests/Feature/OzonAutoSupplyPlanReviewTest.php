@@ -59,7 +59,7 @@ class OzonAutoSupplyPlanReviewTest extends TestCase
     {
         $plan = $this->makePlan(9302);
         $baseExplain = [
-            'inputs' => ['daily_demand' => 1, 'target_cover_days' => 14],
+            'inputs' => ['daily_demand' => 1, 'target_cover_days' => 14, 'min_cover_days' => 10],
             'math' => ['safety_stock' => 2, 'needed_before_caps' => 5, 'needed_after_caps' => 4],
             'confidence' => ['confidence_level' => 'good', 'confidence_reasons' => []],
         ];
@@ -84,7 +84,7 @@ class OzonAutoSupplyPlanReviewTest extends TestCase
             'risk_level' => 'high',
             'priority' => 'critical',
             'explain_json' => [
-                'inputs' => ['daily_demand' => 2, 'target_cover_days' => 14],
+                'inputs' => ['daily_demand' => 2, 'target_cover_days' => 14, 'min_cover_days' => 10],
                 'math' => ['safety_stock' => 3, 'needed_before_caps' => 6, 'needed_after_caps' => 5],
                 'confidence' => ['confidence_level' => 'warning', 'confidence_reasons' => ['low_posting_volume']],
             ],
@@ -102,6 +102,10 @@ class OzonAutoSupplyPlanReviewTest extends TestCase
             ->assertJsonPath('data.data.0.quantity_explanation.in_transit', 3)
             ->assertJsonPath('data.data.0.quantity_explanation.daily_demand', 3)
             ->assertJsonPath('data.data.0.quantity_explanation.qty_rounded', 7)
+            // deficit_qty должен считаться от агрегированного спроса кластера (3/день),
+            // а не от спроса MIN()-подстроки: ceil(10×3 − (12+3)) = 15.
+            ->assertJsonPath('data.data.0.deficit_qty', 15)
+            ->assertJsonPath('data.data.0.surplus_qty', 0)
             ->assertJsonPath('data.data.0.confidence', 'warning');
     }
 

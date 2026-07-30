@@ -64,47 +64,6 @@ class AutoSupplyPlanCalculationTest extends TestCase
         $this->assertSame(56, $method->invoke($job, ['analysis_period_days' => 55], 30));
     }
 
-    public function test_ozon_qty_anchor_is_forced_to_internal_engine(): void
-    {
-        $job = new CalculateAutoSupplyPlanJob('test-plan-id');
-        $method = (new ReflectionClass($job))->getMethod('effectiveOzonQtyAnchor');
-
-        $this->assertSame('internal', $method->invoke($job, 'ozon', 'ozon'));
-        $this->assertSame('internal', $method->invoke($job, 'max', 'ozon'));
-        $this->assertSame('internal', $method->invoke($job, 'average', 'ozon'));
-        $this->assertSame('internal', $method->invoke($job, 'internal', 'ozon'));
-        $this->assertSame('internal', $method->invoke($job, 'ozon', 'wildberries'));
-    }
-
-    public function test_shadow_report_compares_real_legacy_ewma_with_v2_without_affecting_plan(): void
-    {
-        $job = new CalculateAutoSupplyPlanJob('test-plan-id');
-        $method = (new ReflectionClass($job))->getMethod('buildLegacyV2ShadowReport');
-        $report = $method->invoke($job, [[
-            'sku' => 'SKU-1',
-            'cluster_id' => 101,
-            'sales_7_days' => 70,
-            'sales_14_days' => 100,
-            'sales_30_days' => 150,
-            'demand_daily' => 8,
-            'current_stock' => 10,
-            'in_transit' => 5,
-            'qty_rounded' => 100,
-            'is_excluded' => false,
-            'explain_json' => json_encode([
-                'inputs' => ['target_cover_days' => 21, 'pack_multiple' => 6],
-            ]),
-        ]], $this->service);
-
-        $this->assertFalse($report['affects_plan']);
-        $this->assertSame(1, $report['lines_compared']);
-        $this->assertSame(132, $report['legacy_qty_total']);
-        $this->assertSame(100, $report['v2_qty_total']);
-        $this->assertSame(-32, $report['qty_total_delta']);
-        $this->assertSame(1, $report['qty_direction']['legacy_higher']);
-        $this->assertEqualsWithDelta(6.75, $report['largest_differences'][0]['legacy_daily_demand'], 0.001);
-    }
-
     public function test_snapshot_line_facts_preserve_demand_stock_supply_and_economics(): void
     {
         $job = new CalculateAutoSupplyPlanJob('test-plan-id');

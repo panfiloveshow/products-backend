@@ -2,10 +2,8 @@
 
 namespace App\Services\AutoSupplyPlanning;
 
-use App\Services\AutoSupplyPlanService;
-
 /**
- * Собирает неизменяемую матрицу фактов расчёта и безопасный shadow-отчёт.
+ * Собирает неизменяемую матрицу фактов расчёта.
  *
  * В payload не попадают токены, заголовки API или сырые ответы маркетплейса.
  */
@@ -95,86 +93,6 @@ class OzonPlanningFactsBuilder
         }
 
         return $facts;
-    }
-
-    /**
-     * Сравнивает v2 с реально используемой старой EWMA-функцией на тех же фактах.
-     * Результат никогда не влияет на итоговое количество плана.
-     *
-     * @param list<array<string, mixed>> $lines
-     * @return array<string, mixed>
-     */
-    public function buildLegacyV2ShadowReport(array $lines, AutoSupplyPlanService $service): array
-    {
-        $rows = [];
-        $legacyQtyTotal = 0;
-        $v2QtyTotal = 0;
-        $demandAbsDelta = 0.0;
-        $comparableDemandRows = 0;
-        $qtyDirection = ['legacy_higher' => 0, 'v2_higher' => 0, 'same' => 0];
-
-        foreach ($lines as $line) {
-            $explain = $this->decodeExplain($line['explain_json'] ?? null);
-            $inputs = is_array($explain['inputs'] ?? null) ? $explain['inputs'] : [];
-            $legacy = $service->calculateDailyDemand(
-                0.35,
-                (float) ($line['sales_7_days'] ?? 0),
-                (float) ($line['sales_14_days'] ?? 0),
-                (float) ($line['sales_30_days'] ?? 0)
-            );
-            $legacyDaily = (float) $legacy['daily_demand'];
-            $v2Daily = (float) ($line['demand_daily'] ?? 0);
-            $targetDays = max(1, (int) ($inputs['target_cover_days'] ?? 21));
-            $pack = max(1, (int) ($inputs['pack_multiple'] ?? 1));
-            $legacyNeed = $service->calculateNeededBeforeCaps(
-                $legacyDaily,
-                $targetDays,
-                (int) ($line['current_stock'] ?? 0),
-                (int) ($line['in_transit'] ?? 0)
-            );
-            $legacyQty = $service->roundToPackMultiple(
-                (float) ($legacyNeed['needed_before_caps'] ?? 0),
-                $pack
-            );
-            $v2Qty = empty($line['is_excluded']) ? (int) ($line['qty_rounded'] ?? 0) : 0;
-            $direction = $legacyQty > $v2Qty
-                ? 'legacy_higher'
-                : ($v2Qty > $legacyQty ? 'v2_higher' : 'same');
-            $qtyDirection[$direction]++;
-            $legacyQtyTotal += $legacyQty;
-            $v2QtyTotal += $v2Qty;
-            if ($legacyDaily > 0 || $v2Daily > 0) {
-                $demandAbsDelta += abs($v2Daily - $legacyDaily);
-                $comparableDemandRows++;
-            }
-            $rows[] = [
-                'sku' => (string) ($line['sku'] ?? ''),
-                'cluster_id' => isset($line['cluster_id']) ? (string) $line['cluster_id'] : null,
-                'legacy_daily_demand' => round($legacyDaily, 4),
-                'v2_daily_demand' => round($v2Daily, 4),
-                'legacy_qty' => $legacyQty,
-                'v2_qty' => $v2Qty,
-                'qty_delta' => $v2Qty - $legacyQty,
-                'direction' => $direction,
-            ];
-        }
-
-        usort($rows, static fn (array $a, array $b): int => abs($b['qty_delta']) <=> abs($a['qty_delta']));
-
-        return [
-            'version' => 'legacy-ewma-vs-v2-shadow-1',
-            'affects_plan' => false,
-            'legacy_formula' => 'EWMA alpha=0.35 по окнам 7/30 без v2 safety/optimizer',
-            'lines_compared' => count($rows),
-            'legacy_qty_total' => $legacyQtyTotal,
-            'v2_qty_total' => $v2QtyTotal,
-            'qty_total_delta' => $v2QtyTotal - $legacyQtyTotal,
-            'qty_direction' => $qtyDirection,
-            'mean_abs_daily_demand_delta' => $comparableDemandRows > 0
-                ? round($demandAbsDelta / $comparableDemandRows, 4)
-                : null,
-            'largest_differences' => array_slice($rows, 0, 100),
-        ];
     }
 
     /**
