@@ -96,6 +96,11 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
         $ozonAdvertisingByOffer = is_array($ozonAdvertisingImpact['by_offer_id'] ?? null)
             ? $ozonAdvertisingImpact['by_offer_id']
             : [];
+        // В остатках Ozon sku может быть и артикулом, и числовым SKU Ozon — ищем по обеим картам,
+        // иначе реклама не привязывается ни к одной строке плана.
+        $ozonAdvertisingByOzonSku = is_array($ozonAdvertisingImpact['by_ozon_sku'] ?? null)
+            ? $ozonAdvertisingImpact['by_ozon_sku']
+            : [];
         $constraintService = app(MarketplaceConstraintService::class);
         $marketplaceNeedFacts = $constraintService->marketplaceNeedFacts($plan, $marketplace);
         $constraintNeedSkus = array_values(array_unique(array_filter(array_map(
@@ -1005,8 +1010,9 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
 
             // --- Финансовые метрики ---
             $offerId = $wh->sku;
-            $advertisingImpact = $marketplace === 'ozon' && isset($ozonAdvertisingByOffer[$offerId]) && is_array($ozonAdvertisingByOffer[$offerId])
-                ? $ozonAdvertisingByOffer[$offerId]
+            $advertisingLookup = $ozonAdvertisingByOffer[$offerId] ?? $ozonAdvertisingByOzonSku[$offerId] ?? null;
+            $advertisingImpact = $marketplace === 'ozon' && is_array($advertisingLookup)
+                ? $advertisingLookup
                 : null;
             $barcode = $product?->barcode;
             $price = $product?->price ?? $ue?->price ?? 0;
