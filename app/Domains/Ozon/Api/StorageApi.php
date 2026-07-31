@@ -467,8 +467,8 @@ class StorageApi
             $totalCost = 0;
             
             for ($r = $headerRow + 1; $r <= $maxRow; $r++) {
-                $sku = $sheet->getCellByColumnAndRow($skuColumn, $r)->getValue();
-                $cost = $this->parsePlacementMoney($sheet->getCellByColumnAndRow($costColumn, $r)->getCalculatedValue());
+                $sku = $sheet->getCell([$skuColumn, $r])->getValue();
+                $cost = $this->parsePlacementMoney($sheet->getCell([$costColumn, $r])->getCalculatedValue());
                 
                 if (!$sku || empty(trim((string)$sku))) continue;
                 
@@ -508,7 +508,7 @@ class StorageApi
             $headers = [];
             for ($col = 1; $col <= $maxColumn; $col++) {
                 $headers[$col] = $this->normalizePlacementHeader(
-                    (string) $sheet->getCellByColumnAndRow($col, $row)->getValue()
+                    (string) $sheet->getCell([$col, $row])->getValue()
                 );
             }
 
