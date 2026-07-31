@@ -64,6 +64,10 @@ class AutoSupplyPlanService
             $dailyDemand = $shortAvg;
         } elseif ($longAvg > 0) {
             $dailyDemand = $longAvg;
+        } elseif ($sales14 > 0) {
+            // Продажи только в окне 8–14 дней назад (sales7=0, sales30=0 — окна рассинхронены).
+            // Раньше здесь молча возвращался 0, фолбэки были недостижимы и строка выпадала из плана.
+            return ['daily_demand' => $sales14 / 14, 'needs_manual_review' => true];
         } else {
             $dailyDemand = 0.0;
         }
@@ -1166,11 +1170,14 @@ class AutoSupplyPlanService
             ->where('supplies.integration_id', $integrationId)
             ->whereIn('supplies.status', [
                 'draft_ozon',
+                'slot_pending',
                 'slot_booked',
                 'preparing',
                 'ready_to_ship',
                 'shipped',
                 'in_transit',
+                // привезён, но не принят складом — в остатках его ещё нет
+                'at_warehouse',
             ])
             ->select('supply_items.sku', \Illuminate\Support\Facades\DB::raw('SUM(supply_items.planned_qty) as qty'))
             ->groupBy('supply_items.sku')

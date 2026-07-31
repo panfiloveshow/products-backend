@@ -81,7 +81,15 @@ class PlanLineOptimizer
         $budgetSkippedRows = [];
         $budgetSelectionPolicy = $budgetLimit > 0 ? 'score_knapsack_v1' : 'score_order_no_budget';
 
+        // Строки без известной себестоимости (cost<=0) не участвуют в рюкзаке и входят
+        // в план мимо бюджета — честно показываем их количество, а не прячем.
+        $budgetUnpricedLines = 0;
         if ($budgetLimit > 0) {
+            foreach ($candidates as $line) {
+                if ((float) ($line['supply_cost_estimate'] ?? 0) <= 0) {
+                    $budgetUnpricedLines++;
+                }
+            }
             [$selectedCandidates, $budgetSkippedCandidates, $budgetUsed] = $this->selectWithinBudget($candidates, $budgetLimit);
 
             foreach ($budgetSkippedCandidates as $line) {
@@ -160,6 +168,7 @@ class PlanLineOptimizer
                 'budget_used' => $budgetLimit > 0 ? round($budgetUsed, 2) : null,
                 'budget_selection_policy' => $budgetSelectionPolicy,
                 'budget_skipped_lines' => $skippedByReason['budget_limit'] ?? 0,
+                'budget_unpriced_lines' => $budgetUnpricedLines,
                 'negative_profit_skipped_lines' => $skippedByReason['negative_profit'] ?? 0,
                 'selected_deficit_lines' => $selectedDeficitLines,
                 'selected_surplus_lines' => $selectedSurplusLines,

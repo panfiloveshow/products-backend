@@ -53,6 +53,15 @@ class AutoSupplyPlanCalculationTest extends TestCase
         $this->assertTrue($result['needs_manual_review']);
     }
 
+    public function test_ewma_with_only_mid_window_uses_sales14_fallback(): void
+    {
+        // sales7=0, sales30=0, sales14>0 (окна рассинхронены) — раньше молча возвращался 0
+        // без пометки, и строка выпадала из плана
+        $result = $this->service->calculateDailyDemand(0.35, 0, 28, 0);
+        $this->assertEqualsWithDelta(2.0, $result['daily_demand'], 0.01);
+        $this->assertTrue($result['needs_manual_review']);
+    }
+
     public function test_analysis_period_days_uses_user_window_for_demand_facts(): void
     {
         $job = new CalculateAutoSupplyPlanJob('test-plan-id');

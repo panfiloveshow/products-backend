@@ -104,30 +104,49 @@ class MarketplaceConstraintService
 
             $qty = (int) ($line['qty_rounded'] ?? 0);
             $lineWasCappedOrBlocked = false;
+            // Двухпроходная схема: сперва считаем допустимое количество по ВСЕМ cap-ключам,
+            // и только потом списываем квоты. Раньше квота первого ключа расходовалась на
+            // строку, которую блокировал второй ключ, — чистая утечка лимита.
+            $capsToApply = [];
+            $allowedQty = $qty;
+            $tightestConstraint = null;
             foreach ($this->capConstraintsForLine($matchedConstraints) as $capConstraint) {
                 $canonicalKey = (string) ($capConstraint['canonical_key'] ?? '');
                 if ($canonicalKey === '' || ! array_key_exists($canonicalKey, $remainingByKey)) {
                     continue;
                 }
+                $capsToApply[$canonicalKey] = $capConstraint;
+                if ($remainingByKey[$canonicalKey] < $allowedQty) {
+                    $allowedQty = max(0, (int) $remainingByKey[$canonicalKey]);
+                    $tightestConstraint = $capConstraint;
+                }
+            }
 
-                $qty = (int) ($line['qty_rounded'] ?? 0);
-                $allowedQty = min($qty, $remainingByKey[$canonicalKey]);
-                $remainingByKey[$canonicalKey] -= $allowedQty;
+            if ($capsToApply !== []) {
+                // Кратность пака: лимит 7 при паке 5 давал неотгружаемые 7 шт — режем вниз до пака
+                $packMultiple = $this->linePackMultiple($line);
+                if ($allowedQty < $qty && $packMultiple > 1) {
+                    $allowedQty = intdiv($allowedQty, $packMultiple) * $packMultiple;
+                }
+                $appliedConstraint = $tightestConstraint ?? reset($capsToApply);
 
                 if ($allowedQty <= 0) {
                     $blockedLines++;
                     $totalReducedQty += $qty;
-                    $lineWasCappedOrBlocked = true;
-                    $this->recordAppliedExample($appliedExamples, $line, $capConstraint, 'blocked', $qty, 0, $needQtyForExample);
-                    continue 2;
+                    $this->recordAppliedExample($appliedExamples, $line, $appliedConstraint, 'blocked', $qty, 0, $needQtyForExample);
+                    continue;
+                }
+
+                foreach (array_keys($capsToApply) as $canonicalKey) {
+                    $remainingByKey[$canonicalKey] -= $allowedQty;
                 }
 
                 if ($allowedQty < $qty) {
-                    $line = $this->capLine($line, $allowedQty, $capConstraint);
+                    $line = $this->capLine($line, $allowedQty, $appliedConstraint);
                     $cappedLines++;
                     $totalReducedQty += $qty - $allowedQty;
                     $lineWasCappedOrBlocked = true;
-                    $this->recordAppliedExample($appliedExamples, $line, $capConstraint, 'capped', $qty, $allowedQty, $needQtyForExample);
+                    $this->recordAppliedExample($appliedExamples, $line, $appliedConstraint, 'capped', $qty, $allowedQty, $needQtyForExample);
                 }
             }
 
@@ -584,6 +603,12 @@ class MarketplaceConstraintService
             return $line;
         }
 
+        // Потребность МП поднимает qty, но кратность пака сохраняем (вверх до ближайшего пака)
+        $packMultiple = $this->linePackMultiple($line);
+        if ($packMultiple > 1) {
+            $needQty = (int) (ceil($needQty / $packMultiple) * $packMultiple);
+        }
+
         $line['qty_rounded'] = $needQty;
         $line['qty_recommended'] = max((float) ($line['qty_recommended'] ?? 0), (float) $needQty);
 
@@ -609,6 +634,18 @@ class MarketplaceConstraintService
      * @param array<string, mixed> $constraint
      * @return array<string, mixed>
      */
+    /**
+     * Кратность пака строки — из explain_json.inputs.pack_multiple (кладёт расчёт).
+     *
+     * @param array<string, mixed> $line
+     */
+    private function linePackMultiple(array $line): int
+    {
+        $explain = $this->decodeExplain($line);
+
+        return max(1, (int) data_get($explain, 'inputs.pack_multiple', 1));
+    }
+
     private function capLine(array $line, int $allowedQty, array $constraint): array
     {
         $oldQty = (int) ($line['qty_rounded'] ?? 0);

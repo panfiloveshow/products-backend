@@ -147,4 +147,31 @@ class ExecuteOzonSupplyDraftJob implements ShouldQueue
             $executions->refreshStatus($supply->autoSupplyPlanExecution->fresh());
         }
     }
+
+    /**
+     * Попытки исчерпаны или воркер убит по таймауту: без этого поставка навсегда
+     * зависала в waiting_draft, а операция — в running. Исход неоднозначен
+     * (запрос мог уйти в Ozon) — fail-closed на ручную сверку.
+     */
+    public function failed(?\Throwable $exception): void
+    {
+        $supply = Supply::withoutGlobalScopes()
+            ->with('autoSupplyPlanExecution')
+            ->find($this->supplyId);
+        if ($supply === null) {
+            return;
+        }
+
+        if (! $supply->ozon_draft_id) {
+            $supply->update([
+                'execution_step' => 'manual_reconciliation_required',
+                'execution_error' => 'Исполнение остановлено после исчерпания попыток: '
+                    . ($exception?->getMessage() ?: 'таймаут очереди'),
+            ]);
+        }
+
+        if ($supply->autoSupplyPlanExecution !== null) {
+            app(AutoSupplyPlanExecutionService::class)->refreshStatus($supply->autoSupplyPlanExecution->fresh());
+        }
+    }
 }

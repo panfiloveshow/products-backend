@@ -371,10 +371,12 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
         $supplyInTransit = $service->getInTransitFromSupplies($integrationId);
         $ozonClusterSupplies = ($marketplace === 'ozon' && ! empty($clusterMapping));
         $supplyInTransitByClusterPending = $ozonClusterSupplies
-            ? $this->getOzonInTransitFromSuppliesByCluster($integrationId, $clusterMapping, ['draft_ozon', 'slot_booked', 'preparing', 'ready_to_ship'])
+            ? $this->getOzonInTransitFromSuppliesByCluster($integrationId, $clusterMapping, ['draft_ozon', 'slot_pending', 'slot_booked', 'preparing', 'ready_to_ship'])
             : [];
         $supplyInTransitByClusterShipped = $ozonClusterSupplies
-            ? $this->getOzonInTransitFromSuppliesByCluster($integrationId, $clusterMapping, ['shipped', 'in_transit'])
+            // at_warehouse: привезён, но не принят — нет ни в остатках, ни в transit_stock_count;
+            // относим к «отгруженным», чтобы не заказать повторно
+            ? $this->getOzonInTransitFromSuppliesByCluster($integrationId, $clusterMapping, ['shipped', 'in_transit', 'at_warehouse'])
             : [];
 
         // v3: Проверяем, загружен ли CSV-отчёт заказов для этой интеграции
@@ -1045,7 +1047,10 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
 
             $lostRevenueDaily = $dailyDemand * $price;
             $supplyCostEstimate = $economicsKnown ? (float) $costPrice * $qtyRounded : null;
-            $expectedRevenue = $price > 0 ? $dailyDemand * $targetCoverDays * $price : 0;
+            // Единая база экономики: строка = поставка qty штук, выручка тоже от qty.
+            // Раньше revenue шёл от спроса×покрытие и не зависел от qty — прибыль/ROI строк
+            // были несопоставимы, а линейный пересчёт денег после капов становился фиктивным.
+            $expectedRevenue = $price > 0 ? (float) $price * $qtyRounded : 0;
 
             // v2: Улучшенный расчёт прибыли (с учётом комиссии и логистики)
             $commissionCost = $expectedRevenue * ($commissionPercent / 100);
@@ -1434,8 +1439,13 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
                     $metric = $metrics[$sku] ?? null;
                     $recs = $recsPerSku[$sku] ?? collect([]);
 
-                    // 1) Cluster split (если включено и есть что делить)
-                    if ($splitByCluster && ! empty($recs) && $recs->isNotEmpty()) {
+                    // 1) Cluster split (если включено и есть что делить).
+                    // Кластерную строку НЕ делим повторно: она уже адресует конкретный кластер
+                    // со своим спросом/остатком. Повторный сплит по рекомендациям плодил дубли
+                    // SKU×кластер (N родителей × один и тот же набор кластеров) и наследовал
+                    // детям остатки/экономику чужого кластера.
+                    $isClusterLine = ($line['destination_type'] ?? null) === 'cluster';
+                    if ($splitByCluster && ! $isClusterLine && ! empty($recs) && $recs->isNotEmpty()) {
                         $ozonClusterData = $ozonAnalytics[$sku]['clusters'] ?? [];
                         $packMultiple = (int) ($settings->default_pack_multiple ?? 1);
 
@@ -1988,6 +1998,18 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
                     ->values()
                     ->all();
 
+                // Синк порой пишет ОДНО SKU-значение спроса на каждый склад (см. анти-дубль
+                // эвристику в InventoryController). Одинаковые >0 значения на 2+ складах —
+                // это дубль, берём одно; иначе честная сумма по складам кластера.
+                $metricSumOrSame = static function (string $field) use ($group): float {
+                    $values = $group->map(static fn ($row): float => (float) ($row->{$field} ?? 0));
+                    if ($group->count() > 1 && $values->unique()->count() === 1 && (float) $values->first() > 0) {
+                        return (float) $values->first();
+                    }
+
+                    return (float) $values->sum();
+                };
+
                 $aggregate->forceFill([
                     'warehouse_id' => 'cluster:' . $cluster['cluster_id'],
                     'warehouse_name' => $cluster['cluster_name'],
@@ -1995,12 +2017,12 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
                     'quantity' => (int) $group->sum('quantity'),
                     'reserved' => (int) $group->sum('reserved'),
                     'in_transit' => (int) $group->sum('in_transit'),
-                    'average_daily_sales' => (float) $group->sum('average_daily_sales'),
-                    'effective_daily_sales' => (float) $group->sum('effective_daily_sales'),
-                    'real_avg_daily_sales' => (float) $group->sum('real_avg_daily_sales'),
-                    'sales_7_days' => (int) $group->sum('sales_7_days'),
-                    'sales_14_days' => (int) $group->sum('sales_14_days'),
-                    'sales_30_days' => (int) $group->sum('sales_30_days'),
+                    'average_daily_sales' => $metricSumOrSame('average_daily_sales'),
+                    'effective_daily_sales' => $metricSumOrSame('effective_daily_sales'),
+                    'real_avg_daily_sales' => $metricSumOrSame('real_avg_daily_sales'),
+                    'sales_7_days' => (int) $metricSumOrSame('sales_7_days'),
+                    'sales_14_days' => (int) $metricSumOrSame('sales_14_days'),
+                    'sales_30_days' => (int) $metricSumOrSame('sales_30_days'),
                     'storage_cost_per_day' => (float) $group->sum('storage_cost_per_day'),
                     'storage_cost_per_month' => (float) $group->sum('storage_cost_per_month'),
                     'storage_fee_total' => (float) $group->sum('storage_fee_total'),
@@ -2203,7 +2225,7 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
     /**
      * @return array<string, int> keyed by "sku|cluster_id"
      */
-    private function getOzonInTransitFromSuppliesByCluster(int $integrationId, array $clusterMapping, array $statuses = ['draft_ozon', 'slot_booked', 'preparing', 'ready_to_ship', 'shipped', 'in_transit']): array
+    private function getOzonInTransitFromSuppliesByCluster(int $integrationId, array $clusterMapping, array $statuses = ['draft_ozon', 'slot_pending', 'slot_booked', 'preparing', 'ready_to_ship', 'shipped', 'in_transit', 'at_warehouse']): array
     {
         try {
             $rows = \Illuminate\Support\Facades\DB::table('supply_items')
