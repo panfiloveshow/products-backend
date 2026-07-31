@@ -281,7 +281,7 @@ class StorageApi
             return $cached;
         }
 
-        $existingReport = $this->findExistingPlacementReport('seller_placement_by_products');
+        $existingReport = $this->findExistingPlacementReport('seller_placement_by_products', $dateFrom, $dateTo);
         if ($existingReport !== null && ! empty($existingReport['code'])) {
             // URL из /v1/report/list живёт ~3 часа (X-Amz-Expires=10800). Всегда
             // запрашиваем свежую подписанную ссылку через /v1/report/info —
@@ -360,32 +360,44 @@ class StorageApi
     /**
      * Найти существующий отчёт о размещении за последние 24 часа
      */
-    private function findExistingPlacementReport(string $reportType): ?array
+    private function findExistingPlacementReport(string $reportType, ?string $dateFrom = null, ?string $dateTo = null): ?array
     {
         try {
             $reports = $this->getReportList($reportType, 1, 10);
-            
+
             foreach ($reports as $report) {
                 $status = $report['status'] ?? '';
                 $createdAt = $report['created_at'] ?? null;
-                
-                // Проверяем что отчёт успешный и создан менее 2.5 часов назад
+
+                // Переиспользуем ТОЛЬКО отчёт за тот же период: раньше брался любой свежий
+                // отчёт, и запросы за разные месяцы получали одни и те же цифры.
+                if ($dateFrom !== null || $dateTo !== null) {
+                    $params = is_array($report['params'] ?? null) ? $report['params'] : [];
+                    $reportFrom = substr((string) ($params['date_from'] ?? $params['dateFrom'] ?? ''), 0, 10);
+                    $reportTo = substr((string) ($params['date_to'] ?? $params['dateTo'] ?? ''), 0, 10);
+                    if ($reportFrom !== (string) $dateFrom || $reportTo !== (string) $dateTo) {
+                        continue;
+                    }
+                }
+
+                // Проверяем что отчёт успешный и создан недавно
                 // (ссылка на скачивание истекает через 3 часа - X-Amz-Expires=10800)
                 if ($status === 'success' && $createdAt) {
                     $createdTime = strtotime($createdAt);
                     $hoursAgo = (time() - $createdTime) / 3600;
-                    
+
                     if ($hoursAgo < 48) {
                         Log::info('Found existing placement report', [
                             'report_id' => $report['code'] ?? 'unknown',
                             'created_at' => $createdAt,
                             'hours_ago' => round($hoursAgo, 1),
+                            'period' => ($dateFrom ?? '—') . '..' . ($dateTo ?? '—'),
                         ]);
                         return $report;
                     }
                 }
             }
-            
+
             return null;
         } catch (\Exception $e) {
             Log::warning('Error finding existing placement report', ['error' => $e->getMessage()]);
