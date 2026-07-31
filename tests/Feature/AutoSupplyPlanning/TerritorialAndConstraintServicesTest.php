@@ -16,6 +16,51 @@ class TerritorialAndConstraintServicesTest extends TestCase
 {
     use LazilyRefreshDatabase;
 
+    public function test_cap_quota_not_leaked_on_line_blocked_by_second_key(): void
+    {
+        $plan = new AutoSupplyPlan([
+            'marketplace' => 'ozon',
+            'params' => [
+                'cluster_constraints' => [
+                    ['cluster_id' => 154, 'max_qty' => 0, 'cluster_name' => 'Москва'],
+                    ['sku' => 'SKU-1', 'max_qty' => 10, 'reason' => 'Общий лимит товара'],
+                ],
+            ],
+        ]);
+
+        $result = (new MarketplaceConstraintService())->apply([
+            $this->line('SKU-1', 10, clusterId: 154, clusterName: 'Москва'),
+            $this->line('SKU-1', 10, clusterId: 156, clusterName: 'Казань'),
+        ], $plan, 'ozon');
+
+        // Первая строка блокируется нулевым лимитом кластера и НЕ должна расходовать
+        // общий лимит SKU — вторая строка получает полные 10 шт (раньше квота утекала).
+        $this->assertCount(1, $result['lines']);
+        $this->assertSame(10, $result['lines'][0]['qty_rounded']);
+        $this->assertSame(1, $result['summary']['blocked_lines']);
+        $this->assertSame(0, $result['summary']['capped_lines']);
+    }
+
+    public function test_cap_respects_pack_multiple(): void
+    {
+        $plan = new AutoSupplyPlan([
+            'marketplace' => 'ozon',
+            'params' => [
+                'cluster_constraints' => [
+                    ['cluster_id' => 154, 'max_qty' => 7, 'cluster_name' => 'Москва'],
+                ],
+            ],
+        ]);
+
+        $line = $this->line('SKU-1', 10, clusterId: 154, clusterName: 'Москва');
+        $line['explain_json'] = json_encode(['inputs' => ['pack_multiple' => 5]]);
+
+        $result = (new MarketplaceConstraintService())->apply([$line], $plan, 'ozon');
+
+        // Лимит 7 при паке 5 → отгружаемые 5 шт, а не неотгружаемые 7
+        $this->assertSame(5, $result['lines'][0]['qty_rounded']);
+    }
+
     public function test_constraints_cap_and_block_lines_with_russian_summary(): void
     {
         $plan = new AutoSupplyPlan([

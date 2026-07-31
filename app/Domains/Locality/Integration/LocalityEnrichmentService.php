@@ -249,6 +249,15 @@ class LocalityEnrichmentService
             $child['is_cluster_split'] = true;
             $child['aggregated_qty_rounded'] = $totalQty;
 
+            // Деньги родителя делим пропорционально qty ребёнка — раньше каждый child
+            // наследовал ПОЛНУЮ сумму родителя, и стоимость плана раздувалась в N раз.
+            $qtyShare = $totalQty > 0 ? $qty / $totalQty : 0.0;
+            foreach (['supply_cost_estimate', 'expected_revenue', 'expected_profit'] as $moneyKey) {
+                if (isset($line[$moneyKey]) && is_numeric($line[$moneyKey])) {
+                    $child[$moneyKey] = round((float) $line[$moneyKey] * $qtyShare, 2);
+                }
+            }
+
             $expectedSavingsForChild = $this->estimateSavingsForSplit($sku, $split, $qty, $recommendations);
 
             $splitJsonRows[] = [
