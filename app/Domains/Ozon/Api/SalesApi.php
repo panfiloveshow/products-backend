@@ -127,7 +127,10 @@ class SalesApi
                     'filter'   => [
                         'since'    => $since,
                         'to'       => $to,
-                        'statuses' => ['delivered'],
+                        // Без фильтра по статусу: считаем СПРОС (заказы), а не только доставленные.
+                        // 'delivered' систематически терял свежие заказы последних 1-2 недель
+                        // (ещё едут к покупателю) → average_daily_sales/оборачиваемость занижались.
+                        // Отменённые отправления скипаются в цикле ниже.
                     ],
                     'limit'    => $limit,
                     'sort_dir' => 'ASC',
@@ -165,6 +168,10 @@ class SalesApi
                 $hasNext  = (bool) ($response['has_next'] ?? false);
 
                 foreach ($postings as $posting) {
+                    if ((string) ($posting['status'] ?? '') === 'cancelled') {
+                        continue;
+                    }
+
                     $warehouseId = (string)($posting['analytics_data']['warehouse_id'] ?? '');
                     $whName      = $posting['analytics_data']['warehouse_name'] ?? $warehouseId;
 
@@ -365,7 +372,10 @@ class SalesApi
                     'filter'   => [
                         'since'    => $since,
                         'to'       => $to,
-                        'statuses' => ['delivered'],
+                        // Без фильтра по статусу: считаем СПРОС (заказы), а не только доставленные.
+                        // 'delivered' систематически терял свежие заказы последних 1-2 недель
+                        // (ещё едут к покупателю) → average_daily_sales/оборачиваемость занижались.
+                        // Отменённые отправления скипаются в цикле ниже.
                     ],
                     'limit'    => $limit,
                     'sort_dir' => 'ASC',
@@ -395,6 +405,10 @@ class SalesApi
                 $hasNext  = (bool) ($response['has_next'] ?? false);
 
                 foreach ($postings as $posting) {
+                    if ((string) ($posting['status'] ?? '') === 'cancelled') {
+                        continue;
+                    }
+
                     $analytics = $posting['analytics_data'] ?? [];
                     $warehouseName = (string) ($analytics['warehouse_name'] ?? '');
                     $warehouseIdRaw = (string) ($analytics['warehouse_id'] ?? '');

@@ -101,45 +101,58 @@ class SyncStorageCostJob implements ShouldQueue
             return;
         }
 
-        $dateFrom = now()->subDays($this->days)->format('Y-m-d');
-        $dateTo = now()->format('Y-m-d');
+        // Календарные окна — ровно те, что подписаны в UI: «текущий месяц» (1-е — сегодня)
+        // и «прошлый месяц» целиком. Раньше писалось скользящее окно N дней в поле
+        // prev_month, текущий месяц не заполнял никто, а min/max отчётных дат разных SKU
+        // склеивались в лейбл двухмесячного «периода».
+        $currentFrom = now()->startOfMonth()->format('Y-m-d');
+        $currentTo = now()->format('Y-m-d');
+        $prevFrom = now()->subMonthNoOverflow()->startOfMonth()->format('Y-m-d');
+        $prevTo = now()->subMonthNoOverflow()->endOfMonth()->format('Y-m-d');
 
-        // Получаем данные о стоимости размещения из отчёта (ключ = offer_id/артикул)
-        $placementData = $service->getPlacementCostByProducts($dateFrom, $dateTo, $this->maxWaitSeconds);
+        $currentData = $service->getPlacementCostByProducts($currentFrom, $currentTo, $this->maxWaitSeconds);
+        $prevData = $service->getPlacementCostByProducts($prevFrom, $prevTo, $this->maxWaitSeconds);
 
-        if (empty($placementData)) {
+        if (empty($currentData) && empty($prevData)) {
             Log::info("SyncStorageCostJob: No placement data for {$marketplace}");
             return;
         }
 
+        $skus = array_values(array_unique(array_merge(array_keys($currentData), array_keys($prevData))));
+
         Log::info("SyncStorageCostJob: Processing {$marketplace}", [
-            'skus_count' => count($placementData),
+            'skus_count' => count($skus),
+            'current_period' => "$currentFrom..$currentTo",
+            'prev_period' => "$prevFrom..$prevTo",
         ]);
 
         $updatedProducts = 0;
         $updatedWarehouses = 0;
-        $totalStorageCost = 0;
+        $totalCurrentCost = 0.0;
+        $totalPrevCost = 0.0;
 
-        foreach ($placementData as $sku => $data) {
-            $storageCost = (float) ($data['placement_cost'] ?? 0);
-            $totalStorageCost += $storageCost;
+        foreach ($skus as $sku) {
+            $currentCost = (float) ($currentData[$sku]['placement_cost'] ?? 0);
+            $prevCost = (float) ($prevData[$sku]['placement_cost'] ?? 0);
+            $totalCurrentCost += $currentCost;
+            $totalPrevCost += $prevCost;
 
-            // 1) Обновляем Product (обратная совместимость)
+            // 1) Product.storage_cost — полный прошлый месяц (стабильная величина для
+            //    юнит-экономики; месяц-к-дате в начале месяца занижал бы хранение)
             $product = Product::where('sku', $sku)
                 ->where('marketplace', $marketplace)
                 ->where('integration_id', $integrationId)
                 ->first();
 
             if ($product) {
-                $product->storage_cost = $storageCost;
+                $product->storage_cost = $prevCost > 0 ? $prevCost : $currentCost;
                 $product->storage_cost_updated_at = now();
                 $product->save();
                 $updatedProducts++;
             }
 
-            // 2) Обновляем inventory_warehouses: общая сумма уходит в запись с
-            //    максимальным quantity, остальные склады обнуляем — SUM по SKU
-            //    в Excel-экспорте даст точное число платного хранения.
+            // 2) inventory_warehouses: сумма SKU уходит в запись с максимальным
+            //    quantity, остальные склады обнуляем — SUM по SKU остаётся точным.
             $warehouses = InventoryWarehouse::where('sku', $sku)
                 ->where('marketplace', $marketplace)
                 ->where('integration_id', $integrationId)
@@ -148,21 +161,37 @@ class SyncStorageCostJob implements ShouldQueue
 
             $isPrimary = true;
             foreach ($warehouses as $w) {
-                $w->storage_fee_prev_month = $isPrimary ? round($storageCost, 2) : 0;
-                $w->storage_fee_report_from = $dateFrom;
-                $w->storage_fee_report_to = $dateTo;
+                $w->storage_fee_total = $isPrimary ? round($currentCost, 2) : 0;
+                $w->storage_fee_prev_month = $isPrimary ? round($prevCost, 2) : 0;
+                $w->storage_fee_report_from = $currentFrom;
+                $w->storage_fee_report_to = $currentTo;
+                $w->storage_fee_prev_month_period = $prevTo;
                 $w->save();
                 $updatedWarehouses++;
                 $isPrimary = false;
             }
         }
 
+        // SKU интеграции без расходов хранения в обоих периодах: обнуляем суммы и
+        // выравниваем даты, чтобы старые отчётные окна не склеивали период в UI.
+        $clearedRows = InventoryWarehouse::where('marketplace', $marketplace)
+            ->where('integration_id', $integrationId)
+            ->whereNotIn('sku', $skus)
+            ->update([
+                'storage_fee_total' => 0,
+                'storage_fee_prev_month' => 0,
+                'storage_fee_report_from' => $currentFrom,
+                'storage_fee_report_to' => $currentTo,
+                'storage_fee_prev_month_period' => $prevTo,
+            ]);
+
         Log::info("SyncStorageCostJob: {$marketplace} completed", [
             'integration_id' => $integrationId,
             'updated_products' => $updatedProducts,
             'updated_warehouses' => $updatedWarehouses,
-            'total_storage_cost' => round($totalStorageCost, 2),
-            'period_days' => $this->days,
+            'cleared_rows' => $clearedRows,
+            'total_current_cost' => round($totalCurrentCost, 2),
+            'total_prev_cost' => round($totalPrevCost, 2),
         ]);
     }
 }
