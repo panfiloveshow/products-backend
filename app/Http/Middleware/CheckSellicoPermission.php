@@ -28,13 +28,6 @@ class CheckSellicoPermission
     protected const TOKEN_CACHE_KEY = 'sellico_access_token';
 
     /**
-     * TTL grace-кэша положительных результатов проверки прав (секунды) — 24 часа.
-     * Используется как fallback, если CRM недоступен: ранее успешно проверенные
-     * связки (token + workspace + permission) продолжают работать, но новые
-     * получают 503. Это балансирует безопасность и устойчивость к CRM-outage.
-     */
-    protected const GRACE_CACHE_TTL = 86400;
-    /**
      * Маппинг роутов на permissions
      */
     private const ROUTE_PERMISSIONS = [
@@ -412,32 +405,16 @@ class CheckSellicoPermission
 
         $tokenHash = md5($token);
         $cacheKey = "perm:{$workspace}:{$permission}:{$tokenHash}";
-        $graceCacheKey = "perm_grace:{$workspace}:{$permission}:{$tokenHash}";
 
-        $allowed = Cache::remember($cacheKey, self::CACHE_TTL, function () use ($token, $user, $workspace, $permission, $routeName, $graceCacheKey) {
-            $result = $this->checkPermissionRemotely($token, $user, $workspace, $permission, $routeName);
-            // При подтверждённом доступе пишем в grace-кэш на 24 часа —
-            // чтобы пережить кратковременный outage CRM без падения API.
-            if ($result === true) {
-                Cache::put($graceCacheKey, true, self::GRACE_CACHE_TTL);
-            }
-            return $result;
-        });
+        $allowed = Cache::remember(
+            $cacheKey,
+            self::CACHE_TTL,
+            fn () => $this->checkPermissionRemotely($token, $user, $workspace, $permission, $routeName)
+        );
 
-        // Fail-closed with grace: при ошибке CRM пропускаем только тех, кто уже был
-        // успешно проверен в последние 24 часа; новым запросам отвечаем 503.
-        // Это ликвидирует прежний fail-open на любой ошибке/таймауте CRM.
+        // Fail-closed: недоступность CRM никогда не должна продлевать отозванный доступ.
         if ($allowed === null) {
-            if (Cache::has($graceCacheKey)) {
-                Log::warning('CheckSellicoPermission: CRM недоступен, используем grace-кэш', [
-                    'route'      => $routeName,
-                    'permission' => $permission,
-                    'workspace'  => $workspace,
-                ]);
-                return $this->continueInWorkspace($request, $next, $workspaceId);
-            }
-
-            Log::error('CheckSellicoPermission: CRM недоступен и нет grace-кэша — блокируем запрос', [
+            Log::error('CheckSellicoPermission: CRM недоступен — блокируем запрос', [
                 'route'      => $routeName,
                 'permission' => $permission,
                 'workspace'  => $workspace,
@@ -535,10 +512,11 @@ class CheckSellicoPermission
         ];
 
         Log::info('CheckSellicoPermission: отправка запроса к CRM', [
-            'route'           => $routeName,
-            'url'             => "{$crmUrl}/api/check-permission",
-            'params'          => $requestParams,
-            'service_token'   => $serviceToken
+            'route'      => $routeName,
+            'url'        => "{$crmUrl}/api/check-permission",
+            'user'       => $user,
+            'workspace'  => $workspace,
+            'permission' => $permission,
         ]);
 
         try {
@@ -572,7 +550,7 @@ class CheckSellicoPermission
                         'route'      => $routeName,
                         'permission' => $permission,
                     ]);
-                    // Fail-closed: возвращаем null, middleware примет решение на основе grace-кэша.
+                    // Fail-closed: возвращаем null, middleware ответит 503.
                     return null;
                 }
                 Log::info('CheckSellicoPermission: повторная авторизация', [
@@ -604,9 +582,9 @@ class CheckSellicoPermission
                 Log::warning('CheckSellicoPermission: доступ запрещён CRM', [
                     'route'      => $routeName,
                     'status'     => $response->status(),
-                    'body'       => $body,
                     'permission' => $permission,
                     'workspace'  => $workspace,
+                    'service_account_error' => str_contains($body, 'service account'),
                 ]);
                 
                 // Сбрасываем токен и пробуем повторно авторизоваться
@@ -633,7 +611,7 @@ class CheckSellicoPermission
                     if ($retryResponse->status() === 403) {
                         Log::error('CheckSellicoPermission: повторный запрос также вернул 403', [
                             'route'      => $routeName,
-                            'body'       => $retryResponse->body(),
+                            'status'     => $retryResponse->status(),
                             'permission' => $permission,
                         ]);
                     }
@@ -649,7 +627,7 @@ class CheckSellicoPermission
                 'workspace'  => $workspace,
             ]);
 
-            // Fail-closed: null → middleware решит через grace-кэш, иначе 503.
+            // Fail-closed: null → middleware ответит 503.
             return null;
 
         } catch (\Exception $e) {
@@ -660,7 +638,7 @@ class CheckSellicoPermission
                 'workspace'  => $workspace,
             ]);
 
-            // Fail-closed: null → middleware решит через grace-кэш, иначе 503.
+            // Fail-closed: null → middleware ответит 503.
             return null;
         }
     }
@@ -748,7 +726,6 @@ class CheckSellicoPermission
 
             Log::info('CheckSellicoPermission: ответ от Sellico login', [
                 'status' => $response->status(),
-                'body'   => $response->body(),
             ]);
 
             if ($response->successful()) {
@@ -764,14 +741,13 @@ class CheckSellicoPermission
                 }
 
                 Log::warning('CheckSellicoPermission: авторизация успешна, но access_token отсутствует в ответе', [
-                    'body' => $response->body(),
+                    'status' => $response->status(),
                 ]);
                 return null;
             }
 
             Log::error('CheckSellicoPermission: ошибка авторизации в Sellico', [
                 'status' => $response->status(),
-                'body'   => $response->body(),
             ]);
             return null;
 

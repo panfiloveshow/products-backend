@@ -107,4 +107,35 @@ class ProductExportAccessTest extends TestCase
             ->get("/api/products/export/{$exportId}/download")
             ->assertOk();
     }
+
+    public function test_product_export_neutralizes_formula_like_text_cells(): void
+    {
+        Product::query()->firstOrFail()->update([
+            'sku' => '=1+1',
+            'name' => '+SUM(A1:A2)',
+            'marketplace_id' => '-1+1',
+            'barcode' => '@SUM(A1:A2)',
+            'category' => "\t=1+1",
+        ]);
+
+        $response = $this->withHeader('X-Sellico-Workspace', '101')
+            ->postJson('/api/products/export/ozon', [
+                'integration_id' => 10,
+            ])
+            ->assertOk();
+
+        $exportId = $response->json('data.export_id');
+        $csv = Storage::disk('local')->get("exports/products/{$exportId}.csv");
+        $rows = array_map(
+            str_getcsv(...),
+            preg_split('/\r\n|\n|\r/', trim($csv))
+        );
+
+        $this->assertSame("'=1+1", $rows[1][1]);
+        $this->assertSame("'+SUM(A1:A2)", $rows[1][2]);
+        $this->assertSame("'-1+1", $rows[1][4]);
+        $this->assertSame("'@SUM(A1:A2)", $rows[1][5]);
+        $this->assertSame("'\t=1+1", $rows[1][7]);
+        $this->assertSame('1000.00', $rows[1][6]);
+    }
 }

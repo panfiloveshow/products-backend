@@ -1,5 +1,6 @@
 <?php
 
+use App\Logging\ApplySensitiveDataProcessor;
 use App\Logging\SensitiveDataProcessor;
 use Monolog\Handler\NullHandler;
 use Monolog\Handler\StreamHandler;
@@ -76,7 +77,7 @@ return [
             'path' => storage_path('logs/laravel.log'),
             'level' => env('LOG_LEVEL', 'debug'),
             'replace_placeholders' => true,
-            'processors' => [SensitiveDataProcessor::class],
+            'tap' => [ApplySensitiveDataProcessor::class],
             // Лог-файл создают то root (schedule:run в root-кроне), то www-data
             // (php-fpm/воркеры), то danya_user (личный крон unit-economics:sync).
             // Без явного permission первый создатель дня закрывает файл для
@@ -91,7 +92,7 @@ return [
             'level' => env('LOG_LEVEL', 'debug'),
             'days' => env('LOG_DAILY_DAYS', 14),
             'replace_placeholders' => true,
-            'processors' => [SensitiveDataProcessor::class],
+            'tap' => [ApplySensitiveDataProcessor::class],
             'permission' => 0664,
         ],
 
@@ -102,6 +103,7 @@ return [
             'emoji' => env('LOG_SLACK_EMOJI', ':boom:'),
             'level' => env('LOG_LEVEL', 'critical'),
             'replace_placeholders' => true,
+            'tap' => [ApplySensitiveDataProcessor::class],
         ],
 
         'papertrail' => [
@@ -113,7 +115,7 @@ return [
                 'port' => env('PAPERTRAIL_PORT'),
                 'connectionString' => 'tls://'.env('PAPERTRAIL_URL').':'.env('PAPERTRAIL_PORT'),
             ],
-            'processors' => [PsrLogMessageProcessor::class],
+            'processors' => [PsrLogMessageProcessor::class, SensitiveDataProcessor::class],
         ],
 
         'stderr' => [
@@ -132,12 +134,14 @@ return [
             'level' => env('LOG_LEVEL', 'debug'),
             'facility' => env('LOG_SYSLOG_FACILITY', LOG_USER),
             'replace_placeholders' => true,
+            'tap' => [ApplySensitiveDataProcessor::class],
         ],
 
         'errorlog' => [
             'driver' => 'errorlog',
             'level' => env('LOG_LEVEL', 'debug'),
             'replace_placeholders' => true,
+            'tap' => [ApplySensitiveDataProcessor::class],
         ],
 
         'null' => [
@@ -155,7 +159,7 @@ return [
             'level' => env('LOG_LEVEL', 'info'),
             'days' => 30,
             'replace_placeholders' => true,
-            'processors' => [SensitiveDataProcessor::class],
+            'tap' => [ApplySensitiveDataProcessor::class],
             'permission' => 0664,
         ],
 

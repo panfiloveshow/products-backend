@@ -86,7 +86,7 @@ git pull origin main
 2. Подключитесь к серверу:
    - Host: `194.87.104.42`
    - Username: `danya_user`
-   - Password: `8o3QV0iWsZ3IGlP`
+   - Password: вводится интерактивно; никогда не сохраняйте его в Git или истории shell
    - Port: `22` (SFTP)
 3. Загрузите изменённые файлы:
    ```

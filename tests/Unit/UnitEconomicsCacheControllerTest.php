@@ -13,6 +13,7 @@ use App\Services\IntegrationAccessService;
 use App\Services\UnitEconomicsCacheService;
 use App\Services\UnitEconomicsService;
 use Illuminate\Http\UploadedFile;
+use PhpOffice\PhpSpreadsheet\Cell\DataType;
 use PhpOffice\PhpSpreadsheet\Spreadsheet;
 use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
 use Tests\TestCase;
@@ -776,6 +777,48 @@ class UnitEconomicsCacheControllerTest extends TestCase
         $this->assertSame('=F5-(F5*I5/100)-R5-S5-(F5*T5/100)-Y5-AA5', $sheet->getCell('W5')->getValue());
         $this->assertSame('=W5-E5', $sheet->getCell('AF5')->getValue());
         $this->assertSame('=IF(F5>0,AF5/F5*100,0)', $sheet->getCell('AG5')->getValue());
+    }
+
+    public function test_excel_exports_store_external_product_text_as_strings(): void
+    {
+        $controller = new UnitEconomicsCacheController(
+            $this->createMock(UnitEconomicsCacheService::class),
+            $this->createMock(UnitEconomicsService::class),
+            $this->createMock(UnitEconomicsOrchestrator::class),
+            $this->createMock(IntegrationAccessService::class),
+        );
+
+        $method = new \ReflectionMethod(UnitEconomicsCacheController::class, 'buildUnitEconomicsSpreadsheet');
+        $method->setAccessible(true);
+
+        $generic = $method->invoke($controller, [[
+            'sku' => '=1+1',
+            'product_name' => '=2+2',
+            'price' => 100,
+            'cost_price' => 50,
+        ]], 'Test', 'ozon', 'FBO');
+        $genericSheet = $generic->getActiveSheet();
+
+        $this->assertSame('=1+1', $genericSheet->getCell('A5')->getValue());
+        $this->assertSame(DataType::TYPE_STRING, $genericSheet->getCell('A5')->getDataType());
+        $this->assertSame('=2+2', $genericSheet->getCell('B5')->getValue());
+        $this->assertSame(DataType::TYPE_STRING, $genericSheet->getCell('B5')->getDataType());
+
+        $wildberries = $method->invoke($controller, [[
+            'sku' => '=3+3',
+            'product_name' => '=4+4',
+            'price' => 100,
+            'cost_price' => 50,
+        ]], 'Test', 'wildberries', 'FBO');
+        $wildberriesSheet = $wildberries->getActiveSheet();
+
+        $this->assertSame('=3+3', $wildberriesSheet->getCell('A5')->getValue());
+        $this->assertSame(DataType::TYPE_STRING, $wildberriesSheet->getCell('A5')->getDataType());
+        $this->assertSame('=4+4', $wildberriesSheet->getCell('B5')->getValue());
+        $this->assertSame(DataType::TYPE_STRING, $wildberriesSheet->getCell('B5')->getDataType());
+
+        $generic->disconnectWorksheets();
+        $wildberries->disconnectWorksheets();
     }
 
     public function test_excel_export_headers_include_version_format_and_source_contract(): void

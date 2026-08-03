@@ -18,6 +18,7 @@ use App\Models\UnitEconomicsCache;
 use App\Models\UnitEconomicsSettings;
 use App\Models\WildberriesTariffSnapshot;
 use App\Services\IntegrationAccessService;
+use App\Services\Spreadsheet\SafeSpreadsheetWriter;
 use App\Services\UnitEconomicsCacheService;
 use App\Services\UnitEconomicsService;
 use Illuminate\Http\JsonResponse;
@@ -1191,7 +1192,7 @@ class UnitEconomicsCacheController extends Controller
                 $field = $def['field'];
 
                 if ($col === 'A') {
-                    $sheet->setCellValue("A{$currentRow}", $this->resolveDisplayArticle($item));
+                    SafeSpreadsheetWriter::setText($sheet, "A{$currentRow}", $this->resolveDisplayArticle($item));
                 } elseif ($col === 'E') {
                     // E: Наценка — Excel-формула = Цена / Себестоимость
                     $sheet->setCellValue("E{$currentRow}", "=IF(D{$currentRow}>0,C{$currentRow}/D{$currentRow},0)");
@@ -1257,7 +1258,7 @@ class UnitEconomicsCacheController extends Controller
                     $sheet->setCellValue("{$col}{$currentRow}", $value === null ? '' : (float) $value);
                 } elseif (in_array($col, $textColumns, true)) {
                     // Текстовые поля
-                    $sheet->setCellValue("{$col}{$currentRow}", $item[$field] ?? '');
+                    SafeSpreadsheetWriter::setText($sheet, "{$col}{$currentRow}", $item[$field] ?? '');
                 } else {
                     // Числовые поля
                     $sheet->setCellValue("{$col}{$currentRow}", (float) ($item[$field] ?? 0));
@@ -1501,9 +1502,9 @@ class UnitEconomicsCacheController extends Controller
         $scheme = strtoupper((string) ($item['scheme_info']['code'] ?? $item['fulfillment_type'] ?? $item['scheme'] ?? 'FBW'));
 
         // Статичные значения (источник — рассчитанные поля строки).
-        $sheet->setCellValue("A{$r}", $this->resolveDisplayArticle($item));
-        $sheet->setCellValue("B{$r}", (string) ($item['product_name'] ?? $item['name'] ?? ''));
-        $sheet->setCellValue("C{$r}", $scheme);
+        SafeSpreadsheetWriter::setText($sheet, "A{$r}", $this->resolveDisplayArticle($item));
+        SafeSpreadsheetWriter::setText($sheet, "B{$r}", $item['product_name'] ?? $item['name'] ?? '');
+        SafeSpreadsheetWriter::setText($sheet, "C{$r}", $scheme);
         $sheet->setCellValue("D{$r}", $num('volume_liters'));
         $sheet->setCellValue("E{$r}", $num('cost_price'));
         $sheet->setCellValue("F{$r}", $num('price'));
