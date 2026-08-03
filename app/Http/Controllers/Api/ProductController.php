@@ -12,6 +12,7 @@ use App\Services\IntegrationAccessService;
 use App\Services\LimitsSyncService;
 use App\Services\ProductService;
 use App\Services\SellicoApiService;
+use App\Services\Spreadsheet\SafeSpreadsheetWriter;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Storage;
@@ -373,7 +374,7 @@ class ProductController extends Controller
         ]);
 
         foreach ($query->orderBy('id')->cursor() as $product) {
-            fputcsv($handle, [
+            fputcsv($handle, SafeSpreadsheetWriter::csvRow([
                 $product->id,
                 $product->sku,
                 $product->name,
@@ -385,7 +386,7 @@ class ProductController extends Controller
                 $product->stock ?? $product->current_stock ?? null,
                 optional($product->created_at)->toIso8601String(),
                 optional($product->updated_at)->toIso8601String(),
-            ]);
+            ]));
         }
 
         rewind($handle);

@@ -36,7 +36,7 @@ cd /var/www/products-backend
 
 Update via Tinker:
 ```bash
-echo '8o3QV0iWsZ3IGlP' | sudo -S php artisan tinker
+sudo php artisan tinker
 ```
 
 In Tinker:
@@ -66,7 +66,7 @@ exit
 
 Test the new API key:
 ```bash
-echo '8o3QV0iWsZ3IGlP' | sudo -S php artisan tinker
+sudo php artisan tinker
 ```
 
 ```php
@@ -91,7 +91,7 @@ exit
 
 After updating API key:
 ```bash
-echo '8o3QV0iWsZ3IGlP' | sudo -S php artisan queue:work --once
+sudo php artisan queue:work --once
 ```
 
 Or trigger via API:

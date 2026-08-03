@@ -4,6 +4,7 @@ namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
 use App\Models\Supply;
+use App\Models\SupplyItem;
 use App\Models\SupplyPackage;
 use App\Models\SupplyPackageItem;
 use App\Models\SupplyDocument;
@@ -12,6 +13,7 @@ use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Validation\Rule;
 
 class SupplyPackageController extends Controller
 {
@@ -173,7 +175,12 @@ class SupplyPackageController extends Controller
         }
 
         $request->validate([
-            'supply_item_id' => 'nullable|exists:supply_items,id',
+            'supply_item_id' => [
+                'nullable',
+                'integer',
+                Rule::exists('supply_items', 'id')
+                    ->where(fn ($query) => $query->where('supply_id', $package->supply_id)),
+            ],
             'product_id' => 'nullable|uuid|exists:products,id',
             'sku' => 'required|string',
             'barcode' => 'nullable|string',
@@ -186,17 +193,17 @@ class SupplyPackageController extends Controller
         // Проверяем, не превышает ли количество доступное в поставке
         $supplyItem = null;
         if ($request->supply_item_id) {
-            $supplyItem = \App\Models\SupplyItem::find($request->supply_item_id);
-            if ($supplyItem) {
-                $alreadyPacked = SupplyPackageItem::where('supply_item_id', $supplyItem->id)->sum('quantity');
-                $available = $supplyItem->planned_qty - $alreadyPacked;
-                
-                if ($request->quantity > $available) {
-                    return response()->json([
-                        'success' => false,
-                        'message' => "Доступно только {$available} ед. для упаковки (уже упаковано: {$alreadyPacked})",
-                    ], 422);
-                }
+            $supplyItem = SupplyItem::query()
+                ->where('supply_id', $package->supply_id)
+                ->findOrFail($request->integer('supply_item_id'));
+            $alreadyPacked = $this->packedQuantityForSupplyItem($supplyItem);
+            $available = $supplyItem->planned_qty - $alreadyPacked;
+
+            if ($request->quantity > $available) {
+                return response()->json([
+                    'success' => false,
+                    'message' => "Доступно только {$available} ед. для упаковки (уже упаковано: {$alreadyPacked})",
+                ], 422);
             }
         }
 
@@ -218,7 +225,7 @@ class SupplyPackageController extends Controller
 
         // Обновляем packed_qty в supply_item
         if ($supplyItem) {
-            $totalPacked = SupplyPackageItem::where('supply_item_id', $supplyItem->id)->sum('quantity');
+            $totalPacked = $this->packedQuantityForSupplyItem($supplyItem);
             $supplyItem->update(['packed_qty' => $totalPacked]);
         }
 
@@ -254,9 +261,11 @@ class SupplyPackageController extends Controller
 
         // Обновляем packed_qty в supply_item
         if ($supplyItemId) {
-            $supplyItem = \App\Models\SupplyItem::find($supplyItemId);
+            $supplyItem = SupplyItem::query()
+                ->where('supply_id', $package->supply_id)
+                ->find($supplyItemId);
             if ($supplyItem) {
-                $totalPacked = SupplyPackageItem::where('supply_item_id', $supplyItemId)->sum('quantity');
+                $totalPacked = $this->packedQuantityForSupplyItem($supplyItem);
                 $supplyItem->update(['packed_qty' => $totalPacked]);
             }
         }
@@ -318,7 +327,7 @@ class SupplyPackageController extends Controller
         // Получаем товары, которые ещё не упакованы полностью
         $itemsToPack = [];
         foreach ($supply->items as $item) {
-            $alreadyPacked = SupplyPackageItem::where('supply_item_id', $item->id)->sum('quantity');
+            $alreadyPacked = $this->packedQuantityForSupplyItem($item);
             $remaining = $item->planned_qty - $alreadyPacked;
             
             if ($remaining > 0) {
@@ -397,7 +406,7 @@ class SupplyPackageController extends Controller
 
             // Обновляем packed_qty для всех supply_items
             foreach ($supply->items as $item) {
-                $totalPacked = SupplyPackageItem::where('supply_item_id', $item->id)->sum('quantity');
+                $totalPacked = $this->packedQuantityForSupplyItem($item);
                 $item->update(['packed_qty' => $totalPacked]);
             }
         });
@@ -426,7 +435,7 @@ class SupplyPackageController extends Controller
 
         $itemsSummary = [];
         foreach ($supply->items as $item) {
-            $packed = SupplyPackageItem::where('supply_item_id', $item->id)->sum('quantity');
+            $packed = $this->packedQuantityForSupplyItem($item);
             $itemsSummary[] = [
                 'supply_item_id' => $item->id,
                 'sku' => $item->sku,
@@ -498,6 +507,17 @@ class SupplyPackageController extends Controller
         }
 
         return $data;
+    }
+
+    private function packedQuantityForSupplyItem(SupplyItem $supplyItem): int
+    {
+        return (int) SupplyPackageItem::query()
+            ->where('supply_item_id', $supplyItem->id)
+            ->whereHas(
+                'package',
+                fn ($query) => $query->where('supply_id', $supplyItem->supply_id)
+            )
+            ->sum('quantity');
     }
 
     /**

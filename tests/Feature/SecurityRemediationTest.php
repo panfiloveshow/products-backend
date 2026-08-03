@@ -3,6 +3,8 @@
 namespace Tests\Feature;
 
 use App\Http\Middleware\CheckSellicoPermission;
+use App\Logging\ApplySensitiveDataProcessor;
+use App\Logging\SensitiveDataProcessor;
 use App\Models\Integration;
 use App\Models\Product;
 use App\Models\Supplier;
@@ -10,6 +12,9 @@ use App\Models\UnitEconomicsSettings;
 use App\Models\WbWebhookConfig;
 use App\Support\CurrentWorkspace;
 use Illuminate\Foundation\Testing\LazilyRefreshDatabase;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
 use Tests\TestCase;
 
 class SecurityRemediationTest extends TestCase
@@ -180,6 +185,99 @@ class SecurityRemediationTest extends TestCase
                 'auto_supply.view',
                 $permissions[$routeName] ?? null,
                 "{$routeName} must not be authorized by auto_supply.view"
+            );
+        }
+    }
+
+    public function test_crm_outage_fails_closed_even_when_a_legacy_grace_key_exists(): void
+    {
+        config()->set('services.sellico.skip_permission_check', false);
+        config()->set('services.crm.url', 'https://crm-security.test');
+        Cache::flush();
+
+        $clientToken = 'security-client-token';
+        Cache::put('sellico_access_token', 'security-service-token');
+        Cache::put(
+            'perm_grace:101:products.view:'.md5($clientToken),
+            true,
+            now()->addDay()
+        );
+        Http::fake([
+            'https://crm-security.test/api/check-permission*' => Http::response([], 500),
+        ]);
+
+        $this->withHeaders([
+            'X-Sellico-Token' => $clientToken,
+            'X-Sellico-User' => '77',
+            'X-Sellico-Workspace' => '101',
+        ])
+            ->getJson('/api/products')
+            ->assertServiceUnavailable()
+            ->assertJsonPath('error', 'permission_check_failed');
+    }
+
+    public function test_permission_request_logs_metadata_without_credentials(): void
+    {
+        config()->set('services.sellico.skip_permission_check', false);
+        config()->set('services.crm.url', 'https://crm-security.test');
+        Cache::flush();
+
+        $clientToken = 'security-client-token';
+        $serviceToken = 'security-service-token';
+        $integration = Integration::factory()->ozon()->create([
+            'id' => 9701,
+            'work_space_id' => 101,
+        ]);
+        Cache::put('sellico_access_token', $serviceToken);
+        Http::fake([
+            'https://crm-security.test/api/check-permission*' => Http::response(['valid' => true]),
+        ]);
+        Log::spy();
+
+        $this->withHeaders([
+            'X-Sellico-Token' => $clientToken,
+            'X-Sellico-User' => '77',
+            'X-Sellico-Workspace' => '101',
+        ])
+            ->getJson("/api/products?integration_id={$integration->id}&marketplace=ozon")
+            ->assertOk();
+
+        Log::shouldHaveReceived('info')->withArgs(
+            function (string $message, array $context) use ($clientToken, $serviceToken): bool {
+                if ($message !== 'CheckSellicoPermission: отправка запроса к CRM') {
+                    return false;
+                }
+
+                $encoded = json_encode($context);
+
+                return ! str_contains($encoded, $clientToken)
+                    && ! str_contains($encoded, $serviceToken)
+                    && ! array_key_exists('params', $context)
+                    && ! array_key_exists('service_token', $context);
+            }
+        )->once();
+
+        Http::assertSent(
+            fn ($request) => $request['token'] === $clientToken
+                && $request->hasHeader('Authorization', "Bearer {$serviceToken}")
+        );
+    }
+
+    public function test_every_supported_log_channel_applies_sensitive_data_processing(): void
+    {
+        foreach (['single', 'daily', 'slack', 'syslog', 'errorlog', 'locality'] as $channel) {
+            $this->assertContains(
+                ApplySensitiveDataProcessor::class,
+                config("logging.channels.{$channel}.tap", []),
+                "{$channel} must apply sensitive-data processing"
+            );
+        }
+
+        foreach (['papertrail', 'stderr'] as $channel) {
+            $this->assertContains(
+                SensitiveDataProcessor::class,
+                config("logging.channels.{$channel}.processors", []),
+                "{$channel} must apply sensitive-data processing"
             );
         }
     }

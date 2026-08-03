@@ -29,6 +29,7 @@ use App\Services\AutoSupplyPlanning\OzonPlanningFactRefreshService;
 use App\Services\AutoSupplyPlanning\PlanningReadinessChecklistService;
 use App\Services\IntegrationAccessService;
 use App\Services\LimitsSyncService;
+use App\Services\Spreadsheet\SafeSpreadsheetWriter;
 use Carbon\CarbonImmutable;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
@@ -3966,8 +3967,8 @@ class AutoSupplyPlanController extends Controller
 
         $row = 2;
         foreach ($grouped as $item) {
-            $sheet->setCellValue("A{$row}", $item['offer_id']);
-            $sheet->setCellValue("B{$row}", $item['name'] ?? '');
+            SafeSpreadsheetWriter::setText($sheet, "A{$row}", $item['offer_id']);
+            SafeSpreadsheetWriter::setText($sheet, "B{$row}", $item['name'] ?? '');
             $sheet->setCellValue("C{$row}", $item['qty']);
             $row++;
         }
@@ -4079,7 +4080,7 @@ class AutoSupplyPlanController extends Controller
 
         $row = 2;
         foreach ($grouped as $item) {
-            $sheet->setCellValue("A{$row}", $item['barcode']);
+            SafeSpreadsheetWriter::setText($sheet, "A{$row}", $item['barcode']);
             $sheet->setCellValue("B{$row}", $item['qty']);
             $row++;
         }
@@ -4151,7 +4152,7 @@ class AutoSupplyPlanController extends Controller
         $colIndex = 2; // B = 2
         foreach ($warehouseNames as $whName) {
             $colLetter = \PhpOffice\PhpSpreadsheet\Cell\Coordinate::stringFromColumnIndex($colIndex);
-            $sheet->setCellValue("{$colLetter}1", $whName);
+            SafeSpreadsheetWriter::setText($sheet, "{$colLetter}1", $whName);
             // Автоширина
             $sheet->getColumnDimension($colLetter)->setAutoSize(true);
             $colIndex++;
@@ -4175,7 +4176,7 @@ class AutoSupplyPlanController extends Controller
         // === Данные ===
         $row = 2;
         foreach ($matrix as $offerId => $warehouseQty) {
-            $sheet->setCellValue("A{$row}", $offerId);
+            SafeSpreadsheetWriter::setText($sheet, "A{$row}", $offerId);
 
             $colIndex = 2;
             foreach ($warehouseNames as $whName) {
@@ -4243,8 +4244,16 @@ class AutoSupplyPlanController extends Controller
 
         // Создаём ZIP
         $tempFile = tempnam(sys_get_temp_dir(), 'supply_zip_');
+        if ($tempFile === false) {
+            throw new \RuntimeException('Не удалось создать временный ZIP-файл');
+        }
+
+        $temporaryXlsxPaths = [];
         $zip = new \ZipArchive;
-        $zip->open($tempFile, \ZipArchive::CREATE | \ZipArchive::OVERWRITE);
+        if ($zip->open($tempFile, \ZipArchive::CREATE | \ZipArchive::OVERWRITE) !== true) {
+            @unlink($tempFile);
+            throw new \RuntimeException('Не удалось открыть временный ZIP-файл');
+        }
 
         foreach ($byWarehouse as $whName => $items) {
             // Убираем строки с qty < 1
@@ -4274,14 +4283,18 @@ class AutoSupplyPlanController extends Controller
 
             $row = 2;
             foreach ($items as $item) {
-                $sheet->setCellValue("A{$row}", $item['offer_id']);
-                $sheet->setCellValue("B{$row}", $item['name'] ?? '');
+                SafeSpreadsheetWriter::setText($sheet, "A{$row}", $item['offer_id']);
+                SafeSpreadsheetWriter::setText($sheet, "B{$row}", $item['name'] ?? '');
                 $sheet->setCellValue("C{$row}", $item['qty']);
                 $row++;
             }
 
             // Записываем XLSX во временный файл
             $tmpXlsx = tempnam(sys_get_temp_dir(), 'xlsx_');
+            if ($tmpXlsx === false) {
+                throw new \RuntimeException('Не удалось создать временный XLSX-файл');
+            }
+            $temporaryXlsxPaths[] = $tmpXlsx;
             $writer = new Xlsx($spreadsheet);
             $writer->save($tmpXlsx);
             $spreadsheet->disconnectWorksheets();
@@ -4297,9 +4310,9 @@ class AutoSupplyPlanController extends Controller
         $zipContent = file_get_contents($tempFile);
         @unlink($tempFile);
 
-        // Удаляем временные xlsx файлы
-        foreach (glob(sys_get_temp_dir().'/xlsx_*') as $f) {
-            @unlink($f);
+        $this->deleteTemporaryFiles($temporaryXlsxPaths);
+        if ($zipContent === false) {
+            throw new \RuntimeException('Не удалось прочитать временный ZIP-файл');
         }
 
         $filename = "ozon_supply_by_warehouse_{$plan->id}.zip";
@@ -4328,5 +4341,19 @@ class AutoSupplyPlanController extends Controller
             'Content-Disposition' => "attachment; filename=\"{$filename}\"",
             'Cache-Control' => 'max-age=0',
         ]);
+    }
+
+    /**
+     * Delete only files created by the current export request.
+     *
+     * @param  array<int, string>  $paths
+     */
+    private function deleteTemporaryFiles(array $paths): void
+    {
+        foreach ($paths as $path) {
+            if (is_file($path)) {
+                @unlink($path);
+            }
+        }
     }
 }

@@ -68,16 +68,19 @@ class SensitiveDataProcessor implements ProcessorInterface
 
             if ($lowerKey !== '' && $this->isSensitiveKey($lowerKey)) {
                 $data[$key] = self::MASK;
+
                 continue;
             }
 
             if (is_array($value)) {
                 $data[$key] = $this->scrubArray($value);
+
                 continue;
             }
 
             if (is_string($value)) {
                 $data[$key] = $this->scrubString($value);
+
                 continue;
             }
 
@@ -86,6 +89,7 @@ class SensitiveDataProcessor implements ProcessorInterface
                     $asArray = $value->toArray();
                     if (is_array($asArray)) {
                         $data[$key] = $this->scrubArray($asArray);
+
                         continue;
                     }
                 } catch (\Throwable) {
@@ -117,9 +121,15 @@ class SensitiveDataProcessor implements ProcessorInterface
         // Laravel Sanctum / Bearer tokens
         $value = preg_replace('/\b[0-9]+\|[a-zA-Z0-9]{30,}\b/', self::MASK, $value) ?? $value;
         // query-параметры с токенами/паролями
-        $value = preg_replace('/((?:token|api_key|access_token|password|secret)=)[^&\s"\']+/i', '$1' . self::MASK, $value) ?? $value;
+        $value = preg_replace('/((?:token|api_key|access_token|password|secret)=)[^&\s"\']+/i', '$1'.self::MASK, $value) ?? $value;
+        // JSON-строки ответов внешних API
+        $value = preg_replace(
+            '/("(?:token|access_token|refresh_token|api_key|password|secret)"\s*:\s*")[^"]*(")/i',
+            '$1'.self::MASK.'$2',
+            $value
+        ) ?? $value;
         // Authorization: Bearer <…>
-        $value = preg_replace('/(Authorization:\s*Bearer\s+)[^\s"\']+/i', '$1' . self::MASK, $value) ?? $value;
+        $value = preg_replace('/(Authorization:\s*Bearer\s+)[^\s"\']+/i', '$1'.self::MASK, $value) ?? $value;
 
         return $value;
     }
