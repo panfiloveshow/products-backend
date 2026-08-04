@@ -2605,6 +2605,9 @@ class UnitEconomicsCacheController extends Controller
             if ($returnBase <= 0) {
                 $returnBase = $deliveryCost;
             }
+            // Обработка возврата — часть его стоимости, как в калькуляторе
+            // (returnLogistics + returnProcessing) × доля.
+            $returnBase += (float) $cache->return_processing_cost;
 
             // Доля «не доехавших» (отмены + невыкупы) — из % выкупа.
             $returnFraction = 0.0;
