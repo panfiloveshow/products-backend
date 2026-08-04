@@ -45,6 +45,9 @@ class OzonUnitEconomicsCalculatorTest extends TestCase
             'width' => 10,
             'height' => 10,
             'route_key' => 'cluster_far',
+            // Наценка отменена Ozon с 09.07.2026 — механика проверяется на дате,
+            // когда она действовала (исторический заказ / активная фиксация).
+            'order_date' => '2026-06-20',
         ]);
 
         $result = $calculator->calculate($input)->toArray();
@@ -100,6 +103,7 @@ class OzonUnitEconomicsCalculatorTest extends TestCase
             'sales_7_days' => 80,
             'route_key' => 'cluster_regional',
             'route_label' => 'Казань',
+            'order_date' => '2026-06-20',
             'stock_profile' => [
                 ['cluster_name' => 'Казань', 'share_percent' => 100],
             ],
@@ -130,6 +134,7 @@ class OzonUnitEconomicsCalculatorTest extends TestCase
             'height' => 8,
             'sales_7_days' => 80,
             'tariff_effective_from' => '2026-06-16',
+            'order_date' => '2026-06-20',
             'stock_profile' => [
                 ['cluster_name' => 'Казань', 'share_percent' => 100],
             ],
@@ -446,6 +451,7 @@ class OzonUnitEconomicsCalculatorTest extends TestCase
             'fixation_applied' => true,
             'tariff_version_used' => '2026-04-06',
             'markup_version_used' => '2026-04-06',
+            'order_date' => '2026-06-20',
             'stock_profile' => [
                 ['cluster_name' => 'Москва, МО и Дальние регионы', 'share_percent' => 95],
                 ['cluster_name' => 'Санкт-Петербург и СЗО', 'share_percent' => 5],
@@ -481,6 +487,7 @@ class OzonUnitEconomicsCalculatorTest extends TestCase
             'width' => 5,
             'height' => 8,
             'sales_7_days' => 80,
+            'order_date' => '2026-06-20',
             'stock_profile' => [
                 ['cluster_name' => 'Казань', 'share_percent' => 60],
                 ['cluster_name' => 'Москва, МО и Дальние регионы', 'share_percent' => 40],
@@ -540,6 +547,456 @@ class OzonUnitEconomicsCalculatorTest extends TestCase
         $this->assertSame(true, $result['is_local_sale']);
         $this->assertSame(0.0, $result['non_local_markup_percent']);
         $this->assertSame($result['base_logistics'], $result['costs']['logistics']);
+    }
+
+    public function test_unknown_seller_sales_do_not_enable_non_local_markup(): void
+    {
+        $calculator = new OzonUnitEconomicsCalculator();
+        $input = CalculationInput::fromArray([
+            'sku' => 'sku-unknown-sales',
+            'integration_id' => 1,
+            'marketplace' => 'ozon',
+            'fulfillment_type' => 'FBO',
+            'price' => 500,
+            'cost_price' => 200,
+            'length' => 5,
+            'width' => 5,
+            'height' => 8,
+            // sales_7_days неизвестен: порог Ozon (50+ заказов) не подтверждён,
+            // значит наценку не применяем — иначе один артикул показывал бы
+            // разные проценты у SKU с данными и без.
+            'order_date' => '2026-06-20',
+            'stock_profile' => [
+                ['cluster_name' => 'Казань', 'share_percent' => 100],
+            ],
+            'clusters_summary' => [
+                ['cluster_id' => '154', 'cluster_name' => 'Москва, МО и Дальние регионы', 'orders_percent' => 100],
+            ],
+        ]);
+
+        $result = $calculator->calculate($input)->toArray();
+
+        $this->assertSame(false, $result['is_local_sale']);
+        $this->assertSame(0.0, $result['non_local_markup_percent']);
+    }
+
+    public function test_non_local_markup_is_not_applied_after_ozon_cancelled_it(): void
+    {
+        $calculator = new OzonUnitEconomicsCalculator();
+        $input = CalculationInput::fromArray([
+            'sku' => 'sku-markup-cancelled',
+            'integration_id' => 1,
+            'marketplace' => 'ozon',
+            'fulfillment_type' => 'FBO',
+            'price' => 1000,
+            'cost_price' => 300,
+            'length' => 10,
+            'width' => 10,
+            'height' => 10,
+            'route_key' => 'cluster_far',
+            'order_date' => '2026-07-09',
+        ]);
+
+        $result = $calculator->calculate($input)->toArray();
+
+        $this->assertSame(0.0, $result['non_local_markup_percent']);
+        $this->assertSame(0.0, $result['non_local_markup_amount']);
+        $this->assertSame($result['base_logistics'], $result['costs']['logistics']);
+    }
+
+    public function test_stale_tariff_effective_from_does_not_revive_cancelled_markup(): void
+    {
+        $calculator = new OzonUnitEconomicsCalculator();
+        $input = CalculationInput::fromArray([
+            'sku' => 'sku-stale-effective-from',
+            'integration_id' => 1,
+            'marketplace' => 'ozon',
+            'fulfillment_type' => 'FBO',
+            'price' => 500,
+            'cost_price' => 200,
+            'length' => 5,
+            'width' => 5,
+            'height' => 8,
+            'sales_7_days' => 80,
+            // Дата из старого кэша: раньше по ней считались уже отменённые правила.
+            'tariff_effective_from' => '2026-06-16',
+            'stock_profile' => [
+                ['cluster_name' => 'Казань', 'share_percent' => 100],
+            ],
+            'clusters_summary' => [
+                ['cluster_id' => '154', 'cluster_name' => 'Москва, МО и Дальние регионы', 'orders_percent' => 100],
+            ],
+        ]);
+
+        $result = $calculator->calculate($input)->toArray();
+
+        $this->assertSame(0.0, $result['non_local_markup_percent']);
+        $this->assertSame(0.0, $result['weighted_non_local_markup_percent']);
+    }
+
+    public function test_active_supply_fixation_keeps_markup_rules_of_its_base_date(): void
+    {
+        $calculator = new OzonUnitEconomicsCalculator();
+        $base = [
+            'sku' => 'sku-fixation',
+            'integration_id' => 1,
+            'marketplace' => 'ozon',
+            'fulfillment_type' => 'FBO',
+            'price' => 500,
+            'cost_price' => 200,
+            'length' => 5,
+            'width' => 5,
+            'height' => 8,
+            'sales_7_days' => 80,
+            'fixation_applied' => true,
+            'fixation_base_date' => '2026-06-20',
+            'stock_profile' => [
+                ['cluster_name' => 'Казань', 'share_percent' => 100],
+            ],
+            'clusters_summary' => [
+                ['cluster_id' => '154', 'cluster_name' => 'Москва, МО и Дальние регионы', 'orders_percent' => 100],
+            ],
+        ];
+
+        $active = $calculator->calculate(CalculationInput::fromArray(
+            $base + ['fixed_until' => date('Y-m-d', strtotime('+10 days'))]
+        ))->toArray();
+        $expired = $calculator->calculate(CalculationInput::fromArray(
+            $base + ['fixed_until' => date('Y-m-d', strtotime('-1 day'))]
+        ))->toArray();
+
+        $this->assertSame(8.0, $active['non_local_markup_percent']);
+        $this->assertSame(0.0, $expired['non_local_markup_percent']);
+    }
+
+    public function test_local_fbo_sale_gets_commission_discount(): void
+    {
+        $calculator = new OzonUnitEconomicsCalculator();
+        $input = CalculationInput::fromArray([
+            'sku' => 'sku-locality-discount',
+            'integration_id' => 1,
+            'marketplace' => 'ozon',
+            'fulfillment_type' => 'FBO',
+            'price' => 500,
+            'cost_price' => 200,
+            'length' => 5,
+            'width' => 5,
+            'height' => 8,
+            'sales_7_days' => 80,
+            'order_date' => '2026-08-30',
+            'stock_profile' => [
+                ['cluster_name' => 'Казань', 'share_percent' => 100],
+            ],
+            'clusters_summary' => [[
+                'cluster_id' => 'kazan',
+                'cluster_name' => 'Казань',
+                'orders_percent' => 100,
+                'is_local_cluster' => true,
+            ]],
+        ]);
+
+        $result = $calculator->calculate($input)->toArray();
+
+        $this->assertSame(true, $result['is_local_sale']);
+        $this->assertSame(3.0, $result['locality_commission_discount_pp']);
+        $this->assertSame(15.0, $result['locality_commission_discount_amount']);
+        $this->assertSame(
+            round($result['commission_rate_base'] - 3.0, 2),
+            $result['commission_percent']
+        );
+    }
+
+    public function test_no_locality_commission_discount_before_august_30(): void
+    {
+        $calculator = new OzonUnitEconomicsCalculator();
+        $input = CalculationInput::fromArray([
+            'sku' => 'sku-locality-before-start',
+            'integration_id' => 1,
+            'marketplace' => 'ozon',
+            'fulfillment_type' => 'FBO',
+            'price' => 500,
+            'cost_price' => 200,
+            'length' => 5,
+            'width' => 5,
+            'height' => 8,
+            'sales_7_days' => 80,
+            // Повышение комиссий и скидку 6 п.п. с 31.07 Ozon отменил 27.07.
+            'order_date' => '2026-08-29',
+            'stock_profile' => [
+                ['cluster_name' => 'Казань', 'share_percent' => 100],
+            ],
+            'clusters_summary' => [[
+                'cluster_id' => 'kazan',
+                'cluster_name' => 'Казань',
+                'orders_percent' => 100,
+                'is_local_cluster' => true,
+            ]],
+        ]);
+
+        $result = $calculator->calculate($input)->toArray();
+
+        $this->assertSame(true, $result['is_local_sale']);
+        $this->assertSame(0.0, $result['locality_commission_discount_pp']);
+        $this->assertSame($result['commission_rate_base'], $result['commission_percent']);
+    }
+
+    public function test_factual_commission_rate_is_not_discounted_twice(): void
+    {
+        $calculator = new OzonUnitEconomicsCalculator();
+        $base = [
+            'sku' => 'sku-factual-commission',
+            'integration_id' => 1,
+            'marketplace' => 'ozon',
+            'fulfillment_type' => 'FBO',
+            'price' => 500,
+            'cost_price' => 200,
+            'length' => 5,
+            'width' => 5,
+            'height' => 8,
+            'sales_7_days' => 80,
+            'order_date' => '2026-08-30',
+            // Ставка посчитана из отчёта о реализации — скидка Ozon уже внутри.
+            'commission_rate' => 7.0,
+            'stock_profile' => [
+                ['cluster_name' => 'Казань', 'share_percent' => 100],
+            ],
+            'clusters_summary' => [[
+                'cluster_id' => 'kazan',
+                'cluster_name' => 'Казань',
+                'orders_percent' => 100,
+                'is_local_cluster' => true,
+            ]],
+        ];
+
+        $factual = $calculator->calculate(CalculationInput::fromArray(
+            $base + ['commission_rate_is_effective' => true]
+        ))->toArray();
+        $tariff = $calculator->calculate(CalculationInput::fromArray($base))->toArray();
+
+        $this->assertSame(0.0, $factual['locality_commission_discount_pp']);
+        $this->assertSame(7.0, $factual['commission_percent']);
+
+        // Та же ставка, но заявленная как тарифная, скидку получает.
+        $this->assertSame(3.0, $tariff['locality_commission_discount_pp']);
+        $this->assertSame(4.0, $tariff['commission_percent']);
+    }
+
+    public function test_seller_below_fifty_units_gets_discount_on_non_local_orders_too(): void
+    {
+        $calculator = new OzonUnitEconomicsCalculator();
+        $base = [
+            'sku' => 'sku-low-volume',
+            'integration_id' => 1,
+            'marketplace' => 'ozon',
+            'fulfillment_type' => 'FBO',
+            'price' => 500,
+            'cost_price' => 200,
+            'length' => 5,
+            'width' => 5,
+            'height' => 8,
+            'order_date' => '2026-08-30',
+            'stock_profile' => [
+                ['cluster_name' => 'Казань', 'share_percent' => 100],
+            ],
+            'clusters_summary' => [[
+                'cluster_id' => 'kazan-far',
+                'cluster_name' => 'Новосибирск',
+                'orders_percent' => 100,
+                'is_local_cluster' => false,
+            ]],
+        ];
+
+        // Меньше 50 единиц за 7 дней — Ozon даёт скидку и на нелокальные заказы.
+        $lowVolume = $calculator->calculate(CalculationInput::fromArray($base + ['sales_7_days' => 10]))->toArray();
+        // Порог пройден — скидка только за локальность, а заказы нелокальные.
+        $highVolume = $calculator->calculate(CalculationInput::fromArray($base + ['sales_7_days' => 80]))->toArray();
+
+        $this->assertSame(3.0, $lowVolume['locality_commission_discount_pp']);
+        $this->assertSame(0.0, $highVolume['locality_commission_discount_pp']);
+    }
+
+    public function test_exposes_upcoming_commission_rate_from_official_table(): void
+    {
+        $calculator = new OzonUnitEconomicsCalculator();
+        $input = CalculationInput::fromArray([
+            'sku' => 'sku-upcoming-commission',
+            'integration_id' => 1,
+            'marketplace' => 'ozon',
+            'fulfillment_type' => 'FBO',
+            'price' => 1500,
+            'cost_price' => 200,
+            'length' => 5,
+            'width' => 5,
+            'height' => 8,
+            'category_id' => 'Автозвук',
+            'commission_rate' => 12.0,
+            'order_date' => '2026-08-01',
+        ]);
+
+        $result = $calculator->calculate($input)->toArray();
+
+        // Сегодняшняя ставка — из интеграции, будущая — из таблицы с 28.08.
+        $this->assertSame(12.0, $result['commission_percent']);
+        $this->assertSame(50.0, $result['commission_rate_from_2026_08_28']);
+    }
+
+    public function test_locality_commission_discount_is_weighted_by_local_orders_share(): void
+    {
+        $calculator = new OzonUnitEconomicsCalculator();
+        $input = CalculationInput::fromArray([
+            'sku' => 'sku-locality-partial',
+            'integration_id' => 1,
+            'marketplace' => 'ozon',
+            'fulfillment_type' => 'FBO',
+            'price' => 500,
+            'cost_price' => 200,
+            'length' => 5,
+            'width' => 5,
+            'height' => 8,
+            'sales_7_days' => 80,
+            'order_date' => '2026-08-30',
+            'stock_profile' => [
+                ['cluster_name' => 'Казань', 'share_percent' => 100],
+            ],
+            'clusters_summary' => [
+                [
+                    'cluster_id' => 'kazan',
+                    'cluster_name' => 'Казань',
+                    'orders_percent' => 50,
+                    'is_local_cluster' => true,
+                ],
+                [
+                    'cluster_id' => '154',
+                    'cluster_name' => 'Москва, МО и Дальние регионы',
+                    'orders_percent' => 50,
+                    'is_local_cluster' => false,
+                ],
+            ],
+        ]);
+
+        $result = $calculator->calculate($input)->toArray();
+
+        $this->assertSame(50.0, $result['expected_locality_rate']);
+        // Скидку получают только локальные заказы: 3 п.п. × 50% = 1.5 п.п.
+        $this->assertSame(1.5, $result['locality_commission_discount_pp']);
+    }
+
+    public function test_excluded_clusters_get_no_locality_discount(): void
+    {
+        $calculator = new OzonUnitEconomicsCalculator();
+        $base = [
+            'integration_id' => 1,
+            'marketplace' => 'ozon',
+            'fulfillment_type' => 'FBO',
+            'price' => 500,
+            'cost_price' => 200,
+            'length' => 5,
+            'width' => 5,
+            'height' => 8,
+            'sales_7_days' => 80,
+            'order_date' => '2026-08-30',
+        ];
+        $local = static fn (string $cluster): array => [
+            'stock_profile' => [
+                ['cluster_name' => $cluster, 'share_percent' => 100],
+            ],
+            'clusters_summary' => [[
+                'cluster_id' => $cluster,
+                'cluster_name' => $cluster,
+                'orders_percent' => 100,
+                'is_local_cluster' => true,
+            ]],
+        ];
+
+        $kazan = $calculator->calculate(CalculationInput::fromArray(
+            $base + ['sku' => 'sku-locality-kazan'] + $local('Казань')
+        ))->toArray();
+        $moscow = $calculator->calculate(CalculationInput::fromArray(
+            $base + ['sku' => 'sku-locality-moscow'] + $local('Москва, МО и Дальние регионы')
+        ))->toArray();
+
+        // Ozon: у «Москва, МО и Дальние регионы», «СПб и СЗО» и Беларуси скидка 0%.
+        $this->assertSame(3.0, $kazan['locality_commission_discount_pp']);
+        $this->assertSame(0.0, $moscow['locality_commission_discount_pp']);
+        $this->assertSame($moscow['commission_rate_base'], $moscow['commission_percent']);
+    }
+
+    public function test_fbs_local_sale_has_no_locality_commission_discount(): void
+    {
+        $calculator = new OzonUnitEconomicsCalculator();
+        $input = CalculationInput::fromArray([
+            'sku' => 'sku-locality-fbs',
+            'integration_id' => 1,
+            'marketplace' => 'ozon',
+            'fulfillment_type' => 'FBS',
+            'price' => 500,
+            'cost_price' => 200,
+            'length' => 5,
+            'width' => 5,
+            'height' => 8,
+            'sales_7_days' => 80,
+            'order_date' => '2026-08-01',
+            'stock_profile' => [
+                ['cluster_name' => 'Казань', 'share_percent' => 100],
+            ],
+            'clusters_summary' => [[
+                'cluster_id' => 'kazan',
+                'cluster_name' => 'Казань',
+                'orders_percent' => 100,
+                'is_local_cluster' => true,
+            ]],
+        ]);
+
+        $result = $calculator->calculate($input)->toArray();
+
+        $this->assertSame(0.0, $result['locality_commission_discount_pp']);
+        $this->assertSame($result['commission_rate_base'], $result['commission_percent']);
+    }
+
+    public function test_logistics_metadata_exposes_estimate_reserve_and_basis(): void
+    {
+        $calculator = new OzonUnitEconomicsCalculator();
+
+        $withoutClusters = $calculator->calculate(CalculationInput::fromArray([
+            'sku' => 'sku-universal-estimate',
+            'integration_id' => 1,
+            'marketplace' => 'ozon',
+            'fulfillment_type' => 'FBO',
+            'price' => 500,
+            'cost_price' => 200,
+            'length' => 5,
+            'width' => 5,
+            'height' => 8,
+            'redemption_source' => 'no_sales_28d',
+            'orders_count' => 0,
+        ]))->toArray();
+
+        $withProfile = $calculator->calculate(CalculationInput::fromArray([
+            'sku' => 'sku-weighted-basis',
+            'integration_id' => 1,
+            'marketplace' => 'ozon',
+            'fulfillment_type' => 'FBO',
+            'price' => 500,
+            'cost_price' => 200,
+            'length' => 5,
+            'width' => 5,
+            'height' => 8,
+            'sales_7_days' => 80,
+            'stock_profile' => [
+                ['cluster_name' => 'Казань', 'share_percent' => 100],
+            ],
+            'clusters_summary' => [
+                ['cluster_id' => '154', 'cluster_name' => 'Москва, МО и Дальние регионы', 'orders_percent' => 100],
+            ],
+        ]))->toArray();
+
+        // Кластеры неизвестны — в цифре сидит консервативный запас 50%.
+        $this->assertSame('universal_estimate', $withoutClusters['logistics_basis']);
+        $this->assertSame(50.0, $withoutClusters['logistics_estimate_markup_percent']);
+
+        // Есть профиль спроса — это средневзвешенная по кластерам, а не тариф маршрута.
+        $this->assertSame('weighted_clusters', $withProfile['logistics_basis']);
+        $this->assertSame(0.0, $withProfile['logistics_estimate_markup_percent']);
     }
 
     public function test_fbo_uses_volume_weight_for_chargeable_tariff_bucket(): void

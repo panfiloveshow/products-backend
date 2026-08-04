@@ -244,6 +244,7 @@ class UnitEconomicsService
             'volume_weight' => isset($data['volume_weight']) ? (float) $data['volume_weight'] : null,
             'category_id' => $categoryForCommission,
             'commission_rate' => isset($data['commission_percent']) ? (float) $data['commission_percent'] : null,
+            'commission_rate_is_effective' => $data['commission_rate_is_effective'] ?? null,
             'redemption_rate' => isset($data['redemption_rate']) ? (float) $data['redemption_rate'] : null,
             'acquiring_percent' => isset($data['acquiring_percent']) ? (float) $data['acquiring_percent'] : 1.5,
             'storage_cost' => isset($data['storage_cost']) ? (float) $data['storage_cost'] : 0,

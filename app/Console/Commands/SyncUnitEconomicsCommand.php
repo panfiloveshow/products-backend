@@ -2193,6 +2193,8 @@ class SyncUnitEconomicsCommand extends Command
                     // Рассчитываем процент из фактических данных
                     if ($price > 0) {
                         $data['commission_percent'] = round(($actualCosts['avg_commission_per_unit'] / $price) * 100, 2);
+                        // Факт уже включает скидку Ozon за локальность — второй раз не вычитаем.
+                        $data['commission_rate_is_effective'] = true;
                     }
                 } else {
                     // Приоритет: API цен > ozon_data > дефолт
@@ -2941,7 +2943,7 @@ class SyncUnitEconomicsCommand extends Command
                 $clusterName = $cluster['cluster_name'] ?? $clusterMeta['cluster_name'] ?? "Кластер {$clusterId}";
                 $clusterRegion = $cluster['region'] ?? $clusterMeta['region'] ?? null;
                 $route = $pricing->resolveRoute(null, $clusterName);
-                $clusterMarkupPercent = $pricing->resolveDestinationMarkupPercent($clusterName, $pricing->getEffectiveFrom());
+                $clusterMarkupPercent = $pricing->resolveDestinationMarkupPercent($clusterName, now()->toDateString());
                 $effectiveClusterMarkupPercent = (! $markupAllowed || $isLocalCluster) ? 0.0 : $clusterMarkupPercent;
                 $markupReason = ! $markupAllowed
                     ? $markupRuleReason

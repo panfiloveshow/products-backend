@@ -421,11 +421,26 @@ class UnitEconomicsCacheService
             default => 15,
         };
 
-        $commissionPercent = $commissions[$schemeKey]['percent']
+        // Из кэша берём БАЗОВУЮ ставку (до скидки за локальность): в
+        // commission_percent лежит уже эффективная, и повторное применение
+        // скидки на каждом пересчёте занижало бы комиссию.
+        $cachedMarketplaceData = is_array($existingUE?->marketplace_data ?? null)
+            ? $existingUE->marketplace_data
+            : [];
+        $commissionFromApi = $commissions[$schemeKey]['percent']
             ?? $commissions['fbs']['percent']
             ?? $commissions['fbo']['percent']
+            ?? null;
+        $cachedBaseCommission = isset($cachedMarketplaceData['commission_rate_base'])
+            ? (float) $cachedMarketplaceData['commission_rate_base']
+            : null;
+        $commissionPercent = $commissionFromApi
+            ?? $cachedBaseCommission
             ?? $existingUE?->commission_percent
             ?? $defaultCommissionPercent;
+        $commissionRateIsEffective = $commissionFromApi === null
+            && $cachedBaseCommission === null
+            && $existingUE?->commission_percent !== null;
 
         // WB: комиссия из живого снапшота приоритетнее замороженной в wb_data
         // (см. loadWildberriesCommissionBySubject). Так повышение комиссий WB
@@ -438,6 +453,7 @@ class UnitEconomicsCacheService
             );
             if ($snapshotCommission !== null) {
                 $commissionPercent = $snapshotCommission;
+                $commissionRateIsEffective = false;
             }
         }
 
@@ -683,9 +699,12 @@ class UnitEconomicsCacheService
                 // (Select-only, size_restricted) — при них наценка не применяется независимо от продаж.
                 $manualMarkupOverride = (bool) ($settings?->is_select_only || $settings?->is_size_restricted);
                 $isFboScheme = strtoupper($fulfillmentType) === 'FBO';
+                // Неизвестное число заказов продавца — наценку не применяем
+                // (fail-closed, как в SyncUnitEconomicsCommand).
                 $markupAllowed = ! $manualMarkupOverride
                     && $isFboScheme
-                    && ($sales7Days === null || $sales7Days >= 50);
+                    && $sales7Days !== null
+                    && $sales7Days >= 50;
                 $clustersSummary = $this->mergeOzonRealOrdersClustersSummary(
                     $skuLocality['clusters_summary'],
                     $baseClustersSummary,
@@ -967,6 +986,7 @@ class UnitEconomicsCacheService
             'additional_costs' => $uzumReturnCost,
             'category_id' => $product->category ?? 'default',
             'commission_rate' => (float) $commissionPercent,
+            'commission_rate_is_effective' => $commissionRateIsEffective,
             'redemption_rate' => (float) $redemptionRate,
             'redemption_source' => $redemptionSource,
             'redemption_period_days' => $redemptionPeriodDays,
@@ -1640,22 +1660,28 @@ class UnitEconomicsCacheService
                 ? (bool) $cluster['is_local_cluster']
                 : ($canonicalName !== null && in_array($canonicalName, $stockClusterCanonical, true));
             $resolvedRoute = $pricing->resolveRoute(null, is_string($clusterName) ? $clusterName : null);
+            // Правила наценки — на сегодня, а не на дату версии тарифов: версия
+            // может быть объявлена заранее, а отмена наценки действует уже сейчас.
             $nonLocalMarkupPercent = $pricing->resolveDestinationMarkupPercent(
                 is_string($clusterName) ? $clusterName : null,
-                $pricing->getEffectiveFrom()
+                now()->toDateString()
             );
-            if (! $markupAllowed || $isLocalCluster) {
+            // Наценки по действующему тарифу нет (например, Ozon отменил её с
+            // 09.07.2026) — stale-значение из профиля не должно её воскрешать.
+            if (! $markupAllowed || $isLocalCluster || $nonLocalMarkupPercent <= 0.0) {
                 $effectiveMarkupPercent = 0.0;
             } elseif (array_key_exists('effective_markup_percent', $cluster) && $cluster['effective_markup_percent'] !== null) {
                 $effectiveMarkupPercent = (float) $cluster['effective_markup_percent'];
             } else {
                 $effectiveMarkupPercent = $nonLocalMarkupPercent;
             }
-            $markupReason = $cluster['markup_reason']
-                ?? $matched['markup_reason']
-                ?? (! $markupAllowed
-                    ? $markupDisabledReason
-                    : ($isLocalCluster ? 'local_cluster' : ($nonLocalMarkupPercent > 0 ? 'non_local_markup_applied' : 'no_markup_for_cluster')));
+            $markupReason = ($markupAllowed && ! $isLocalCluster && $effectiveMarkupPercent <= 0.0)
+                ? 'no_markup_for_cluster'
+                : ($cluster['markup_reason']
+                    ?? $matched['markup_reason']
+                    ?? (! $markupAllowed
+                        ? $markupDisabledReason
+                        : ($isLocalCluster ? 'local_cluster' : 'non_local_markup_applied')));
 
             return [
                 'cluster_id' => $cluster['cluster_id'] ?? $matched['cluster_id'] ?? null,
