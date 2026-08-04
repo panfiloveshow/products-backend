@@ -2,6 +2,8 @@
 
 namespace App\Domains\Locality\Presentation;
 
+use App\Domains\Ozon\Tariffs\OzonPricingMatrix;
+
 /**
  * Собирает человекочитаемое объяснение «почему при высокой локальности есть
  * нелокальная наценка» по РЕАЛЬНЫМ цифрам конкретного SKU.
@@ -16,6 +18,11 @@ namespace App\Domains\Locality\Presentation;
  */
 class SkuLocalityExplanationBuilder
 {
+    public function __construct(
+        private readonly OzonPricingMatrix $pricing = new OzonPricingMatrix(),
+    ) {
+    }
+
     /**
      * @return array{
      *   short:string,
@@ -26,7 +33,8 @@ class SkuLocalityExplanationBuilder
      *     non_local_share_percent:float,
      *     gross_markup_percent:float,
      *     effective_markup_percent:float,
-     *     overpayment_rub:float
+     *     overpayment_rub:float,
+     *     markup_active:bool
      *   }
      * }
      */
@@ -45,12 +53,18 @@ class SkuLocalityExplanationBuilder
             ? round(($overpaymentRub / $revenueRub) * 100, 2)
             : 0.0;
 
+        // Ozon отменил нелокальную наценку с 09.07.2026: цифры остаются верными
+        // для прошлых заказов, но в текущую цену уже не идут — иначе экран
+        // предлагает управлять расходом, которого больше нет.
+        $markupActive = $this->pricing->isNonLocalMarkupActive();
+
         $figures = [
             'local_share_percent' => $localSharePercent,
             'non_local_share_percent' => $nonLocalShare,
             'gross_markup_percent' => round($grossMarkupPercent, 2),
             'effective_markup_percent' => $effective,
             'overpayment_rub' => round($overpaymentRub, 2),
+            'markup_active' => $markupActive,
         ];
 
         // Нет заказов, учитываемых в локальности.
@@ -97,13 +111,23 @@ class SkuLocalityExplanationBuilder
         $short = "Локальность {$localStr}: наценка Ozon ~{$grossStr} начисляется только на {$nlStr} "
             . "нелокальных заказов → эффективно {$effStr} от выручки ({$rubStr}).";
 
+        $effectiveTail = $markupActive
+            ? 'Именно эта величина ложится в логистику единицы и юнит-экономику.'
+            : 'В юнит-экономику она больше не идёт.';
+
         $full = "Высокая локальность и большая ставка наценки не противоречат друг другу — это про разное.\n\n"
             . "• Локальность {$localStr} — доля заказов, отгруженных из кластера назначения.\n"
             . "• Наценка ~{$grossStr} — средняя ставка Ozon по кластерам, куда уезжают нелокальные заказы "
             . "(по таблице 8–12%). Берётся только с {$nlStr} нелокальных заказов, а не со всей выручки.\n"
             . "• Эффективно {$effStr} — та же наценка, размазанная по всей выручке SKU "
-            . "(≈ {$grossStr} × {$nlStr}). Именно эта величина ложится в логистику единицы и юнит-экономику.\n"
+            . "(≈ {$grossStr} × {$nlStr}). {$effectiveTail}\n"
             . "• Переплата за логистику за период — {$rubStr}.";
+
+        if (! $markupActive) {
+            $short .= ' Историческая: Ozon отменил нелокальную наценку с 09.07.2026.';
+            $full .= "\n\nИсторические данные: с 09.07.2026 Ozon наценку за нелокальность не берёт. "
+                . 'Локальность теперь влияет на цену иначе — через скидку на комиссию для локальных заказов.';
+        }
 
         $breakdown = [
             [
@@ -118,8 +142,10 @@ class SkuLocalityExplanationBuilder
             ],
             [
                 'value' => $effStr,
-                'label' => 'Эффективно от выручки SKU — идёт в юнит-экономику единицы',
-                'scope' => 'расчёт цены',
+                'label' => $markupActive
+                    ? 'Эффективно от выручки SKU — идёт в юнит-экономику единицы'
+                    : 'Эффективно от выручки SKU — в юнит-экономику больше не идёт',
+                'scope' => $markupActive ? 'расчёт цены' : 'история',
             ],
             [
                 'value' => $rubStr,
