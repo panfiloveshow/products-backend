@@ -383,15 +383,16 @@ class OzonPricingMatrix
             return null;
         }
 
-        $key = $this->normalizeCommissionKey($category);
-        if ($key === '') {
-            return null;
+        $index = null;
+        foreach ($this->commissionCandidates($category) as $key) {
+            $index = $this->commissionTable['by_type'][$key]
+                ?? $this->commissionTable['by_category'][$key]
+                ?? $this->commissionTable['by_main_category'][$key]
+                ?? null;
+            if ($index !== null) {
+                break;
+            }
         }
-
-        $index = $this->commissionTable['by_type'][$key]
-            ?? $this->commissionTable['by_category'][$key]
-            ?? $this->commissionTable['by_main_category'][$key]
-            ?? null;
         if ($index === null) {
             return null;
         }
@@ -413,6 +414,40 @@ class OzonPricingMatrix
         };
 
         return isset($rates[$tier]) ? (float) $rates[$tier] : null;
+    }
+
+    /**
+     * Варианты названия для поиска в таблице вознаграждений.
+     *
+     * Товар хранит категорию как «Основная категория > Категория»
+     * (например «Галантерея и аксессуары > Аксессуары»), поэтому пробуем сперва
+     * самую конкретную часть, затем более общие и строку целиком.
+     *
+     * @return list<string>
+     */
+    private function commissionCandidates(?string $category): array
+    {
+        $raw = trim((string) $category);
+        if ($raw === '') {
+            return [];
+        }
+
+        $candidates = [];
+        if (str_contains($raw, '>')) {
+            foreach (array_reverse(explode('>', $raw)) as $part) {
+                $key = $this->normalizeCommissionKey($part);
+                if ($key !== '') {
+                    $candidates[] = $key;
+                }
+            }
+        }
+
+        $whole = $this->normalizeCommissionKey($raw);
+        if ($whole !== '') {
+            $candidates[] = $whole;
+        }
+
+        return array_values(array_unique($candidates));
     }
 
     private function normalizeCommissionKey(?string $value): string

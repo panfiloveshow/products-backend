@@ -146,6 +146,13 @@ class OzonPricingMatrixTest extends TestCase
         $this->assertSame(20.0, $matrix->resolveCommissionFromOfficialTable('FBS', '  автозвук  ', 90));
         $this->assertNull($matrix->resolveCommissionFromOfficialTable('FBO', 'Такой категории нет', 500));
 
+        // Товар хранит категорию как «Основная категория > Категория» —
+        // берём самую конкретную часть, а не строку целиком.
+        $this->assertSame(55.0, $matrix->resolveCommissionFromOfficialTable('FBO', 'Галантерея и аксессуары > Аксессуары', 1500));
+        $this->assertSame(50.0, $matrix->resolveCommissionFromOfficialTable('FBO', 'Автотовары > Запчасти для легковых автомобилей', 1500));
+        // Если конкретная часть незнакома, откатываемся на основную категорию.
+        $this->assertSame(55.0, $matrix->resolveCommissionFromOfficialTable('FBO', 'Галантерея и аксессуары > Неизвестный тип', 1500));
+
         // До 28.08 расчёт остаётся на прежних ставках, с 28.08 — по таблице.
         $before = $matrix->resolveCommission('FBO', 'Автозвук', 1500, '2026-08-27');
         $after = $matrix->resolveCommission('FBO', 'Автозвук', 1500, '2026-08-28');
