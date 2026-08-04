@@ -4,6 +4,7 @@ namespace App\Http\Controllers\Api;
 
 use App\Domains\Ozon\Tariffs\OzonPricingMatrix;
 use App\Domains\Ozon\Tariffs\OzonRfbsTariffMatrix;
+use App\Domains\Ozon\UnitEconomics\OzonUnitEconomicsCalculator;
 use App\Domains\UnitEconomics\DTO\CalculationInput;
 use App\Domains\UnitEconomics\UnitEconomicsOrchestrator;
 use App\Http\Controllers\Controller;
@@ -2604,6 +2605,9 @@ class UnitEconomicsCacheController extends Controller
             if ($returnBase <= 0) {
                 $returnBase = $deliveryCost;
             }
+            // Обработка возврата — часть его стоимости, как в калькуляторе
+            // (returnLogistics + returnProcessing) × доля.
+            $returnBase += (float) $cache->return_processing_cost;
 
             // Доля «не доехавших» (отмены + невыкупы) — из % выкупа.
             $returnFraction = 0.0;
@@ -2620,8 +2624,12 @@ class UnitEconomicsCacheController extends Controller
                 $ordersForReturns = (int) ($cache->orders_count ?? 0);
                 $returnsForReturns = (int) ($cache->returns_count ?? 0);
                 if ($ordersForReturns > 0 && $returnsForReturns > 0) {
-                    $returnFraction = min(1.0, $returnFraction + ($returnsForReturns / $ordersForReturns));
+                    $returnFraction += $returnsForReturns / $ordersForReturns;
                 }
+                // Потери — на единицу выкупа, а не на заказ (как в калькуляторе).
+                $returnFraction = OzonUnitEconomicsCalculator::returnFractionPerSoldUnit($returnFraction);
+            } else {
+                $returnFraction = min(1.0, $returnFraction);
             }
 
             if ($returnFraction > 0) {

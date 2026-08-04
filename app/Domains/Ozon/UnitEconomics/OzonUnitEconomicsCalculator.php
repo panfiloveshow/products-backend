@@ -160,7 +160,8 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
         // Не доехавшие (100 − % выкупа) + пост-доставочные возвраты (/v1/returns/*),
         // которые постинги не видят. Без второго слагаемого при выкупе 100% возвраты терялись.
         $returnRate = $input->redemptionRate !== null ? max(0.0, (100 - $input->redemptionRate) / 100) : 0.0;
-        $returnRate = min(1.0, $returnRate + $this->postDeliveryReturnsFraction($input));
+        // На единицу выкупа, а не на заказ — см. returnFractionPerSoldUnit().
+        $returnRate = self::returnFractionPerSoldUnit($returnRate + $this->postDeliveryReturnsFraction($input));
         $expectedReturnCost = $ownReturnCost * $returnRate;
 
         return $this->buildResult(
@@ -223,7 +224,8 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
         // Не доехавшие (100 − % выкупа) + пост-доставочные возвраты (/v1/returns/*),
         // которые постинги не видят. Без второго слагаемого при выкупе 100% возвраты терялись.
         $returnRate = $input->redemptionRate !== null ? max(0.0, (100 - $input->redemptionRate) / 100) : 0.0;
-        $returnRate = min(1.0, $returnRate + $this->postDeliveryReturnsFraction($input));
+        // На единицу выкупа, а не на заказ — см. returnFractionPerSoldUnit().
+        $returnRate = self::returnFractionPerSoldUnit($returnRate + $this->postDeliveryReturnsFraction($input));
         $expectedReturnCost = $ownReturnCost * $returnRate;
 
         return $this->buildResult(
@@ -495,7 +497,7 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
 
         $returnsFraction = $this->postDeliveryReturnsFraction($input);
 
-        $totalReturnFraction = min(1.0, $nonRedeemedFraction + $returnsFraction);
+        $totalReturnFraction = self::returnFractionPerSoldUnit($nonRedeemedFraction + $returnsFraction);
 
         if ($totalReturnFraction <= 0.0) {
             return [
@@ -510,6 +512,31 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
             'logistics' => $returnLogistics,
             'processing' => $returnProcessing,
         ];
+    }
+
+    /**
+     * Перевести долю потерянных ЗАКАЗОВ в расход на одну ПРОДАННУЮ единицу.
+     *
+     * Карточка юнит-экономики считается на единицу выкупа: выручка — полная цена
+     * одной проданной штуки, комиссия/эквайринг тоже от неё. Значит и обратную
+     * логистику надо раскидывать на проданные, а не на все заказы. При выкупе 70%
+     * на каждую проданную приходится 0.3 / 0.7 = 0.43 невыкупа, а не 0.3 —
+     * старая формула занижала расход ровно в 1/выкуп раз.
+     */
+    public static function returnFractionPerSoldUnit(float $lostFraction): float
+    {
+        $lostFraction = max(0.0, $lostFraction);
+        $soldFraction = 1.0 - $lostFraction;
+
+        // Продаж нет вообще (no_sales_28d ⇒ выкуп 0%) — худший сценарий 100%,
+        // как было до перевода на единицу выкупа.
+        if ($soldFraction <= 0.0) {
+            return 1.0;
+        }
+
+        // ponytail: кап 3 возврата на продажу (= выкуп 25%). Ниже этого SKU
+        // убыточен при любой цене, точность там уже ничего не решает.
+        return min(3.0, $lostFraction / $soldFraction);
     }
 
     /**

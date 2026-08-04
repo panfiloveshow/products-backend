@@ -330,8 +330,9 @@ class OzonUnitEconomicsCalculatorTest extends TestCase
 
         $result = $calculator->calculate($input)->toArray();
 
-        // 2 возврата из 10 заказов → доля 0.2 → (return_logistics + return_processing) * 0.2.
-        $expected = round(($result['return_logistics'] + $result['return_processing']) * 0.2, 2);
+        // 2 возврата из 10 заказов → потеряно 0.2, продано 0.8 → на единицу
+        // выкупа приходится 0.2 / 0.8 = 0.25 возврата.
+        $expected = round(($result['return_logistics'] + $result['return_processing']) * 0.25, 2);
         $this->assertGreaterThan(0.0, $result['expected_return_cost']);
         $this->assertSame($expected, $result['expected_return_cost']);
         $this->assertSame(
@@ -343,7 +344,7 @@ class OzonUnitEconomicsCalculatorTest extends TestCase
     public function test_partial_buyout_and_real_returns_are_summed(): void
     {
         // 80% выкупа (20% не доехало) + 1 пост-доставочный возврат из 10 заказов (10%)
-        // → суммарная доля возвратной логистики 0.3.
+        // → потеряно 0.3 заказов, продано 0.7 → 0.3 / 0.7 на единицу выкупа.
         $calculator = new OzonUnitEconomicsCalculator();
         $input = CalculationInput::fromArray([
             'sku' => 'sku-partial-and-returns',
@@ -365,8 +366,22 @@ class OzonUnitEconomicsCalculatorTest extends TestCase
 
         $result = $calculator->calculate($input)->toArray();
 
-        $expected = round(($result['return_logistics'] + $result['return_processing']) * 0.3, 2);
+        $expected = round(($result['return_logistics'] + $result['return_processing']) * (0.3 / 0.7), 2);
         $this->assertSame($expected, $result['expected_return_cost']);
+    }
+
+    public function test_return_fraction_is_per_sold_unit_not_per_order(): void
+    {
+        // Выручка в карточке — цена одной проданной штуки, поэтому потери
+        // делятся на проданные заказы, а не на все.
+        $this->assertSame(0.0, OzonUnitEconomicsCalculator::returnFractionPerSoldUnit(0.0));
+        $this->assertEqualsWithDelta(0.1765, OzonUnitEconomicsCalculator::returnFractionPerSoldUnit(0.15), 0.0001);
+        $this->assertEqualsWithDelta(0.4286, OzonUnitEconomicsCalculator::returnFractionPerSoldUnit(0.30), 0.0001);
+        $this->assertSame(1.0, OzonUnitEconomicsCalculator::returnFractionPerSoldUnit(0.50));
+        // Кап 3 возврата на продажу (выкуп 25%) и ниже.
+        $this->assertSame(3.0, OzonUnitEconomicsCalculator::returnFractionPerSoldUnit(0.80));
+        // Продаж нет вообще — худший сценарий 100%, как до перевода на единицу выкупа.
+        $this->assertSame(1.0, OzonUnitEconomicsCalculator::returnFractionPerSoldUnit(1.0));
     }
 
     public function test_cancelled_only_fbo_orders_do_not_apply_non_local_markup(): void
