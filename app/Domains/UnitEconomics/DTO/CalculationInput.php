@@ -33,6 +33,9 @@ class CalculationInput
         // Категория для комиссии
         public readonly ?string $categoryId = null,
         public readonly ?float $commissionRate = null,  // Если известна заранее
+        // true — ставка уже итоговая (посчитана из факта реализации и включает
+        // скидку Ozon за локальность). Тогда скидку повторно не вычитаем.
+        public readonly ?bool $commissionRateIsEffective = null,
         
         // Доп. параметры
         public readonly ?string $warehouseId = null,
@@ -166,6 +169,9 @@ class CalculationInput
             additionalCosts: isset($data['additional_costs']) ? (float) $data['additional_costs'] : null,
             categoryId: $data['category_id'] ?? null,
             commissionRate: isset($data['commission_rate']) ? (float) $data['commission_rate'] : null,
+            commissionRateIsEffective: isset($data['commission_rate_is_effective'])
+                ? (bool) $data['commission_rate_is_effective']
+                : null,
             warehouseId: $data['warehouse_id'] ?? null,
             redemptionRate: isset($data['redemption_rate']) ? (float) $data['redemption_rate'] : null,
             deliveryCoefficient: isset($data['delivery_coefficient']) ? (float) $data['delivery_coefficient'] : null,

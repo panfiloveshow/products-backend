@@ -48,14 +48,26 @@ class OverpaymentCalculatorTest extends TestCase
     {
         $result = $this->calc->compute([
             // Москва доставка — по таблице Ozon 8%
-            ['sale_price' => 1000, 'shipping_cluster_name' => 'Санкт-Петербург', 'destination_cluster_name' => 'Москва'],
+            ['sale_price' => 1000, 'shipping_cluster_name' => 'Санкт-Петербург', 'destination_cluster_name' => 'Москва', 'order_date' => '2026-06-20'],
             // Москва доставка — 8% от 2000 = 160
-            ['sale_price' => 2000, 'shipping_cluster_name' => 'Санкт-Петербург', 'destination_cluster_name' => 'Москва'],
+            ['sale_price' => 2000, 'shipping_cluster_name' => 'Санкт-Петербург', 'destination_cluster_name' => 'Москва', 'order_date' => '2026-06-20'],
         ]);
         // 8% × (1000 + 2000) = 240 (точное значение зависит от matrix config;
         // тест валидирует, что non_local_orders=2 и потенциал > 0)
         $this->assertSame(2, $result['non_local_orders']);
         $this->assertGreaterThan(0.0, $result['potential']);
+    }
+
+    public function test_orders_after_markup_cancellation_have_no_potential_overpayment(): void
+    {
+        $result = $this->calc->compute([
+            ['sale_price' => 1000, 'shipping_cluster_name' => 'Санкт-Петербург', 'destination_cluster_name' => 'Москва', 'order_date' => '2026-07-09'],
+        ]);
+
+        // Наценку за нелокальность Ozon отменил — переплачивать больше нечем,
+        // но нелокальный заказ по-прежнему считается для доли локальности.
+        $this->assertSame(1, $result['non_local_orders']);
+        $this->assertSame(0.0, $result['potential']);
     }
 
     public function test_actual_overpayment_still_counted_when_markup_applied(): void
@@ -65,6 +77,7 @@ class OverpaymentCalculatorTest extends TestCase
                 'sale_price' => 1000,
                 'shipping_cluster_name' => 'Санкт-Петербург',
                 'destination_cluster_name' => 'Москва',
+                'order_date' => '2026-06-20',
                 'markup_applied' => true,
                 'non_local_markup_amount' => 80,
             ],

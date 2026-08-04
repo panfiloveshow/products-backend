@@ -80,7 +80,12 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
             dominantClusterShare: $context['dominant_cluster_share'],
             expectedLocalityRate: $context['expected_locality_rate'],
             weightedNonLocalMarkupPercent: $context['weighted_non_local_markup_percent'],
-            clustersSummary: $context['clusters_summary']
+            clustersSummary: $context['clusters_summary'],
+            commissionRateBase: $context['commission_rate_base'],
+            localityCommissionDiscountPp: $context['locality_commission_discount_pp'],
+            logisticsBasis: $context['logistics_basis'],
+            logisticsEstimateMarkupPercent: $context['logistics_estimate_markup_percent'],
+            upcomingCommissionRate: $context['upcoming_commission_rate']
         );
     }
 
@@ -127,7 +132,12 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
             dominantClusterShare: $context['dominant_cluster_share'],
             expectedLocalityRate: $context['expected_locality_rate'],
             weightedNonLocalMarkupPercent: $context['weighted_non_local_markup_percent'],
-            clustersSummary: $context['clusters_summary']
+            clustersSummary: $context['clusters_summary'],
+            commissionRateBase: $context['commission_rate_base'],
+            localityCommissionDiscountPp: $context['locality_commission_discount_pp'],
+            logisticsBasis: $context['logistics_basis'],
+            logisticsEstimateMarkupPercent: $context['logistics_estimate_markup_percent'],
+            upcomingCommissionRate: $context['upcoming_commission_rate']
         );
     }
 
@@ -184,7 +194,12 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
             dominantClusterShare: $context['dominant_cluster_share'],
             expectedLocalityRate: $context['expected_locality_rate'],
             weightedNonLocalMarkupPercent: $context['weighted_non_local_markup_percent'],
-            clustersSummary: $context['clusters_summary']
+            clustersSummary: $context['clusters_summary'],
+            commissionRateBase: $context['commission_rate_base'],
+            localityCommissionDiscountPp: $context['locality_commission_discount_pp'],
+            logisticsBasis: $context['logistics_basis'],
+            logisticsEstimateMarkupPercent: $context['logistics_estimate_markup_percent'],
+            upcomingCommissionRate: $context['upcoming_commission_rate']
         );
     }
 
@@ -242,7 +257,12 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
             dominantClusterShare: $context['dominant_cluster_share'],
             expectedLocalityRate: $context['expected_locality_rate'],
             weightedNonLocalMarkupPercent: $context['weighted_non_local_markup_percent'],
-            clustersSummary: $context['clusters_summary']
+            clustersSummary: $context['clusters_summary'],
+            commissionRateBase: $context['commission_rate_base'],
+            localityCommissionDiscountPp: $context['locality_commission_discount_pp'],
+            logisticsBasis: $context['logistics_basis'],
+            logisticsEstimateMarkupPercent: $context['logistics_estimate_markup_percent'],
+            upcomingCommissionRate: $context['upcoming_commission_rate']
         );
     }
 
@@ -280,7 +300,12 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
         ?float $dominantClusterShare = null,
         ?float $expectedLocalityRate = null,
         ?float $weightedNonLocalMarkupPercent = null,
-        array $clustersSummary = []
+        array $clustersSummary = [],
+        ?float $commissionRateBase = null,
+        float $localityCommissionDiscountPp = 0,
+        ?string $logisticsBasis = null,
+        float $logisticsEstimateMarkupPercent = 0,
+        ?float $upcomingCommissionRate = null
     ): UnitEconomicsResult {
         $price = $input->price;
         
@@ -384,6 +409,22 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
             'non_local_markup_percent' => round($nonLocalMarkupPercent, 2),
             'non_local_markup_amount' => round($input->price * ($nonLocalMarkupPercent / 100), 2),
             'sales_fee_percent' => round((float) ($salesFeePercent ?? $commissionRate), 2),
+            // Комиссия до скидки за локальность и сама скидка (в п.п.) —
+            // без них нельзя показать, почему ставка отличается от тарифа Ozon.
+            'commission_rate_base' => round((float) ($commissionRateBase ?? $commissionRate), 2),
+            'locality_commission_discount_pp' => round($localityCommissionDiscountPp, 2),
+            'locality_commission_discount_amount' => round($input->price * ($localityCommissionDiscountPp / 100), 2),
+            // Ставка из официальной таблицы Ozon с 28.08.2026 (null — категория
+            // товара в таблице не найдена).
+            'commission_rate_from_2026_08_28' => $upcomingCommissionRate !== null
+                ? round($upcomingCommissionRate, 2)
+                : null,
+            // Из чего собрана цифра логистики: 'route_tariff' — тариф маршрута,
+            // 'weighted_clusters' — средневзвешенная по кластерам спроса,
+            // 'universal_estimate' — универсальный тариф с запасом (см. процент ниже),
+            // 'own_delivery' — своя доставка продавца (RFBS/Express).
+            'logistics_basis' => $logisticsBasis,
+            'logistics_estimate_markup_percent' => round($logisticsEstimateMarkupPercent, 2),
             'shipping_cluster_id' => $input->shippingClusterId,
             'shipping_cluster_name' => $input->shippingClusterName,
             'destination_cluster_id' => $input->destinationClusterId,
@@ -545,8 +586,8 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
     {
         $hasNoSales = $input->redemptionSource === 'no_sales_28d'
             || ($input->ordersCount !== null && $input->ordersCount <= 0);
-        $commissionData = $this->pricing->resolveCommission($scheme, $input->categoryId, $input->price);
-        $pricingDate = $input->orderDate ?? $input->tariffEffectiveFrom ?? $this->pricing->getEffectiveFrom();
+        $pricingDate = $this->resolvePricingDate($input);
+        $commissionData = $this->pricing->resolveCommission($scheme, $input->categoryId, $input->price, $pricingDate);
         $hasExactClusters = ! $hasNoSales
             && ($input->shippingClusterName !== null || $input->destinationClusterName !== null);
         $hasLegacyRouteMetadata = ! $hasNoSales
@@ -630,11 +671,54 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
         if ($input->markupApplied === false || ! $this->hasRealizedSaleForMarkup($input)) {
             $nonLocalMarkupPercent = 0.0;
         }
+        // Ozon отменил наценку за нелокальность с 09.07.2026. Значение из кэша,
+        // конфига или входа не должно её воскрешать — гейт по дате расчёта
+        // (для фиксаций и исторических заказов дата своя, см. resolvePricingDate).
+        if (! $this->pricing->isNonLocalMarkupActive($pricingDate)) {
+            $nonLocalMarkupPercent = 0.0;
+            $weightedNonLocalMarkupPercent = 0.0;
+        }
+
+        // Локальность с 31.07.2026 даёт скидку на комиссию, а не на логистику.
+        // Считаем её взвешенно: скидку получают только локальные заказы, и не во
+        // всех кластерах назначения (с 30.08 Москва/СПб/Беларусь исключены).
+        $localityCommissionDiscountPp = $input->commissionRateIsEffective === true
+            // Ставка посчитана из факта реализации — скидка Ozon в ней уже есть.
+            ? 0.0
+            : ($profileMetrics['locality_commission_discount_pp'] ?? null);
+        if ($localityCommissionDiscountPp === null) {
+            $localityCommissionDiscountPp = $isLocalSale === true
+                ? $this->pricing->resolveLocalityCommissionDiscountPp(
+                    $scheme,
+                    $input->destinationClusterName ?? $input->shippingClusterName,
+                    $pricingDate
+                )
+                : 0.0;
+        }
+        $baseCommissionRate = $commissionRate;
+        $commissionRate = max(0.0, $baseCommissionRate - $localityCommissionDiscountPp);
+
+        $usesProfileLogistics = ! $hasNoSales && isset($profileMetrics['base_logistics']);
         $baseLogistics = $hasNoSales
             ? (float) $logisticsData['base_cost']
             : ($profileMetrics['base_logistics']
                 ?? $input->weightedLogisticsCost
                 ?? (float) $logisticsData['base_cost']);
+        // На чём построена цифра логистики — иначе её невозможно сверить с
+        // тарифом Ozon: взвешенная по кластерам ≠ тариф одного маршрута, а в
+        // universal-оценку зашит запас universal_logistics_fallback_markup_percent.
+        $logisticsBasis = match (true) {
+            ! $usesOfficialLogisticsMatrix => 'own_delivery',
+            $usesProfileLogistics => 'weighted_clusters',
+            ! $hasNoSales && $input->weightedLogisticsCost !== null => 'weighted_clusters',
+            (bool) ($clusterLogisticsData['used_universal_tariff'] ?? false) => 'universal_estimate',
+            default => 'route_tariff',
+        };
+        $logisticsEstimateMarkupPercent = match ($logisticsBasis) {
+            'weighted_clusters' => (float) ($profileMetrics['estimate_markup_percent'] ?? 0.0),
+            'universal_estimate' => (float) ($clusterLogisticsData['estimate_markup_percent'] ?? 0.0),
+            default => 0.0,
+        };
         $nonLocalMarkupAmount = $input->price * ($nonLocalMarkupPercent / 100);
         $displayRouteKey = $routeResolutionStatus === 'resolved' ? ($logisticsData['route_key'] ?? null) : null;
         $displayRouteLabel = match ($routeResolutionStatus) {
@@ -646,10 +730,21 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
         return [
             'commission_rate' => $commissionRate,
             'commission' => $input->price * ($commissionRate / 100),
+            'commission_rate_base' => $baseCommissionRate,
+            'locality_commission_discount_pp' => $localityCommissionDiscountPp,
+            // Ставка по официальной таблице Ozon, вступающей в силу 28.08.2026 —
+            // чтобы можно было посчитать цены заранее, до её вступления.
+            'upcoming_commission_rate' => $this->pricing->resolveCommissionFromOfficialTable(
+                $scheme,
+                $input->categoryId,
+                $input->price
+            ),
             'acquiring_rate' => $acquiringRate,
             'acquiring' => $input->price * ($acquiringRate / 100),
             'base_logistics' => $baseLogistics,
             'logistics' => round($baseLogistics + $nonLocalMarkupAmount, 2),
+            'logistics_basis' => $logisticsBasis,
+            'logistics_estimate_markup_percent' => $logisticsEstimateMarkupPercent,
             'last_mile' => (float) ($schemeCosts['last_mile'] ?? 0),
             'route_key' => $displayRouteKey,
             'route_label' => $displayRouteLabel,
@@ -670,6 +765,33 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
             'weighted_non_local_markup_percent' => $weightedNonLocalMarkupPercent ?? $nonLocalMarkupPercent,
             'clusters_summary' => $input->clustersSummary,
         ];
+    }
+
+    /**
+     * Дата, по правилам которой считаем этот SKU.
+     *
+     * Порядок: конкретный заказ → активная фиксация поставки (60 дней) → сегодня.
+     * Раньше вместо «сегодня» подставлялась tariff_effective_from из кэша: она
+     * не обновлялась при пересчёте, и по устаревшей дате возвращались уже
+     * отменённые правила (например, наценка за нелокальность после 09.07.2026).
+     */
+    private function resolvePricingDate(CalculationInput $input): string
+    {
+        if (! empty($input->orderDate)) {
+            return substr((string) $input->orderDate, 0, 10);
+        }
+
+        $today = function_exists('now') ? now()->toDateString() : date('Y-m-d');
+
+        if ($input->fixationApplied === true && ! empty($input->fixedUntil)) {
+            $fixedUntil = substr((string) $input->fixedUntil, 0, 10);
+            $fixationDate = $input->fixationBaseDate ?? $input->tariffEffectiveFrom;
+            if ($fixedUntil >= $today && ! empty($fixationDate)) {
+                return substr((string) $fixationDate, 0, 10);
+            }
+        }
+
+        return $today;
     }
 
     private function resolveWeightedProfileMetrics(string $scheme, CalculationInput $input, float $volume, string $pricingDate): ?array
@@ -718,11 +840,24 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
         // Локальная продажа без фиксации допустима только когда весь доступный сток
         // сосредоточен в одном кластере. Иначе не считаем продажу полностью локальной.
         $singleStockCluster = count($stockClusterNames) === 1 ? $stockClusterNames[0] : null;
+        // Порог Ozon: наценка применяется только при 50+ FBO-заказах продавца за 7
+        // дней. Неизвестное значение трактуем как «не разрешено» — так же, как
+        // SyncUnitEconomicsCommand. Иначе SKU без данных о продажах получал
+        // наценку, а соседний с данными — нет, и один артикул показывал разные %.
         $markupAllowed = $scheme === 'FBO'
-            && ($input->sales7Days === null || $input->sales7Days >= 50);
+            && $input->sales7Days !== null
+            && $input->sales7Days >= 50;
+        // Обратная сторона того же порога: у продавца меньше 50 единиц за 7
+        // дней — Ozon даёт скидку на вознаграждение по всем заказам, не только
+        // локальным. Неизвестный объём трактуем как «порог пройден» (без скидки).
+        $lowVolumeSellerDiscount = $scheme === 'FBO'
+            && $input->sales7Days !== null
+            && $input->sales7Days < 50;
 
         $weightedBaseLogistics = 0.0;
         $weightedMarkupPercent = 0.0;
+        $weightedEstimateMarkupPercent = 0.0;
+        $weightedLocalityDiscountPp = 0.0;
         $localityShare = 0.0;
         $hasDemand = false;
 
@@ -759,6 +894,18 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
                 $localityShare += $share;
             }
 
+            // Скидку на комиссию получают локальные заказы, а также все заказы
+            // продавца, у которого меньше 50 единиц за 7 дней перешли в «Готов
+            // к отгрузке» — Ozon начисляет её независимо от локальности.
+            // Исключённые кластеры (Москва, СПб, Беларусь) не получают её никогда.
+            if ($isLocalCluster || $lowVolumeSellerDiscount) {
+                $weightedLocalityDiscountPp += ($share / 100) * $this->pricing->resolveLocalityCommissionDiscountPp(
+                    $scheme,
+                    $destinationCluster,
+                    $pricingDate
+                );
+            }
+
             $sourceCluster = $fixedShippingCluster
                 ?? ($isLocalCluster ? $destinationCluster : ($dominantSourceCluster ?? $destinationCluster));
 
@@ -772,6 +919,7 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
             );
 
             $weightedBaseLogistics += ($share / 100) * (float) $clusterLogistics['base_cost'];
+            $weightedEstimateMarkupPercent += ($share / 100) * (float) ($clusterLogistics['estimate_markup_percent'] ?? 0.0);
 
             // Источник истины — effective_markup_percent из обогащённого clusters_summary.
             // Если его нет (preview / legacy input) — вычисляем тем же правилом, что и Service.
@@ -802,6 +950,8 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
         return [
             'base_logistics' => round($weightedBaseLogistics, 2),
             'weighted_markup_percent' => round($weightedMarkupPercent, 2),
+            'estimate_markup_percent' => round($weightedEstimateMarkupPercent, 2),
+            'locality_commission_discount_pp' => round($weightedLocalityDiscountPp, 2),
             'expected_locality_rate' => round(min(100.0, $localityShare), 2),
             'dominant_source_cluster' => $dominantSourceCluster,
         ];

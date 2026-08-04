@@ -201,8 +201,10 @@ class UnitEconomicsCacheServiceTest extends TestCase
         );
 
         $this->assertCount(2, $merged);
-        $this->assertSame(8.0, $merged[0]['effective_markup_percent']);
-        $this->assertSame('non_local_markup_applied', $merged[0]['markup_reason']);
+        // Наценка отменена Ozon с 09.07.2026 — нелокальный кластер остаётся
+        // нелокальным, но платить за это больше нечем.
+        $this->assertSame(0.0, $merged[0]['effective_markup_percent']);
+        $this->assertSame('no_markup_for_cluster', $merged[0]['markup_reason']);
         $this->assertFalse($merged[0]['is_local_cluster']);
         $this->assertSame(0.0, $merged[1]['effective_markup_percent']);
         $this->assertSame('local_cluster', $merged[1]['markup_reason']);
@@ -277,9 +279,10 @@ class UnitEconomicsCacheServiceTest extends TestCase
             true
         );
 
-        $this->assertSame(8.0, $merged[0]['non_local_markup_percent']);
-        $this->assertSame(8.0, $merged[0]['effective_markup_percent']);
-        $this->assertSame('non_local_markup_applied', $merged[0]['markup_reason']);
+        $this->assertSame(0.0, $merged[0]['non_local_markup_percent']);
+        $this->assertSame(0.0, $merged[0]['effective_markup_percent']);
+        $this->assertSame('no_markup_for_cluster', $merged[0]['markup_reason']);
+        $this->assertFalse($merged[0]['is_local_cluster']);
     }
 
     public function test_cache_conversion_calculates_tax_from_price_when_metadata_has_no_tax_amount(): void

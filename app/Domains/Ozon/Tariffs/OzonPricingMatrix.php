@@ -6,11 +6,13 @@ class OzonPricingMatrix
 {
     private array $config;
     private array $logisticsMatrix;
+    private array $commissionTable;
 
     public function __construct(?array $config = null)
     {
         $this->config = $config ?? self::loadConfig();
         $this->logisticsMatrix = self::loadLogisticsMatrix();
+        $this->commissionTable = self::loadCommissionTable();
     }
 
     public function getConfig(): array
@@ -159,6 +161,24 @@ class OzonPricingMatrix
     }
 
     /**
+     * Действует ли на дату наценка за нелокальную продажу.
+     *
+     * Ozon отменил её для всех кластеров доставки с 09.07.2026
+     * (`non_local_markup_cancelled_from`). Исторические расчёты по заказам до
+     * этой даты и SKU с активной 60-дневной фиксацией поставки продолжают
+     * считаться по старым правилам — они передают свою дату.
+     */
+    public function isNonLocalMarkupActive(?string $date = null): bool
+    {
+        $cancelledFrom = trim((string) ($this->config['non_local_markup_cancelled_from'] ?? ''));
+        if ($cancelledFrom === '') {
+            return true;
+        }
+
+        return $this->normalizeDate($date) < $cancelledFrom;
+    }
+
+    /**
      * Наценка за нелокальную продажу на кластер назначения.
      *
      * Если передана дата — сначала проверяем `non_local_markup_windows`
@@ -176,8 +196,11 @@ class OzonPricingMatrix
             return 0.0;
         }
 
-        $checkDate = $date ?? (function_exists('now') ? now()->toDateString() : date('Y-m-d'));
-        $checkDate = substr((string) $checkDate, 0, 10);
+        $checkDate = $this->normalizeDate($date);
+
+        if (! $this->isNonLocalMarkupActive($checkDate)) {
+            return 0.0;
+        }
 
         $windows = $this->logisticsMatrix['non_local_markup_windows'] ?? [];
         foreach ($windows as $window) {
@@ -198,6 +221,56 @@ class OzonPricingMatrix
         $map = $this->logisticsMatrix['non_local_markup_by_destination'] ?? [];
         if (array_key_exists($canonical, $map)) {
             return (float) $map[$canonical];
+        }
+
+        return 0.0;
+    }
+
+    /**
+     * Скидка на комиссию за локальный заказ, в процентных пунктах.
+     *
+     * С 31.07.2026 локальность влияет не на логистику, а на ставку продажи:
+     * Ozon поднял базовую комиссию FBO и возвращает часть скидкой, если товар
+     * лежит в кластере покупателя. С 30.08 скидка уменьшена, а для кластеров
+     * из `excluded_destinations` не действует вовсе.
+     *
+     * Возвращает 0 для схем вне `schemes` (скидка объявлена только для FBO),
+     * для дат вне окон и для исключённых кластеров назначения.
+     */
+    public function resolveLocalityCommissionDiscountPp(
+        string $scheme,
+        ?string $destinationCluster = null,
+        ?string $date = null
+    ): float {
+        $discount = (array) ($this->config['locality_commission_discount'] ?? []);
+        if ($discount === []) {
+            return 0.0;
+        }
+
+        $schemes = array_map('strtoupper', (array) ($discount['schemes'] ?? []));
+        if ($schemes !== [] && ! in_array(strtoupper($scheme), $schemes, true)) {
+            return 0.0;
+        }
+
+        $checkDate = $this->normalizeDate($date);
+        $canonical = $this->resolveClusterName($destinationCluster);
+
+        foreach ((array) ($discount['windows'] ?? []) as $window) {
+            $from = (string) ($window['from'] ?? '');
+            $to = (string) ($window['to'] ?? '');
+            if ($from !== '' && $checkDate < $from) {
+                continue;
+            }
+            if ($to !== '' && $checkDate > $to) {
+                continue;
+            }
+
+            $excluded = (array) ($window['excluded_destinations'] ?? []);
+            if ($canonical !== null && in_array($canonical, $excluded, true)) {
+                return 0.0;
+            }
+
+            return (float) ($window['percent_points'] ?? 0.0);
         }
 
         return 0.0;
@@ -251,11 +324,29 @@ class OzonPricingMatrix
         ];
     }
 
-    public function resolveCommission(string $scheme, ?string $category, float $price): array
+    public function resolveCommission(string $scheme, ?string $category, float $price, ?string $date = null): array
     {
         $scheme = strtoupper($scheme);
         $categoryKey = $this->resolveCategoryKey($category);
         $segment = $this->resolvePriceSegment($price);
+
+        // С 28.08.2026 действует официальная таблица вознаграждений по
+        // категориям — она точнее самодельного резерва по трём группам.
+        $tableEffectiveFrom = (string) ($this->commissionTable['effective_from'] ?? '');
+        if ($tableEffectiveFrom !== '' && $this->normalizeDate($date) >= $tableEffectiveFrom) {
+            $tableRate = $this->resolveCommissionFromOfficialTable($scheme, $category, $price);
+            if ($tableRate !== null) {
+                return [
+                    'category_key' => $categoryKey,
+                    'price_segment' => $segment,
+                    'sales_fee_percent' => $tableRate,
+                    'tariff_source' => 'ozon_category_table',
+                    'tariff_effective_from' => $tableEffectiveFrom,
+                    'is_fallback' => false,
+                ];
+            }
+        }
+
         $commissions = $this->config['commissions'] ?? [];
 
         $rate = $commissions[$categoryKey][$scheme][$segment]
@@ -270,6 +361,65 @@ class OzonPricingMatrix
             'tariff_effective_from' => $this->getEffectiveFrom(),
             'is_fallback' => $categoryKey === 'default',
         ];
+    }
+
+    /**
+     * Ставка вознаграждения по официальной таблице Ozon, действующей с 28.08.2026.
+     *
+     * Матчим по названию: тип товара → категория → основная категория. Если
+     * ничего не совпало, возвращаем null — вызывающий код останется на текущих
+     * данных (из API или резерва), а не подставит заниженные 10%.
+     */
+    public function resolveCommissionFromOfficialTable(string $scheme, ?string $category, float $price): ?float
+    {
+        $schemeKey = match (strtoupper($scheme)) {
+            'FBO' => 'FBO',
+            'FBO_FRESH', 'FRESH' => 'FBO_FRESH',
+            'FBS', 'EXPRESS' => 'FBS',
+            'RFBS', 'REALFBS' => 'RFBS',
+            default => null,
+        };
+        if ($schemeKey === null) {
+            return null;
+        }
+
+        $key = $this->normalizeCommissionKey($category);
+        if ($key === '') {
+            return null;
+        }
+
+        $index = $this->commissionTable['by_type'][$key]
+            ?? $this->commissionTable['by_category'][$key]
+            ?? $this->commissionTable['by_main_category'][$key]
+            ?? null;
+        if ($index === null) {
+            return null;
+        }
+
+        $rates = $this->commissionTable['rate_sets'][$index][$schemeKey] ?? null;
+        if ($rates === null) {
+            return null;
+        }
+
+        // RFBS в таблице — одна ставка на все ценовые сегменты.
+        if (! is_array($rates)) {
+            return (float) $rates;
+        }
+
+        $tier = match (true) {
+            $price <= 100.0 => 0,
+            $price <= 300.0 => 1,
+            default => 2,
+        };
+
+        return isset($rates[$tier]) ? (float) $rates[$tier] : null;
+    }
+
+    private function normalizeCommissionKey(?string $value): string
+    {
+        $normalized = preg_replace('/\s+/u', ' ', trim((string) $value));
+
+        return mb_strtolower((string) $normalized);
     }
 
     public function resolveLogistics(string $scheme, float $volume, ?string $routeKey = null, ?string $routeLabel = null): array
@@ -302,6 +452,16 @@ class OzonPricingMatrix
     public function getSchemeCosts(string $scheme): array
     {
         return $this->config['scheme_costs'][strtoupper($scheme)] ?? [];
+    }
+
+    private function normalizeDate(?string $date): string
+    {
+        $value = trim((string) ($date ?? ''));
+        if ($value === '') {
+            $value = function_exists('now') ? now()->toDateString() : date('Y-m-d');
+        }
+
+        return substr($value, 0, 10);
     }
 
     private function resolveVolumeBucket(float $volume): string
@@ -369,6 +529,30 @@ class OzonPricingMatrix
         }
 
         $path = dirname(__DIR__, 4).'/config/ozon_unit_economics.php';
+
+        if (is_file($path)) {
+            $loaded = require $path;
+
+            return is_array($loaded) ? $loaded : [];
+        }
+
+        return [];
+    }
+
+    private static function loadCommissionTable(): array
+    {
+        if (function_exists('app')) {
+            try {
+                $app = app();
+                if ($app && $app->bound('config')) {
+                    return (array) config('ozon_commissions_2026_08_28', []);
+                }
+            } catch (\Throwable) {
+                // Fall back to direct config file loading for plain PHPUnit tests.
+            }
+        }
+
+        $path = dirname(__DIR__, 4).'/config/ozon_commissions_2026_08_28.php';
 
         if (is_file($path)) {
             $loaded = require $path;

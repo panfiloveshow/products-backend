@@ -240,12 +240,18 @@ class UnitEconomicsCacheControllerTest extends TestCase
             true
         );
 
+        // Наценка за нелокальность отменена Ozon с 09.07.2026, поэтому по текущей
+        // дате она нулевая во всех кластерах. Локальность по-прежнему размечается:
+        // Москва есть в стоке (local_cluster), Самары в стоке нет.
         $this->assertSame(0.0, $summary[0]['effective_markup_percent']);
-        $this->assertSame(8.0, $summary[0]['non_local_markup_percent']);
+        $this->assertSame(0.0, $summary[0]['non_local_markup_percent']);
         $this->assertSame('local_cluster', $summary[0]['markup_reason']);
-        $this->assertSame(12.0, $summary[1]['effective_markup_percent']);
+        $this->assertTrue($summary[0]['is_local_cluster']);
+        $this->assertSame(0.0, $summary[1]['effective_markup_percent']);
+        $this->assertSame('no_markup_for_cluster', $summary[1]['markup_reason']);
+        $this->assertFalse($summary[1]['is_local_cluster']);
         $this->assertSame(0.0, $salesProfile[0]['effective_markup_percent']);
-        $this->assertSame(12.0, $salesProfile[1]['effective_markup_percent']);
+        $this->assertSame(0.0, $salesProfile[1]['effective_markup_percent']);
         $this->assertSame('Самара', $salesProfile[1]['cluster_name']);
     }
 

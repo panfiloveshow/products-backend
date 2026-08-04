@@ -2717,6 +2717,21 @@ class UnitEconomicsCacheController extends Controller
             }
             $data['price_segment'] = $cache->price_segment;
             $data['sales_fee_percent'] = round((float) ($cache->sales_fee_percent ?? $cache->commission_percent), 2);
+            // Комиссия до скидки за локальность и сама скидка (Ozon, с 31.07.2026),
+            // плюс происхождение цифры логистики — чтобы её можно было сверить с тарифом.
+            $data['commission_rate_base'] = isset($marketplaceData['commission_rate_base'])
+                ? round((float) $marketplaceData['commission_rate_base'], 2)
+                : $data['sales_fee_percent'];
+            $data['locality_commission_discount_pp'] = isset($marketplaceData['locality_commission_discount_pp'])
+                ? round((float) $marketplaceData['locality_commission_discount_pp'], 2)
+                : 0.0;
+            $data['commission_rate_from_2026_08_28'] = isset($marketplaceData['commission_rate_from_2026_08_28'])
+                ? round((float) $marketplaceData['commission_rate_from_2026_08_28'], 2)
+                : null;
+            $data['logistics_basis'] = $marketplaceData['logistics_basis'] ?? null;
+            $data['logistics_estimate_markup_percent'] = isset($marketplaceData['logistics_estimate_markup_percent'])
+                ? round((float) $marketplaceData['logistics_estimate_markup_percent'], 2)
+                : 0.0;
             $data['route_resolution_status'] = $marketplaceData['route_resolution_status']
                 ?? $ozonData['route_resolution_status']
                 ?? ($data['route_key'] ? 'resolved' : 'unknown');
@@ -2744,7 +2759,7 @@ class UnitEconomicsCacheController extends Controller
             // Наценка за нелокальную продажу Ozon относится к FBO; FBS-заказы не запускают её.
             $isFboScheme = strtoupper($cache->fulfillment_type ?? '') === 'FBO';
             $sellerSales7Days = $data['sales_7_days'];
-            $data['markup_allowed'] = $isFboScheme && ($sellerSales7Days === null || $sellerSales7Days >= 50);
+            $data['markup_allowed'] = $isFboScheme && $sellerSales7Days !== null && $sellerSales7Days >= 50;
             $profitRange = $this->normalizeProfitRangeForNetProfit($marketplaceData, (float) $cache->net_profit);
             $data['profit_min'] = $profitRange['profit_min'];
             $data['profit_base'] = $profitRange['profit_base'];
@@ -4112,7 +4127,7 @@ class UnitEconomicsCacheController extends Controller
             $isLocalCluster = $canonicalName !== null && in_array($canonicalName, $stockClusterCanonical, true);
             $nonLocalMarkupPercent = $pricing->resolveDestinationMarkupPercent(
                 is_string($resolvedName) ? $resolvedName : null,
-                $pricing->getEffectiveFrom()
+                now()->toDateString()
             );
             $effectiveMarkupPercent = (! $markupAllowed || $isLocalCluster) ? 0.0 : $nonLocalMarkupPercent;
             $markupReason = $cluster['markup_reason']

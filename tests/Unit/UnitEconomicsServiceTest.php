@@ -253,6 +253,7 @@ class UnitEconomicsServiceTest extends TestCase
 
     /**
      * Тест новой Ozon-модели: нелокальная продажа даёт route-based markup
+     * до 09.07.2026 — с этой даты Ozon наценку отменил.
      */
     public function test_calculate_ozon_with_route_markup(): void
     {
@@ -264,6 +265,7 @@ class UnitEconomicsServiceTest extends TestCase
             'fulfillment_type' => 'FBO',
             'redemption_rate' => 80,
             'route_key' => 'cluster_far',
+            'order_date' => '2026-06-20',
         ];
 
         $result = $this->service->calculate('ozon', $data);
@@ -272,6 +274,26 @@ class UnitEconomicsServiceTest extends TestCase
         $this->assertSame(false, $result['is_local_sale']);
         $this->assertEquals(8.0, $result['non_local_markup_percent']);
         $this->assertEquals(80.0, $result['non_local_markup_amount']);
+    }
+
+    public function test_calculate_ozon_drops_route_markup_after_cancellation_date(): void
+    {
+        $data = [
+            'price' => 1000,
+            'cost_price' => 300,
+            'sales_count' => 1,
+            'volume_liters' => 1,
+            'fulfillment_type' => 'FBO',
+            'redemption_rate' => 80,
+            'route_key' => 'cluster_far',
+            'order_date' => '2026-07-09',
+        ];
+
+        $result = $this->service->calculate('ozon', $data);
+
+        $this->assertSame(false, $result['is_local_sale']);
+        $this->assertEquals(0.0, $result['non_local_markup_percent']);
+        $this->assertEquals(0.0, $result['non_local_markup_amount']);
     }
 
     /**

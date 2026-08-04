@@ -66,8 +66,10 @@ class OverpaymentCalculator
                 continue;
             }
 
-            // Non-local: считаем потенциальную наценку по таблице Ozon
-            $markupPct = $this->pricing->resolveDestinationMarkupPercent($dest);
+            // Non-local: считаем потенциальную наценку по таблице Ozon на дату
+            // заказа. Ozon отменил наценку с 09.07.2026 — по свежим заказам
+            // потенциальной переплаты нет, по старым отчёт остаётся корректным.
+            $markupPct = $this->pricing->resolveDestinationMarkupPercent($dest, $this->orderDate($item));
             $price = $this->salePrice($item);
             if ($price <= 0 || $markupPct <= 0) {
                 $nonLocalOrders++;
@@ -115,6 +117,20 @@ class OverpaymentCalculator
     private function salePrice(object|array $item): float
     {
         return (float) (is_array($item) ? ($item['sale_price'] ?? 0) : ($item->sale_price ?? 0));
+    }
+
+    private function orderDate(object|array $item): ?string
+    {
+        $value = is_array($item) ? ($item['order_date'] ?? null) : ($item->order_date ?? null);
+        if ($value === null || $value === '') {
+            return null;
+        }
+
+        if ($value instanceof \DateTimeInterface) {
+            return $value->format('Y-m-d');
+        }
+
+        return substr((string) $value, 0, 10);
     }
 
     private function shippingCluster(object|array $item): ?string
