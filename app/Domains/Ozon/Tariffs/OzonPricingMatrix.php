@@ -161,6 +161,28 @@ class OzonPricingMatrix
     }
 
     /**
+     * Протухла ли ставка комиссии, снятая из API, для расчёта на дату $pricingDate.
+     *
+     * Ставка из API — самая точная, пока правила не сменились. С 28.08.2026 у Ozon
+     * новая таблица вознаграждений, и значение, снятое до неё, занижает комиссию
+     * (по «Электрическим чайникам» 31% против 54%). Если товар не пересинкован
+     * после смены правил — считаем по официальной таблице, а не по старому API.
+     */
+    public function isCommissionObservationStale(?string $observedAt, ?string $pricingDate = null): bool
+    {
+        $tableEffectiveFrom = trim((string) ($this->commissionTable['effective_from'] ?? ''));
+        if ($tableEffectiveFrom === '' || $this->normalizeDate($pricingDate) < $tableEffectiveFrom) {
+            return false;
+        }
+
+        // Без даты наблюдения не гадаем: ставку мог передать пользователь или
+        // расчёт по факту реализации. Синк её проставляет — там гейт и работает.
+        $observed = trim((string) $observedAt);
+
+        return $observed !== '' && $observed < $tableEffectiveFrom;
+    }
+
+    /**
      * Действует ли на дату наценка за нелокальную продажу.
      *
      * Ozon отменил её для всех кластеров доставки с 09.07.2026

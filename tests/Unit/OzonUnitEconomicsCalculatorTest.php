@@ -1088,6 +1088,21 @@ class OzonUnitEconomicsCalculatorTest extends TestCase
         ))->toArray();
         $this->assertSame(15.0, $beforeTable['commission_rate_base']);
 
+        // Ставка из API, снятая до 28.08, после этой даты занижает комиссию —
+        // берём официальную таблицу вместо протухшего значения.
+        $stale = $calculator->calculate(CalculationInput::fromArray($base + [
+            'commission_rate' => 31.0,
+            'commission_observed_at' => '2026-08-05',
+        ]))->toArray();
+        $this->assertSame(54.0, $stale['commission_rate_base']);
+
+        // Ставка, снятая уже по новым правилам, остаётся в приоритете.
+        $fresh = $calculator->calculate(CalculationInput::fromArray($base + [
+            'commission_rate' => 47.0,
+            'commission_observed_at' => '2026-08-29',
+        ]))->toArray();
+        $this->assertSame(47.0, $fresh['commission_rate_base']);
+
         // Москва в списке исключений — там скидки нет даже при локальной продаже.
         $moscow = $calculator->calculate(CalculationInput::fromArray($base + [
             'stock_profile' => [['cluster_name' => 'Москва, МО и Дальние регионы', 'share_percent' => 100]],

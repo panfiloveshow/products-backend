@@ -53,6 +53,8 @@ class CalculationInput
         public readonly ?float $storageCost = null,
         // Фактическая последняя миля магазина (Ozon: 9-11 ₽ против тарифных 25 ₽).
         public readonly ?float $lastMileCost = null,
+        // Дата, на которую снята ставка комиссии из API (Y-m-d).
+        public readonly ?string $commissionObservedAt = null,
         public readonly ?float $additionalCommissionPercent = null,
         public readonly array $tariffBreakdown = [],
         public readonly ?float $ownDeliveryCost = null,
@@ -190,6 +192,7 @@ class CalculationInput
             acquiringPercent: isset($data['acquiring_percent']) ? (float) $data['acquiring_percent'] : null,
             storageCost: isset($data['storage_cost']) ? (float) $data['storage_cost'] : null,
             lastMileCost: isset($data['last_mile_cost']) ? (float) $data['last_mile_cost'] : null,
+            commissionObservedAt: isset($data['commission_observed_at']) ? (string) $data['commission_observed_at'] : null,
             additionalCommissionPercent: isset($data['additional_commission_percent']) ? (float) $data['additional_commission_percent'] : null,
             tariffBreakdown: isset($data['tariff_breakdown']) && is_array($data['tariff_breakdown']) ? $data['tariff_breakdown'] : [],
             ownDeliveryCost: isset($data['own_delivery_cost']) ? (float) $data['own_delivery_cost'] : null,

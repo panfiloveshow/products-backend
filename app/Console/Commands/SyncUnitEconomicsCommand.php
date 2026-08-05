@@ -2197,6 +2197,12 @@ class SyncUnitEconomicsCommand extends Command
                         $data['commission_rate_is_effective'] = true;
                     }
                 } else {
+                    // Когда наблюдалась ставка из API. С 28.08.2026 у Ozon новая
+                    // таблица вознаграждений (по «Электрическим чайникам» 31% → 54%),
+                    // и ставка, снятая до этой даты, после неё врёт. Метка позволяет
+                    // калькулятору предпочесть официальную таблицу протухшему API.
+                    $data['commission_observed_at'] = optional($product->updated_at)->toDateString();
+
                     // Приоритет: API цен > ozon_data > дефолт
                     $data['fbo_commission_percent'] = $fboCommissionFromApi ?? $commissions['fbo']['percent'] ?? 15;
                     $data['fbs_commission_percent'] = $fbsCommissionFromApi ?? $commissions['fbs']['percent'] ?? 21;

@@ -651,7 +651,16 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
             $logisticsData['non_local_markup_percent'] = $legacyRouteData['non_local_markup_percent'];
         }
         $schemeCosts = $this->pricing->getSchemeCosts($scheme);
-        $commissionRate = $input->commissionRate ?? (float) $commissionData['sales_fee_percent'];
+        // Ставка из API имеет приоритет, но только пока она не старше правил, по
+        // которым считаем. С 28.08.2026 у Ozon новая таблица вознаграждений
+        // («Электрические чайники» 31% → 54%): ставка, снятая до этой даты, после
+        // неё занижает комиссию, поэтому берём официальную таблицу.
+        // Ставка, посчитанная из факта реализации, всегда свежая — её не трогаем.
+        $commissionIsStale = $input->commissionRateIsEffective !== true
+            && $this->pricing->isCommissionObservationStale($input->commissionObservedAt, $pricingDate);
+        $commissionRate = $commissionIsStale
+            ? (float) $commissionData['sales_fee_percent']
+            : ($input->commissionRate ?? (float) $commissionData['sales_fee_percent']);
         $acquiringRate = $input->acquiringPercent ?? 1.5;
         $dominantClusterId = $input->dominantClusterId;
         $dominantClusterShare = $input->dominantClusterShare;
