@@ -3314,7 +3314,10 @@ class UnitEconomicsCacheController extends Controller
         }
         $data['acquiring_percent'] = $acquiringPercent;
         $acquiringAmount = round($price * $acquiringPercent / 100, 2);
-        $storageCost = $isWb ? round((float) ($data['storage_cost'] ?? 0), 2) : 0.0;
+        // Хранение вычитается на обоих маркетплейсах. У Ozon оно обнулялось — при том
+        // что по факту это 0.6-6.8% выручки магазина (FBO), и в effective_logistics
+        // его нет. Для FBS/RFBS/EXPRESS калькулятор сам отдаёт 0.
+        $storageCost = round((float) ($data['storage_cost'] ?? 0), 2);
         $drrAmount = round($price * (float) ($data['drr_percent'] ?? 0) / 100, 2);
         // Налог: база — фактическая цена продажи из отчёта о реализации Ozon («реализовано
         // со скидкой», скидки Ozon за счёт продавца + баллы), если синк её принёс; иначе цена.

@@ -1037,4 +1037,133 @@ class OzonUnitEconomicsCalculatorTest extends TestCase
         $this->assertSame(2.0, $result['chargeable_volume_liters']);
         $this->assertSame(29.48, $result['base_logistics']);
     }
+
+    public function test_rules_in_effect_on_first_september_2026(): void
+    {
+        // Приёмка на 01.09.2026: к этой дате у Ozon одновременно действуют
+        // таблица вознаграждений с 28.08, скидка 3 п.п. за локальность с 30.08
+        // и отменённая 09.07 наценка за нелокальность.
+        $calculator = new OzonUnitEconomicsCalculator();
+        $base = [
+            'sku' => 'sku-2026-09-01',
+            'integration_id' => 1,
+            'marketplace' => 'ozon',
+            'fulfillment_type' => 'FBO',
+            'price' => 2000,
+            'cost_price' => 700,
+            'length' => 20,
+            'width' => 15,
+            'height' => 10,
+            'sales_7_days' => 80,
+            'order_date' => '2026-09-01',
+            'category_id' => 'Бытовая техника',
+        ];
+
+        $local = $calculator->calculate(CalculationInput::fromArray($base + [
+            'stock_profile' => [['cluster_name' => 'Казань', 'share_percent' => 100]],
+            'clusters_summary' => [[
+                'cluster_id' => 'kazan',
+                'cluster_name' => 'Казань',
+                'orders_percent' => 100,
+                'is_local_cluster' => true,
+            ]],
+        ]))->toArray();
+
+        // Наценки за нелокальность нет ни при каком раскладе.
+        $this->assertSame(0.0, $local['non_local_markup_percent']);
+        $this->assertSame(0.0, $local['non_local_markup_amount']);
+
+        // Локальный FBO-заказ в неисключённом кластере получает скидку 3 п.п.
+        $this->assertSame(3.0, $local['locality_commission_discount_pp']);
+        $this->assertSame(
+            round($local['commission_rate_base'] - 3.0, 2),
+            round($local['commission_percent'], 2)
+        );
+
+        // База — ставка официальной таблицы, действующей с 28.08.2026 (до неё
+        // на ту же категорию действовал резерв 15%).
+        $this->assertSame(54.0, $local['commission_rate_base']);
+        $beforeTable = $calculator->calculate(CalculationInput::fromArray(
+            array_merge($base, ['order_date' => '2026-08-27'])
+        ))->toArray();
+        $this->assertSame(15.0, $beforeTable['commission_rate_base']);
+
+        // Ставка из API, снятая до 28.08, после этой даты занижает комиссию —
+        // берём официальную таблицу вместо протухшего значения.
+        $stale = $calculator->calculate(CalculationInput::fromArray($base + [
+            'commission_rate' => 31.0,
+            'commission_observed_at' => '2026-08-05',
+        ]))->toArray();
+        $this->assertSame(54.0, $stale['commission_rate_base']);
+
+        // Ставка, снятая уже по новым правилам, остаётся в приоритете.
+        $fresh = $calculator->calculate(CalculationInput::fromArray($base + [
+            'commission_rate' => 47.0,
+            'commission_observed_at' => '2026-08-29',
+        ]))->toArray();
+        $this->assertSame(47.0, $fresh['commission_rate_base']);
+
+        // Москва в списке исключений — там скидки нет даже при локальной продаже.
+        $moscow = $calculator->calculate(CalculationInput::fromArray($base + [
+            'stock_profile' => [['cluster_name' => 'Москва, МО и Дальние регионы', 'share_percent' => 100]],
+            'clusters_summary' => [[
+                'cluster_id' => 'msk',
+                'cluster_name' => 'Москва, МО и Дальние регионы',
+                'orders_percent' => 100,
+                'is_local_cluster' => true,
+            ]],
+        ]))->toArray();
+        $this->assertSame(0.0, $moscow['locality_commission_discount_pp']);
+    }
+
+    public function test_actual_last_mile_overrides_tariff_default(): void
+    {
+        // Тарифные 25 ₽ — потолок. Фактически Ozon списывает 9-11 ₽ (курьерская
+        // развозка), и если магазин посчитан по транзакциям — берём его цифру.
+        $calculator = new OzonUnitEconomicsCalculator();
+        $base = [
+            'sku' => 'sku-lm',
+            'integration_id' => 1,
+            'marketplace' => 'ozon',
+            'fulfillment_type' => 'FBO',
+            'price' => 1000,
+            'cost_price' => 300,
+            'length' => 10,
+            'width' => 10,
+            'height' => 10,
+        ];
+
+        $default = $calculator->calculate(CalculationInput::fromArray($base))->toArray();
+        $actual = $calculator->calculate(CalculationInput::fromArray($base + ['last_mile_cost' => 10.8]))->toArray();
+
+        $this->assertSame(25.0, $default['last_mile']);
+        $this->assertSame(10.8, $actual['last_mile']);
+        $this->assertSame(round($default['effective_logistics'] - 14.2, 2), $actual['effective_logistics']);
+    }
+
+    public function test_storage_is_charged_only_on_fbo(): void
+    {
+        // Ozon берёт хранение только на своём складе; при FBS/RFBS/EXPRESS товар
+        // лежит у продавца, а раньше одна и та же сумма попадала во все схемы.
+        $calculator = new OzonUnitEconomicsCalculator();
+        $base = [
+            'sku' => 'sku-storage',
+            'integration_id' => 1,
+            'marketplace' => 'ozon',
+            'price' => 1000,
+            'cost_price' => 300,
+            'length' => 10,
+            'width' => 10,
+            'height' => 10,
+            'storage_cost' => 12.5,
+            'own_delivery_cost' => 100,
+        ];
+
+        $this->assertSame(12.5, $calculator->calculate(CalculationInput::fromArray($base + ['fulfillment_type' => 'FBO']))->toArray()['storage_cost']);
+
+        foreach (['FBS', 'RFBS', 'EXPRESS'] as $scheme) {
+            $result = $calculator->calculate(CalculationInput::fromArray($base + ['fulfillment_type' => $scheme]))->toArray();
+            $this->assertSame(0.0, $result['storage_cost'], $scheme);
+        }
+    }
 }

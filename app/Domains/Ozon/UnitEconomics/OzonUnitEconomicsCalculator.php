@@ -315,7 +315,10 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
         $costPrice = $input->costPrice ?? 0;
         $packagingCost = $input->packagingCost ?? 0;
         $additionalCosts = $input->additionalCosts ?? 0;
-        $storageCost = $input->storageCost ?? 0;
+        // Хранение Ozon берёт только на своём складе. При FBS/RFBS/EXPRESS товар лежит
+        // у продавца, а в расчёт всё равно попадало хранение из остатков — одна и та же
+        // сумма во всех четырёх схемах.
+        $storageCost = strtoupper($input->fulfillmentType) === 'FBO' ? ($input->storageCost ?? 0) : 0.0;
         $acceptanceCost = $input->acceptanceCost ?? 0;
         $penaltyCost = $input->penaltyCost ?? 0;
 
@@ -648,7 +651,16 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
             $logisticsData['non_local_markup_percent'] = $legacyRouteData['non_local_markup_percent'];
         }
         $schemeCosts = $this->pricing->getSchemeCosts($scheme);
-        $commissionRate = $input->commissionRate ?? (float) $commissionData['sales_fee_percent'];
+        // Ставка из API имеет приоритет, но только пока она не старше правил, по
+        // которым считаем. С 28.08.2026 у Ozon новая таблица вознаграждений
+        // («Электрические чайники» 31% → 54%): ставка, снятая до этой даты, после
+        // неё занижает комиссию, поэтому берём официальную таблицу.
+        // Ставка, посчитанная из факта реализации, всегда свежая — её не трогаем.
+        $commissionIsStale = $input->commissionRateIsEffective !== true
+            && $this->pricing->isCommissionObservationStale($input->commissionObservedAt, $pricingDate);
+        $commissionRate = $commissionIsStale
+            ? (float) $commissionData['sales_fee_percent']
+            : ($input->commissionRate ?? (float) $commissionData['sales_fee_percent']);
         $acquiringRate = $input->acquiringPercent ?? 1.5;
         $dominantClusterId = $input->dominantClusterId;
         $dominantClusterShare = $input->dominantClusterShare;
@@ -772,7 +784,10 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
             'logistics' => round($baseLogistics + $nonLocalMarkupAmount, 2),
             'logistics_basis' => $logisticsBasis,
             'logistics_estimate_markup_percent' => $logisticsEstimateMarkupPercent,
-            'last_mile' => (float) ($schemeCosts['last_mile'] ?? 0),
+            // Фактическая последняя миля магазина, если она посчитана по транзакциям
+            // (OzonActualRatesService): тарифные 25 ₽ — это потолок, реально Ozon
+            // списывает 9-11 ₽ курьерской развозкой.
+            'last_mile' => $input->lastMileCost ?? (float) ($schemeCosts['last_mile'] ?? 0),
             'route_key' => $displayRouteKey,
             'route_label' => $displayRouteLabel,
             'price_segment' => $input->priceSegment ?? $commissionData['price_segment'],

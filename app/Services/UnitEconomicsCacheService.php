@@ -820,6 +820,15 @@ class UnitEconomicsCacheService
         }
 
         $drrPercent = (float) ($settings?->drr_percent ?? $existingUE?->drr_percent ?? 0);
+        if ($drrPercent <= 0 && $marketplace === 'ozon') {
+            // Ручного ДРР нет — берём фактический расход магазина (CPC + «оплата за
+            // заказ») из транзакций. До этого в кэше и Excel реклама была ровно 0
+            // при фактических 5.7% выручки; per-SKU в транзакциях нет, поэтому это
+            // средняя по магазину — экран поверх неё кладёт точные данные Performance.
+            // В unit_economics.drr_percent не пишем: там живёт ручной ввод продавца.
+            $drrPercent = (float) (app(\App\Services\Ozon\OzonActualRatesService::class)
+                ->forIntegration((int) $product->integration_id)['ad_percent'] ?? 0);
+        }
         $ourSharePercent = (float) ($settings?->our_share_percent ?? $existingUE?->our_share_percent ?? 0);
         $taxPercent = (float) ($settings?->tax_percent ?? $existingUE?->tax_percent ?? 0);
         $vatPercent = (float) ($settings?->vat_percent ?? $existingUE?->vat_percent ?? 0);
