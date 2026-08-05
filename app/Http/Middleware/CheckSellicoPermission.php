@@ -362,21 +362,6 @@ class CheckSellicoPermission
             ?? $request->header('X-Token')
             ?? $request->bearerToken();
 
-        $user = $request->header('X-Sellico-User')
-            ?? $request->header('X-User-Id')
-            ?? $request->header('X-User-Email')
-            ?? 0;
-
-        // Расширение может не прислать id пользователя (X-Sellico-User) — тогда CRM делает
-        // User::findOrFail(0) → 404 → блок. Резолвим id из токена через GET /api/user (кэш 1ч),
-        // чтобы проверка прав работала по реальному пользователю. Веб-путь остаётся как есть.
-        if ($token && (empty($user) || $user === '0' || $user === 0)) {
-            $resolved = $this->resolveUserIdFromToken($token);
-            if ($resolved) {
-                $user = $resolved;
-            }
-        }
-
         $workspace = $request->header('X-Sellico-Workspace')
             ?? $request->header('X-Workspace-Id')
             ?? $request->input('workspace');
@@ -399,10 +384,34 @@ class CheckSellicoPermission
             ], 401);
         }
 
-        // Кешируем токен пользователя по workspace_id — используется CLI-синком для доступа к API
-        $workspace = (string) $workspaceId;
-        Cache::put("workspace_user_token:{$workspace}", $token, now()->addHours(22));
+        // X-Sellico-User / X-User-Id / X-User-Email приходят из браузера и
+        // являются недоверенными подсказками. Идентичность всегда получаем по
+        // предъявленному токену через CRM; иначе подмена заголовка позволила бы
+        // проверять permission от имени другого пользователя.
+        $identity = $this->resolveUserIdentityFromToken($token);
+        if ($identity['user_id'] === null) {
+            $isInvalidToken = $identity['status'] === 'invalid';
 
+            Log::warning('CheckSellicoPermission: не удалось подтвердить владельца токена', [
+                'route'      => $routeName,
+                'permission' => $permission,
+                'workspace'  => (string) $workspaceId,
+                'reason'     => $identity['status'],
+            ]);
+
+            return response()->json([
+                'message' => $isInvalidToken
+                    ? 'Недействительный токен авторизации'
+                    : 'Не удалось подтвердить пользователя. Попробуйте позже.',
+                'error' => $isInvalidToken
+                    ? 'invalid_token_identity'
+                    : 'identity_resolution_failed',
+            ], $isInvalidToken ? 401 : 503);
+        }
+
+        $user = $identity['user_id'];
+
+        $workspace = (string) $workspaceId;
         $tokenHash = md5($token);
         $cacheKey = "perm:{$workspace}:{$permission}:{$tokenHash}";
 
@@ -442,6 +451,11 @@ class CheckSellicoPermission
                 'route'      => $routeName,
             ], 403);
         }
+
+        // CLI-синк может использовать этот токен только после того, как CRM
+        // подтвердила доступ именно к запрошенному workspace. Запись до $allowed
+        // позволяла отравить кэш чужого tenant даже при итоговом 403.
+        Cache::put("workspace_user_token:{$workspace}", $token, now()->addHours(22));
 
         return $this->continueInWorkspace($request, $next, $workspaceId);
     }
@@ -644,18 +658,33 @@ class CheckSellicoPermission
     }
 
     /**
-     * Резолвит id пользователя Sellico по его токену (GET /api/user), с кэшем на 1 час.
-     * Нужно для расширения, которое может не прислать X-Sellico-User → иначе user=0 → CRM 404.
+     * Резолвит доверенный id пользователя только по токену (GET /api/user).
+     * Положительный результат кэшируется на час; ошибки и недействительные
+     * токены не кэшируются, чтобы восстановление CRM/сессии работало сразу.
+     *
+     * @return array{status: 'resolved'|'invalid'|'unavailable', user_id: ?string}
      */
-    protected function resolveUserIdFromToken(string $token): ?string
+    protected function resolveUserIdentityFromToken(string $token): array
     {
         $cacheKey = 'sellico_user_id:'.md5($token);
         $cached = Cache::get($cacheKey);
         if ($cached !== null) {
-            return $cached !== '' ? (string) $cached : null;
+            $validatedCachedId = filter_var($cached, FILTER_VALIDATE_INT, [
+                'options' => ['min_range' => 1],
+            ]);
+            if ($validatedCachedId !== false) {
+                return [
+                    'status' => 'resolved',
+                    'user_id' => (string) $validatedCachedId,
+                ];
+            }
+
+            // Старые версии могли записать пустую строку при некорректном
+            // ответе CRM. Такая запись не является подтверждённой identity.
+            Cache::forget($cacheKey);
         }
 
-        $crmUrl = 'https://sellico.ru';
+        $crmUrl = rtrim((string) (config('services.crm.url') ?? 'https://sellico.ru'), '/');
         $plainToken = str_contains($token, '|') ? explode('|', $token, 2)[1] : $token;
 
         try {
@@ -666,18 +695,50 @@ class CheckSellicoPermission
 
             if ($response->successful()) {
                 $id = $response->json('id');
-                $val = $id !== null ? (string) $id : '';
-                Cache::put($cacheKey, $val, now()->addHour());
+                $validatedId = filter_var($id, FILTER_VALIDATE_INT, [
+                    'options' => ['min_range' => 1],
+                ]);
 
-                return $val !== '' ? $val : null;
+                if ($validatedId === false) {
+                    Log::error('CheckSellicoPermission: CRM вернул некорректный профиль токена', [
+                        'status' => $response->status(),
+                    ]);
+
+                    return [
+                        'status' => 'unavailable',
+                        'user_id' => null,
+                    ];
+                }
+
+                $userId = (string) $validatedId;
+                Cache::put($cacheKey, $userId, now()->addHour());
+
+                return [
+                    'status' => 'resolved',
+                    'user_id' => $userId,
+                ];
             }
+
+            if (in_array($response->status(), [401, 403], true)) {
+                return [
+                    'status' => 'invalid',
+                    'user_id' => null,
+                ];
+            }
+
+            Log::warning('CheckSellicoPermission: CRM не подтвердил профиль токена', [
+                'status' => $response->status(),
+            ]);
         } catch (\Exception $e) {
             Log::warning('CheckSellicoPermission: не удалось резолвить user id из токена', [
-                'error' => $e->getMessage(),
+                'exception' => $e::class,
             ]);
         }
 
-        return null;
+        return [
+            'status' => 'unavailable',
+            'user_id' => null,
+        ];
     }
 
     /**

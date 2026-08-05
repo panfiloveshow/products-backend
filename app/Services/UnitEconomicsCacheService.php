@@ -820,14 +820,20 @@ class UnitEconomicsCacheService
         }
 
         $drrPercent = (float) ($settings?->drr_percent ?? $existingUE?->drr_percent ?? 0);
+        // Фактические ставки магазина по транзакциям. Это второй движок расчёта:
+        // он собирает вход сам, поэтому те же подстановки, что в синке, нужны и здесь —
+        // иначе в кэше остаются тарифные дефолты (25 ₽ последней мили, 1.5% эквайринга).
+        $ozonActualRates = $marketplace === 'ozon'
+            ? app(\App\Services\Ozon\OzonActualRatesService::class)->forIntegration((int) $product->integration_id)
+            : [];
+
         if ($drrPercent <= 0 && $marketplace === 'ozon') {
             // Ручного ДРР нет — берём фактический расход магазина (CPC + «оплата за
             // заказ») из транзакций. До этого в кэше и Excel реклама была ровно 0
             // при фактических 5.7% выручки; per-SKU в транзакциях нет, поэтому это
             // средняя по магазину — экран поверх неё кладёт точные данные Performance.
             // В unit_economics.drr_percent не пишем: там живёт ручной ввод продавца.
-            $drrPercent = (float) (app(\App\Services\Ozon\OzonActualRatesService::class)
-                ->forIntegration((int) $product->integration_id)['ad_percent'] ?? 0);
+            $drrPercent = (float) ($ozonActualRates['ad_percent'] ?? 0);
         }
         $ourSharePercent = (float) ($settings?->our_share_percent ?? $existingUE?->our_share_percent ?? 0);
         $taxPercent = (float) ($settings?->tax_percent ?? $existingUE?->tax_percent ?? 0);
@@ -842,6 +848,11 @@ class UnitEconomicsCacheService
         $acquiringPercent = (float) (($existingAcquiringPercent !== null && (float) $existingAcquiringPercent > 0)
             ? $existingAcquiringPercent
             : $defaultAcquiring);
+        // Факт по транзакциям точнее и сохранённого значения, и дефолта: Ozon
+        // списывает 0.71-1.08%, а не 1.5%.
+        if (($ozonActualRates['acquiring_percent'] ?? null) !== null) {
+            $acquiringPercent = (float) $ozonActualRates['acquiring_percent'];
+        }
         $storageCost = $marketplace === 'wildberries'
             ? (float) ($marketplaceData['storage_cost_per_unit'] ?? $marketplaceData['storage_cost_normalized'] ?? 0)
             : (float) ($marketplaceData['storage_cost_per_unit']
@@ -850,6 +861,12 @@ class UnitEconomicsCacheService
                 ?? $product->storage_cost
                 ?? $existingUE?->storage_cost
                 ?? 0);
+        // Хранение Ozon — фактический расход склада, приведённый к проданной
+        // единице. Без этого сюда попадала месячная сумма по остаткам (до 29 тыс ₽
+        // «на единицу»), а калькулятор оставит её только схеме FBO.
+        if (($ozonActualRates['storage_per_unit'] ?? null) !== null) {
+            $storageCost = (float) $ozonActualRates['storage_per_unit'];
+        }
         if ($marketplace === 'wildberries' && ! in_array(strtoupper($fulfillmentType), ['FBO', 'FBW'], true)) {
             $storageCost = 0.0;
         }
@@ -996,6 +1013,11 @@ class UnitEconomicsCacheService
             'category_id' => $product->category ?? 'default',
             'commission_rate' => (float) $commissionPercent,
             'commission_rate_is_effective' => $commissionRateIsEffective,
+            // Когда снята ставка из API: с 28.08.2026 у Ozon новая таблица
+            // вознаграждений, и значение старше неё калькулятор игнорирует.
+            'commission_observed_at' => $marketplace === 'ozon' && $commissionFromApi !== null
+                ? optional($product->updated_at)->toDateString()
+                : null,
             'redemption_rate' => (float) $redemptionRate,
             'redemption_source' => $redemptionSource,
             'redemption_period_days' => $redemptionPeriodDays,
@@ -1022,6 +1044,7 @@ class UnitEconomicsCacheService
             'vat_percent' => $vatPercent,
             'acquiring_percent' => $acquiringPercent,
             'storage_cost' => $storageCost,
+            'last_mile_cost' => $ozonActualRates['last_mile_avg'] ?? null,
             'additional_commission_percent' => null,
             'own_delivery_cost' => $ownDeliveryCost,
             'own_return_cost' => $ownReturnCost,
