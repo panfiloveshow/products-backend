@@ -2252,6 +2252,10 @@ class SyncUnitEconomicsCommand extends Command
                 // Эквайринг (приоритет: факт по транзакциям > финансовые транзакции > фактические затраты > дефолт 1.5%)
                 if (($actualRates['acquiring_percent'] ?? null) !== null) {
                     $data['acquiring_percent'] = $ratePolicy->acquiringPercent($actualRates);
+                    // Тот же маркер, что у точного эквайринга WB: ниже по коду
+                    // прежнее авто-значение из БД перетирает свежее, и застрявшие
+                    // 1.5% пережили бы пересчёт (18 084 строки после прошлого синка).
+                    $data['_acquiring_precise'] = true;
                 } elseif ($acquiringData && isset($acquiringData['avg_acquiring_percent']) && $acquiringData['avg_acquiring_percent'] > 0) {
                     // Из финансовых транзакций /v3/finance/transaction/list
                     $data['acquiring_percent'] = $acquiringData['avg_acquiring_percent'];
