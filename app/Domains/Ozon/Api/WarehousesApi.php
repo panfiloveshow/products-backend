@@ -88,9 +88,12 @@ class WarehousesApi
             for ($page = 0; $page < $maxPages; $page++) {
                 $response = $this->client->post('/v1/returns/list', [
                     'filter' => [
-                        'logistic_return_date' => [
-                            'from' => now()->subDays($days)->format('Y-m-d\TH:i:s\Z'),
-                            'to' => now()->format('Y-m-d\TH:i:s\Z'),
+                        // logistic_return_date молча отдаёт пустой список (проверено на
+                        // проде: 0 возвратов там, где их 2517). Рабочий фильтр —
+                        // visual_status_change_moment с time_from/time_to.
+                        'visual_status_change_moment' => [
+                            'time_from' => now()->subDays($days)->format('Y-m-d\TH:i:s\Z'),
+                            'time_to' => now()->format('Y-m-d\TH:i:s\Z'),
                         ],
                     ],
                     'limit' => 500, // Максимум 500 согласно документации
@@ -99,6 +102,14 @@ class WarehousesApi
 
                 $returns = $response['returns'] ?? [];
                 foreach ($returns as $return) {
+                    // Считаем ТОЛЬКО пост-доставочные возвраты (ClientReturn).
+                    // Cancellation — это отмены и невыкупы, они уже сидят в % выкупа
+                    // (OzonPostingsBuyoutCalculator); сложив их сюда, мы бы задвоили
+                    // обратную логистику. На проде 30д: 1912 отмен против 598 возвратов.
+                    if (($return['type'] ?? null) !== 'ClientReturn') {
+                        continue;
+                    }
+
                     // /v1/returns/list отдаёт ОДИН товар в поле `product` (объект),
                     // а не массив `products`. Старый код читал ['products'] → цикл
                     // всегда пустой → returns_count = 0 у всех SKU → при выкупе 100%
@@ -120,9 +131,13 @@ class WarehousesApi
                     }
                 }
 
-                // Курсор следующей страницы. Останавливаемся, когда API сообщил,
-                // что страниц больше нет, либо не вернул курсор/полную страницу.
-                $nextLastId = (int) ($response['last_id'] ?? 0);
+                // Курсор следующей страницы. Ozon НЕ отдаёт last_id в ответе
+                // (в теле только returns + has_next) — курсором служит id последнего
+                // возврата страницы. Со старым чтением $response['last_id'] цикл
+                // обрывался после первых 500 записей.
+                $nextLastId = empty($returns)
+                    ? 0
+                    : (int) ($returns[array_key_last($returns)]['id'] ?? 0);
                 $hasNext = $response['has_next'] ?? (count($returns) >= 500);
                 if (! $hasNext || $nextLastId === 0 || $nextLastId === $lastId || empty($returns)) {
                     break;

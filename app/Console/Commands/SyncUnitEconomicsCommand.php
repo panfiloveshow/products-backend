@@ -2216,8 +2216,25 @@ class SyncUnitEconomicsCommand extends Command
                 // Стоимость возврата из API
                 $data['return_cost'] = $schemaCommission['return_amount'] ?? 100;
 
-                // Эквайринг (приоритет: финансовые транзакции > фактические затраты > дефолт 1.5%)
-                if ($acquiringData && isset($acquiringData['avg_acquiring_percent']) && $acquiringData['avg_acquiring_percent'] > 0) {
+                // === ФАКТИЧЕСКИЕ СТАВКИ МАГАЗИНА (ozon_finance_transactions) ===
+                // Эквайринг/последняя миля/хранение по факту вместо тарифных дефолтов.
+                // Раньше эквайринг тянули отдельным API-обходом транзакций и отключили
+                // из-за OOM; здесь тот же ответ одним SQL по локальной таблице.
+                $actualRates = app(\App\Services\Ozon\OzonActualRatesService::class)
+                    ->forIntegration((int) $product->integration_id);
+                if (($actualRates['last_mile_avg'] ?? null) !== null) {
+                    $data['last_mile_cost'] = $actualRates['last_mile_avg'];
+                }
+                if (($actualRates['storage_per_unit'] ?? null) !== null) {
+                    // Хранение магазина, приведённое к одной проданной единице.
+                    // Калькулятор оставит его только схеме FBO.
+                    $data['storage_cost'] = $actualRates['storage_per_unit'];
+                }
+
+                // Эквайринг (приоритет: факт по транзакциям > финансовые транзакции > фактические затраты > дефолт 1.5%)
+                if (($actualRates['acquiring_percent'] ?? null) !== null) {
+                    $data['acquiring_percent'] = $actualRates['acquiring_percent'];
+                } elseif ($acquiringData && isset($acquiringData['avg_acquiring_percent']) && $acquiringData['avg_acquiring_percent'] > 0) {
                     // Из финансовых транзакций /v3/finance/transaction/list
                     $data['acquiring_percent'] = $acquiringData['avg_acquiring_percent'];
                     $data['acquiring_value'] = $acquiringData['total_acquiring'] / max($acquiringData['orders_count'], 1);

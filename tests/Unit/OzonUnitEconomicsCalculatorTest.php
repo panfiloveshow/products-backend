@@ -1037,4 +1037,55 @@ class OzonUnitEconomicsCalculatorTest extends TestCase
         $this->assertSame(2.0, $result['chargeable_volume_liters']);
         $this->assertSame(29.48, $result['base_logistics']);
     }
+
+    public function test_actual_last_mile_overrides_tariff_default(): void
+    {
+        // Тарифные 25 ₽ — потолок. Фактически Ozon списывает 9-11 ₽ (курьерская
+        // развозка), и если магазин посчитан по транзакциям — берём его цифру.
+        $calculator = new OzonUnitEconomicsCalculator();
+        $base = [
+            'sku' => 'sku-lm',
+            'integration_id' => 1,
+            'marketplace' => 'ozon',
+            'fulfillment_type' => 'FBO',
+            'price' => 1000,
+            'cost_price' => 300,
+            'length' => 10,
+            'width' => 10,
+            'height' => 10,
+        ];
+
+        $default = $calculator->calculate(CalculationInput::fromArray($base))->toArray();
+        $actual = $calculator->calculate(CalculationInput::fromArray($base + ['last_mile_cost' => 10.8]))->toArray();
+
+        $this->assertSame(25.0, $default['last_mile']);
+        $this->assertSame(10.8, $actual['last_mile']);
+        $this->assertSame(round($default['effective_logistics'] - 14.2, 2), $actual['effective_logistics']);
+    }
+
+    public function test_storage_is_charged_only_on_fbo(): void
+    {
+        // Ozon берёт хранение только на своём складе; при FBS/RFBS/EXPRESS товар
+        // лежит у продавца, а раньше одна и та же сумма попадала во все схемы.
+        $calculator = new OzonUnitEconomicsCalculator();
+        $base = [
+            'sku' => 'sku-storage',
+            'integration_id' => 1,
+            'marketplace' => 'ozon',
+            'price' => 1000,
+            'cost_price' => 300,
+            'length' => 10,
+            'width' => 10,
+            'height' => 10,
+            'storage_cost' => 12.5,
+            'own_delivery_cost' => 100,
+        ];
+
+        $this->assertSame(12.5, $calculator->calculate(CalculationInput::fromArray($base + ['fulfillment_type' => 'FBO']))->toArray()['storage_cost']);
+
+        foreach (['FBS', 'RFBS', 'EXPRESS'] as $scheme) {
+            $result = $calculator->calculate(CalculationInput::fromArray($base + ['fulfillment_type' => $scheme]))->toArray();
+            $this->assertSame(0.0, $result['storage_cost'], $scheme);
+        }
+    }
 }

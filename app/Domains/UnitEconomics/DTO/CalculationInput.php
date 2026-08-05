@@ -51,6 +51,8 @@ class CalculationInput
         public readonly ?float $vatPercent = null,
         public readonly ?float $acquiringPercent = null,
         public readonly ?float $storageCost = null,
+        // Фактическая последняя миля магазина (Ozon: 9-11 ₽ против тарифных 25 ₽).
+        public readonly ?float $lastMileCost = null,
         public readonly ?float $additionalCommissionPercent = null,
         public readonly array $tariffBreakdown = [],
         public readonly ?float $ownDeliveryCost = null,
@@ -187,6 +189,7 @@ class CalculationInput
             vatPercent: isset($data['vat_percent']) ? (float) $data['vat_percent'] : null,
             acquiringPercent: isset($data['acquiring_percent']) ? (float) $data['acquiring_percent'] : null,
             storageCost: isset($data['storage_cost']) ? (float) $data['storage_cost'] : null,
+            lastMileCost: isset($data['last_mile_cost']) ? (float) $data['last_mile_cost'] : null,
             additionalCommissionPercent: isset($data['additional_commission_percent']) ? (float) $data['additional_commission_percent'] : null,
             tariffBreakdown: isset($data['tariff_breakdown']) && is_array($data['tariff_breakdown']) ? $data['tariff_breakdown'] : [],
             ownDeliveryCost: isset($data['own_delivery_cost']) ? (float) $data['own_delivery_cost'] : null,
