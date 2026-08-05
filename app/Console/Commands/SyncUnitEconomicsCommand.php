@@ -2209,12 +2209,21 @@ class SyncUnitEconomicsCommand extends Command
                     $data['fbs_commission_percent'] = $fbsCommissionFromApi ?? $commissions['fbs']['percent'] ?? 21;
                     $data['rfbs_commission_percent'] = $rfbsCommissionFromApi ?? 20;
 
-                    // Выбираем комиссию по текущей схеме
-                    $data['commission_percent'] = match ($fulfillmentType) {
+                    // Ставку по схеме выбирает OzonRatePolicy — её же зовёт
+                    // UnitEconomicsCacheService. Раньше EXPRESS считался по ставке
+                    // RFBS (31% вместо express 43%) и занижал комиссию.
+                    $data['commission_percent'] = app(OzonRatePolicy::class)->commissionPercentForScheme(
+                        $fulfillmentType,
+                        $commissions,
+                        [
+                            'fbo' => $fboCommissionFromApi,
+                            'fbs' => $fbsCommissionFromApi,
+                            'rfbs' => $rfbsCommissionFromApi,
+                        ]
+                    ) ?? match ($fulfillmentType) {
                         'FBO' => $data['fbo_commission_percent'],
                         'FBS' => $data['fbs_commission_percent'],
-                        'RFBS' => $data['rfbs_commission_percent'],
-                        'EXPRESS' => $data['rfbs_commission_percent'],
+                        'RFBS', 'EXPRESS' => $data['rfbs_commission_percent'],
                         default => $schemaCommission['percent'] ?? 15,
                     };
                     $data['commission_value'] = $schemaCommission['value'] ?? null;

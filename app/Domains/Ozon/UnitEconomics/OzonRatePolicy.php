@@ -76,6 +76,44 @@ class OzonRatePolicy
     }
 
     /**
+     * Ставка вознаграждения по схеме из ответа Ozon (`ozon_data.commissions`).
+     *
+     * У EXPRESS собственная ставка, и она заметно выше: по BR2101BK Ozon отдаёт
+     * express 43% против rfbs 31%. Синк подставлял EXPRESS ставку RFBS и занижал
+     * комиссию на 441 строке каталога, а кэш читал правильную — сверка двух
+     * движков это и вскрыла.
+     *
+     * @param array<string, mixed> $commissions ozon_data.commissions
+     * @param array<string, float|null> $overrides ставки из API цен, приоритетнее сохранённых
+     */
+    public function commissionPercentForScheme(string $scheme, array $commissions, array $overrides = []): ?float
+    {
+        $key = match (strtoupper($scheme)) {
+            'FBO' => 'fbo',
+            'FBS' => 'fbs',
+            // realFBS и DBS Ozon отдаёт под ключом rfbs — так же их сводит кэш-сервис.
+            'RFBS', 'REALFBS', 'DBS' => 'rfbs',
+            'EXPRESS' => 'express',
+            default => null,
+        };
+
+        if ($key === null) {
+            return null;
+        }
+
+        $value = $overrides[$key]
+            ?? $commissions[$key]['percent']
+            // Ozon не всегда отдаёт ставку по каждой схеме: express добираем из
+            // rfbs (обе — realFBS), остальные из fbs/fbo.
+            ?? ($key === 'express' ? ($commissions['rfbs']['percent'] ?? null) : null)
+            ?? $commissions['fbs']['percent']
+            ?? $commissions['fbo']['percent']
+            ?? null;
+
+        return $value !== null ? (float) $value : null;
+    }
+
+    /**
      * ДРР: ручная настройка продавца приоритетнее факта. Факт — средний по
      * магазину (клики + «оплата за заказ»): per-SKU разбивки в транзакциях нет.
      */

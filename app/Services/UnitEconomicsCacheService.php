@@ -428,10 +428,13 @@ class UnitEconomicsCacheService
         $cachedMarketplaceData = is_array($existingUE?->marketplace_data ?? null)
             ? $existingUE->marketplace_data
             : [];
-        $commissionFromApi = $commissions[$schemeKey]['percent']
-            ?? $commissions['fbs']['percent']
-            ?? $commissions['fbo']['percent']
-            ?? null;
+        // Выбор ставки по схеме — в OzonRatePolicy, её же зовёт синк.
+        $commissionFromApi = $marketplace === 'ozon'
+            ? app(OzonRatePolicy::class)->commissionPercentForScheme($fulfillmentType, $commissions)
+            : ($commissions[$schemeKey]['percent']
+                ?? $commissions['fbs']['percent']
+                ?? $commissions['fbo']['percent']
+                ?? null);
         $cachedBaseCommission = isset($cachedMarketplaceData['commission_rate_base'])
             ? (float) $cachedMarketplaceData['commission_rate_base']
             : null;

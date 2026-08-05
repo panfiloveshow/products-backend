@@ -55,6 +55,33 @@ class OzonRatePolicyTest extends TestCase
         $this->assertSame(0.0, $policy->drrPercent(null, []));
     }
 
+    public function test_express_uses_its_own_commission_not_rfbs(): void
+    {
+        $policy = new OzonRatePolicy();
+        $commissions = [
+            'fbo' => ['percent' => 31],
+            'fbs' => ['percent' => 31],
+            'rfbs' => ['percent' => 31],
+            'express' => ['percent' => 43],
+        ];
+
+        $this->assertSame(43.0, $policy->commissionPercentForScheme('EXPRESS', $commissions));
+        $this->assertSame(31.0, $policy->commissionPercentForScheme('RFBS', $commissions));
+        $this->assertSame(31.0, $policy->commissionPercentForScheme('FBO', $commissions));
+        // realFBS и DBS сводятся к rfbs.
+        $this->assertSame(31.0, $policy->commissionPercentForScheme('REALFBS', $commissions));
+        $this->assertSame(31.0, $policy->commissionPercentForScheme('DBS', $commissions));
+
+        // Ставка из API цен важнее сохранённой в ozon_data.
+        $this->assertSame(28.0, $policy->commissionPercentForScheme('FBO', $commissions, ['fbo' => 28.0]));
+
+        // Ozon не отдал express — добираем из rfbs, а не из fbs/fbo.
+        $noExpress = ['fbo' => ['percent' => 10], 'fbs' => ['percent' => 20], 'rfbs' => ['percent' => 33]];
+        $this->assertSame(33.0, $policy->commissionPercentForScheme('EXPRESS', $noExpress));
+
+        $this->assertNull($policy->commissionPercentForScheme('FBO', []));
+    }
+
     public function test_actual_rates_are_ozon_only(): void
     {
         $policy = new OzonRatePolicy();
