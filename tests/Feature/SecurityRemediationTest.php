@@ -203,6 +203,7 @@ class SecurityRemediationTest extends TestCase
             now()->addDay()
         );
         Http::fake([
+            'https://crm-security.test/api/user' => Http::response(['id' => 77]),
             'https://crm-security.test/api/check-permission*' => Http::response([], 500),
         ]);
 
@@ -214,6 +215,134 @@ class SecurityRemediationTest extends TestCase
             ->getJson('/api/products')
             ->assertServiceUnavailable()
             ->assertJsonPath('error', 'permission_check_failed');
+    }
+
+    public function test_permission_identity_is_resolved_from_token_and_spoofed_user_headers_are_ignored(): void
+    {
+        config()->set('services.sellico.skip_permission_check', false);
+        config()->set('services.crm.url', 'https://crm-security.test');
+        Cache::flush();
+
+        $clientToken = 'security-client-token';
+        $serviceToken = 'security-service-token';
+        $integration = Integration::factory()->ozon()->create([
+            'id' => 9801,
+            'work_space_id' => 101,
+        ]);
+        Cache::put('sellico_access_token', $serviceToken);
+        Http::fake([
+            'https://crm-security.test/api/user' => Http::response(['id' => 77]),
+            'https://crm-security.test/api/check-permission*' => Http::response(['valid' => true]),
+        ]);
+
+        $this->withHeaders([
+            'Authorization' => "Bearer {$clientToken}",
+            'X-Sellico-User' => '999',
+            'X-User-Id' => '998',
+            'X-User-Email' => 'attacker@example.test',
+            'X-Sellico-Workspace' => '101',
+        ])
+            ->getJson("/api/products?integration_id={$integration->id}&marketplace=ozon")
+            ->assertOk();
+
+        Http::assertSent(
+            fn ($request) => $request->url() === 'https://crm-security.test/api/user'
+                && $request->hasHeader('Authorization', "Bearer {$clientToken}")
+        );
+        Http::assertSent(
+            fn ($request) => str_starts_with($request->url(), 'https://crm-security.test/api/check-permission')
+                && (string) $request['user'] === '77'
+                && (string) $request['workspace'] === '101'
+                && $request['token'] === $clientToken
+                && $request->hasHeader('Authorization', "Bearer {$serviceToken}")
+        );
+    }
+
+    public function test_permission_fails_closed_when_token_identity_cannot_be_resolved(): void
+    {
+        config()->set('services.sellico.skip_permission_check', false);
+        config()->set('services.crm.url', 'https://crm-security.test');
+        Cache::flush();
+
+        $clientToken = 'invalid-client-token';
+        $integration = Integration::factory()->ozon()->create([
+            'id' => 9802,
+            'work_space_id' => 101,
+        ]);
+        Cache::put('sellico_access_token', 'security-service-token');
+        Http::fake([
+            'https://crm-security.test/api/user' => Http::response([], 401),
+            'https://crm-security.test/api/check-permission*' => Http::response(['valid' => true]),
+        ]);
+
+        $this->withHeaders([
+            'Authorization' => "Bearer {$clientToken}",
+            'X-Sellico-User' => '77',
+            'X-Sellico-Workspace' => '101',
+        ])
+            ->getJson("/api/products?integration_id={$integration->id}&marketplace=ozon")
+            ->assertUnauthorized()
+            ->assertJsonPath('error', 'invalid_token_identity');
+
+        Http::assertNotSent(
+            fn ($request) => str_starts_with($request->url(), 'https://crm-security.test/api/check-permission')
+        );
+    }
+
+    public function test_denied_workspace_is_never_bound_or_cached_for_the_token(): void
+    {
+        config()->set('services.sellico.skip_permission_check', false);
+        config()->set('services.crm.url', 'https://crm-security.test');
+        Cache::flush();
+
+        $clientToken = 'workspace-spoof-token';
+        Cache::put('sellico_access_token', 'security-service-token');
+        Http::fake([
+            'https://crm-security.test/api/user' => Http::response(['id' => 77]),
+            'https://crm-security.test/api/check-permission*' => Http::response(['valid' => false]),
+        ]);
+
+        $this->withHeaders([
+            'Authorization' => "Bearer {$clientToken}",
+            'X-Sellico-Workspace' => '202',
+        ])
+            ->getJson('/api/products')
+            ->assertForbidden()
+            ->assertJsonPath('error', 'permission_denied');
+
+        $this->assertFalse(Cache::has('workspace_user_token:202'));
+        $this->assertNull(CurrentWorkspace::id());
+    }
+
+    public function test_invalid_legacy_identity_cache_entry_is_revalidated_from_token(): void
+    {
+        config()->set('services.sellico.skip_permission_check', false);
+        config()->set('services.crm.url', 'https://crm-security.test');
+        Cache::flush();
+
+        $clientToken = 'legacy-cache-token';
+        $integration = Integration::factory()->ozon()->create([
+            'id' => 9803,
+            'work_space_id' => 101,
+        ]);
+        Cache::put('sellico_access_token', 'security-service-token');
+        Cache::put('sellico_user_id:'.md5($clientToken), '', now()->addHour());
+        Http::fake([
+            'https://crm-security.test/api/user' => Http::response(['id' => 77]),
+            'https://crm-security.test/api/check-permission*' => Http::response(['valid' => true]),
+        ]);
+
+        $this->withHeaders([
+            'Authorization' => "Bearer {$clientToken}",
+            'X-Sellico-Workspace' => '101',
+        ])
+            ->getJson("/api/products?integration_id={$integration->id}&marketplace=ozon")
+            ->assertOk();
+
+        Http::assertSent(
+            fn ($request) => $request->url() === 'https://crm-security.test/api/user'
+        );
+        $this->assertSame('77', Cache::get('sellico_user_id:'.md5($clientToken)));
     }
 
     public function test_permission_request_logs_metadata_without_credentials(): void
@@ -230,6 +359,7 @@ class SecurityRemediationTest extends TestCase
         ]);
         Cache::put('sellico_access_token', $serviceToken);
         Http::fake([
+            'https://crm-security.test/api/user' => Http::response(['id' => 77]),
             'https://crm-security.test/api/check-permission*' => Http::response(['valid' => true]),
         ]);
         Log::spy();
@@ -258,7 +388,8 @@ class SecurityRemediationTest extends TestCase
         )->once();
 
         Http::assertSent(
-            fn ($request) => $request['token'] === $clientToken
+            fn ($request) => str_starts_with($request->url(), 'https://crm-security.test/api/check-permission')
+                && $request['token'] === $clientToken
                 && $request->hasHeader('Authorization', "Bearer {$serviceToken}")
         );
     }
