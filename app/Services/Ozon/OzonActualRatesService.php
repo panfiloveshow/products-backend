@@ -33,12 +33,18 @@ class OzonActualRatesService
     private const SALE_OPERATION = 'OperationAgentDeliveredToCustomer';
     private const ACQUIRING_OPERATION = 'MarketplaceRedistributionOfAcquiringOperation';
     private const STORAGE_OPERATION = 'OperationMarketplaceServiceStorage';
+    /** Реклама: клики и «оплата за заказ». Per-SKU в транзакциях нет — только магазин целиком. */
+    private const AD_OPERATIONS = [
+        'OperationMarketplaceCostPerClick',
+        'OperationPromotionWithCostPerOrder',
+    ];
 
     /**
      * @return array{
      *   acquiring_percent: ?float,
      *   last_mile_avg: ?float,
      *   storage_per_unit: ?float,
+     *   ad_percent: ?float,
      *   revenue: float,
      *   units: int,
      *   days: int
@@ -68,6 +74,7 @@ class OzonActualRatesService
             'acquiring_percent' => null,
             'last_mile_avg' => null,
             'storage_per_unit' => null,
+            'ad_percent' => null,
             'revenue' => $revenue,
             'units' => $units,
             'days' => $days,
@@ -87,6 +94,11 @@ class OzonActualRatesService
         $acquiring = $sum(self::ACQUIRING_OPERATION);
         $storage = $sum(self::STORAGE_OPERATION);
         $lastMile = $this->lastMileTotal($integrationId, $from, $to);
+        $ads = abs((float) DB::table('ozon_finance_transactions')
+            ->where('integration_id', $integrationId)
+            ->whereIn('operation_type', self::AD_OPERATIONS)
+            ->whereBetween('operation_date', [$from, $to])
+            ->sum('amount'));
 
         return [
             // Ставки-выбросы не пропускаем: Ozon не берёт больше 3% эквайринга,
@@ -94,6 +106,9 @@ class OzonActualRatesService
             'acquiring_percent' => $acquiring > 0 ? min(3.0, round($acquiring / $revenue * 100, 2)) : null,
             'last_mile_avg' => $lastMile > 0 ? round($lastMile / $units, 2) : null,
             'storage_per_unit' => $storage > 0 ? round($storage / $units, 2) : null,
+            // Средняя по магазину: per-SKU разбивки у рекламных списаний нет
+            // (posting_number там — документ кампании, sku всегда пустой).
+            'ad_percent' => $ads > 0 ? round($ads / $revenue * 100, 2) : null,
             'revenue' => $revenue,
             'units' => $units,
             'days' => $days,
