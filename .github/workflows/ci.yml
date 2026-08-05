@@ -64,6 +64,7 @@ jobs:
           tests/Unit/SyncUnitEconomicsCommandExitCodeTest.php
           tests/Feature/UnitEconomicsPriceIntegrityTest.php
           tests/Feature/UnitEconomicsCacheConsistencyTest.php
+          tests/Feature/SecurityRemediationTest.php
           tests/Feature/HealthEndpointTest.php
 
       - name: Report dependency vulnerabilities

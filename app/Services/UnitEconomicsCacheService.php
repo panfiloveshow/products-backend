@@ -4,6 +4,7 @@ namespace App\Services;
 
 use App\Domains\Ozon\Tariffs\OzonPricingMatrix;
 use App\Domains\Ozon\Tariffs\OzonRfbsTariffMatrix;
+use App\Domains\Ozon\UnitEconomics\OzonRatePolicy;
 use App\Domains\Ozon\UnitEconomics\RedemptionSource;
 use App\Domains\UnitEconomics\DTO\CalculationInput;
 use App\Domains\UnitEconomics\DTO\UnitEconomicsResult;
@@ -427,10 +428,13 @@ class UnitEconomicsCacheService
         $cachedMarketplaceData = is_array($existingUE?->marketplace_data ?? null)
             ? $existingUE->marketplace_data
             : [];
-        $commissionFromApi = $commissions[$schemeKey]['percent']
-            ?? $commissions['fbs']['percent']
-            ?? $commissions['fbo']['percent']
-            ?? null;
+        // Выбор ставки по схеме — в OzonRatePolicy, её же зовёт синк.
+        $commissionFromApi = $marketplace === 'ozon'
+            ? app(OzonRatePolicy::class)->commissionPercentForScheme($fulfillmentType, $commissions)
+            : ($commissions[$schemeKey]['percent']
+                ?? $commissions['fbs']['percent']
+                ?? $commissions['fbo']['percent']
+                ?? null);
         $cachedBaseCommission = isset($cachedMarketplaceData['commission_rate_base'])
             ? (float) $cachedMarketplaceData['commission_rate_base']
             : null;
@@ -819,22 +823,16 @@ class UnitEconomicsCacheService
             );
         }
 
-        $drrPercent = (float) ($settings?->drr_percent ?? $existingUE?->drr_percent ?? 0);
-        // Фактические ставки магазина по транзакциям. Это второй движок расчёта:
-        // он собирает вход сам, поэтому те же подстановки, что в синке, нужны и здесь —
-        // иначе в кэше остаются тарифные дефолты (25 ₽ последней мили, 1.5% эквайринга).
-        $ozonActualRates = $marketplace === 'ozon'
-            ? app(\App\Services\Ozon\OzonActualRatesService::class)->forIntegration((int) $product->integration_id)
-            : [];
+        // Приоритеты ставок Ozon — в OzonRatePolicy: их же применяет синк.
+        // Дублирование этой логики уже дважды приводило к тому, что правка в одном
+        // движке не долетала до другого.
+        $ratePolicy = app(OzonRatePolicy::class);
+        $ozonActualRates = $ratePolicy->actualRates($marketplace, (int) $product->integration_id);
 
-        if ($drrPercent <= 0 && $marketplace === 'ozon') {
-            // Ручного ДРР нет — берём фактический расход магазина (CPC + «оплата за
-            // заказ») из транзакций. До этого в кэше и Excel реклама была ровно 0
-            // при фактических 5.7% выручки; per-SKU в транзакциях нет, поэтому это
-            // средняя по магазину — экран поверх неё кладёт точные данные Performance.
-            // В unit_economics.drr_percent не пишем: там живёт ручной ввод продавца.
-            $drrPercent = (float) ($ozonActualRates['ad_percent'] ?? 0);
-        }
+        $manualDrr = $settings?->drr_percent ?? $existingUE?->drr_percent;
+        $drrPercent = $marketplace === 'ozon'
+            ? $ratePolicy->drrPercent($manualDrr !== null ? (float) $manualDrr : null, $ozonActualRates)
+            : (float) ($manualDrr ?? 0);
         $ourSharePercent = (float) ($settings?->our_share_percent ?? $existingUE?->our_share_percent ?? 0);
         $taxPercent = (float) ($settings?->tax_percent ?? $existingUE?->tax_percent ?? 0);
         $vatPercent = (float) ($settings?->vat_percent ?? $existingUE?->vat_percent ?? 0);
@@ -842,18 +840,15 @@ class UnitEconomicsCacheService
         $defaultAcquiring = match ($marketplace) {
             'wildberries' => 1.5,
             'yandex_market' => 2.0,
-            'ozon' => 1.5,
+            'ozon' => OzonRatePolicy::DEFAULT_ACQUIRING_PERCENT,
             default => 0,
         };
-        $acquiringPercent = (float) (($existingAcquiringPercent !== null && (float) $existingAcquiringPercent > 0)
-            ? $existingAcquiringPercent
-            : $defaultAcquiring);
-        // Факт по транзакциям точнее и сохранённого значения, и дефолта: Ozon
-        // списывает 0.71-1.08%, а не 1.5%.
-        if (($ozonActualRates['acquiring_percent'] ?? null) !== null) {
-            $acquiringPercent = (float) $ozonActualRates['acquiring_percent'];
-        }
-        $storageCost = $marketplace === 'wildberries'
+        $acquiringPercent = $ratePolicy->acquiringPercent(
+            $ozonActualRates,
+            $existingAcquiringPercent !== null ? (float) $existingAcquiringPercent : null,
+            $defaultAcquiring
+        );
+        $storageFallback = $marketplace === 'wildberries'
             ? (float) ($marketplaceData['storage_cost_per_unit'] ?? $marketplaceData['storage_cost_normalized'] ?? 0)
             : (float) ($marketplaceData['storage_cost_per_unit']
                 ?? $marketplaceData['storage_cost_normalized']
@@ -861,12 +856,7 @@ class UnitEconomicsCacheService
                 ?? $product->storage_cost
                 ?? $existingUE?->storage_cost
                 ?? 0);
-        // Хранение Ozon — фактический расход склада, приведённый к проданной
-        // единице. Без этого сюда попадала месячная сумма по остаткам (до 29 тыс ₽
-        // «на единицу»), а калькулятор оставит её только схеме FBO.
-        if (($ozonActualRates['storage_per_unit'] ?? null) !== null) {
-            $storageCost = (float) $ozonActualRates['storage_per_unit'];
-        }
+        $storageCost = $ratePolicy->storageCost($ozonActualRates, $storageFallback);
         if ($marketplace === 'wildberries' && ! in_array(strtoupper($fulfillmentType), ['FBO', 'FBW'], true)) {
             $storageCost = 0.0;
         }
@@ -1044,7 +1034,7 @@ class UnitEconomicsCacheService
             'vat_percent' => $vatPercent,
             'acquiring_percent' => $acquiringPercent,
             'storage_cost' => $storageCost,
-            'last_mile_cost' => $ozonActualRates['last_mile_avg'] ?? null,
+            'last_mile_cost' => $ratePolicy->lastMileCost($ozonActualRates),
             'additional_commission_percent' => null,
             'own_delivery_cost' => $ownDeliveryCost,
             'own_return_cost' => $ownReturnCost,
