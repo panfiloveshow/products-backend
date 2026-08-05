@@ -6,6 +6,7 @@ use App\Domains\Marketplace\MarketplaceFactory;
 use App\Domains\Ozon\Api\DeliveryAnalyticsApi;
 use App\Domains\Ozon\OzonMarketplace;
 use App\Domains\Ozon\Tariffs\OzonPricingMatrix;
+use App\Domains\Ozon\UnitEconomics\OzonRatePolicy;
 use App\Domains\Wildberries\UnitEconomics\WildberriesCommissionResolver;
 use App\Domains\Wildberries\UnitEconomics\WildberriesSppResolver;
 use App\Domains\Wildberries\WildberriesMarketplace;
@@ -2223,23 +2224,25 @@ class SyncUnitEconomicsCommand extends Command
                 $data['return_cost'] = $schemaCommission['return_amount'] ?? 100;
 
                 // === ФАКТИЧЕСКИЕ СТАВКИ МАГАЗИНА (ozon_finance_transactions) ===
-                // Эквайринг/последняя миля/хранение по факту вместо тарифных дефолтов.
-                // Раньше эквайринг тянули отдельным API-обходом транзакций и отключили
-                // из-за OOM; здесь тот же ответ одним SQL по локальной таблице.
-                $actualRates = app(\App\Services\Ozon\OzonActualRatesService::class)
-                    ->forIntegration((int) $product->integration_id);
-                if (($actualRates['last_mile_avg'] ?? null) !== null) {
-                    $data['last_mile_cost'] = $actualRates['last_mile_avg'];
+                // Приоритеты — в OzonRatePolicy, её же зовёт UnitEconomicsCacheService:
+                // второй движок собирает вход сам, и раздельная логика уже дважды
+                // приводила к расхождению карточки с расчётом синка.
+                $ratePolicy = app(OzonRatePolicy::class);
+                $actualRates = $ratePolicy->actualRates('ozon', (int) $product->integration_id);
+                $lastMile = $ratePolicy->lastMileCost($actualRates);
+                if ($lastMile !== null) {
+                    $data['last_mile_cost'] = $lastMile;
                 }
-                if (($actualRates['storage_per_unit'] ?? null) !== null) {
-                    // Хранение магазина, приведённое к одной проданной единице.
-                    // Калькулятор оставит его только схеме FBO.
-                    $data['storage_cost'] = $actualRates['storage_per_unit'];
-                }
+                // Хранение магазина, приведённое к одной проданной единице.
+                // Калькулятор оставит его только схеме FBO.
+                $data['storage_cost'] = $ratePolicy->storageCost(
+                    $actualRates,
+                    (float) ($data['storage_cost'] ?? 0)
+                );
 
                 // Эквайринг (приоритет: факт по транзакциям > финансовые транзакции > фактические затраты > дефолт 1.5%)
                 if (($actualRates['acquiring_percent'] ?? null) !== null) {
-                    $data['acquiring_percent'] = $actualRates['acquiring_percent'];
+                    $data['acquiring_percent'] = $ratePolicy->acquiringPercent($actualRates);
                 } elseif ($acquiringData && isset($acquiringData['avg_acquiring_percent']) && $acquiringData['avg_acquiring_percent'] > 0) {
                     // Из финансовых транзакций /v3/finance/transaction/list
                     $data['acquiring_percent'] = $acquiringData['avg_acquiring_percent'];
