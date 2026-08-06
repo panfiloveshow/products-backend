@@ -2840,6 +2840,29 @@ class UnitEconomicsCacheController extends Controller
                 $recalculatedWeighted += ($share / 100) * (float) ($clusterRow['effective_markup_percent'] ?? 0);
             }
             $weightedMarkup = round($recalculatedWeighted, 2);
+
+            // «Старая юнитка»: взвешенная нелокальная наценка по таблице, действовавшей
+            // ДО отмены 09.07.2026 (дата 08.07). Ozon наценку отменил, поэтому в текущих
+            // цифрах её нет — но менеджерам нужен режим сравнения «до/сейчас/с 28.08»,
+            // и фронт без этой ставки старый расчёт не восстановит.
+            $legacyPricing = app(OzonPricingMatrix::class);
+            $legacyWeighted = 0.0;
+            foreach ($data['clusters_summary'] as $clusterRow) {
+                if (! is_array($clusterRow)) {
+                    continue;
+                }
+                $share = (float) ($clusterRow['orders_percent'] ?? 0);
+                if ($share <= 0 || ! empty($clusterRow['is_local_cluster'])) {
+                    continue;
+                }
+                $legacyWeighted += ($share / 100) * $legacyPricing->resolveDestinationMarkupPercent(
+                    (string) ($clusterRow['cluster_name'] ?? ''),
+                    '2026-07-08'
+                );
+            }
+            $data['legacy_non_local_markup_percent'] = round($legacyWeighted, 2);
+            $data['legacy_non_local_markup_amount'] = round((float) $cache->price * ($legacyWeighted / 100), 2);
+
             [$displayMarkup, $displayMarkupAmount, $hasFactualMarkup] = $isFboScheme
                 ? $this->resolveOzonDisplayNonLocalMarkup(
                     $orderEconomicsSummary,
