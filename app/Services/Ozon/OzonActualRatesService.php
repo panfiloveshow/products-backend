@@ -44,7 +44,17 @@ class OzonActualRatesService
      */
     public function forIntegration(int $integrationId, int $days = 28): array
     {
-        return self::$cache[$integrationId.':'.$days] ??= $this->compute($integrationId, $days);
+        return self::$cache[$this->cacheKey($integrationId, $days)] ??= $this->compute($integrationId, $days);
+    }
+
+    /**
+     * Дата в ключе: транзакции приходят ежедневно, а статический кэш живёт
+     * столько же, сколько процесс воркера — без даты он раздавал бы ставки
+     * прошлой недели до рестарта очереди.
+     */
+    private function cacheKey(int $integrationId, int $days): string
+    {
+        return $integrationId.':'.$days.':'.now()->toDateString();
     }
 
     private function compute(int $integrationId, int $days): array
@@ -129,7 +139,7 @@ class OzonActualRatesService
      */
     public function lastMilePerSku(int $integrationId, int $days = 28): array
     {
-        return self::$skuLastMileCache[$integrationId.':'.$days] ??= $this->computeLastMilePerSku($integrationId, $days);
+        return self::$skuLastMileCache[$this->cacheKey($integrationId, $days)] ??= $this->computeLastMilePerSku($integrationId, $days);
     }
 
     private function computeLastMilePerSku(int $integrationId, int $days): array
