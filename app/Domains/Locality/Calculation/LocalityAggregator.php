@@ -72,6 +72,13 @@ class LocalityAggregator
                 'calculation_mode',
                 'calculation_confidence',
                 'order_date',
+                // Дата правил для Overpayment/LostMargin: заказы из зафиксированных
+                // поставок считаются по дате фиксации (60 дней после отмены наценки
+                // 09.07.2026). Без этих двух колонок калькуляторы падали на дату
+                // заказа и занулили переплату у всех фиксаций. bool + date — на
+                // memory footprint не влияют.
+                'fixation_applied',
+                'fixation_base_date',
                 'tariff_version_used',
                 'volume_liters',
             ])
