@@ -7,6 +7,7 @@ use App\Models\Product;
 use App\Models\SyncLog;
 use App\Models\Integration;
 use App\Domains\Marketplace\MarketplaceFactory;
+use App\Jobs\RecalculateUnitEconomicsCacheJob;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
@@ -131,6 +132,11 @@ class SyncStorageCostJob implements ShouldQueue
         $totalCurrentCost = 0.0;
         $totalPrevCost = 0.0;
 
+        // Заказы по SKU в тех же календарных окнах, что и начисления хранения —
+        // для честного ₽/шт. Делить месячную сумму на чужое окно нельзя.
+        $unitsPrev = $this->orderedUnitsBySku($integrationId, $prevFrom, $prevTo);
+        $unitsCurrent = $this->orderedUnitsBySku($integrationId, $currentFrom, $currentTo);
+
         foreach ($skus as $sku) {
             $currentCost = (float) ($currentData[$sku]['placement_cost'] ?? 0);
             $prevCost = (float) ($prevData[$sku]['placement_cost'] ?? 0);
@@ -146,6 +152,15 @@ class SyncStorageCostJob implements ShouldQueue
 
             if ($product) {
                 $product->storage_cost = $prevCost > 0 ? $prevCost : $currentCost;
+                // ₽/шт: сумма и заказы из ОДНОГО окна (прошлый месяц приоритетнее —
+                // полный; фолбэк на месяц-к-дате). Нет заказов в окне — null:
+                // на непродающийся товар «за шт» не существует.
+                $perUnitBase = $prevCost > 0
+                    ? [$prevCost, (int) ($unitsPrev[$sku] ?? 0)]
+                    : [$currentCost, (int) ($unitsCurrent[$sku] ?? 0)];
+                $product->storage_cost_per_unit = ($perUnitBase[0] > 0 && $perUnitBase[1] > 0)
+                    ? round($perUnitBase[0] / $perUnitBase[1], 2)
+                    : null;
                 $product->storage_cost_updated_at = now();
                 $product->save();
                 $updatedProducts++;
@@ -185,6 +200,17 @@ class SyncStorageCostJob implements ShouldQueue
                 'storage_fee_prev_month_period' => $prevTo,
             ]);
 
+        // SKU, у которых расход хранения пропал (вывезли остатки, кончился платный
+        // объём) — сбрасываем и ₽/шт, иначе UE вечно вычитает старое хранение.
+        Product::where('marketplace', $marketplace)
+            ->where('integration_id', $integrationId)
+            ->whereNotIn('sku', $skus)
+            ->whereNotNull('storage_cost_per_unit')
+            ->update(['storage_cost_per_unit' => null, 'storage_cost' => 0, 'storage_cost_updated_at' => now()]);
+
+        // Кэш UE держит старые цифры хранения до пересчёта.
+        RecalculateUnitEconomicsCacheJob::dispatch($integrationId);
+
         Log::info("SyncStorageCostJob: {$marketplace} completed", [
             'integration_id' => $integrationId,
             'updated_products' => $updatedProducts,
@@ -193,5 +219,23 @@ class SyncStorageCostJob implements ShouldQueue
             'total_current_cost' => round($totalCurrentCost, 2),
             'total_prev_cost' => round($totalPrevCost, 2),
         ]);
+    }
+
+    /**
+     * Заказы SKU (артикул) за окно — из ozon_order_unit_economics, как и
+     * сортировка «продажи 28д» в листинге UE.
+     *
+     * @return array<string, int>
+     */
+    private function orderedUnitsBySku(int $integrationId, string $from, string $to): array
+    {
+        return \Illuminate\Support\Facades\DB::table('ozon_order_unit_economics')
+            ->where('integration_id', $integrationId)
+            ->whereBetween('order_date', [$from.' 00:00:00', $to.' 23:59:59'])
+            ->selectRaw('sku, count(*) as units')
+            ->groupBy('sku')
+            ->pluck('units', 'sku')
+            ->map(fn ($v) => (int) $v)
+            ->all();
     }
 }

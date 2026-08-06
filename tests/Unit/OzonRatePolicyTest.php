@@ -29,9 +29,12 @@ class OzonRatePolicyTest extends TestCase
     {
         $policy = new OzonRatePolicy();
 
-        // Ozon per-SKU хранения не отдаёт: смир по магазину запрещён,
-        // даже когда fallback принёс «месячную сумму по остаткам».
+        // Смир по магазину запрещён, даже когда fallback принёс
+        // «месячную сумму по остаткам».
         $this->assertSame(0.0, $policy->storageCost(self::ACTUAL, 8740.93));
+        // Единственный источник — per-SKU факт из отчёта placement/by-products.
+        $this->assertSame(36.89, $policy->storageCost(self::ACTUAL, 8740.93, 36.89));
+        $this->assertSame(0.0, $policy->storageCost(self::ACTUAL, 8740.93, 0.0));
     }
 
     public function test_falls_back_when_store_has_no_transactions(): void

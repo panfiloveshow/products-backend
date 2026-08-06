@@ -856,7 +856,11 @@ class UnitEconomicsCacheService
                 ?? $product->storage_cost
                 ?? $existingUE?->storage_cost
                 ?? 0);
-        $storageCost = $ratePolicy->storageCost($ozonActualRates, $storageFallback);
+        $storageCost = $ratePolicy->storageCost(
+            $ozonActualRates,
+            $storageFallback,
+            $this->ozonStoragePerUnit($product, $marketplace)
+        );
         if ($marketplace === 'wildberries' && ! in_array(strtoupper($fulfillmentType), ['FBO', 'FBW'], true)) {
             $storageCost = 0.0;
         }
@@ -2644,6 +2648,25 @@ class UnitEconomicsCacheService
         foreach ($schemes as $scheme) {
             Cache::forget("ue_stats_{$integrationId}_{$marketplace}_".strtoupper($scheme));
         }
+    }
+
+    /**
+     * Хранение Ozon на проданную единицу — факт из отчёта placement/by-products.
+     * Свежесть до 3 суток: SyncStorageCostJob ходит ежедневно, протухшее значение
+     * означает сломанный синк — лучше показать 0, чем прошлогоднее хранение.
+     */
+    private function ozonStoragePerUnit($product, string $marketplace): ?float
+    {
+        if ($marketplace !== 'ozon') {
+            return null;
+        }
+        $perUnit = $product->storage_cost_per_unit;
+        $updatedAt = $product->storage_cost_updated_at;
+        if ($perUnit === null || $perUnit <= 0 || $updatedAt === null) {
+            return null;
+        }
+
+        return now()->diffInHours($updatedAt, true) <= 72 ? (float) $perUnit : null;
     }
 
     /**

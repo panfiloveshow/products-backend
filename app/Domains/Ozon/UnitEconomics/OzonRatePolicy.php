@@ -77,17 +77,21 @@ class OzonRatePolicy
     }
 
     /**
-     * Хранение Ozon per-SKU НЕ существует: транзакция OperationMarketplaceServiceStorage
-     * приходит одной суммой на магазин в день (items пустой), а API остатков денег
-     * не отдаёт. Раньше сумму размазывали поровну на все проданные единицы — ходовая
-     * мелочь платила как залежавшийся КГТ, и цифра была одинаковой во всех строках.
-     * Юнит-экономика строится на товар, поэтому выдуманное среднее не показываем: 0.
+     * Хранение Ozon: ТОЛЬКО per-SKU факт из отчёта placement/by-products
+     * (products.storage_cost_per_unit, пишет SyncStorageCostJob), иначе 0.
+     * Размазанное среднее по магазину запрещено: платят единицы SKU (в НБК ЧЕКИ —
+     * 4 из 50), а смир вешал одинаковую цифру на все строки. Транзакция хранения
+     * приходит одной суммой на магазин в день — из неё per-SKU не собрать.
      * Не-Ozon движки приходят с пустыми actualRates и живут своим fallback
      * (WB/YM считают хранение из своих тарифов по объёму).
      */
-    public function storageCost(array $actualRates, float $fallback = 0.0): float
+    public function storageCost(array $actualRates, float $fallback = 0.0, ?float $perSkuPerUnit = null): float
     {
-        return $actualRates === [] ? $fallback : 0.0;
+        if ($actualRates === []) {
+            return $fallback;
+        }
+
+        return $perSkuPerUnit !== null && $perSkuPerUnit > 0 ? $perSkuPerUnit : 0.0;
     }
 
     /**

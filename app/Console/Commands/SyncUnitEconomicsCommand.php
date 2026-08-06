@@ -2251,11 +2251,18 @@ class SyncUnitEconomicsCommand extends Command
                 if ($lastMile !== null) {
                     $data['last_mile_cost'] = $lastMile;
                 }
-                // Хранение per-SKU у Ozon недоступно — политика вернёт 0,
-                // а не размазанное среднее по магазину (см. OzonRatePolicy).
+                // Хранение Ozon: per-SKU факт из отчёта placement/by-products
+                // (products.storage_cost_per_unit), иначе 0 — среднее по магазину
+                // политика больше не размазывает (см. OzonRatePolicy).
+                $storagePerUnitFresh = ($product->storage_cost_per_unit ?? null) !== null
+                    && $product->storage_cost_updated_at !== null
+                    && now()->diffInHours($product->storage_cost_updated_at, true) <= 72
+                        ? (float) $product->storage_cost_per_unit
+                        : null;
                 $data['storage_cost'] = $ratePolicy->storageCost(
                     $actualRates,
-                    (float) ($data['storage_cost'] ?? 0)
+                    (float) ($data['storage_cost'] ?? 0),
+                    $storagePerUnitFresh
                 );
 
                 // Эквайринг (приоритет: факт по транзакциям > финансовые транзакции > фактические затраты > дефолт 1.5%)
