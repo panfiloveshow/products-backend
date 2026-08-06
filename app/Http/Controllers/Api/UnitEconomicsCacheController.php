@@ -822,6 +822,9 @@ class UnitEconomicsCacheController extends Controller
             'period' => 'nullable|integer|in:7,28',
             'period_days' => 'nullable|integer|in:7,28',
             'as_of' => 'nullable|date',
+            // Тарифная эпоха Ozon: выгрузка совпадает с выбранным на странице
+            // режимом «до 09.07 / сейчас / с 28.08», а не только с фильтрами.
+            'tariff_era' => 'nullable|string|in:legacy,current,upcoming',
         ])->validate();
 
         $resolution = $this->integrationAccessService->ensureAccessibleIntegration(
@@ -833,6 +836,7 @@ class UnitEconomicsCacheController extends Controller
             abort($resolution['status'] ?? 404, $resolution['message'] ?? 'Интеграция не найдена');
         }
 
+        $tariffEra = (string) ($validated['tariff_era'] ?? 'current');
         $fulfillmentType = strtoupper((string) $validated['fulfillment_type']);
         // WB «Склад WB» на фронте — FBW, а в кэше схема хранится как FBO. Нормализуем,
         // иначе forScheme('FBW') не находит строк и выгрузка пустая/невалидная.
@@ -893,7 +897,8 @@ class UnitEconomicsCacheController extends Controller
             $fulfillmentType,
             $ozonLocalitySnapshotDate,
             $ozonLocalityPeriodDays,
-            $onlyInStock
+            $onlyInStock,
+            $tariffEra
         ) {
             $settingsMap = UnitEconomicsSettings::where('integration_id', $integrationId)
                 ->whereIn('sku', $items->pluck('sku')->unique()->values()->all())
@@ -941,6 +946,9 @@ class UnitEconomicsCacheController extends Controller
                     );
                 }
 
+                if ($marketplace === 'ozon' && $tariffEra !== 'current') {
+                    $enriched = $this->applyTariffEraToExportItem($enriched, $tariffEra);
+                }
                 if ($onlyInStock && (float) ($enriched['current_stock'] ?? 0) <= 0) {
                     continue;
                 }
@@ -954,22 +962,93 @@ class UnitEconomicsCacheController extends Controller
         $integrationName = $integration?->name ?? "ID {$integrationId}";
 
         // Генерируем Excel
+        $eraTitleSuffix = match ($tariffEra) {
+            'legacy' => ' — тарифы до 09.07.2026 (с нелокальной наценкой)',
+            'upcoming' => ' — прогноз по комиссиям с 28.08.2026',
+            default => '',
+        };
         $spreadsheet = $this->buildUnitEconomicsSpreadsheet(
             $enrichedItems,
-            $integrationName,
+            $integrationName.$eraTitleSuffix,
             $marketplace,
             $fulfillmentType
         );
 
         $date = now()->format('Y-m-d');
         $time = now()->format('His');
-        $filename = "unit-economics-{$marketplace}-{$fulfillmentType}-{$date}-{$time}.xlsx";
+        $eraFileSuffix = match ($tariffEra) {
+            'legacy' => '-do-09-07',
+            'upcoming' => '-s-28-08',
+            default => '',
+        };
+        $filename = "unit-economics-{$marketplace}-{$fulfillmentType}{$eraFileSuffix}-{$date}-{$time}.xlsx";
 
         return new StreamedResponse(function () use ($spreadsheet) {
             $writer = new Xlsx($spreadsheet);
             $writer->save('php://output');
             $spreadsheet->disconnectWorksheets();
         }, 200, $this->buildExportHeaders($filename));
+    }
+
+    /**
+     * Проекция строки выгрузки на тарифную эпоху Ozon — та же математика, что
+     * у переключателя «до 09.07 / сейчас / с 28.08» на фронте: Excel обязан
+     * совпадать с таблицей в выбранном режиме.
+     *  - legacy: нелокальная наценка старых правил (legacy_non_local_markup_*)
+     *    возвращается в эфф. логистику, колонки наценки показывают её ставку;
+     *  - upcoming: комиссия из таблицы вознаграждений с 28.08.2026.
+     * После подмены компонент На РС/прибыль/маржа пересчитываются каноном.
+     */
+    private function applyTariffEraToExportItem(array $item, string $era): array
+    {
+        $price = (float) ($item['price'] ?? 0);
+        if ($price <= 0) {
+            return $item;
+        }
+
+        if ($era === 'upcoming') {
+            $upcoming = $item['commission_rate_from_2026_08_28'] ?? null;
+            if (is_numeric($upcoming) && (float) $upcoming > 0) {
+                $item['commission_percent'] = round((float) $upcoming, 2);
+                $item['commission_amount'] = round($price * ((float) $upcoming) / 100, 2);
+                $item['commission_per_unit'] = $item['commission_amount'];
+            }
+        } elseif ($era === 'legacy') {
+            $legacyPct = (float) ($item['legacy_non_local_markup_percent'] ?? 0);
+            $legacyAmt = (float) ($item['legacy_non_local_markup_amount'] ?? 0);
+            $currentAmt = (float) ($item['non_local_markup_amount'] ?? 0);
+            $extra = max(0.0, $legacyAmt - $currentAmt);
+            if ($extra > 0) {
+                $item['effective_logistics'] = round((float) ($item['effective_logistics'] ?? 0) + $extra, 2);
+            }
+            $item['non_local_markup_percent'] = $legacyPct;
+            $item['non_local_markup_amount'] = $legacyAmt;
+            $item['logistics_markup_percent'] = $legacyPct;
+            $item['logistics_markup_amount'] = $legacyAmt;
+        }
+
+        $commission = (float) ($item['commission_amount'] ?? 0);
+        $effLog = (float) ($item['effective_logistics'] ?? 0);
+        $acquiring = (float) ($item['acquiring_amount'] ?? 0);
+        $storage = (float) ($item['storage_cost'] ?? 0);
+        $drr = (float) ($item['drr_amount'] ?? 0);
+        $tax = (float) ($item['tax_amount'] ?? 0);
+        $vat = (float) ($item['vat_amount'] ?? 0);
+        $ourShare = (float) ($item['our_share_amount'] ?? 0);
+        $costPrice = (float) ($item['cost_price'] ?? 0);
+
+        $toSettlement = round($price - $commission - $effLog - $acquiring - $storage - $drr, 2);
+        $netProfit = round($toSettlement - $costPrice - $tax - $vat - $ourShare, 2);
+
+        $item['to_settlement_account'] = $toSettlement;
+        $item['net_profit'] = $netProfit;
+        $item['net_profit_per_unit'] = $netProfit;
+        $item['margin_percent'] = round($netProfit / $price * 100, 2);
+        $item['roi_percent'] = $costPrice > 0 ? round($netProfit / $costPrice * 100, 2) : 0.0;
+        $item['total_costs'] = round($costPrice + $commission + $effLog + $acquiring + $storage + $drr + $tax + $vat + $ourShare, 2);
+        $item['total_costs_per_unit'] = $item['total_costs'];
+
+        return $item;
     }
 
     /**
