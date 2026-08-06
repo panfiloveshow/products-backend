@@ -488,6 +488,47 @@ class OzonUnitEconomicsCalculatorTest extends TestCase
         $this->assertSame(false, $result['is_local_sale']);
     }
 
+    public function test_fixated_order_after_markup_cancellation_keeps_old_rules(): void
+    {
+        $calculator = new OzonUnitEconomicsCalculator();
+        $base = [
+            'sku' => 'sku-fix',
+            'integration_id' => 1,
+            'marketplace' => 'ozon',
+            'fulfillment_type' => 'FBO',
+            'price' => 500,
+            'cost_price' => 200,
+            'length' => 5,
+            'width' => 5,
+            'height' => 8,
+            'sales_7_days' => 80,
+            'orders_count' => 10,
+            'delivered_count' => 8,
+            'shipping_cluster_name' => 'Казань',
+            'destination_cluster_name' => 'Москва, МО и Дальние регионы',
+            // Заказ ПОСЛЕ отмены наценки 09.07.2026.
+            'order_date' => '2026-07-20',
+            'markup_applied' => true,
+            'markup_reason_code' => 'non_local_markup_applied',
+        ];
+
+        // Поставка зафиксирована до отмены: 60 дней живут правила даты фиксации,
+        // наценка 8% (Москва, МО) продолжает списываться — и должна показываться.
+        $fixated = $calculator->calculate(CalculationInput::fromArray($base + [
+            'fixation_applied' => true,
+            'fixation_base_date' => '2026-07-01',
+            'fixed_until' => '2026-09-01',
+            'tariff_version_used' => '2026-07-01',
+            'markup_version_used' => '2026-07-01',
+        ]))->toArray();
+        $this->assertSame(8.0, $fixated['non_local_markup_percent']);
+        $this->assertGreaterThan(0, $fixated['non_local_markup_amount']);
+
+        // Без фиксации той же датой — наценка отменена, ноль.
+        $free = $calculator->calculate(CalculationInput::fromArray($base))->toArray();
+        $this->assertSame(0.0, $free['non_local_markup_percent']);
+    }
+
     public function test_fbo_multi_cluster_stock_is_not_treated_as_fully_local_without_fixation(): void
     {
         $calculator = new OzonUnitEconomicsCalculator();
