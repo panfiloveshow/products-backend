@@ -2238,15 +2238,31 @@ class SyncUnitEconomicsCommand extends Command
                 // приводила к расхождению карточки с расчётом синка.
                 $ratePolicy = app(OzonRatePolicy::class);
                 $actualRates = $ratePolicy->actualRates('ozon', (int) $product->integration_id);
-                $lastMile = $ratePolicy->lastMileCost($actualRates);
+                $ozonDataForSku = is_array($product->ozon_data ?? null) ? $product->ozon_data : [];
+                $lastMile = $ratePolicy->lastMileCost(
+                    $actualRates,
+                    (int) $product->integration_id,
+                    array_filter([
+                        $ozonDataForSku['sku'] ?? null,
+                        $ozonDataForSku['fbo_sku'] ?? null,
+                        $ozonDataForSku['fbs_sku'] ?? null,
+                    ])
+                );
                 if ($lastMile !== null) {
                     $data['last_mile_cost'] = $lastMile;
                 }
-                // Хранение магазина, приведённое к одной проданной единице.
-                // Калькулятор оставит его только схеме FBO.
+                // Хранение Ozon: per-SKU факт из отчёта placement/by-products
+                // (products.storage_cost_per_unit), иначе 0 — среднее по магазину
+                // политика больше не размазывает (см. OzonRatePolicy).
+                $storagePerUnitFresh = ($product->storage_cost_per_unit ?? null) !== null
+                    && $product->storage_cost_updated_at !== null
+                    && now()->diffInHours($product->storage_cost_updated_at, true) <= 72
+                        ? (float) $product->storage_cost_per_unit
+                        : null;
                 $data['storage_cost'] = $ratePolicy->storageCost(
                     $actualRates,
-                    (float) ($data['storage_cost'] ?? 0)
+                    (float) ($data['storage_cost'] ?? 0),
+                    $storagePerUnitFresh
                 );
 
                 // Эквайринг (приоритет: факт по транзакциям > финансовые транзакции > фактические затраты > дефолт 1.5%)

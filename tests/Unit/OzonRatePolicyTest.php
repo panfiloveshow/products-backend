@@ -15,8 +15,6 @@ class OzonRatePolicyTest extends TestCase
     private const ACTUAL = [
         'acquiring_percent' => 1.08,
         'last_mile_avg' => 10.38,
-        'storage_per_unit' => 25.19,
-        'ad_percent' => 5.74,
     ];
 
     public function test_actual_rates_beat_stored_value_and_default(): void
@@ -25,7 +23,18 @@ class OzonRatePolicyTest extends TestCase
 
         $this->assertSame(1.08, $policy->acquiringPercent(self::ACTUAL, 4.2));
         $this->assertSame(10.38, $policy->lastMileCost(self::ACTUAL));
-        $this->assertSame(25.19, $policy->storageCost(self::ACTUAL, 8740.93));
+    }
+
+    public function test_ozon_storage_is_never_a_shop_average(): void
+    {
+        $policy = new OzonRatePolicy();
+
+        // Смир по магазину запрещён, даже когда fallback принёс
+        // «месячную сумму по остаткам».
+        $this->assertSame(0.0, $policy->storageCost(self::ACTUAL, 8740.93));
+        // Единственный источник — per-SKU факт из отчёта placement/by-products.
+        $this->assertSame(36.89, $policy->storageCost(self::ACTUAL, 8740.93, 36.89));
+        $this->assertSame(0.0, $policy->storageCost(self::ACTUAL, 8740.93, 0.0));
     }
 
     public function test_falls_back_when_store_has_no_transactions(): void
@@ -39,6 +48,7 @@ class OzonRatePolicyTest extends TestCase
 
         // Нет факта последней мили — калькулятор возьмёт тариф схемы.
         $this->assertNull($policy->lastMileCost([]));
+        // Пустые rates = не-Ozon движок: его хранение (WB/YM) живёт своим fallback.
         $this->assertSame(12.0, $policy->storageCost([], 12.0));
     }
 
@@ -48,10 +58,10 @@ class OzonRatePolicyTest extends TestCase
 
         // Продавец задал свой ДРР — уважаем его.
         $this->assertSame(9.0, $policy->drrPercent(9.0, self::ACTUAL));
-        // Не задал — берём фактический расход магазина вместо нуля.
-        $this->assertSame(5.74, $policy->drrPercent(null, self::ACTUAL));
-        $this->assertSame(5.74, $policy->drrPercent(0.0, self::ACTUAL));
-        // Нет ни того, ни другого — реклама не выдумывается.
+        // Не задал — средний по магазину НЕ подставляем: одинаковый «рекламный
+        // налог» на все SKU снимался отчётом Performance, и маржа росла от синка.
+        $this->assertSame(0.0, $policy->drrPercent(null, self::ACTUAL));
+        $this->assertSame(0.0, $policy->drrPercent(0.0, self::ACTUAL));
         $this->assertSame(0.0, $policy->drrPercent(null, []));
     }
 

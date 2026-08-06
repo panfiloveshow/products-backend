@@ -856,7 +856,11 @@ class UnitEconomicsCacheService
                 ?? $product->storage_cost
                 ?? $existingUE?->storage_cost
                 ?? 0);
-        $storageCost = $ratePolicy->storageCost($ozonActualRates, $storageFallback);
+        $storageCost = $ratePolicy->storageCost(
+            $ozonActualRates,
+            $storageFallback,
+            $this->ozonStoragePerUnit($product, $marketplace)
+        );
         if ($marketplace === 'wildberries' && ! in_array(strtoupper($fulfillmentType), ['FBO', 'FBW'], true)) {
             $storageCost = 0.0;
         }
@@ -1034,7 +1038,11 @@ class UnitEconomicsCacheService
             'vat_percent' => $vatPercent,
             'acquiring_percent' => $acquiringPercent,
             'storage_cost' => $storageCost,
-            'last_mile_cost' => $ratePolicy->lastMileCost($ozonActualRates),
+            'last_mile_cost' => $ratePolicy->lastMileCost(
+                $ozonActualRates,
+                (int) $product->integration_id,
+                $this->ozonNumericSkuCandidates($product)
+            ),
             'additional_commission_percent' => null,
             'own_delivery_cost' => $ownDeliveryCost,
             'own_return_cost' => $ownReturnCost,
@@ -2640,6 +2648,41 @@ class UnitEconomicsCacheService
         foreach ($schemes as $scheme) {
             Cache::forget("ue_stats_{$integrationId}_{$marketplace}_".strtoupper($scheme));
         }
+    }
+
+    /**
+     * Хранение Ozon на проданную единицу — факт из отчёта placement/by-products.
+     * Свежесть до 3 суток: SyncStorageCostJob ходит ежедневно, протухшее значение
+     * означает сломанный синк — лучше показать 0, чем прошлогоднее хранение.
+     */
+    private function ozonStoragePerUnit($product, string $marketplace): ?float
+    {
+        if ($marketplace !== 'ozon') {
+            return null;
+        }
+        $perUnit = $product->storage_cost_per_unit;
+        $updatedAt = $product->storage_cost_updated_at;
+        if ($perUnit === null || $perUnit <= 0 || $updatedAt === null) {
+            return null;
+        }
+
+        return now()->diffInHours($updatedAt, true) <= 72 ? (float) $perUnit : null;
+    }
+
+    /**
+     * Числовые SKU Ozon товара — ключи per-SKU ставок из финансовых транзакций
+     * (products.sku — это артикул, а в транзакциях лежит ozon_data.sku).
+     *
+     * @return array<int, string>
+     */
+    private function ozonNumericSkuCandidates($product): array
+    {
+        $ozonData = is_array($product->ozon_data ?? null) ? $product->ozon_data : [];
+
+        return array_values(array_filter(array_map(
+            static fn ($value) => (string) ($value ?? ''),
+            [$ozonData['sku'] ?? null, $ozonData['fbo_sku'] ?? null, $ozonData['fbs_sku'] ?? null]
+        ), static fn (string $value) => $value !== '' && $value !== '0'));
     }
 
     // ...
