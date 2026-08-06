@@ -66,10 +66,12 @@ class OverpaymentCalculator
                 continue;
             }
 
-            // Non-local: считаем потенциальную наценку по таблице Ozon на дату
-            // заказа. Ozon отменил наценку с 09.07.2026 — по свежим заказам
-            // потенциальной переплаты нет, по старым отчёт остаётся корректным.
-            $markupPct = $this->pricing->resolveDestinationMarkupPercent($dest, $this->orderDate($item));
+            // Non-local: потенциальная наценка по таблице Ozon на дату ПРАВИЛ.
+            // Для заказов из зафиксированных поставок (заявка до 08.07.2026) это
+            // дата фиксации — старые правила живут 60 дней; иначе дата заказа.
+            // Ozon отменил наценку с 09.07.2026 — по свежим нефиксированным
+            // заказам потенциальной переплаты нет.
+            $markupPct = $this->pricing->resolveDestinationMarkupPercent($dest, $this->pricingDate($item));
             $price = $this->salePrice($item);
             if ($price <= 0 || $markupPct <= 0) {
                 $nonLocalOrders++;
@@ -117,6 +119,23 @@ class OverpaymentCalculator
     private function salePrice(object|array $item): float
     {
         return (float) (is_array($item) ? ($item['sale_price'] ?? 0) : ($item->sale_price ?? 0));
+    }
+
+    /** Дата правил: fixation_base_date у фиксаций, иначе дата заказа. */
+    private function pricingDate(object|array $item): ?string
+    {
+        $applied = is_array($item) ? ($item['fixation_applied'] ?? false) : ($item->fixation_applied ?? false);
+        if ($applied) {
+            $base = is_array($item) ? ($item['fixation_base_date'] ?? null) : ($item->fixation_base_date ?? null);
+            if ($base instanceof \DateTimeInterface) {
+                return $base->format('Y-m-d');
+            }
+            if ($base !== null && $base !== '') {
+                return substr((string) $base, 0, 10);
+            }
+        }
+
+        return $this->orderDate($item);
     }
 
     private function orderDate(object|array $item): ?string

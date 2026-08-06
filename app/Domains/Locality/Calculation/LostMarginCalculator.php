@@ -45,8 +45,13 @@ class LostMarginCalculator
         }
 
         $salePrice = (float) ($item->sale_price ?? 0);
-        $orderDate = $item->order_date ?? null;
-        $markupPct = (float) $this->pricing->resolveDestinationMarkupPercent((string) $dest, $orderDate ? (string) $orderDate : null);
+        // Дата правил: у заказов из зафиксированных поставок наценка живёт по
+        // дате фиксации (60 дней после отмены 09.07.2026), иначе — дата заказа.
+        $orderDate = ($item->fixation_applied ?? false)
+            ? ($item->fixation_base_date ?? $item->order_date ?? null)
+            : ($item->order_date ?? null);
+        $orderDate = $orderDate instanceof \DateTimeInterface ? $orderDate->format('Y-m-d') : ($orderDate !== null ? substr((string) $orderDate, 0, 10) : null);
+        $markupPct = (float) $this->pricing->resolveDestinationMarkupPercent((string) $dest, $orderDate);
         $potentialMarkup = $salePrice > 0 && $markupPct > 0
             ? round($salePrice * ($markupPct / 100), 2)
             : 0.0;
@@ -60,7 +65,7 @@ class LostMarginCalculator
                 $salePrice,
                 (string) $dest,
                 (string) $dest,
-                $orderDate ? (string) $orderDate : null,
+                $orderDate,
             );
             $hypoBase = (float) ($hypothetical['base_cost'] ?? 0);
             $currentBase = (float) $item->base_logistics_tariff;
