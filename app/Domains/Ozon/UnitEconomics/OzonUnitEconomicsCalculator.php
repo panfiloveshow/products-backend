@@ -819,21 +819,22 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
      */
     private function resolvePricingDate(CalculationInput $input): string
     {
-        if (! empty($input->orderDate)) {
-            return substr((string) $input->orderDate, 0, 10);
-        }
-
         $today = function_exists('now') ? now()->toDateString() : date('Y-m-d');
+        $referenceDate = ! empty($input->orderDate) ? substr((string) $input->orderDate, 0, 10) : $today;
 
+        // Фиксация ПРИОРИТЕТНЕЕ даты заказа: заказ из зафиксированной поставки
+        // (заявка до 08.07.2026) 60 дней живёт по правилам даты фиксации — в том
+        // числе с нелокальной наценкой, отменённой 09.07. Раньше orderDate
+        // побеждал, и гейт отмены занулял наценку у фиксированных заказов.
         if ($input->fixationApplied === true && ! empty($input->fixedUntil)) {
             $fixedUntil = substr((string) $input->fixedUntil, 0, 10);
             $fixationDate = $input->fixationBaseDate ?? $input->tariffEffectiveFrom;
-            if ($fixedUntil >= $today && ! empty($fixationDate)) {
+            if ($fixedUntil >= $referenceDate && ! empty($fixationDate)) {
                 return substr((string) $fixationDate, 0, 10);
             }
         }
 
-        return $today;
+        return $referenceDate;
     }
 
     private function resolveWeightedProfileMetrics(string $scheme, CalculationInput $input, float $volume, string $pricingDate): ?array

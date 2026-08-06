@@ -115,13 +115,22 @@ class OzonOrderUnitEconomicsService
         $effectiveShippingClusterId = $fixation?->shipping_cluster_id
             ?? ($effectiveShippingClusterRow?->cluster_id ? (string) $effectiveShippingClusterRow->cluster_id : null);
 
+        // Дата ПРАВИЛ: заказ из зафиксированной поставки (заявка до 08.07.2026)
+        // 60 дней живёт по правилам даты фиксации — включая нелокальную наценку,
+        // отменённую 09.07. С датой заказа гейт отмены занулял наценку и у
+        // фиксаций: 1200+ нелокальных заказов после отмены прошли как
+        // zero_markup_cluster, хотя Ozon продолжал списывать по-старому.
+        $pricingDate = ($fixation?->fixation_base_date ?? null)
+            ? Carbon::parse($fixation->fixation_base_date)->toDateString()
+            : $orderDate?->toDateString();
+
         $clusterLogistics = $this->pricing->resolveClusterLogistics(
             'FBO',
             $volumeLiters,
             (float) ($item->price ?? 0),
             $effectiveShippingClusterName,
             $destinationClusterName,
-            $orderDate?->toDateString()
+            $pricingDate
         );
 
         [$markupApplied, $markupReasonCode, $markupReasonLabel, $markupExceptionStatus] = $this->resolveMarkupDecision(
@@ -129,7 +138,8 @@ class OzonOrderUnitEconomicsService
             $sku,
             $effectiveShippingClusterName,
             $destinationClusterName,
-            (float) ($item->price ?? 0)
+            (float) ($item->price ?? 0),
+            $pricingDate
         );
 
         $markupPercent = $markupApplied ? (float) $clusterLogistics['non_local_markup_percent'] : 0.0;
@@ -324,7 +334,8 @@ class OzonOrderUnitEconomicsService
         string $sku,
         ?string $shippingClusterName,
         ?string $destinationClusterName,
-        float $price
+        float $price,
+        ?string $pricingDate = null
     ): array {
         if ($posting->status === Posting::STATUS_CANCELLED || $posting->cancelled_at !== null) {
             return [false, 'cancelled_order', 'Надбавка не применяется: заказ отменён', 'confirmed'];
@@ -345,14 +356,13 @@ class OzonOrderUnitEconomicsService
             return [false, 'fbo_lt_50_orders_7d', 'Надбавка не применяется: за 7 дней по FBO меньше 50 заказов', 'confirmed'];
         }
 
-        // Для per-order расчёта передаём дату заказа — это важно для временных окон
-        // Ozon (напр. ДВ 0% с 18.04 по 18.05.2026): заказ от 17.04 должен получить
-        // постоянные 8%, а заказ от 20.04 — временные 0%.
-        // Используем $this->resolveOrderDate() (in_process_at → delivered → shipped → shipment),
-        // а НЕ inline fallback на created_at (время нашего INSERT), иначе заказ с NULL
-        // in_process_at получил бы наценку на момент нашего sync'а, а не реальную.
-        $orderDate = $this->resolveOrderDate($posting)?->toDateString();
-        $markupPercent = $this->pricing->resolveDestinationMarkupPercent($destinationClusterName, $orderDate);
+        // Дата правил приходит из calculateForItem: для заказов из зафиксированных
+        // поставок это fixation_base_date (старые правила живут 60 дней), для
+        // остальных — дата заказа (важно для временных окон Ozon, напр. ДВ 0%
+        // с 18.04 по 18.05.2026: заказ от 17.04 получает постоянные 8%,
+        // от 20.04 — временные 0%).
+        $pricingDate ??= $this->resolveOrderDate($posting)?->toDateString();
+        $markupPercent = $this->pricing->resolveDestinationMarkupPercent($destinationClusterName, $pricingDate);
         if ($markupPercent <= 0) {
             return [false, 'zero_markup_cluster', 'Надбавка не применяется: для кластера назначения ставка 0%', 'confirmed'];
         }
