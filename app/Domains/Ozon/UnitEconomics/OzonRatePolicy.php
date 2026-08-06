@@ -53,26 +53,41 @@ class OzonRatePolicy
     }
 
     /**
-     * Последняя миля: факт магазина, иначе тарифный потолок из конфига схемы.
-     * Реально Ozon берёт 9-11 ₽ курьерской развозкой против тарифных 25 ₽.
+     * Последняя миля: факт по ЭТОМУ SKU (транзакции за 28 дней) → среднее по
+     * магазину (когда у SKU меньше 3 продаж) → тарифный потолок из конфига схемы.
+     * У Ozon миля зависит от цены товара, поэтому сначала всегда per-SKU факт.
+     *
+     * @param array<int, mixed> $skuCandidates числовые SKU Ozon товара (sku/fbo_sku/fbs_sku)
      */
-    public function lastMileCost(array $actualRates): ?float
+    public function lastMileCost(array $actualRates, ?int $integrationId = null, array $skuCandidates = []): ?float
     {
+        if ($integrationId !== null && $skuCandidates !== []) {
+            $perSku = $this->actualRates->lastMilePerSku($integrationId);
+            foreach ($skuCandidates as $candidate) {
+                $key = (string) $candidate;
+                if ($key !== '' && isset($perSku[$key])) {
+                    return $perSku[$key];
+                }
+            }
+        }
+
         return ($actualRates['last_mile_avg'] ?? null) !== null
             ? (float) $actualRates['last_mile_avg']
             : null;
     }
 
     /**
-     * Хранение: фактический расход склада на проданную единицу. Без него сюда
-     * попадала месячная сумма по остаткам — до 29 тыс ₽ «на единицу».
-     * Схему учитывает калькулятор: платит только FBO.
+     * Хранение Ozon per-SKU НЕ существует: транзакция OperationMarketplaceServiceStorage
+     * приходит одной суммой на магазин в день (items пустой), а API остатков денег
+     * не отдаёт. Раньше сумму размазывали поровну на все проданные единицы — ходовая
+     * мелочь платила как залежавшийся КГТ, и цифра была одинаковой во всех строках.
+     * Юнит-экономика строится на товар, поэтому выдуманное среднее не показываем: 0.
+     * Не-Ozon движки приходят с пустыми actualRates и живут своим fallback
+     * (WB/YM считают хранение из своих тарифов по объёму).
      */
     public function storageCost(array $actualRates, float $fallback = 0.0): float
     {
-        return ($actualRates['storage_per_unit'] ?? null) !== null
-            ? (float) $actualRates['storage_per_unit']
-            : $fallback;
+        return $actualRates === [] ? $fallback : 0.0;
     }
 
     /**
@@ -114,15 +129,14 @@ class OzonRatePolicy
     }
 
     /**
-     * ДРР: ручная настройка продавца приоритетнее факта. Факт — средний по
-     * магазину (клики + «оплата за заказ»): per-SKU разбивки в транзакциях нет.
+     * ДРР: только ручная настройка продавца. Средний по магазину ad_percent
+     * больше НЕ подставляем: он вешал одинаковый «рекламный налог» на каждый
+     * товар, а после загрузки отчёта Performance per-SKU факт его снимал — и
+     * маржа «росла» от самого факта синка. Per-SKU реклама приходит из отчёта
+     * Performance (фронт + advertising-impact), не из этого дефолта.
      */
     public function drrPercent(?float $manual, array $actualRates): float
     {
-        if ($manual !== null && $manual > 0) {
-            return $manual;
-        }
-
-        return (float) ($actualRates['ad_percent'] ?? 0);
+        return $manual !== null && $manual > 0 ? $manual : 0.0;
     }
 }

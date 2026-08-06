@@ -1034,7 +1034,11 @@ class UnitEconomicsCacheService
             'vat_percent' => $vatPercent,
             'acquiring_percent' => $acquiringPercent,
             'storage_cost' => $storageCost,
-            'last_mile_cost' => $ratePolicy->lastMileCost($ozonActualRates),
+            'last_mile_cost' => $ratePolicy->lastMileCost(
+                $ozonActualRates,
+                (int) $product->integration_id,
+                $this->ozonNumericSkuCandidates($product)
+            ),
             'additional_commission_percent' => null,
             'own_delivery_cost' => $ownDeliveryCost,
             'own_return_cost' => $ownReturnCost,
@@ -2640,6 +2644,22 @@ class UnitEconomicsCacheService
         foreach ($schemes as $scheme) {
             Cache::forget("ue_stats_{$integrationId}_{$marketplace}_".strtoupper($scheme));
         }
+    }
+
+    /**
+     * Числовые SKU Ozon товара — ключи per-SKU ставок из финансовых транзакций
+     * (products.sku — это артикул, а в транзакциях лежит ozon_data.sku).
+     *
+     * @return array<int, string>
+     */
+    private function ozonNumericSkuCandidates($product): array
+    {
+        $ozonData = is_array($product->ozon_data ?? null) ? $product->ozon_data : [];
+
+        return array_values(array_filter(array_map(
+            static fn ($value) => (string) ($value ?? ''),
+            [$ozonData['sku'] ?? null, $ozonData['fbo_sku'] ?? null, $ozonData['fbs_sku'] ?? null]
+        ), static fn (string $value) => $value !== '' && $value !== '0'));
     }
 
     // ...

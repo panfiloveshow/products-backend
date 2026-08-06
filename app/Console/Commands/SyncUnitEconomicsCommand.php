@@ -2238,12 +2238,21 @@ class SyncUnitEconomicsCommand extends Command
                 // приводила к расхождению карточки с расчётом синка.
                 $ratePolicy = app(OzonRatePolicy::class);
                 $actualRates = $ratePolicy->actualRates('ozon', (int) $product->integration_id);
-                $lastMile = $ratePolicy->lastMileCost($actualRates);
+                $ozonDataForSku = is_array($product->ozon_data ?? null) ? $product->ozon_data : [];
+                $lastMile = $ratePolicy->lastMileCost(
+                    $actualRates,
+                    (int) $product->integration_id,
+                    array_filter([
+                        $ozonDataForSku['sku'] ?? null,
+                        $ozonDataForSku['fbo_sku'] ?? null,
+                        $ozonDataForSku['fbs_sku'] ?? null,
+                    ])
+                );
                 if ($lastMile !== null) {
                     $data['last_mile_cost'] = $lastMile;
                 }
-                // Хранение магазина, приведённое к одной проданной единице.
-                // Калькулятор оставит его только схеме FBO.
+                // Хранение per-SKU у Ozon недоступно — политика вернёт 0,
+                // а не размазанное среднее по магазину (см. OzonRatePolicy).
                 $data['storage_cost'] = $ratePolicy->storageCost(
                     $actualRates,
                     (float) ($data['storage_cost'] ?? 0)
