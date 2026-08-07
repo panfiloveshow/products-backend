@@ -3,7 +3,6 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
-use App\Models\Integration;
 use App\Models\Product;
 use App\Models\UnitEconomics;
 use App\Models\UnitEconomicsCache;
@@ -102,9 +101,7 @@ class CostPriceController extends Controller
         $integrationId = (int) $validated['integration_id'];
         $generatedAt = now()->utc();
 
-        $marketplace = (string) Integration::query()->whereKey($integrationId)->value('marketplace');
-
-        if ($marketplace === 'ozon') {
+        if ($this->isOzonIntegration($integrationId)) {
             $items = $this->ozonUnitEconomicsRows($integrationId)
                 ->map(fn ($row): array => $this->ozonUnitEconomicsItem($row, $generatedAt))
                 ->filter(fn (array $item): bool => $item['offer_id'] !== '')
@@ -259,6 +256,34 @@ class CostPriceController extends Controller
                 'calculated.marketplace_data',
                 'calculated.updated_at as calculated_at',
             ]);
+    }
+
+    /**
+     * Определяет, является ли интеграция Ozon-магазином.
+     *
+     * Запрос сервисный (repricer.service), workspace-контекста нет, поэтому
+     * integrations читается напрямую, без Eloquent tenant-scope — глобальный
+     * scope не должен молча превратить Ozon-магазин в пустую WB-ветку.
+     * Значение нормализуется, а если строка интеграции отсутствует или
+     * маркетплейс не распознан — решаем по фактическим товарам интеграции.
+     */
+    private function isOzonIntegration(int $integrationId): bool
+    {
+        $marketplace = strtolower(trim((string) DB::table('integrations')
+            ->where('id', $integrationId)
+            ->value('marketplace')));
+
+        if ($marketplace === 'ozon') {
+            return true;
+        }
+        if ($marketplace === 'wildberries') {
+            return false;
+        }
+
+        return DB::table('products')
+            ->where('integration_id', $integrationId)
+            ->where('marketplace', 'ozon')
+            ->exists();
     }
 
     /**
