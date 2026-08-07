@@ -289,6 +289,86 @@ class CostPriceControllerTest extends TestCase
         $this->assertEquals(5.5, $item['max_allowed_drr']);
     }
 
+    public function test_ozon_products_without_any_economics_still_appear_in_items(): void
+    {
+        // Товар есть, но ни настроек (unit_economics_settings), ни расчёта
+        // (unit_economics) ещё нет — товар всё равно обязан попасть в items,
+        // а readiness-флаги показать, чего не хватает.
+        $integration = Integration::factory()->ozon()->create(['id' => 61024]);
+        Product::factory()->ozon()->create([
+            'integration_id' => $integration->id,
+            'sku' => 'OZ-BARE-001',
+            'ozon_data' => ['offer_id' => 'OZ-BARE-001', 'sku' => 1712345690],
+        ]);
+        Product::factory()->ozon()->create([
+            'integration_id' => $integration->id,
+            'sku' => 'OZ-BARE-002',
+            'ozon_data' => ['offer_id' => 'OZ-BARE-002'],
+        ]);
+
+        $payload = (new CostPriceController(new CostPriceParserService()))
+            ->unitEconomicsExport(Request::create(
+                '/api/products/unit-economics/export?integration_id=' . $integration->id
+            ))->getData(true);
+
+        $this->assertCount(2, $payload['items']);
+        $offerIds = array_column($payload['items'], 'offer_id');
+        $this->assertSame(['OZ-BARE-001', 'OZ-BARE-002'], $offerIds);
+        foreach ($payload['items'] as $item) {
+            $this->assertFalse($item['ready']);
+            $this->assertNull($item['cost_price']);
+            $this->assertContains('missing_cost_price', $item['readiness_reasons']);
+            $this->assertContains('missing_price', $item['readiness_reasons']);
+            $this->assertContains('stale_calculation', $item['readiness_reasons']);
+        }
+    }
+
+    public function test_ozon_branch_is_taken_for_non_canonical_marketplace_value(): void
+    {
+        // Регистр/пробелы в integrations.marketplace не должны ронять экспорт
+        // в пустую WB-ветку.
+        $integration = Integration::factory()->ozon()->create([
+            'id' => 61025,
+            'marketplace' => 'OZON',
+        ]);
+        Product::factory()->ozon()->create([
+            'integration_id' => $integration->id,
+            'sku' => 'OZ-CASE-001',
+            'ozon_data' => ['offer_id' => 'OZ-CASE-001'],
+        ]);
+
+        $payload = (new CostPriceController(new CostPriceParserService()))
+            ->unitEconomicsExport(Request::create(
+                '/api/products/unit-economics/export?integration_id=' . $integration->id
+            ))->getData(true);
+
+        $this->assertCount(1, $payload['items']);
+        $this->assertSame('OZ-CASE-001', $payload['items'][0]['offer_id']);
+    }
+
+    public function test_ozon_branch_falls_back_to_products_when_integration_marketplace_is_unknown(): void
+    {
+        // Если в зеркале integrations маркетплейс не заполнен/не распознан,
+        // судим по фактическим товарам интеграции.
+        $integration = Integration::factory()->ozon()->create([
+            'id' => 61026,
+            'marketplace' => '',
+        ]);
+        Product::factory()->ozon()->create([
+            'integration_id' => $integration->id,
+            'sku' => 'OZ-FALLBACK-001',
+            'ozon_data' => ['offer_id' => 'OZ-FALLBACK-001'],
+        ]);
+
+        $payload = (new CostPriceController(new CostPriceParserService()))
+            ->unitEconomicsExport(Request::create(
+                '/api/products/unit-economics/export?integration_id=' . $integration->id
+            ))->getData(true);
+
+        $this->assertCount(1, $payload['items']);
+        $this->assertSame('OZ-FALLBACK-001', $payload['items'][0]['offer_id']);
+    }
+
     public function test_ozon_export_does_not_leak_wildberries_rows_and_vice_versa(): void
     {
         $ozon = Integration::factory()->ozon()->create(['id' => 61022]);
