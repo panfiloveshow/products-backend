@@ -3,6 +3,7 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
+use App\Models\Integration;
 use App\Models\Product;
 use App\Models\UnitEconomics;
 use App\Models\UnitEconomicsCache;
@@ -85,10 +86,12 @@ class CostPriceController extends Controller
     }
 
     /**
-     * Экспорт юнит-экономики по nmID для внешних сервисов (репрайсер).
-     * Джойнит себестоимость (unit_economics_settings по sku=баркод) с товаром WB,
+     * Экспорт юнит-экономики для внешних сервисов (репрайсер).
+     * WB: джойнит себестоимость (unit_economics_settings по sku=баркод) с товаром WB,
      * чтобы отдать себестоимость, комиссию, налог и рассчитанный СПП
      * с ключом nmID, а не баркодом.
+     * Ozon: те же экономические поля с ключом offer_id (артикул продавца)
+     * плюс числовой SKU Ozon, без WB-специфичных источников (СПП/снапшоты WB).
      * GET /api/products/unit-economics/export?integration_id=X
      */
     public function unitEconomicsExport(Request $request): JsonResponse
@@ -98,15 +101,28 @@ class CostPriceController extends Controller
         ]);
         $integrationId = (int) $validated['integration_id'];
         $generatedAt = now()->utc();
-        $sourceEvidence = $this->sourceFreshness->freshEvidence($integrationId, $generatedAt);
 
-        $items = $this->unitEconomicsRows($integrationId)
-            ->map(fn ($row): array => $this->unitEconomicsItem($row, $generatedAt, $sourceEvidence))
-            ->filter(fn (array $item): bool => $item['nm_id'] > 0)
-            ->groupBy('nm_id')
-            ->map(fn ($variants): array => $this->conservativeUnitEconomicsItem($variants))
-            ->sortBy('nm_id')
-            ->values();
+        $marketplace = (string) Integration::query()->whereKey($integrationId)->value('marketplace');
+
+        if ($marketplace === 'ozon') {
+            $items = $this->ozonUnitEconomicsRows($integrationId)
+                ->map(fn ($row): array => $this->ozonUnitEconomicsItem($row, $generatedAt))
+                ->filter(fn (array $item): bool => $item['offer_id'] !== '')
+                ->groupBy('offer_id')
+                ->map(fn ($variants): array => $this->conservativeUnitEconomicsItem($variants))
+                ->sortBy('offer_id')
+                ->values();
+        } else {
+            $sourceEvidence = $this->sourceFreshness->freshEvidence($integrationId, $generatedAt);
+
+            $items = $this->unitEconomicsRows($integrationId)
+                ->map(fn ($row): array => $this->unitEconomicsItem($row, $generatedAt, $sourceEvidence))
+                ->filter(fn (array $item): bool => $item['nm_id'] > 0)
+                ->groupBy('nm_id')
+                ->map(fn ($variants): array => $this->conservativeUnitEconomicsItem($variants))
+                ->sortBy('nm_id')
+                ->values();
+        }
 
         return response()->json([
             'schema_version' => 2,
@@ -243,6 +259,135 @@ class CostPriceController extends Controller
                 'calculated.marketplace_data',
                 'calculated.updated_at as calculated_at',
             ]);
+    }
+
+    /**
+     * Строки юнит-экономики Ozon: себестоимость и налог из unit_economics_settings
+     * (sku = offer_id, fallback на артикул продавца и сохранённую себестоимость),
+     * рассчитанная экономика фактической схемы — из unit_economics (marketplace=ozon).
+     */
+    private function ozonUnitEconomicsRows(int $integrationId)
+    {
+        return Product::query()
+            ->where('products.integration_id', $integrationId)
+            ->where('products.marketplace', 'ozon')
+            ->leftJoin('unit_economics_settings as settings', function ($join) {
+                $join->on('settings.integration_id', '=', 'products.integration_id')
+                    ->on('settings.sku', '=', 'products.sku');
+            })
+            ->leftJoin('unit_economics_settings as vendor_settings', function ($join) {
+                $join->on('vendor_settings.integration_id', '=', 'products.integration_id')
+                    ->on('vendor_settings.sku', '=', 'products.vendor_code');
+            })
+            ->leftJoin('unit_economics as calculated', function ($join) {
+                $join->on('calculated.integration_id', '=', 'products.integration_id')
+                    ->on('calculated.sku', '=', 'products.sku')
+                    ->where('calculated.marketplace', '=', 'ozon')
+                    ->where('calculated.is_actual_scheme', '=', true);
+            })
+            ->get([
+                'products.sku as offer_id',
+                'products.ozon_data',
+                DB::raw('COALESCE(NULLIF(settings.cost_price, 0), NULLIF(vendor_settings.cost_price, 0), NULLIF(calculated.cost_price, 0), NULLIF(products.cost_price, 0)) AS cost_price'),
+                DB::raw('COALESCE(settings.tax_percent, vendor_settings.tax_percent, calculated.tax_percent) AS tax_percent'),
+                'calculated.price',
+                'calculated.commission_percent',
+                'calculated.effective_logistics',
+                'calculated.net_profit',
+                'calculated.net_profit_per_unit',
+                'calculated.margin_percent',
+                'calculated.drr_percent',
+                'calculated.updated_at as calculated_at',
+            ]);
+    }
+
+    /**
+     * Одна строка экспорта Ozon. Ключ — offer_id (артикул продавца), sku —
+     * числовой SKU Ozon из ozon_data. Экономика — те же поля, что у WB;
+     * WB-специфичные проверки источников (СПП, тарифные снапшоты WB,
+     * выкуп/габариты/эквайринг WB) к Ozon не применяются.
+     */
+    private function ozonUnitEconomicsItem($row, $checkedAt): array
+    {
+        $ozonData = is_array($row->ozon_data) ? $row->ozon_data : (json_decode((string) $row->ozon_data, true) ?: []);
+        $ozonSku = (int) ($ozonData['sku'] ?? 0);
+
+        $number = static fn ($value): ?float => $value === null ? null : (float) $value;
+        $price = $number($row->price);
+        $costPrice = $number($row->cost_price);
+        $commissionPercent = $number($row->commission_percent);
+        $taxPercent = $number($row->tax_percent);
+        $logisticsCost = $number($row->effective_logistics);
+        $netProfit = $number($row->net_profit_per_unit ?? $row->net_profit);
+        $marginPercent = $number($row->margin_percent);
+        $drrPercent = $number($row->drr_percent);
+        // Как и для WB: отсутствующий текущий ДРР — не синтетический ноль;
+        // маржа без рекламы сама является реальным потолком безубыточности.
+        $maxAllowedDrr = $marginPercent !== null
+            ? round(max(0, min(100, $marginPercent + ($drrPercent ?? 0))), 2)
+            : null;
+        $marginBeforeAds = ($price !== null && $maxAllowedDrr !== null)
+            ? round($price * $maxAllowedDrr / 100, 2)
+            : null;
+
+        $otherCosts = null;
+        if ($price !== null && $costPrice !== null && $logisticsCost !== null && $commissionPercent !== null && $taxPercent !== null && $marginBeforeAds !== null) {
+            $commissionAmount = $price * $commissionPercent / 100;
+            $taxAmount = $price * $taxPercent / 100;
+            $otherCosts = round(max(0, $price - $costPrice - $logisticsCost - $commissionAmount - $taxAmount - $marginBeforeAds), 2);
+        }
+
+        $calculatedAt = $row->calculated_at ? \Illuminate\Support\Carbon::parse($row->calculated_at)->utc() : null;
+
+        $reasons = [];
+        foreach ([
+            'price' => $price,
+            'cost_price' => $costPrice,
+            'commission' => $commissionPercent,
+            'tax' => $taxPercent,
+            'logistics' => $logisticsCost,
+            'profit' => $netProfit,
+        ] as $field => $value) {
+            if ($value === null || (in_array($field, ['price', 'cost_price'], true) && $value <= 0)) {
+                $reasons[] = 'missing_' . $field;
+            }
+        }
+        if ($maxAllowedDrr === null) {
+            $reasons[] = 'missing_max_allowed_drr';
+        } elseif ($maxAllowedDrr <= 0) {
+            $reasons[] = 'unprofitable';
+        }
+        if ($calculatedAt === null || $calculatedAt->lt($checkedAt->copy()->subHours(72))) {
+            $reasons[] = 'stale_calculation';
+        }
+        if ($netProfit !== null && $netProfit <= 0) {
+            $reasons[] = 'unprofitable';
+        }
+        $reasons = array_values(array_unique($reasons));
+
+        return [
+            'offer_id' => trim((string) $row->offer_id),
+            'sku' => $ozonSku > 0 ? $ozonSku : null,
+            'price' => $price,
+            'cost_price' => $costPrice,
+            'logistics_cost' => $logisticsCost,
+            'other_costs' => $otherCosts,
+            'commission_percent' => $commissionPercent,
+            'tax_percent' => $taxPercent,
+            'net_profit' => $netProfit,
+            'margin_percent' => $marginPercent,
+            'drr_percent' => $drrPercent,
+            'margin_before_ads' => $marginBeforeAds,
+            'max_allowed_drr' => $maxAllowedDrr,
+            'calculated_at' => $calculatedAt?->toRfc3339String(),
+            'ready' => $reasons === [],
+            'readiness_reasons' => $reasons,
+            'sources' => [
+                'cost' => 'unit_economics_settings',
+                'price' => 'unit_economics',
+                'tax' => 'unit_economics_settings',
+            ],
+        ];
     }
 
     /**
