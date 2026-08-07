@@ -195,6 +195,131 @@ class CostPriceControllerTest extends TestCase
         $this->assertTrue($payload['items'][0]['ready']);
     }
 
+    public function test_unit_economics_export_returns_ozon_items_keyed_by_offer_id(): void
+    {
+        $integration = Integration::factory()->ozon()->create(['id' => 61020]);
+        $product = Product::factory()->ozon()->create([
+            'integration_id' => $integration->id,
+            'sku' => 'OZ-ART-001',
+            'vendor_code' => 'OZ-ART-001',
+            'ozon_data' => ['offer_id' => 'OZ-ART-001', 'sku' => 1712345678],
+        ]);
+        UnitEconomicsSettings::create([
+            'integration_id' => $integration->id,
+            'sku' => $product->sku,
+            'cost_price' => 450,
+            'tax_percent' => 6,
+        ]);
+        UnitEconomics::create([
+            'integration_id' => $integration->id,
+            'sku' => $product->sku,
+            'marketplace' => 'ozon',
+            'fulfillment_type' => 'FBO',
+            'is_actual_scheme' => true,
+            'price' => 1200,
+            'commission_percent' => 18,
+            'effective_logistics' => 90,
+            'net_profit' => 120,
+            'net_profit_per_unit' => 120,
+            'margin_percent' => 10,
+            'drr_percent' => 5,
+        ]);
+
+        $controller = new CostPriceController(new CostPriceParserService());
+        $payload = $controller->unitEconomicsExport(Request::create(
+            '/api/products/unit-economics/export?integration_id=' . $integration->id
+        ))->getData(true);
+
+        $this->assertSame(2, $payload['schema_version']);
+        $this->assertSame($integration->id, $payload['integration_id']);
+        $this->assertTrue($payload['complete']);
+        $this->assertCount(1, $payload['items']);
+
+        $item = $payload['items'][0];
+        $this->assertSame('OZ-ART-001', $item['offer_id']);
+        $this->assertSame(1712345678, $item['sku']);
+        $this->assertEquals(450.0, $item['cost_price']);
+        $this->assertEquals(90.0, $item['logistics_cost']);
+        $this->assertEquals(18.0, $item['commission_percent']);
+        $this->assertEquals(6.0, $item['tax_percent']);
+        $this->assertEquals(120.0, $item['net_profit']);
+        $this->assertEquals(15.0, $item['max_allowed_drr']);
+        $this->assertEquals(180.0, $item['margin_before_ads']);
+        $this->assertTrue($item['ready']);
+        $this->assertNotEmpty($item['calculated_at']);
+        $this->assertArrayNotHasKey('nm_id', $item);
+    }
+
+    public function test_ozon_export_reports_missing_cost_price_but_keeps_offer_visible(): void
+    {
+        $integration = Integration::factory()->ozon()->create(['id' => 61021]);
+        Product::factory()->ozon()->create([
+            'integration_id' => $integration->id,
+            'sku' => 'OZ-ART-002',
+            'vendor_code' => 'OZ-ART-002',
+            'cost_price' => 0,
+            'ozon_data' => ['offer_id' => 'OZ-ART-002', 'sku' => 1712345679],
+        ]);
+        UnitEconomics::create([
+            'integration_id' => $integration->id,
+            'sku' => 'OZ-ART-002',
+            'marketplace' => 'ozon',
+            'fulfillment_type' => 'FBS',
+            'is_actual_scheme' => true,
+            'price' => 900,
+            'commission_percent' => 20,
+            'effective_logistics' => 70,
+            'net_profit' => 50,
+            'net_profit_per_unit' => 50,
+            'margin_percent' => 5.5,
+        ]);
+
+        $payload = (new CostPriceController(new CostPriceParserService()))
+            ->unitEconomicsExport(Request::create(
+                '/api/products/unit-economics/export?integration_id=' . $integration->id
+            ))->getData(true);
+
+        $this->assertCount(1, $payload['items']);
+        $item = $payload['items'][0];
+        $this->assertSame('OZ-ART-002', $item['offer_id']);
+        $this->assertNull($item['cost_price']);
+        $this->assertFalse($item['ready']);
+        $this->assertContains('missing_cost_price', $item['readiness_reasons']);
+        // Маржа без ДРР остаётся реальным потолком безубыточности
+        $this->assertEquals(5.5, $item['max_allowed_drr']);
+    }
+
+    public function test_ozon_export_does_not_leak_wildberries_rows_and_vice_versa(): void
+    {
+        $ozon = Integration::factory()->ozon()->create(['id' => 61022]);
+        $wb = Integration::factory()->wildberries()->create(['id' => 61023]);
+        Product::factory()->ozon()->create([
+            'integration_id' => $ozon->id,
+            'sku' => 'OZ-ART-003',
+            'ozon_data' => ['offer_id' => 'OZ-ART-003', 'sku' => 1712345680],
+        ]);
+        Product::factory()->wildberries()->create([
+            'integration_id' => $wb->id,
+            'sku' => '2038816371499',
+            'marketplace_id' => '184010799:2038816371499',
+            'wb_data' => ['nmID' => 184010799],
+        ]);
+
+        $controller = new CostPriceController(new CostPriceParserService());
+        $ozonPayload = $controller->unitEconomicsExport(Request::create(
+            '/api/products/unit-economics/export?integration_id=' . $ozon->id
+        ))->getData(true);
+        $wbPayload = $controller->unitEconomicsExport(Request::create(
+            '/api/products/unit-economics/export?integration_id=' . $wb->id
+        ))->getData(true);
+
+        $this->assertCount(1, $ozonPayload['items']);
+        $this->assertSame('OZ-ART-003', $ozonPayload['items'][0]['offer_id']);
+        $this->assertCount(1, $wbPayload['items']);
+        $this->assertSame(184010799, $wbPayload['items'][0]['nm_id']);
+        $this->assertArrayNotHasKey('offer_id', $wbPayload['items'][0]);
+    }
+
     public function test_calculated_zero_drr_is_not_treated_as_missing(): void
     {
         $integration = Integration::factory()->wildberries()->create(['id' => 61009]);
