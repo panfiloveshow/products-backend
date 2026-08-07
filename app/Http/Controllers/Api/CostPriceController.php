@@ -293,7 +293,11 @@ class CostPriceController extends Controller
      */
     private function ozonUnitEconomicsRows(int $integrationId)
     {
+        // Сервисный экспорт (shared-token, integration_id задан явно) не должен
+        // зависеть от workspace текущего запроса: tenant-scope молча отдаёт
+        // пустой список для интеграций чужого workspace.
         return Product::query()
+            ->withoutGlobalScope('current_workspace')
             ->where('products.integration_id', $integrationId)
             ->where('products.marketplace', 'ozon')
             ->leftJoin('unit_economics_settings as settings', function ($join) {
