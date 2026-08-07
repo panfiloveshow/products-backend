@@ -1025,6 +1025,11 @@ class UnitEconomicsCacheController extends Controller
             $item['non_local_markup_amount'] = $legacyAmt;
             $item['logistics_markup_percent'] = $legacyPct;
             $item['logistics_markup_amount'] = $legacyAmt;
+            // Причина из текущих правил («ставка 0%») противоречила бы ставке
+            // старой таблицы в соседней колонке.
+            $item['markup_rule_reason_label'] = $legacyPct > 0
+                ? 'Режим «до 09.07.2026»: ставка старой таблицы по кластерам заказов товара'
+                : 'Режим «до 09.07.2026»: заказы локальные или кластеры со ставкой 0%';
         }
 
         $commission = (float) ($item['commission_amount'] ?? 0);
