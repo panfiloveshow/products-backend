@@ -823,7 +823,8 @@ class WildberriesMarketplace implements LegacyMarketplaceInterface, MarketplaceI
      *
      * @return array{office_name:string, geo_name:string}|null
      */
-    public function resolveFbsOfficeGeo(): ?array
+    /** @param array<string, array{warehouse_name?:string, geo_name?:?string}>|null $tariffs уже полученные box-тарифы — второй запрос к /tariffs/box в одном синке ловит лимит WB и молча отдаёт пусто */
+    public function resolveFbsOfficeGeo(?array $tariffs = null): ?array
     {
         $officeIds = [];
         foreach ($this->fbsSupplies->getSellerWarehouses() as $warehouse) {
@@ -844,7 +845,10 @@ class WildberriesMarketplace implements LegacyMarketplaceInterface, MarketplaceI
         // Детерминированная политика: гео резолвится по каждому складу продавца;
         // расхождение округов между складами — предупреждение, применяется офис
         // ПЕРВОГО склада из ответа WB (интеграция несёт один wb_fbs_marketplace_geo).
-        $tariffs = $this->getSupplyTariffs();
+        $tariffs ??= $this->getSupplyTariffs();
+        if ($tariffs === []) {
+            return null;
+        }
         $resolved = [];
         foreach ($officeIds as $officeId) {
             $officeName = $officesById[$officeId] ?? '';
