@@ -97,7 +97,11 @@ class WildberriesUnitEconomicsCalculator implements UnitEconomicsCalculatorInter
 
         $officialWarehouseCoef = $this->resolveOfficialWarehouseCoefficient($scheme, $input->tariffBreakdown['box'] ?? null);
         $usesOfficialWarehouseCoef = ! $usesOwnDelivery && $officialWarehouseCoef !== null;
-        if ($usesOfficialWarehouseCoef) {
+        $manualWarehouseCoef = ($options['warehouse_coefficient_is_manual'] ?? $input->warehouseCoefficientIsManual)
+            && ! $usesOwnDelivery;
+        // Ручной КС не перетираем коэффициентом из тарифа: на FBS тариф отдаёт один
+        // статичный коэффициент склада WB, а менеджер ставит фактический.
+        if ($usesOfficialWarehouseCoef && ! $manualWarehouseCoef) {
             $warehouseCoef = $officialWarehouseCoef;
         }
         $warehouseCoefPercent = $warehouseCoef * 100;
@@ -105,10 +109,12 @@ class WildberriesUnitEconomicsCalculator implements UnitEconomicsCalculatorInter
         $localizationIndexForCalculation = $usesOwnDelivery ? 1.0 : $localizationIndex;
 
         // baseLogistics — логистика до КС и ИЛ. Для официальных тарифов WB
-        // восстанавливаем базу делением на КС, потому что WB уже включил КС в base/liter.
-        $baseLogistics = ($usesOfficialWarehouseCoef && $warehouseCoefForCalculation > 0)
-            ? $tariffLogistics / $warehouseCoefForCalculation
-            : $tariffLogistics;
+        // восстанавливаем базу делением на КС, зашитый WB в base/liter, — он может
+        // отличаться от применяемого (ручной КС), тогда логистика реально меняется.
+        $embeddedWarehouseCoef = ($usesOfficialWarehouseCoef && $officialWarehouseCoef > 0)
+            ? $officialWarehouseCoef
+            : 1.0;
+        $baseLogistics = $tariffLogistics / $embeddedWarehouseCoef;
 
         // КС, ₽ = базовая логистика × (КС - 1) — надбавка к логистике от КС
         $warehouseCoefAmount = $baseLogistics * ($warehouseCoefForCalculation - 1);
@@ -134,9 +140,15 @@ class WildberriesUnitEconomicsCalculator implements UnitEconomicsCalculatorInter
                 'tariff_breakdown' => $input->tariffBreakdown,
             ]);
 
-        // Ожидаемые возвраты = обр.логистика × (100 - %выкупа) / 100
-        $returnRate = (100 - $redemptionRate) / 100;
-        $expectedReturnCost = $returnLogistics * $returnRate;
+        // Ожидаемые возвраты: WB списывает логистику за КАЖДУЮ поездку к клиенту
+        // (включая невыкупленные) плюс обратную логистику за возврат — невыкуп
+        // стоит оба плеча. Потери считаем на единицу выкупа, а не на заказ:
+        // при выкупе 70% на каждую продажу приходится 0.3/0.7 невыкупа
+        // (см. ReturnEconomics::fractionPerSoldUnit — кап 3, как у Ozon).
+        $returnFraction = \App\Domains\UnitEconomics\ReturnEconomics::fractionPerSoldUnit(
+            max(0.0, (100 - $redemptionRate) / 100)
+        );
+        $expectedReturnCost = ($logistics + $returnLogistics) * $returnFraction;
 
         // Эффективная логистика = логистика + ожид.возвраты
         $effectiveLogistics = $logistics + $expectedReturnCost;
@@ -150,7 +162,8 @@ class WildberriesUnitEconomicsCalculator implements UnitEconomicsCalculatorInter
             $storageCost = 0.0;
         }
 
-        $acceptanceCost = $input->acceptanceCost ?? 0;
+        // Приёмка бывает только при поставке на склад WB — на схемах продавца её нет.
+        $acceptanceCost = in_array($scheme, ['FBO', 'FBW'], true) ? ($input->acceptanceCost ?? 0) : 0.0;
         $penaltyCost = $input->penaltyCost ?? 0;
 
         $acquiringRate = $options['acquiring_percent'] ?? $input->acquiringPercent ?? 1.5;
@@ -240,6 +253,7 @@ class WildberriesUnitEconomicsCalculator implements UnitEconomicsCalculatorInter
             'markup_multiplier' => $markupMultiplier,
             'base_logistics' => round($baseLogistics, 2),
             'warehouse_coef_included_in_tariff' => $usesOfficialWarehouseCoef,
+            'warehouse_coef_is_manual' => (bool) $manualWarehouseCoef,
             'tariff_source' => $input->tariffBreakdown['source'] ?? $input->tariffSource,
             'tariff_effective_from' => $input->tariffBreakdown['effective_date'] ?? $input->tariffEffectiveFrom,
             'tariff_warehouse_name' => $input->tariffBreakdown['warehouse_name'] ?? null,
