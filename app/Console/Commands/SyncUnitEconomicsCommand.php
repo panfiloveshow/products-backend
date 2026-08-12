@@ -938,7 +938,7 @@ class SyncUnitEconomicsCommand extends Command
                     // Кэш-сервис по нему выбирает строку «Маркетплейс: {ФО}» с реальным
                     // КС и base/liter FBS вместо склада без коэффициента.
                     try {
-                        $fbsGeo = $wbService->resolveFbsOfficeGeo();
+                        $fbsGeo = $wbService->resolveFbsOfficeGeo($wbTariffsData ?: null);
                         if ($fbsGeo !== null && $integration !== null) {
                             $integration->settings = array_merge($integration->settings ?? [], [
                                 'wb_fbs_office_name' => $fbsGeo['office_name'],
