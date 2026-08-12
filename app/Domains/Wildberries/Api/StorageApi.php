@@ -2,6 +2,7 @@
 
 namespace App\Domains\Wildberries\Api;
 
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
 
 /**
@@ -163,6 +164,16 @@ class StorageApi
      */
     public function getSupplyTariffs(): array
     {
+        // Тарифы коробов общие для всех продавцов и меняются от силы раз в день,
+        // а /api/v1/tariffs/box жёстко лимитирован: повторный запрос в течение
+        // минуты отдаёт пусто (из-за этого молча не резолвилась FBS-привязка).
+        // Кешируем удачный ответ на час; пустой — не кешируем.
+        $cacheKey = 'wb:supply-tariffs:'.now()->format('Y-m-d');
+        $cached = Cache::get($cacheKey);
+        if (is_array($cached) && $cached !== []) {
+            return $cached;
+        }
+
         try {
             // The box tariff belongs to common-api (not marketplace-api) and
             // `date` is mandatory. Normalize WB's comma-decimal response into
@@ -194,6 +205,10 @@ class StorageApi
                     'storage_base_liter' => $this->decimal($warehouse['boxStorageBase'] ?? null),
                     'storage_additional_liter' => $this->decimal($warehouse['boxStorageLiter'] ?? null),
                 ];
+            }
+
+            if ($result !== []) {
+                Cache::put($cacheKey, $result, now()->addHour());
             }
 
             return $result;
