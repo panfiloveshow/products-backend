@@ -38,14 +38,21 @@ final class FbsOfficeGeoMatcher
                 continue;
             }
 
-            // Имя склада должно целиком «сидеть» в имени офиса: склад «Обухово»
-            // ⊂ офис «Москва (СК Обухово)». Побеждает самое специфичное имя.
+            // Матч, когда одно имя целиком «сидит» в другом: склад «Обухово» ⊂
+            // офис «Москва (СК Обухово)», офис «Нижний Новгород» ⊂ склад
+            // «СЦ Нижний Новгород Ларина». Побеждает наибольшее пересечение.
             $warehouseTokens = self::tokens($name);
-            if ($warehouseTokens === [] || array_diff($warehouseTokens, $officeTokens) !== []) {
+            if ($warehouseTokens === []) {
                 continue;
             }
-            if (count($warehouseTokens) > $bestScore) {
-                $bestScore = count($warehouseTokens);
+            $warehouseInOffice = array_diff($warehouseTokens, $officeTokens) === [];
+            $officeInWarehouse = array_diff($officeTokens, $warehouseTokens) === [];
+            if (! $warehouseInOffice && ! $officeInWarehouse) {
+                continue;
+            }
+            $score = count(array_intersect($warehouseTokens, $officeTokens));
+            if ($score > $bestScore) {
+                $bestScore = $score;
                 $best = ['warehouse_name' => $name, 'geo_name' => $geo];
             }
         }
