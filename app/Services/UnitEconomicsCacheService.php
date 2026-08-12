@@ -791,7 +791,10 @@ class UnitEconomicsCacheService
                 (int) $product->integration_id,
                 (string) $fulfillmentType,
                 $marketplaceData,
-                is_array($tariffBreakdown) ? $tariffBreakdown : []
+                is_array($tariffBreakdown) ? $tariffBreakdown : [],
+                ($integrationSettings['wb_fbs_marketplace_geo'] ?? null) !== null && $integrationSettings['wb_fbs_marketplace_geo'] !== ''
+                    ? (string) $integrationSettings['wb_fbs_marketplace_geo']
+                    : null
             );
             $tariffSource = $tariffBreakdown['source'] ?? $tariffSource;
             $tariffEffectiveFrom = $tariffBreakdown['effective_date'] ?? $tariffEffectiveFrom;
@@ -2498,8 +2501,28 @@ class UnitEconomicsCacheService
         return null;
     }
 
-    private function resolveWildberriesTariffBreakdown(int $integrationId, string $fulfillmentType, array $marketplaceData, array $existing): array
+    private function resolveWildberriesTariffBreakdown(int $integrationId, string $fulfillmentType, array $marketplaceData, array $existing, ?string $fbsMarketplaceGeo = null): array
     {
+        // FBS/DBW тарифицируются строкой «Маркетплейс: {ФО}» по округу СЦ
+        // привязки склада продавца (wb_fbs_marketplace_geo из настроек, кладёт
+        // синк) — в ней реальные КС (165% ЦФО) и base/liter FBS. Ветка стоит ДО
+        // раннего return: сохранённый breakdown обычно несёт ФБО-склад отгрузки
+        // без marketplace-коэффициента, и КС на FBS схлопывался бы в 100%.
+        if ($fbsMarketplaceGeo !== null && in_array(strtoupper($fulfillmentType), ['FBS', 'DBW'], true)) {
+            $this->warmWildberriesTariffSnapshotCache($integrationId);
+            $marketplaceRow = ($this->wildberriesTariffSnapshotCache[$integrationId]['box_by_warehouse'] ?? [])[$this->normalizeWildberriesWarehouseName('Маркетплейс: '.$fbsMarketplaceGeo)] ?? null;
+            if ($marketplaceRow) {
+                return [
+                    'source' => 'wildberries_tariff_snapshots_fbs_geo',
+                    'effective_date' => optional($marketplaceRow->effective_date)->toDateString(),
+                    'warehouse_name' => $marketplaceRow->warehouse_name,
+                    'scheme' => strtoupper($fulfillmentType),
+                    'box' => $marketplaceRow->payload ?? [],
+                    'return' => $this->wildberriesTariffSnapshotCache[$integrationId]['return'] ?? [],
+                ];
+            }
+        }
+
         if (isset($existing['box']) || isset($existing['source'])) {
             return $existing;
         }

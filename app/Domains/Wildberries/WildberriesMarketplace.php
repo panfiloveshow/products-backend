@@ -813,4 +813,61 @@ class WildberriesMarketplace implements LegacyMarketplaceInterface, MarketplaceI
     {
         return $this->fbsSupplies;
     }
+
+    /**
+     * Тарифная география FBS: офис привязки склада продавца → федеральный округ.
+     *
+     * WB тарифицирует FBS-логистику строкой «Маркетплейс: {ФО}» по округу СЦ
+     * привязки (в кабинете «Склад WB: Москва (СК Обухово)» → ЦФО → КС 165%).
+     * Округ берём из geo_name склада-тёзки в box-тарифах.
+     *
+     * @return array{office_name:string, geo_name:string}|null
+     */
+    public function resolveFbsOfficeGeo(): ?array
+    {
+        $officeIds = [];
+        foreach ($this->fbsSupplies->getSellerWarehouses() as $warehouse) {
+            if (! empty($warehouse['office_id'])) {
+                $officeIds[] = (int) $warehouse['office_id'];
+            }
+        }
+        $officeIds = array_values(array_unique($officeIds));
+        if ($officeIds === []) {
+            return null;
+        }
+
+        $officesById = [];
+        foreach ($this->fbsSupplies->getOffices() as $office) {
+            $officesById[(int) ($office['id'] ?? 0)] = trim((string) ($office['name'] ?? ''));
+        }
+
+        // Детерминированная политика: гео резолвится по каждому складу продавца;
+        // расхождение округов между складами — предупреждение, применяется офис
+        // ПЕРВОГО склада из ответа WB (интеграция несёт один wb_fbs_marketplace_geo).
+        $tariffs = $this->getSupplyTariffs();
+        $resolved = [];
+        foreach ($officeIds as $officeId) {
+            $officeName = $officesById[$officeId] ?? '';
+            if ($officeName === '') {
+                continue;
+            }
+            $match = \App\Domains\Wildberries\Tariffs\FbsOfficeGeoMatcher::match($officeName, $tariffs);
+            if ($match !== null) {
+                $resolved[] = ['office_name' => $officeName, 'geo_name' => $match['geo_name']];
+            }
+        }
+        if ($resolved === []) {
+            return null;
+        }
+
+        $geoNames = array_unique(array_column($resolved, 'geo_name'));
+        if (count($geoNames) > 1) {
+            Log::warning('WB FBS-склады привязаны к разным округам — применяется первый', [
+                'integration_id' => $this->integration?->id,
+                'resolved' => $resolved,
+            ]);
+        }
+
+        return $resolved[0];
+    }
 }
