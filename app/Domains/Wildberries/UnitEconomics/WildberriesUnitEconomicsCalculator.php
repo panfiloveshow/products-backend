@@ -133,11 +133,13 @@ class WildberriesUnitEconomicsCalculator implements UnitEconomicsCalculatorInter
             ? $baseLogistics
             : (($baseLogistics * $warehouseCoefForCalculation * $localizationIndexForCalculation) + $salesDistributionAmount);
 
-        // Обратная логистика (возврат)
+        // Обратная логистика (возврат) — тариф зависит от схемы: FBS/DBW
+        // возвращаются в ПВЗ (25+4/л), складские схемы — обратной магистралью.
         $returnLogistics = in_array($scheme, ['DBS', 'EDBS'], true)
             ? ($input->ownReturnCost ?? 0)
             : $this->tariffs->calculateReturnLogisticsCost($volumeInLiters, $weight, [
                 'tariff_breakdown' => $input->tariffBreakdown,
+                'scheme' => $scheme,
             ]);
 
         // Ожидаемые возвраты: WB списывает логистику за КАЖДУЮ поездку к клиенту
