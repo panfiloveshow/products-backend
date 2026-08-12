@@ -149,7 +149,7 @@ class UnitEconomicsCacheController extends Controller
             ->nonLocalMarkupRange($validated['non_local_markup_min'] ?? null, $validated['non_local_markup_max'] ?? null)
             ->confidence($validated['confidence'] ?? null)
             ->localityState($validated['locality_state'] ?? null)
-            ->schemeStockOnly($marketplace, filter_var($validated['scheme_stock_only'] ?? false, FILTER_VALIDATE_BOOLEAN), $validated['fulfillment_type'])
+            ->schemeStockOnly($marketplace, filter_var($validated['scheme_stock_only'] ?? false, FILTER_VALIDATE_BOOLEAN), $validated['fulfillment_type'], (int) $validated['integration_id'])
             ->wbPrimaryBarcode($marketplace, (int) $validated['integration_id']);
         $statsQuery = clone $query;
 
