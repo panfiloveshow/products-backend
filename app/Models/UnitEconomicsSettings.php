@@ -33,6 +33,8 @@ class UnitEconomicsSettings extends Model
         'redemption_rate_override',
         // WB-специфичные
         'spp_percent',
+        'warehouse_coef_percent_override',
+        'acceptance_cost',
         // Ozon markup overrides (исключения из наценки за нелокальную продажу)
         'is_select_only',
         'is_size_restricted',
@@ -52,6 +54,8 @@ class UnitEconomicsSettings extends Model
         'height_mm' => 'decimal:2',
         'weight_g' => 'decimal:2',
         'spp_percent' => 'decimal:2',
+        'warehouse_coef_percent_override' => 'decimal:2',
+        'acceptance_cost' => 'decimal:2',
         'is_select_only' => 'boolean',
         'is_size_restricted' => 'boolean',
     ];

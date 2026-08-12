@@ -783,6 +783,7 @@ class UnitEconomicsCacheService
 
         $sppPercent = 0.0;
         $warehouseCoefficient = 1.0;
+        $manualWarehouseCoefPercent = null;
         $localizationIndex = 1.0;
         $salesDistributionIndex = 0.0;
         if ($marketplace === 'wildberries') {
@@ -795,12 +796,27 @@ class UnitEconomicsCacheService
             $tariffSource = $tariffBreakdown['source'] ?? $tariffSource;
             $tariffEffectiveFrom = $tariffBreakdown['effective_date'] ?? $tariffEffectiveFrom;
             $sppPercent = (float) ($settings?->spp_percent ?? $marketplaceData['spp_percent'] ?? $existingUE?->spp_percent ?? 0);
-            $warehouseCoefficient = $this->getAverageWarehouseCoefficient($product->integration_id, $product->sku, $marketplace, (string) $fulfillmentType);
+            // Приоритет КС: ручной (unit_economics_settings) > средний по складам товара >
+            // коэффициент из тарифа WB. Последний важен для FBS: склады продавца
+            // коэффициента не несут, и раньше там всегда получалось 100%.
+            $manualWarehouseCoefPercent = $settings?->warehouse_coef_percent_override;
+            $autoWarehouseCoefficient = $this->getAverageWarehouseCoefficient(
+                $product->integration_id,
+                $product->sku,
+                $marketplace,
+                (string) $fulfillmentType
+            );
+            $warehouseCoefficient = ($manualWarehouseCoefPercent !== null && (float) $manualWarehouseCoefPercent > 0)
+                ? (float) $manualWarehouseCoefPercent / 100
+                : ($autoWarehouseCoefficient ?? 1.0);
 
             // Делаем средневзвешенный по складам КС авторитетным: записываем его в box-тариф,
             // чтобы калькулятор не перетирал его коэффициентом одного склада/фолбэка «Цифровой склад».
             // Логистика по сумме не меняется (КС в ней сокращается), меняется корректный показ КС.
-            if (is_array($tariffBreakdown) && is_array($tariffBreakdown['box'] ?? null) && $warehouseCoefficient > 0) {
+            // Не делаем этого, когда КС ручной (иначе он сократится и логистику не изменит)
+            // или когда своего КС нет — тогда коэффициент берётся из тарифа как есть.
+            if ($manualWarehouseCoefPercent === null && $autoWarehouseCoefficient !== null
+                && is_array($tariffBreakdown) && is_array($tariffBreakdown['box'] ?? null) && $warehouseCoefficient > 0) {
                 $coefKey = in_array(strtoupper((string) $fulfillmentType), ['FBS', 'DBW'], true)
                     ? 'delivery_marketplace_coef_percent'
                     : 'delivery_coef_percent';
@@ -921,7 +937,10 @@ class UnitEconomicsCacheService
             ?? $marketplaceData['marketplace_compensation']
             ?? 0
         );
-        $acceptanceCost = (float) ($marketplaceData['acceptance_cost'] ?? 0);
+        // Приёмка. У WB фактическая платная приёмка на единицу из API не приходит
+        // (в юните всегда была 0), поэтому её задают вручную. Обнуление на схемах
+        // продавца — в калькуляторе, вместе с той же логикой для хранения.
+        $acceptanceCost = (float) ($settings?->acceptance_cost ?? $marketplaceData['acceptance_cost'] ?? 0);
         $penaltyCost = (float) ($marketplaceData['penalty_cost'] ?? 0);
         $uzumReturnCost = 0.0; // эффективный сбор за возврат FBO (заполняется в Uzum-блоке)
 
@@ -1029,6 +1048,7 @@ class UnitEconomicsCacheService
             'in_flight_count' => $redemption['in_flight_count'] ?? $existingMarketplaceData['in_flight_count'] ?? null,
             'delivery_coefficient' => null,
             'warehouse_coefficient' => (float) $warehouseCoefficient,
+            'warehouse_coefficient_is_manual' => $manualWarehouseCoefPercent !== null,
             'localization_index' => (float) $localizationIndex,
             'sales_distribution_index' => (float) $salesDistributionIndex,
             'spp_percent' => $sppPercent,
@@ -1858,9 +1878,11 @@ class UnitEconomicsCacheService
      * @param  string  $sku  SKU товара
      * @param  string  $marketplace  Маркетплейс
      * @param  string  $scheme  Схема работы (FBW/FBS/DBW/...) — для фильтра складов
-     * @return float Средний КС (1.0 = 100%, 1.4 = 140%)
+     * @return float|null Средний КС (1.0 = 100%, 1.4 = 140%) или null, если источника нет
+     *                    (типично для FBS: у складов продавца коэффициента WB не бывает).
+     *                    null означает «взять коэффициент из тарифа WB», а не «100%».
      */
-    private function getAverageWarehouseCoefficient(int $integrationId, string $sku, string $marketplace, string $scheme = ''): float
+    private function getAverageWarehouseCoefficient(int $integrationId, string $sku, string $marketplace, string $scheme = ''): ?float
     {
         $cacheKey = $integrationId.'|'.$marketplace.'|'.$sku.'|'.strtoupper($scheme);
         if (array_key_exists($cacheKey, $this->warehouseCoefficientCache)) {
@@ -1882,30 +1904,28 @@ class UnitEconomicsCacheService
             });
         }
 
-        if ($warehouses->isEmpty()) {
-            $this->warehouseCoefficientCache[$cacheKey] = 1.0;
-
-            return 1.0; // По умолчанию 100%
-        }
-
-        // Склады с остатками — взвешенное среднее
-        $warehousesWithStock = $warehouses->filter(fn ($w) => $w->quantity > 0);
+        // Склады с остатками И заполненным коэффициентом — взвешенное среднее.
+        // Строки без коэффициента (склады продавца на FBS) не считаем за 100%:
+        // иначе реальный коэффициент схемы «Маркетплейс» из тарифа WB подменялся
+        // бы единицей, и КС на FBS всегда показывал 100%.
+        $warehousesWithStock = $warehouses->filter(
+            fn ($w) => $w->quantity > 0 && $w->warehouse_coefficient !== null && (float) $w->warehouse_coefficient > 0
+        );
         $totalQuantity = $warehousesWithStock->sum('quantity');
 
         if ($totalQuantity > 0) {
             $weightedSum = 0;
             foreach ($warehousesWithStock as $wh) {
-                $coef = (float) ($wh->warehouse_coefficient ?? 1.0);
-                $weightedSum += $coef * $wh->quantity;
+                $weightedSum += (float) $wh->warehouse_coefficient * $wh->quantity;
             }
             $this->warehouseCoefficientCache[$cacheKey] = $weightedSum / $totalQuantity;
 
             return $this->warehouseCoefficientCache[$cacheKey];
         }
 
-        $this->warehouseCoefficientCache[$cacheKey] = 1.0;
+        $this->warehouseCoefficientCache[$cacheKey] = null;
 
-        return 1.0;
+        return null; // Нет источника — коэффициент возьмётся из тарифа WB
     }
 
     /**
@@ -2025,9 +2045,12 @@ class UnitEconomicsCacheService
         };
 
         // Средний КС магазина — разумный дефолт для товаров без остатка.
+        // На схемах продавца усредняем коэффициент схемы «Маркетплейс»: склада
+        // продавца в тарифах WB нет, а FBO-коэффициент к FBS-логистике не относится.
+        $wantsMarketplaceCoef = in_array(strtoupper($scheme), ['FBS', 'DBS', 'EDBS', 'DBW'], true);
         $allCoefs = [];
         foreach ($boxByWarehouse as $snap) {
-            $c = $coefFromSnapshot($snap, false);
+            $c = $coefFromSnapshot($snap, $wantsMarketplaceCoef);
             if ($c !== null) {
                 $allCoefs[] = $c;
             }
