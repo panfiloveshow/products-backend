@@ -934,6 +934,23 @@ class SyncUnitEconomicsCommand extends Command
                         $this->info('  WB Тарифы: получено для '.count($wbTariffsData).' складов');
                     }
 
+                    // Тарифная география FBS: офис привязки склада продавца → ФО.
+                    // Кэш-сервис по нему выбирает строку «Маркетплейс: {ФО}» с реальным
+                    // КС и base/liter FBS вместо склада без коэффициента.
+                    try {
+                        $fbsGeo = $wbService->resolveFbsOfficeGeo();
+                        if ($fbsGeo !== null && $integration !== null) {
+                            $integration->settings = array_merge($integration->settings ?? [], [
+                                'wb_fbs_office_name' => $fbsGeo['office_name'],
+                                'wb_fbs_marketplace_geo' => $fbsGeo['geo_name'],
+                            ]);
+                            $integration->save();
+                            $this->info('  WB FBS-привязка: «'.$fbsGeo['office_name'].'» → '.$fbsGeo['geo_name']);
+                        }
+                    } catch (\Throwable $fbsGeoEx) {
+                        $this->warn('  WB FBS-привязка: '.$fbsGeoEx->getMessage());
+                    }
+
                     $wbCommissionsData = $wbService->getCommissions();
                     if (! empty($wbCommissionsData)) {
                         $this->info('  WB Комиссии: получено для '.count($wbCommissionsData).' категорий');

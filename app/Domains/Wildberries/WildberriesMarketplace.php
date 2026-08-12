@@ -813,4 +813,46 @@ class WildberriesMarketplace implements LegacyMarketplaceInterface, MarketplaceI
     {
         return $this->fbsSupplies;
     }
+
+    /**
+     * Тарифная география FBS: офис привязки склада продавца → федеральный округ.
+     *
+     * WB тарифицирует FBS-логистику строкой «Маркетплейс: {ФО}» по округу СЦ
+     * привязки (в кабинете «Склад WB: Москва (СК Обухово)» → ЦФО → КС 165%).
+     * Округ берём из geo_name склада-тёзки в box-тарифах.
+     *
+     * @return array{office_name:string, geo_name:string}|null
+     */
+    public function resolveFbsOfficeGeo(): ?array
+    {
+        $sellerWarehouses = $this->fbsSupplies->getSellerWarehouses();
+        $officeId = null;
+        foreach ($sellerWarehouses as $warehouse) {
+            if (! empty($warehouse['office_id'])) {
+                $officeId = (int) $warehouse['office_id'];
+                break;
+            }
+        }
+        if ($officeId === null) {
+            return null;
+        }
+
+        $officeName = null;
+        foreach ($this->fbsSupplies->getOffices() as $office) {
+            if ((int) ($office['id'] ?? 0) === $officeId) {
+                $officeName = trim((string) ($office['name'] ?? ''));
+                break;
+            }
+        }
+        if ($officeName === null || $officeName === '') {
+            return null;
+        }
+
+        $match = \App\Domains\Wildberries\Tariffs\FbsOfficeGeoMatcher::match(
+            $officeName,
+            $this->getSupplyTariffs()
+        );
+
+        return $match === null ? null : ['office_name' => $officeName, 'geo_name' => $match['geo_name']];
+    }
 }
