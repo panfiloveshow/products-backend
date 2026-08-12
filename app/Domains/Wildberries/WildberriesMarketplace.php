@@ -825,34 +825,49 @@ class WildberriesMarketplace implements LegacyMarketplaceInterface, MarketplaceI
      */
     public function resolveFbsOfficeGeo(): ?array
     {
-        $sellerWarehouses = $this->fbsSupplies->getSellerWarehouses();
-        $officeId = null;
-        foreach ($sellerWarehouses as $warehouse) {
+        $officeIds = [];
+        foreach ($this->fbsSupplies->getSellerWarehouses() as $warehouse) {
             if (! empty($warehouse['office_id'])) {
-                $officeId = (int) $warehouse['office_id'];
-                break;
+                $officeIds[] = (int) $warehouse['office_id'];
             }
         }
-        if ($officeId === null) {
+        $officeIds = array_values(array_unique($officeIds));
+        if ($officeIds === []) {
             return null;
         }
 
-        $officeName = null;
+        $officesById = [];
         foreach ($this->fbsSupplies->getOffices() as $office) {
-            if ((int) ($office['id'] ?? 0) === $officeId) {
-                $officeName = trim((string) ($office['name'] ?? ''));
-                break;
+            $officesById[(int) ($office['id'] ?? 0)] = trim((string) ($office['name'] ?? ''));
+        }
+
+        // Детерминированная политика: гео резолвится по каждому складу продавца;
+        // расхождение округов между складами — предупреждение, применяется офис
+        // ПЕРВОГО склада из ответа WB (интеграция несёт один wb_fbs_marketplace_geo).
+        $tariffs = $this->getSupplyTariffs();
+        $resolved = [];
+        foreach ($officeIds as $officeId) {
+            $officeName = $officesById[$officeId] ?? '';
+            if ($officeName === '') {
+                continue;
+            }
+            $match = \App\Domains\Wildberries\Tariffs\FbsOfficeGeoMatcher::match($officeName, $tariffs);
+            if ($match !== null) {
+                $resolved[] = ['office_name' => $officeName, 'geo_name' => $match['geo_name']];
             }
         }
-        if ($officeName === null || $officeName === '') {
+        if ($resolved === []) {
             return null;
         }
 
-        $match = \App\Domains\Wildberries\Tariffs\FbsOfficeGeoMatcher::match(
-            $officeName,
-            $this->getSupplyTariffs()
-        );
+        $geoNames = array_unique(array_column($resolved, 'geo_name'));
+        if (count($geoNames) > 1) {
+            Log::warning('WB FBS-склады привязаны к разным округам — применяется первый', [
+                'integration_id' => $this->integration?->id,
+                'resolved' => $resolved,
+            ]);
+        }
 
-        return $match === null ? null : ['office_name' => $officeName, 'geo_name' => $match['geo_name']];
+        return $resolved[0];
     }
 }

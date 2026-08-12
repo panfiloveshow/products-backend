@@ -53,10 +53,13 @@ final class FbsOfficeGeoMatcher
         return $best;
     }
 
+    /** Служебные слова имён офисов/складов WB — не топонимы. */
+    private const STOP_WORDS = ['ск', 'сц', 'пвз', 'wb', 'вб', 'склад'];
+
     /**
-     * Значимые токены имени: «Москва (СК Обухово)» → [москва, обухово].
-     * Служебные слова (СК/СЦ/склад/город-дубли в скобках) короче 4 символов
-     * отсеиваются длиной.
+     * Значимые токены имени: «Москва (СК Обухово)» → [москва, обухово],
+     * «Уфа (СК Уфа)» → [уфа]. Короткие топонимы (Уфа) сохраняются — служебные
+     * слова режутся стоп-листом, а не длиной.
      *
      * @return list<string>
      */
@@ -65,6 +68,9 @@ final class FbsOfficeGeoMatcher
         $normalized = mb_strtolower($name);
         $words = preg_split('/[^a-zа-яё0-9]+/u', $normalized) ?: [];
 
-        return array_values(array_filter($words, static fn (string $w) => mb_strlen($w) >= 4));
+        return array_values(array_unique(array_filter(
+            $words,
+            static fn (string $w) => mb_strlen($w) >= 3 && ! in_array($w, self::STOP_WORDS, true)
+        )));
     }
 }

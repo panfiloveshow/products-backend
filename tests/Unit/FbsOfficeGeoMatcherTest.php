@@ -37,11 +37,24 @@ class FbsOfficeGeoMatcherTest extends TestCase
 
     public function test_multiword_warehouse_requires_all_tokens(): void
     {
-        // Офис со словом «Санкт-Петербург» без «Уткина Заводь» не должен
-        // цепляться за многословный склад частично… но полный набор — матчится.
+        // Частичный набор токенов многословного склада — не матч:
+        $this->assertNull(FbsOfficeGeoMatcher::match('СПб (СЦ Санкт-Петербург)', $this->tariffs));
+
+        // …а полный набор — матчится.
         $match = FbsOfficeGeoMatcher::match('СПб (СЦ Санкт-Петербург Уткина Заводь)', $this->tariffs);
 
         $this->assertNotNull($match);
         $this->assertSame('Северо-Западный федеральный округ', $match['geo_name']);
+    }
+
+    public function test_short_toponyms_survive_token_filter(): void
+    {
+        // «Уфа» — 3 буквы: режем стоп-словами (СК/СЦ), а не длиной.
+        $tariffs = ['Уфа' => ['warehouse_name' => 'Уфа', 'geo_name' => 'Приволжский федеральный округ']];
+
+        $match = FbsOfficeGeoMatcher::match('Уфа (СК Уфа)', $tariffs);
+
+        $this->assertNotNull($match);
+        $this->assertSame('Приволжский федеральный округ', $match['geo_name']);
     }
 }
