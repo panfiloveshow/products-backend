@@ -3209,6 +3209,14 @@ class UnitEconomicsCacheController extends Controller
             $wbHasStock = (bool) ($wbBreakdown['has_stock'] ?? false);
             $wbIntegrationAvg = (float) ($wbBreakdown['integration_avg'] ?? $avgWarehouseCoef);
 
+            // Настройки интеграции нужны и для КС (FBS-привязка), и для ИЛ ниже.
+            if ($pageContext !== null && isset($pageContext['integrations_by_id'])) {
+                $integration = $pageContext['integrations_by_id']->get($cache->integration_id);
+            } else {
+                $integration = Integration::find($cache->integration_id);
+            }
+            $integrationSettings = is_array($integration?->settings ?? null) ? $integration->settings : [];
+
             // Ручной КС бьёт авто-разбивку: на FBS склады продавца коэффициента WB
             // не несут, и авто всегда даёт 100%.
             $manualWarehouseCoefPercent = $settings?->warehouse_coef_percent_override;
@@ -3226,6 +3234,32 @@ class UnitEconomicsCacheController extends Controller
                 ]];
             }
             $data['warehouse_coef_is_manual'] = $manualWarehouseCoefPercent !== null;
+
+            // FBS/DBW: КС определяется СЦ привязки склада продавца (строка тарифов
+            // «Маркетплейс: {ФО}»), а не складами ФБО-остатков — их коэффициенты к
+            // логистике со склада продавца отношения не имеют. Гейт по настройке
+            // wb_fbs_marketplace_geo (её пишет синк): без привязки поведение прежнее.
+            $schemeUpper = strtoupper((string) $fulfillmentType);
+            $fbsGeo = (string) ($integrationSettings['wb_fbs_marketplace_geo'] ?? '');
+            $fbsCalcCoefPercent = (float) ($marketplaceData['warehouse_coef_percent'] ?? 0);
+            if ($manualWarehouseCoefPercent === null
+                && in_array($schemeUpper, ['FBS', 'DBW'], true)
+                && $fbsGeo !== ''
+                && $fbsCalcCoefPercent > 0
+            ) {
+                $warehouseCoefPercent = $fbsCalcCoefPercent;
+                $avgWarehouseCoef = $warehouseCoefPercent / 100;
+                $wbHasStock = true; // тултип привязки, а не «нет остатков»
+                $fbsOfficeName = (string) ($integrationSettings['wb_fbs_office_name'] ?? '');
+                $warehouseDetails = [[
+                    'warehouse_id' => null,
+                    'warehouse_name' => 'СЦ привязки'.($fbsOfficeName !== '' ? ' «'.$fbsOfficeName.'»' : '').' → '.$fbsGeo,
+                    'coefficient_raw' => round($avgWarehouseCoef, 3),
+                    'coefficient' => round($warehouseCoefPercent, 0),
+                    'quantity' => 0,
+                    'share_percent' => 100.0,
+                ]];
+            }
 
             // Нет остатков по складам нужной схемы — показываем честно, что КС это
             // среднее по магазину, а не FBS-«Мой склад» под видом FBW (и не пустой
@@ -3255,13 +3289,8 @@ class UnitEconomicsCacheController extends Controller
             // Сумма надбавки КС = базовая логистика × (коэффициент - 1)
             $data['warehouse_coef_amount'] = round($baseLogistics * ($avgWarehouseCoef - 1), 2);
 
-            // ИЛ (индекс локализации) — из интеграции (настройка магазина)
-            if ($pageContext !== null && isset($pageContext['integrations_by_id'])) {
-                $integration = $pageContext['integrations_by_id']->get($cache->integration_id);
-            } else {
-                $integration = Integration::find($cache->integration_id);
-            }
-            $integrationSettings = is_array($integration?->settings ?? null) ? $integration->settings : [];
+            // ИЛ (индекс локализации) — из интеграции (настройка магазина);
+            // $integration/$integrationSettings загружены выше, у блока КС.
             $localizationIndex = (float) (
                 $marketplaceData['localization_index']
                 ?? $integrationSettings['wb_localization_index']
