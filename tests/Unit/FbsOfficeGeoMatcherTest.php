@@ -47,6 +47,20 @@ class FbsOfficeGeoMatcherTest extends TestCase
         $this->assertSame('Северо-Западный федеральный округ', $match['geo_name']);
     }
 
+    public function test_office_contained_in_longer_warehouse_name_matches(): void
+    {
+        // Склад с уточнением улицы: офис «Нижний Новгород» ⊂ «СЦ Нижний Новгород Ларина».
+        $tariffs = ['СЦ Нижний Новгород Ларина' => ['warehouse_name' => 'СЦ Нижний Новгород Ларина', 'geo_name' => 'Приволжский федеральный округ']];
+
+        $match = FbsOfficeGeoMatcher::match('Нижний Новгород', $tariffs);
+
+        $this->assertNotNull($match);
+        $this->assertSame('Приволжский федеральный округ', $match['geo_name']);
+
+        // Пересечение без вложенности — не матч: «Великий Новгород» ≠ «Нижний Новгород».
+        $this->assertNull(FbsOfficeGeoMatcher::match('Великий Новгород', $tariffs));
+    }
+
     public function test_short_toponyms_survive_token_filter(): void
     {
         // «Уфа» — 3 буквы: режем стоп-словами (СК/СЦ), а не длиной.
