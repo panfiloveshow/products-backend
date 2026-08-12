@@ -69,7 +69,10 @@ class WildberriesMarketplace implements LegacyMarketplaceInterface, MarketplaceI
      */
     public static function fromIntegration(Integration $integration): self
     {
-        return new self($integration->getDecryptedCredentials(), $integration);
+        // resolveCredentials, а не getDecryptedCredentials: у интеграций без
+        // локального ключа (создание через Sellico) api_key приходит фолбэком,
+        // иначе Statistics API отвечает 401 «empty Authorization header».
+        return new self($integration->resolveCredentials(), $integration);
     }
 
     /**
