@@ -205,15 +205,33 @@ class UnitEconomicsCache extends Model
      * Только товары с остатками на складах выбранной схемы: вкладка FBS
      * показывает то, что реально лежит на складах продавца, FBW — на складах WB.
      * Без флага вкладки показывают все товары с пересчётом под схему (как раньше).
+     *
+     * Fail-open: если у интеграции ВООБЩЕ нет остатков этой группы складов
+     * (инвентарь не синкан или магазин работает по одной схеме), фильтр не
+     * применяется — иначе вкладка опустошалась бы из-за бедных данных, а не
+     * из-за реального отсутствия товара.
      */
-    public function scopeSchemeStockOnly(Builder $query, string $marketplace, ?bool $enabled, string $fulfillmentType): Builder
+    public function scopeSchemeStockOnly(Builder $query, string $marketplace, ?bool $enabled, string $fulfillmentType, ?int $integrationId = null): Builder
     {
-        if (! $enabled || $marketplace !== 'wildberries') {
+        if (! $enabled || $marketplace !== 'wildberries' || $integrationId === null) {
             return $query;
         }
 
         $marketplaceSchemes = ['FBS', 'DBW', 'DBS', 'EDBS'];
         $wantsMarketplaceStock = in_array(strtoupper($fulfillmentType), $marketplaceSchemes, true);
+        $groupCondition = $wantsMarketplaceStock
+            ? 'upper(coalesce(fulfillment_type, \'\')) in (\''.implode("','", $marketplaceSchemes).'\')'
+            : 'upper(coalesce(fulfillment_type, \'\')) not in (\''.implode("','", $marketplaceSchemes).'\')';
+
+        $groupHasStock = \Illuminate\Support\Facades\DB::table('inventory_warehouses')
+            ->where('integration_id', $integrationId)
+            ->where('quantity', '>', 0)
+            ->whereRaw($groupCondition)
+            ->exists();
+        if (! $groupHasStock) {
+            return $query;
+        }
+
         $table = $this->getTable();
 
         return $query->whereExists(function ($sub) use ($table, $marketplaceSchemes, $wantsMarketplaceStock) {
