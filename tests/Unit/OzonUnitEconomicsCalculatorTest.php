@@ -237,7 +237,8 @@ class OzonUnitEconomicsCalculatorTest extends TestCase
             $result = $calculator->calculate($input)->toArray();
 
             $this->assertSame(250.0, $result['return_logistics'], $scheme);
-            $this->assertSame(250.0, $result['expected_return_cost'], $scheme);
+            // Оба плеча своей доставки: «туда» (250) + свой возврат (250).
+            $this->assertSame(500.0, $result['expected_return_cost'], $scheme);
             $this->assertSame(
                 $result['costs']['logistics'] + $result['expected_return_cost'],
                 $result['effective_logistics'],
@@ -332,7 +333,8 @@ class OzonUnitEconomicsCalculatorTest extends TestCase
 
         // 2 возврата из 10 заказов → потеряно 0.2, продано 0.8 → на единицу
         // выкупа приходится 0.2 / 0.8 = 0.25 возврата.
-        $expected = round(($result['return_logistics'] + $result['return_processing']) * 0.25, 2);
+        // Прямая магистраль невыкупленной поездки списывается тоже — в возврате два плеча.
+        $expected = round(($result['base_logistics'] + $result['return_logistics'] + $result['return_processing']) * 0.25, 2);
         $this->assertGreaterThan(0.0, $result['expected_return_cost']);
         $this->assertSame($expected, $result['expected_return_cost']);
         $this->assertSame(
@@ -366,7 +368,8 @@ class OzonUnitEconomicsCalculatorTest extends TestCase
 
         $result = $calculator->calculate($input)->toArray();
 
-        $expected = round(($result['return_logistics'] + $result['return_processing']) * (0.3 / 0.7), 2);
+        // Два плеча (прямое + обратное) + обработка — на единицу выкупа.
+        $expected = round(($result['base_logistics'] + $result['return_logistics'] + $result['return_processing']) * (0.3 / 0.7), 2);
         $this->assertSame($expected, $result['expected_return_cost']);
     }
 

@@ -42,6 +42,7 @@ class CalculationInput
         public readonly ?float $redemptionRate = null,  // % выкупа (для расчёта возвратов)
         public readonly ?float $deliveryCoefficient = null,  // Коэффициент времени доставки (Ozon FBO)
         public readonly ?float $warehouseCoefficient = null,  // КС (коэффициент склада) — множитель логистики WB (1.0 = 100%, 1.4 = 140%)
+        public readonly bool $warehouseCoefficientIsManual = false,  // КС задан руками — не перетирать коэффициентом из тарифа WB
         public readonly ?float $localizationIndex = null,  // ИЛ (индекс локализации) — множитель логистики WB (1.0 = без изменений)
         public readonly ?float $salesDistributionIndex = null,  // ИРП WB, проценты от цены до скидки WB (например 1.15 = 1.15%)
         public readonly ?float $sppPercent = null,
@@ -180,6 +181,7 @@ class CalculationInput
             redemptionRate: isset($data['redemption_rate']) ? (float) $data['redemption_rate'] : null,
             deliveryCoefficient: isset($data['delivery_coefficient']) ? (float) $data['delivery_coefficient'] : null,
             warehouseCoefficient: isset($data['warehouse_coefficient']) ? (float) $data['warehouse_coefficient'] : null,
+            warehouseCoefficientIsManual: (bool) ($data['warehouse_coefficient_is_manual'] ?? false),
             localizationIndex: isset($data['localization_index']) ? (float) $data['localization_index'] : null,
             salesDistributionIndex: isset($data['sales_distribution_index'])
                 ? (float) $data['sales_distribution_index']

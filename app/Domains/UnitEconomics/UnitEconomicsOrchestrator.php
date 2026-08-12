@@ -135,6 +135,7 @@ class UnitEconomicsOrchestrator
                 redemptionRate: $input->redemptionRate,
                 deliveryCoefficient: $input->deliveryCoefficient,
                 warehouseCoefficient: $input->warehouseCoefficient,
+                warehouseCoefficientIsManual: $input->warehouseCoefficientIsManual,
                 localizationIndex: $input->localizationIndex,
                 salesDistributionIndex: $input->salesDistributionIndex,
                 sppPercent: $input->sppPercent,

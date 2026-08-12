@@ -536,6 +536,10 @@ class UnitEconomicsCacheController extends Controller
             'redemption_rate_override' => 'nullable|numeric|min:0|max:100',
             // WB-специфичные
             'spp_percent' => 'nullable|numeric|min:0|max:100',
+            // Ручной КС (коэффициент склада), % — 0 сбрасывает на авто-расчёт по складам
+            'warehouse_coef_percent_override' => 'nullable|numeric|min:0|max:500',
+            // Платная приёмка на единицу, ₽ (WB её в юнит-экономику не отдаёт)
+            'acceptance_cost' => 'nullable|numeric|min:0',
             // ИЛ (индекс локализации) — хранится на уровне интеграции, но принимаем здесь для удобства
             'localization_index' => 'nullable|numeric|min:0.50|max:2.50',
             // ИРП (индекс распределения продаж) — хранится на уровне WB-интеграции, значение из ЛК WB в процентах
@@ -606,10 +610,21 @@ class UnitEconomicsCacheController extends Controller
             }
         }
 
-        // Обновляем или создаём настройки товара
+        // Обновляем или создаём настройки товара.
+        // array_filter отбрасывает null (= «поле не передали»), поэтому сброс КС на авто
+        // передаётся нулём и превращается в null здесь.
+        $payload = array_filter($validated, fn ($v) => $v !== null);
+        if (array_key_exists('warehouse_coef_percent_override', $validated)
+            && $validated['warehouse_coef_percent_override'] !== null
+        ) {
+            $payload['warehouse_coef_percent_override'] = (float) $validated['warehouse_coef_percent_override'] > 0
+                ? (float) $validated['warehouse_coef_percent_override']
+                : null;
+        }
+
         $settings = UnitEconomicsSettings::updateOrCreate(
             ['integration_id' => $integrationId, 'sku' => $sku],
-            array_filter($validated, fn ($v) => $v !== null)
+            $payload
         );
 
         // ИЛ/ИРП — настройки всей WB-интеграции, поэтому пересчитываем всю интеграцию.
@@ -2712,6 +2727,14 @@ class UnitEconomicsCacheController extends Controller
                 }
                 // Потери — на единицу выкупа, а не на заказ (как в калькуляторе).
                 $returnFraction = OzonUnitEconomicsCalculator::returnFractionPerSoldUnit($returnFraction);
+                // Прямое плечо невыкупленной поездки Ozon тоже списывает —
+                // магистраль без последней мили (вручения не было), как в калькуляторе.
+                $returnBase += $deliveryLogistics;
+            } elseif ($cache->marketplace === 'wildberries') {
+                // WB: как в WildberriesUnitEconomicsCalculator — оба плеча
+                // (логистику WB списывает за каждую поездку) на единицу выкупа.
+                $returnFraction = \App\Domains\UnitEconomics\ReturnEconomics::fractionPerSoldUnit($returnFraction);
+                $returnBase += $deliveryLogistics;
             } else {
                 $returnFraction = min(1.0, $returnFraction);
             }
@@ -3093,6 +3116,12 @@ class UnitEconomicsCacheController extends Controller
             $data['acquiring_amount'] = round((float) ($data['acquiring_amount'] ?? $cache->acquiring_amount ?? ($price * $data['acquiring_percent'] / 100)), 2);
             $data['acquiring_per_unit'] = round((float) ($data['acquiring_per_unit'] ?? ($data['acquiring_amount'] ?? 0)), 2);
 
+            // Платная приёмка на единицу — ручной ввод (WB её в юнит-экономику не отдаёт).
+            // Есть только на складских схемах: на FBS/DBS/EDBS приёмки нет.
+            $data['acceptance_cost'] = in_array(strtoupper((string) $cache->fulfillment_type), ['FBO', 'FBW'], true)
+                ? round((float) ($settings?->acceptance_cost ?? $marketplaceData['acceptance_cost'] ?? 0), 2)
+                : 0.0;
+
             // Габариты из wb_data (приоритет: настройки > wb_data > кэш)
             if (! $lengthMm && isset($wbData['length_mm'])) {
                 $lengthMm = $wbData['length_mm'];
@@ -3177,6 +3206,24 @@ class UnitEconomicsCacheController extends Controller
             $warehouseDetails = is_array($wbBreakdown['details'] ?? null) ? $wbBreakdown['details'] : [];
             $wbHasStock = (bool) ($wbBreakdown['has_stock'] ?? false);
             $wbIntegrationAvg = (float) ($wbBreakdown['integration_avg'] ?? $avgWarehouseCoef);
+
+            // Ручной КС бьёт авто-разбивку: на FBS склады продавца коэффициента WB
+            // не несут, и авто всегда даёт 100%.
+            $manualWarehouseCoefPercent = $settings?->warehouse_coef_percent_override;
+            if ($manualWarehouseCoefPercent !== null && (float) $manualWarehouseCoefPercent > 0) {
+                $warehouseCoefPercent = (float) $manualWarehouseCoefPercent;
+                $avgWarehouseCoef = $warehouseCoefPercent / 100;
+                $wbHasStock = true; // не подменять тултип «нет остатков» на средний по магазину
+                $warehouseDetails = [[
+                    'warehouse_id' => null,
+                    'warehouse_name' => 'КС задан вручную',
+                    'coefficient_raw' => round($avgWarehouseCoef, 3),
+                    'coefficient' => round($warehouseCoefPercent, 0),
+                    'quantity' => 0,
+                    'share_percent' => 100.0,
+                ]];
+            }
+            $data['warehouse_coef_is_manual'] = $manualWarehouseCoefPercent !== null;
 
             // Нет остатков по складам нужной схемы — показываем честно, что КС это
             // среднее по магазину, а не FBS-«Мой склад» под видом FBW (и не пустой
@@ -3425,6 +3472,9 @@ class UnitEconomicsCacheController extends Controller
         // что по факту это 0.6-6.8% выручки магазина (FBO), и в effective_logistics
         // его нет. Для FBS/RFBS/EXPRESS калькулятор сам отдаёт 0.
         $storageCost = round((float) ($data['storage_cost'] ?? 0), 2);
+        // Платная приёмка — удержание маркетплейса, как хранение. WB её в юните
+        // не отдаёт, значение задаётся вручную и приходит из настроек товара.
+        $acceptanceCost = round((float) ($data['acceptance_cost'] ?? 0), 2);
         $drrAmount = round($price * (float) ($data['drr_percent'] ?? 0) / 100, 2);
         // Налог: база — фактическая цена продажи из отчёта о реализации Ozon («реализовано
         // со скидкой», скидки Ozon за счёт продавца + баллы), если синк её принёс; иначе цена.
@@ -3435,13 +3485,14 @@ class UnitEconomicsCacheController extends Controller
         $ourShareAmount = $isWb ? 0.0 : round($price * (float) ($data['our_share_percent'] ?? 0) / 100, 2);
 
         $toSettlement = round(
-            $price - $commissionAmount - $effectiveLogistics - $acquiringAmount - $storageCost - $drrAmount,
+            $price - $commissionAmount - $effectiveLogistics - $acquiringAmount - $storageCost
+            - $acceptanceCost - $drrAmount,
             2
         );
         $netProfit = round($toSettlement - $costPrice - $taxAmount - $vatAmount - $ourShareAmount, 2);
         $totalCosts = round(
             $costPrice + $commissionAmount + $effectiveLogistics + $acquiringAmount
-            + $storageCost + $drrAmount + $taxAmount + $vatAmount + $ourShareAmount,
+            + $storageCost + $acceptanceCost + $drrAmount + $taxAmount + $vatAmount + $ourShareAmount,
             2
         );
 
@@ -3452,6 +3503,7 @@ class UnitEconomicsCacheController extends Controller
         $data['acquiring_per_unit'] = $acquiringAmount;
         $data['storage_cost'] = $storageCost;
         $data['storage_per_unit'] = $storageCost;
+        $data['acceptance_cost'] = $acceptanceCost;
         $data['drr_amount'] = $drrAmount;
         $data['tax_amount'] = $taxAmount;
         $data['vat_amount'] = $vatAmount;
