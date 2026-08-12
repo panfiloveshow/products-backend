@@ -242,7 +242,9 @@ class FbsSuppliesApi
      */
     public function getOffices(): array
     {
-        $response = $this->client->get(self::BASE_URL . '/api/v3/offices');
+        // endpoint и base URL раздельно: client->get сам клеит хост, полный URL
+        // в endpoint давал «https://…https://…» и пустой ответ.
+        $response = $this->client->get('/api/v3/offices');
 
         if (!$response) {
             return [];
@@ -268,7 +270,7 @@ class FbsSuppliesApi
      */
     public function getSellerWarehouses(): array
     {
-        $response = $this->client->get(self::BASE_URL . '/api/v3/warehouses');
+        $response = $this->client->get('/api/v3/warehouses');
 
         if (!$response) {
             return [];
