@@ -938,7 +938,27 @@ class SyncUnitEconomicsCommand extends Command
                     // Кэш-сервис по нему выбирает строку «Маркетплейс: {ФО}» с реальным
                     // КС и base/liter FBS вместо склада без коэффициента.
                     try {
-                        $fbsGeo = $wbService->resolveFbsOfficeGeo($wbTariffsData);
+                        // /tariffs/box под 429 отдаёт пусто — добираем имена и гео
+                        // складов из свежих box-снапшотов (для матчинга больше не нужно).
+                        $fbsGeoTariffs = $wbTariffsData;
+                        if ($fbsGeoTariffs === []) {
+                            foreach (\DB::table('wildberries_tariff_snapshots')
+                                ->where('tariff_type', 'box')
+                                ->whereNotNull('warehouse_name')
+                                ->orderByDesc('effective_date')
+                                ->limit(300)
+                                ->get() as $tariffSnap) {
+                                if (isset($fbsGeoTariffs[$tariffSnap->warehouse_name])) {
+                                    continue;
+                                }
+                                $snapPayload = json_decode($tariffSnap->payload ?? '', true);
+                                $fbsGeoTariffs[$tariffSnap->warehouse_name] = [
+                                    'warehouse_name' => $tariffSnap->warehouse_name,
+                                    'geo_name' => is_array($snapPayload) ? ($snapPayload['geo_name'] ?? null) : null,
+                                ];
+                            }
+                        }
+                        $fbsGeo = $wbService->resolveFbsOfficeGeo($fbsGeoTariffs);
                         if ($fbsGeo !== null && $integration !== null) {
                             $integration->settings = array_merge($integration->settings ?? [], [
                                 'wb_fbs_office_name' => $fbsGeo['office_name'],
