@@ -202,6 +202,35 @@ class UnitEconomicsCache extends Model
     }
 
     /**
+     * Только товары с остатками на складах выбранной схемы: вкладка FBS
+     * показывает то, что реально лежит на складах продавца, FBW — на складах WB.
+     * Без флага вкладки показывают все товары с пересчётом под схему (как раньше).
+     */
+    public function scopeSchemeStockOnly(Builder $query, string $marketplace, ?bool $enabled, string $fulfillmentType): Builder
+    {
+        if (! $enabled || $marketplace !== 'wildberries') {
+            return $query;
+        }
+
+        $marketplaceSchemes = ['FBS', 'DBW', 'DBS', 'EDBS'];
+        $wantsMarketplaceStock = in_array(strtoupper($fulfillmentType), $marketplaceSchemes, true);
+        $table = $this->getTable();
+
+        return $query->whereExists(function ($sub) use ($table, $marketplaceSchemes, $wantsMarketplaceStock) {
+            $sub->selectRaw('1')
+                ->from('inventory_warehouses as iw')
+                ->whereColumn('iw.integration_id', $table.'.integration_id')
+                ->whereColumn('iw.sku', $table.'.sku')
+                ->where('iw.quantity', '>', 0)
+                ->whereRaw(
+                    $wantsMarketplaceStock
+                        ? 'upper(coalesce(iw.fulfillment_type, \'\')) in (\''.implode("','", $marketplaceSchemes).'\')'
+                        : 'upper(coalesce(iw.fulfillment_type, \'\')) not in (\''.implode("','", $marketplaceSchemes).'\')'
+                );
+        });
+    }
+
+    /**
      * WB: одна строка на артикул (nmID), а не на баркод.
      *
      * WB-карточка (nmID) может прийти с несколькими баркодами (size.skus) → синк

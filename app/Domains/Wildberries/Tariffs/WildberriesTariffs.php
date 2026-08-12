@@ -119,11 +119,28 @@ class WildberriesTariffs implements TariffsProviderInterface
     }
 
     /**
+     * Возврат невыкупа на FBS/DBW приезжает продавцу в ПВЗ — тариф WB
+     * «Обратная логистика»: 25 ₽ первый литр + 4 ₽ за каждый следующий.
+     * На складских схемах возврат едет обратной магистралью по тарифу
+     * логистики склада (46+14 базовые) — там своя ветка ниже.
+     */
+    private const FBS_RETURN_BASE = 25.0;
+
+    private const FBS_RETURN_LITER = 4.0;
+
+    /**
      * Рассчитать стоимость обратной логистики (возврат)
      * Обратная логистика = базовая логистика (без коэффициентов)
      */
     public function calculateReturnLogisticsCost(float $volume, float $weight, array $options = []): float
     {
+        // Схемы со склада продавца: возврат через ПВЗ по плоскому тарифу WB,
+        // FBO-магистраль здесь ни при чём (без схемы — старое поведение).
+        $scheme = strtoupper((string) ($options['scheme'] ?? ''));
+        if (in_array($scheme, ['FBS', 'DBW'], true)) {
+            return $this->calculateBasePlusLiter($volume, self::FBS_RETURN_BASE, self::FBS_RETURN_LITER);
+        }
+
         $return = $options['tariff_breakdown']['return'] ?? null;
         if (is_array($return)) {
             $base = $this->firstNumeric($return, ['base', 'return_base', 'returnDeliveryBase', 'boxDeliveryBase']);

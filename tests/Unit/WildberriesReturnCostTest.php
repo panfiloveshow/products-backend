@@ -65,6 +65,36 @@ class WildberriesReturnCostTest extends TestCase
         );
     }
 
+    public function test_fbs_return_uses_pvz_tariff_not_fbo_magistral(): void
+    {
+        // FBS-возврат приезжает продавцу в ПВЗ: 25 ₽ первый литр + 4 ₽/л далее.
+        $result = (new WildberriesUnitEconomicsCalculator)->calculate($this->input(100));
+
+        $this->assertSame(25.0, $result->metadata['return_logistics']);
+    }
+
+    public function test_fbs_return_tariff_charges_extra_liters(): void
+    {
+        $input = CalculationInput::fromArray([
+            'sku' => 'test-returns-5l',
+            'integration_id' => 1,
+            'marketplace' => 'wildberries',
+            'fulfillment_type' => 'FBS',
+            'price' => 1000,
+            'length' => 10,
+            'width' => 25,
+            'height' => 20, // 5 литров
+            'weight' => 0.5,
+            'commission_rate' => 20,
+            'redemption_rate' => 100,
+        ]);
+
+        $result = (new WildberriesUnitEconomicsCalculator)->calculate($input);
+
+        // 25 + 4 × 4 доп. литра = 41 ₽.
+        $this->assertSame(41.0, $result->metadata['return_logistics']);
+    }
+
     public function test_fraction_is_capped_at_three_returns_per_sale(): void
     {
         $result = (new WildberriesUnitEconomicsCalculator)->calculate($this->input(10));

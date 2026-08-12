@@ -48,12 +48,19 @@ final class WildberriesCommissionResolver
             [15, 'default'],
         ];
 
+        // Платные опции WB (например, расширенный контент) добавляют п.п. ко ВСЕМ
+        // комиссиям кабинета — настройка интеграции, поверх любого источника.
+        $extraPp = (float) ($integrationSettings['wb_commission_extra_pp'] ?? 0);
+
         foreach ($candidates as [$value, $source]) {
             if ($value !== null && is_numeric($value)) {
-                return ['value' => (float) $value, 'source' => $source];
+                return [
+                    'value' => (float) $value + $extraPp,
+                    'source' => $extraPp !== 0.0 ? $source.'+extra_pp' : $source,
+                ];
             }
         }
 
-        return ['value' => 15.0, 'source' => 'default'];
+        return ['value' => 15.0 + $extraPp, 'source' => $extraPp !== 0.0 ? 'default+extra_pp' : 'default'];
     }
 }

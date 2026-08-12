@@ -108,6 +108,7 @@ class UnitEconomicsCacheController extends Controller
             'non_local_markup_max' => 'nullable|numeric',
             'confidence' => 'nullable|string|in:low,medium,high',
             'locality_state' => 'nullable|string|in:local,non_local,mixed,no_sales',
+            'scheme_stock_only' => 'nullable|boolean',
             'sort' => 'nullable|string|in:sku,product_name,price,net_profit,margin_percent,commission_percent,sales_count,stock,total_stock,current_stock,days_of_stock,relevance',
             'sort_order' => 'nullable|string|in:asc,desc',
             'spp_known_first' => 'nullable|boolean',
@@ -148,6 +149,7 @@ class UnitEconomicsCacheController extends Controller
             ->nonLocalMarkupRange($validated['non_local_markup_min'] ?? null, $validated['non_local_markup_max'] ?? null)
             ->confidence($validated['confidence'] ?? null)
             ->localityState($validated['locality_state'] ?? null)
+            ->schemeStockOnly($marketplace, filter_var($validated['scheme_stock_only'] ?? false, FILTER_VALIDATE_BOOLEAN), $validated['fulfillment_type'])
             ->wbPrimaryBarcode($marketplace, (int) $validated['integration_id']);
         $statsQuery = clone $query;
 
