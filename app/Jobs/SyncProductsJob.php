@@ -490,6 +490,7 @@ class SyncProductsJob implements ShouldBeUnique, ShouldQueue
             }
             if ($marketplace === 'wildberries') {
                 $updateData = $this->preserveWbFboWarehouses($existingProduct, $updateData);
+                $updateData = $this->preserveWbRedemption($existingProduct, $updateData);
             }
             if ($marketplace === 'uzum') {
                 $updateData = $this->preserveUzumDimensions($existingProduct, $updateData);
@@ -523,6 +524,34 @@ class SyncProductsJob implements ShouldBeUnique, ShouldQueue
         if (is_array($oldDims) && empty($updateData['uzum_data']['dimensions'])) {
             $updateData['uzum_data']['dimensions'] = $oldDims;
         }
+        return $updateData;
+    }
+
+    /**
+     * WB: не даём % выкупа из воронки деградировать до дефолта. Воронка
+     * (Analytics sales-funnel) жёстко рейт-лимитена (~единицы запросов в час);
+     * при 429 синк товаров пересобирает wb_data без redemption_* — и следующий
+     * ЮЭ-синк откатывал весь магазин на дефолт 80%. Если свежих данных нет,
+     * а старые были — переносим старые (redemption_observed_at покажет возраст).
+     */
+    private function preserveWbRedemption(Product $existing, array $updateData): array
+    {
+        if (! isset($updateData['wb_data']) || ! is_array($updateData['wb_data'])) {
+            return $updateData;
+        }
+        if (($updateData['wb_data']['redemption_rate'] ?? null) !== null) {
+            return $updateData;
+        }
+        if (($existing->wb_data['redemption_rate'] ?? null) === null) {
+            return $updateData;
+        }
+
+        foreach (['redemption_rate', 'redemption_orders_count', 'redemption_buyouts_count', 'redemption_source', 'redemption_observed_at'] as $key) {
+            if (isset($existing->wb_data[$key])) {
+                $updateData['wb_data'][$key] = $existing->wb_data[$key];
+            }
+        }
+
         return $updateData;
     }
 
