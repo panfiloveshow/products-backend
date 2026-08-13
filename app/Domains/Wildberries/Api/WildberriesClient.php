@@ -709,14 +709,22 @@ class WildberriesClient
                     return null;
                 }
 
-                // 429 — глобальный лимитер.
-                // stocks-report: ретраим (по документации ~20 сек между попытками).
-                // sales-funnel и прочие аналитические эндпоинты: НЕ ретраим — их лимит жёсткий
-                // (~1-5 запросов в час), и повторные попытки только сжигают квоту впустую.
-                if ($status === 429 && $attempts < $maxAttempts && str_contains($endpoint, 'stocks-report')) {
-                    $sleepSeconds = 20;
+                // 429 — лимитер WB. Ответ несёт X-RateLimit-Retry (секунды до
+                // следующего разрешённого запроса) — ждём ровно столько и повторяем.
+                // Раньше sales-funnel не ретраился вовсе: один 429 ронял воронку
+                // выкупа на весь магазин до следующего синка (наблюдалось на инт. 76 —
+                // 100% строк на дефолте 80%). Без заголовка: stocks-report ~20 сек
+                // по документации, остальным ждать нечего — выходим.
+                if ($status === 429 && $attempts < $maxAttempts) {
+                    $retryAfter = (int) ($response->header('X-RateLimit-Retry') ?: $response->header('Retry-After'));
+                    if ($retryAfter <= 0 && str_contains($endpoint, 'stocks-report')) {
+                        $retryAfter = 20;
+                    }
+                    if ($retryAfter > 0 && $retryAfter <= 120) {
+                        $sleepSeconds = $retryAfter;
 
-                    continue;
+                        continue;
+                    }
                 }
 
                 Log::warning('WB Analytics API POST error', [

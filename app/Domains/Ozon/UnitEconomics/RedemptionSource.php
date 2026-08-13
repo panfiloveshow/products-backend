@@ -29,6 +29,11 @@ enum RedemptionSource: string
     case FallbackOrdersReturns = 'fallback_orders_returns';
     case FallbackPartial = 'fallback_partial';
 
+    // WB — воронка продаж (analytics sales-funnel, как «% выкупа» в ЛК, 30 дней).
+    // Без этого case fromStringSafe() превращал его в Default: воронка не считалась
+    // свежей и в CacheService проигрывала застрявшему existingUE=80/default.
+    case WbSalesFunnel = 'wb_sales_funnel';
+
     // Yandex/WB и legacy Ozon:
     case Api = 'api';
     case ApiOrdersSkuSales = 'api_orders_sku_sales';
@@ -51,6 +56,7 @@ enum RedemptionSource: string
         return match ($this) {
             self::Postings28d => RedemptionSourceFamily::Postings,
             self::AnalyticsApi28d,
+            self::WbSalesFunnel,
             self::Api,
             self::ApiOrdersSkuSales => RedemptionSourceFamily::Api,
             self::NoSales28d => RedemptionSourceFamily::NoSales,
@@ -72,7 +78,8 @@ enum RedemptionSource: string
             self::AnalyticsApi28d,
             self::NoSales28d,
             self::FallbackOrdersReturns,
-            self::FallbackPartial => true,
+            self::FallbackPartial,
+            self::WbSalesFunnel => true,
             default => false,
         };
     }
@@ -87,7 +94,8 @@ enum RedemptionSource: string
             self::AnalyticsApi28d,
             self::NoSales28d => 28,
             self::FallbackOrdersReturns,
-            self::FallbackPartial => 30,
+            self::FallbackPartial,
+            self::WbSalesFunnel => 30,
             default => 28,
         };
     }
