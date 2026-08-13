@@ -35,6 +35,34 @@ class WildberriesAnalyticsRetryTest extends TestCase
         Http::assertSentCount(1);
     }
 
+    public function test_falls_back_to_retry_after_header(): void
+    {
+        Http::fake([
+            'seller-analytics-api.wildberries.ru/*' => Http::sequence()
+                ->push(['detail' => 'rate limit exceeded'], 429, ['Retry-After' => '1'])
+                ->push(['data' => ['products' => []]], 200),
+        ]);
+
+        $client = new WildberriesClient('test-key');
+
+        $this->assertNotNull($client->analyticsPost('/api/analytics/v3/sales-funnel/products', []));
+        Http::assertSentCount(2);
+    }
+
+    public function test_stocks_report_honors_rate_limit_header(): void
+    {
+        Http::fake([
+            'seller-analytics-api.wildberries.ru/*' => Http::sequence()
+                ->push(['detail' => 'rate limit exceeded'], 429, ['X-RateLimit-Retry' => '1'])
+                ->push(['report' => []], 200),
+        ]);
+
+        $client = new WildberriesClient('test-key');
+
+        $this->assertSame(['report' => []], $client->analyticsPost('/api/analytics/v1/stocks-report/wb-warehouses', []));
+        Http::assertSentCount(2);
+    }
+
     public function test_429_with_huge_retry_header_does_not_block_worker(): void
     {
         Http::fake([
