@@ -478,6 +478,7 @@ class UnitEconomicsCacheServiceTest extends TestCase
 
         $this->assertSame(40.0, $result->metadata['base_logistics']);
         $this->assertSame(60.0, $result->metadata['base_logistics'] + $result->metadata['warehouse_coef_amount']);
+        // ИЛ на FBO действует переходно (остатки поставок до 15.08.2026).
         $this->assertSame(12.0, $result->metadata['localization_amount']);
         $this->assertSame(72.0, $result->costs->logistics);
     }
@@ -566,6 +567,7 @@ class UnitEconomicsCacheServiceTest extends TestCase
             'length' => 10,
             'width' => 10,
             'height' => 30,
+            'localization_index' => 1.2,
             'redemption_rate' => 100,
             'storage_cost' => 0,
             'acquiring_percent' => 0,
@@ -581,6 +583,8 @@ class UnitEconomicsCacheServiceTest extends TestCase
         ]));
 
         $this->assertSame(40.0, $result->metadata['base_logistics']);
+        // ИЛ на FBS не применяется (заказы-исключения по методике WB).
+        $this->assertSame(0.0, $result->metadata['localization_amount']);
         $this->assertSame(40.0, $result->costs->logistics);
     }
 

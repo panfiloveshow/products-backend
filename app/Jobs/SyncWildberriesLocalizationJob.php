@@ -39,6 +39,10 @@ class SyncWildberriesLocalizationJob implements ShouldBeUnique, ShouldQueue
 
     public function handle(LocalizationIndexService $localization): void
     {
+        // ИЛ с 15.08.2026 действует только переходно (FBW-остатки из поставок до
+        // 15.08, до конца 60/90-дневной фиксации тарифа). Джоба оставлена на этот
+        // период. ponytail: замкнуть накоротко после ~15.11.2026 — освободит общую
+        // квоту /supplier/sales (~1 запрос/мин, делится с воронкой % выкупа).
         $integration = Integration::find($this->integrationId);
         if (! $integration || $integration->marketplace !== 'wildberries') {
             return;
