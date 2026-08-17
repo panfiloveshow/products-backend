@@ -446,7 +446,7 @@ class UnitEconomicsCacheServiceTest extends TestCase
         $this->assertSame('Коледино', $result->metadata['tariff_warehouse_name']);
     }
 
-    public function test_wildberries_official_box_tariff_applies_localization_without_double_warehouse_coef(): void
+    public function test_wildberries_official_box_tariff_ignores_disabled_localization_index(): void
     {
         $calculator = new WildberriesUnitEconomicsCalculator();
 
@@ -478,8 +478,10 @@ class UnitEconomicsCacheServiceTest extends TestCase
 
         $this->assertSame(40.0, $result->metadata['base_logistics']);
         $this->assertSame(60.0, $result->metadata['base_logistics'] + $result->metadata['warehouse_coef_amount']);
-        $this->assertSame(12.0, $result->metadata['localization_amount']);
-        $this->assertSame(72.0, $result->costs->logistics);
+        // ИЛ отключён с 15.08.2026: входное значение 1.2 игнорируется.
+        $this->assertSame(1.0, $result->metadata['localization_index']);
+        $this->assertSame(0.0, $result->metadata['localization_amount']);
+        $this->assertSame(60.0, $result->costs->logistics);
     }
 
     public function test_wildberries_dbs_does_not_apply_warehouse_or_localization_amounts_to_own_delivery(): void
@@ -545,10 +547,11 @@ class UnitEconomicsCacheServiceTest extends TestCase
         ]));
 
         $this->assertSame(40.0, $result->metadata['base_logistics']);
-        $this->assertSame(12.0, $result->metadata['localization_amount']);
+        // ИЛ и ИРП отключены: логистика = база × КС, без надбавок индексов.
+        $this->assertSame(0.0, $result->metadata['localization_amount']);
         $this->assertSame(0.0, $result->metadata['sales_distribution_index']);
         $this->assertSame(0.0, $result->metadata['sales_distribution_amount']);
-        $this->assertSame(72.0, $result->costs->logistics);
+        $this->assertSame(60.0, $result->costs->logistics);
     }
 
     public function test_wildberries_fbs_uses_marketplace_box_tariff_fields(): void

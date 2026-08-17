@@ -126,7 +126,9 @@ class UnitEconomicsService
         $storageCost = $data['storage_cost'] ?? ($volumeLiters * $storageTariff * $storageDays * $salesCount);
 
         $warehouseCoefficient = (float) ($data['warehouse_coefficient'] ?? 1.0);
-        $localizationIndex = (float) ($data['localization_index'] ?? 1.0);
+        // ИЛ отключён WB с 15.08.2026 (новость от 14.08.2026): единые КС для всех
+        // складов РФ, индекс исключён из формулы логистики. Входное значение игнорируем.
+        $localizationIndex = 1.0;
         $deliveryBaseLiter = (float) ($data['delivery_base_liter'] ?? 46);
         $deliveryAdditionalLiter = (float) ($data['delivery_additional_liter'] ?? 14);
         $baseLogisticsPerUnit = $this->calculateWildberriesFallbackLogisticsBase(
@@ -136,8 +138,8 @@ class UnitEconomicsService
         );
         $ownDeliveryCost = (float) ($data['own_delivery_cost'] ?? 0);
         $ownReturnCost = (float) ($data['own_return_cost'] ?? 0);
-        // ИРП (индекс распределения продаж) — наценка за нелокальные продажи, в процентах от цены.
-        // Формула WB: base × КС × ИЛ + Цена × ИРП%.
+        // Формула WB с 15.08.2026: base × КС (единый 170% / 100% СГТ).
+        // ИРП отключён с 13.07.2026 (данные несут 0), ИЛ — с 15.08.2026 (принудительно 1.0).
         $salesDistributionIndex = (float) ($data['sales_distribution_index'] ?? 0);
         $salesDistributionMarkupPerUnit = $price * ($salesDistributionIndex / 100);
         $logisticsPerUnit = in_array($fulfillmentType, ['DBS', 'EDBS'], true)

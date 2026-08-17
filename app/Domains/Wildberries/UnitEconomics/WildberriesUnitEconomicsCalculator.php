@@ -49,8 +49,11 @@ class WildberriesUnitEconomicsCalculator implements UnitEconomicsCalculatorInter
         // Приоритет: options > input > 1.0 (по умолчанию)
         $warehouseCoef = $options['warehouse_coefficient'] ?? $input->warehouseCoefficient ?? 1.0;
         $warehouseCoefPercent = $warehouseCoef * 100; // Для отображения КС: 1.4 = 140%
-        // ИЛ (индекс локализации) — множитель логистики (1.0 = без изменений, < 1.0 = скидка, > 1.0 = наценка)
-        $localizationIndex = $options['localization_index'] ?? $input->localizationIndex ?? 1.0;
+        // ИЛ отключён WB с 15.08.2026 (новость WB Partners от 14.08.2026): индекс
+        // исключён из формулы логистики для складов РФ, действуют единые КС
+        // (170% / 100% СГТ) из тарифного фида. Сохранённые/ручные значения
+        // игнорируем; поле в выдаче остаётся нейтральным (1.0).
+        $localizationIndex = 1.0;
         // ИРП отключён WB с 13.07.2026 (новость WB Partners от 08.07.2026): индекс
         // исключён из формулы логистики, действует формула до 23.03.2026.
         // Сохранённые/ручные значения игнорируем; поля в выдаче остаются нулями.
@@ -127,8 +130,8 @@ class WildberriesUnitEconomicsCalculator implements UnitEconomicsCalculatorInter
             ? 0.0
             : ($wbDiscountBasePrice * ($salesDistributionIndexPercent / 100));
 
-        // Логистика WB с 13.07.2026 — как до 23.03.2026:
-        // базовая логистика × КС × ИЛ (ИРП отключён, salesDistributionAmount = 0).
+        // Логистика WB с 15.08.2026: базовая логистика × КС (единый 170% / 100% СГТ).
+        // ИРП отключён с 13.07.2026, ИЛ — с 15.08.2026 (оба множителя нейтральны).
         $logistics = $usesOwnDelivery
             ? $baseLogistics
             : (($baseLogistics * $warehouseCoefForCalculation * $localizationIndexForCalculation) + $salesDistributionAmount);

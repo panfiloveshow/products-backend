@@ -32,9 +32,9 @@ class LocalizationIndexExclusionsTest extends TestCase
 
         $byArticle = $result['ktr_by_article'];
 
-        // A — обычный расчёт по таблице
+        // A — обычный расчёт по таблице (с 15.08.2026 таблица нейтрализована: КТР = 1.00)
         $this->assertEqualsWithDelta(40.0, $byArticle['100']['localization_rate'], 0.001);
-        $this->assertEqualsWithDelta(1.35, $byArticle['100']['ktr'], 0.001);
+        $this->assertEqualsWithDelta(1.00, $byArticle['100']['ktr'], 0.001);
         $this->assertEqualsWithDelta(0.00, $byArticle['100']['krp'], 0.001);
         $this->assertFalse($byArticle['100']['fully_excluded']);
 
@@ -53,12 +53,10 @@ class LocalizationIndexExclusionsTest extends TestCase
         $this->assertFalse($byArticle['400']['fully_excluded']);
         $this->assertSame(8, $byArticle['400']['counted_orders']);
         $this->assertEqualsWithDelta(100.0, $byArticle['400']['localization_rate'], 0.001);
-        $this->assertEqualsWithDelta(0.50, $byArticle['400']['ktr'], 0.001);
+        $this->assertEqualsWithDelta(1.00, $byArticle['400']['ktr'], 0.001);
 
-        // Средневзвешенный ИЛ:
-        // A 10*1.35=13.5; B 10*1.00=10.0; C 5*1.00=5.0; D 8*0.50 + 2*1.00=6.0
-        // Σ=34.5 / 35 = 0.9857 → 0.99
-        $this->assertEqualsWithDelta(0.99, $result['localization_index'], 0.001);
+        // ИЛ отключён с 15.08.2026 (таблица КТР нейтрализована) → всегда 1.0.
+        $this->assertEqualsWithDelta(1.00, $result['localization_index'], 0.001);
 
         // КРП в действующей тарифной таблице отключён.
         $this->assertEqualsWithDelta(0.00, $result['sales_distribution_index'], 0.001);
@@ -70,13 +68,14 @@ class LocalizationIndexExclusionsTest extends TestCase
 
         // Без FBS и КГТ поведение совпадает со старым (local/total).
         $salesByRegion = [
-            '100' => ['total' => 10, 'local' => 8, 'excluded_fbs' => 0], // 80% → 0.85
+            '100' => ['total' => 10, 'local' => 8, 'excluded_fbs' => 0], // 80%, КТР нейтрален
         ];
 
         $result = $service->aggregateIndices($salesByRegion, []);
 
         $this->assertEqualsWithDelta(80.0, $result['ktr_by_article']['100']['localization_rate'], 0.001);
-        $this->assertEqualsWithDelta(0.85, $result['localization_index'], 0.001);
+        // ИЛ отключён с 15.08.2026 — независимо от доли локализации всегда 1.0.
+        $this->assertEqualsWithDelta(1.00, $result['localization_index'], 0.001);
     }
 
     public function test_is_product_oversized_thresholds(): void
