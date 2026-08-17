@@ -943,7 +943,12 @@ class UnitEconomicsCacheService
         // Приёмка. У WB фактическая платная приёмка на единицу из API не приходит
         // (в юните всегда была 0), поэтому её задают вручную. Обнуление на схемах
         // продавца — в калькуляторе, вместе с той же логикой для хранения.
-        $acceptanceCost = (float) ($settings?->acceptance_cost ?? $marketplaceData['acceptance_cost'] ?? 0);
+        // Приёмка FBS WB: платная приёмка отправлений на СЦ, в среднем ~25 ₽/ед
+        // (решение 2026-08-17). Ручное значение из настроек приоритетнее.
+        // ponytail: единая средняя, не пер-СЦ тариф — уточнить, если запросят точность.
+        $acceptanceCost = (float) ($settings?->acceptance_cost
+            ?? $marketplaceData['acceptance_cost']
+            ?? ($marketplace === 'wildberries' && strtoupper((string) $fulfillmentType) === 'FBS' ? 25.0 : 0));
         $penaltyCost = (float) ($marketplaceData['penalty_cost'] ?? 0);
         $uzumReturnCost = 0.0; // эффективный сбор за возврат FBO (заполняется в Uzum-блоке)
 

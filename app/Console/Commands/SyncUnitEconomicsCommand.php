@@ -1972,7 +1972,9 @@ class SyncUnitEconomicsCommand extends Command
                 }
 
                 // === ПРИЁМКА ===
-                $data['acceptance_cost'] = $wbData['acceptance_cost'] ?? 0;
+                // FBS: платная приёмка на СЦ, в среднем ~25 ₽/ед (решение 2026-08-17).
+                $data['acceptance_cost'] = $wbData['acceptance_cost']
+                    ?? ($fulfillmentType === 'FBS' ? 25.0 : 0);
 
                 // === СПП (Скидка постоянного покупателя) ===
                 // Приоритет: 1) из статистики продаж API, 2) wb_data, 3) дефолт 0

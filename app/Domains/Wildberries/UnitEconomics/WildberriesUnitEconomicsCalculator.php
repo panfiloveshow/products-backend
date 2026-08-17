@@ -171,8 +171,9 @@ class WildberriesUnitEconomicsCalculator implements UnitEconomicsCalculatorInter
             $storageCost = 0.0;
         }
 
-        // Приёмка бывает только при поставке на склад WB — на схемах продавца её нет.
-        $acceptanceCost = in_array($scheme, ['FBO', 'FBW'], true) ? ($input->acceptanceCost ?? 0) : 0.0;
+        // Приёмка: FBO/FBW — поставка на склад WB; FBS — платная приёмка
+        // отправлений на СЦ (дефолт ~25 ₽/ед задаёт сборщик входа). На DBS/EDBS/DBW нет.
+        $acceptanceCost = in_array($scheme, ['FBO', 'FBW', 'FBS'], true) ? ($input->acceptanceCost ?? 0) : 0.0;
         $penaltyCost = $input->penaltyCost ?? 0;
 
         $acquiringRate = $options['acquiring_percent'] ?? $input->acquiringPercent ?? 1.5;

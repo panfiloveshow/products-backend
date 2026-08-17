@@ -568,6 +568,7 @@ class UnitEconomicsCacheServiceTest extends TestCase
             'width' => 10,
             'height' => 30,
             'localization_index' => 1.2,
+            'acceptance_cost' => 25,
             'redemption_rate' => 100,
             'storage_cost' => 0,
             'acquiring_percent' => 0,
@@ -586,6 +587,9 @@ class UnitEconomicsCacheServiceTest extends TestCase
         // ИЛ на FBS не применяется (заказы-исключения по методике WB).
         $this->assertSame(0.0, $result->metadata['localization_amount']);
         $this->assertSame(40.0, $result->costs->logistics);
+        // Платная приёмка FBS на СЦ учитывается в расходах.
+        $this->assertSame(25.0, $result->metadata['acceptance_cost']);
+        $this->assertSame(25.0, $result->costs->acceptanceCost);
     }
 
     public function test_wildberries_calculator_uses_current_small_volume_tariff_tiers(): void
