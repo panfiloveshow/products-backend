@@ -466,7 +466,8 @@ class UnitEconomicsCacheService
         // стоял 100% — это завышало маржу у новых интеграций и для товаров,
         // которых нет в выгрузке Ozon Analytics (non-Premium / свежие SKU).
         $defaultRedemptionRate = match ($marketplace) {
-            'wildberries' => 80,
+            // 50 для WB — решение 2026-08-17: без данных считаем консервативно.
+            'wildberries' => 50,
             'ozon' => 85,
             'yandex', 'yandex_market' => 90,
             default => 90,

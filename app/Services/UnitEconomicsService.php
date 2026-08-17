@@ -159,7 +159,7 @@ class UnitEconomicsService
             ? $ownReturnCost
             : (float) ($data['return_logistics_cost'] ?? $baseLogisticsPerUnit);
         $returnLogisticsCost = $returnLogisticsPerUnit * $salesCount;
-        $redemptionRate = (float) ($data['redemption_rate'] ?? 80);
+        $redemptionRate = (float) ($data['redemption_rate'] ?? 50);
         $expectedReturnCost = $returnLogisticsCost * ((100 - $redemptionRate) / 100);
 
         $acquiringPercent = (float) ($data['acquiring_percent'] ?? 1.5);
