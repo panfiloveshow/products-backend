@@ -39,13 +39,10 @@ class SyncWildberriesLocalizationJob implements ShouldBeUnique, ShouldQueue
 
     public function handle(LocalizationIndexService $localization): void
     {
-        // ИРП отключён WB с 13.07.2026, ИЛ — с 15.08.2026 (новость WB Partners от
-        // 14.08.2026): оба индекса исключены из формулы логистики (склады РФ),
-        // расчёт даёт только нейтральные значения. Не тратим общую квоту
-        // /api/v1/supplier/sales (~1 запрос/мин, делится с воронкой % выкупа).
-        // Вернуть WB индексы — убрать этот return.
-        return;
-
+        // ИЛ с 15.08.2026 действует только переходно (FBW-остатки из поставок до
+        // 15.08, до конца 60/90-дневной фиксации тарифа). Джоба оставлена на этот
+        // период. ponytail: замкнуть накоротко после ~15.11.2026 — освободит общую
+        // квоту /supplier/sales (~1 запрос/мин, делится с воронкой % выкупа).
         $integration = Integration::find($this->integrationId);
         if (! $integration || $integration->marketplace !== 'wildberries') {
             return;
