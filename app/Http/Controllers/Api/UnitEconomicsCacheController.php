@@ -50,7 +50,7 @@ use Symfony\Component\HttpFoundation\StreamedResponse;
  */
 class UnitEconomicsCacheController extends Controller
 {
-    private const EXPORT_TEMPLATE_VERSION = '2026-07-15-01';
+    private const EXPORT_TEMPLATE_VERSION = '2026-08-18-01';
 
     private const EXPORT_TEMPLATE_FORMAT = 'v2';
 
@@ -1588,6 +1588,9 @@ class UnitEconomicsCacheController extends Controller
             'AH' => ['header' => 'Цена для цели, ₽',   'width' => 14, 'field' => 'target_price',              'format' => $money],
             // ponytail: колонка в конце, а не рядом с A — вставка сдвинула бы все буквенные ссылки в живых формулах
             'AI' => ['header' => 'Артикул WB',         'width' => 12, 'field' => 'nm_id',                     'format' => '@'],
+            // Приёмка (FBW — ручная за поставку; FBS — платная приёмка на СЦ, дефолт 25 ₽/ед).
+            // Тоже в конце из-за буквенных ссылок; вычитается в формулах V/W.
+            'AJ' => ['header' => 'Приёмка, ₽',         'width' => 11, 'field' => 'acceptance_cost',           'format' => $money],
         ];
     }
 
@@ -1628,12 +1631,13 @@ class UnitEconomicsCacheController extends Controller
         $sheet->setCellValue("AB{$r}", $num('vat_percent'));
         $sheet->setCellValue("AD{$r}", $num('our_share_percent'));
         $sheet->setCellValueExplicit("AI{$r}", (string) ($item['nm_id'] ?? ''), \PhpOffice\PhpSpreadsheet\Cell\DataType::TYPE_STRING);
+        $sheet->setCellValue("AJ{$r}", $num('acceptance_cost'));
 
         // Живые формулы (пересчитываются при ручной правке в Excel).
         $sheet->setCellValue("G{$r}",  "=IF(E{$r}>0,F{$r}/E{$r},0)");
         $sheet->setCellValue("U{$r}",  "=F{$r}*T{$r}/100");
-        $sheet->setCellValue("V{$r}",  "=IF(F{$r}>0,(F{$r}*I{$r}/100+R{$r}+S{$r}+F{$r}*T{$r}/100)/F{$r}*100,0)");
-        $sheet->setCellValue("W{$r}",  "=F{$r}-(F{$r}*I{$r}/100)-R{$r}-S{$r}-(F{$r}*T{$r}/100)-Y{$r}-AA{$r}");
+        $sheet->setCellValue("V{$r}",  "=IF(F{$r}>0,(F{$r}*I{$r}/100+R{$r}+S{$r}+AJ{$r}+F{$r}*T{$r}/100)/F{$r}*100,0)");
+        $sheet->setCellValue("W{$r}",  "=F{$r}-(F{$r}*I{$r}/100)-R{$r}-S{$r}-AJ{$r}-(F{$r}*T{$r}/100)-Y{$r}-AA{$r}");
         $sheet->setCellValue("Y{$r}",  "=F{$r}*X{$r}/100");
         $sheet->setCellValue("AA{$r}", "=F{$r}*Z{$r}/100");
         $sheet->setCellValue("AC{$r}", "=F{$r}*AB{$r}/100");
@@ -1643,7 +1647,7 @@ class UnitEconomicsCacheController extends Controller
         $sheet->setCellValue(
             "AH{$r}",
             "=IF((1-(I{$r}+T{$r}+X{$r}+Z{$r})/100-\$E\$3/100)>0,"
-            . "(R{$r}+S{$r}+E{$r})/(1-(I{$r}+T{$r}+X{$r}+Z{$r})/100-\$E\$3/100),\"\")"
+            . "(R{$r}+S{$r}+AJ{$r}+E{$r})/(1-(I{$r}+T{$r}+X{$r}+Z{$r})/100-\$E\$3/100),\"\")"
         );
     }
 
