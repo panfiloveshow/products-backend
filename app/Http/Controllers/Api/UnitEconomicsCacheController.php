@@ -1290,8 +1290,10 @@ class UnitEconomicsCacheController extends Controller
             if ($isWildberriesExport) {
                 // Схема в строке = схема выгрузки (как чип на фронте): цифры посчитаны
                 // для запрошенной вкладки, фактическая схема товара тут только путает
-                // («в выгрузке FBS есть строки FBO»).
-                $this->writeWildberriesExportRow($sheet, $currentRow, $item, strtoupper((string) $validated['fulfillment_type']));
+                // («в выгрузке FBS есть строки FBO»). В кэше вкладка FBW хранится как
+                // FBO — показываем обратно FBW.
+                $exportScheme = strtoupper($fulfillmentType) === 'FBO' ? 'FBW' : strtoupper($fulfillmentType);
+                $this->writeWildberriesExportRow($sheet, $currentRow, $item, $exportScheme);
             } else {
             foreach ($columns as $col => $def) {
                 $field = $def['field'];
