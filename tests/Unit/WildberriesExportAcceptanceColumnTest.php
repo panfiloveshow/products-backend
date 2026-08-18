@@ -18,9 +18,16 @@ class WildberriesExportAcceptanceColumnTest extends TestCase
         $controller = (new \ReflectionClass(UnitEconomicsCacheController::class))->newInstanceWithoutConstructor();
 
         $columns = (new \ReflectionMethod($controller, 'wildberriesExportColumns'))->invoke($controller);
-        $this->assertArrayHasKey('AJ', $columns);
-        $this->assertSame('Приёмка, ₽', $columns['AJ']['header']);
-        $this->assertSame('acceptance_cost', $columns['AJ']['field']);
+        // Приёмка живёт рядом с хранением (S), а не в хвосте — менеджеры её там не находили.
+        $this->assertSame('Приёмка, ₽', $columns['T']['header']);
+        $this->assertSame('acceptance_cost', $columns['T']['field']);
+        $this->assertSame('Хранение, ₽', $columns['S']['header']);
+
+        // Буква каждого поля из раскладки — формулы должны ссылаться ровно на них.
+        $letterOf = [];
+        foreach ($columns as $letter => $def) {
+            $letterOf[$def['field']] = $letter;
+        }
 
         $sheet = (new Spreadsheet())->getActiveSheet();
         (new \ReflectionMethod($controller, 'writeWildberriesExportRow'))->invoke($controller, $sheet, 5, [
@@ -31,9 +38,13 @@ class WildberriesExportAcceptanceColumnTest extends TestCase
             'acceptance_cost' => 25.0,
         ]);
 
-        $this->assertSame(25.0, $sheet->getCell('AJ5')->getValue());
-        $this->assertStringContainsString('-AJ5', (string) $sheet->getCell('W5')->getValue());
-        $this->assertStringContainsString('AJ5', (string) $sheet->getCell('V5')->getValue());
-        $this->assertStringContainsString('AJ5', (string) $sheet->getCell('AH5')->getValue());
+        $acc = $letterOf['acceptance_cost'];
+        $this->assertSame(25.0, $sheet->getCell("{$acc}5")->getValue());
+        $this->assertStringContainsString("-{$acc}5", (string) $sheet->getCell($letterOf['to_settlement_account'].'5')->getValue());
+        $this->assertStringContainsString("{$acc}5", (string) $sheet->getCell($letterOf['total_expenses_percent'].'5')->getValue());
+        $this->assertStringContainsString("{$acc}5", (string) $sheet->getCell($letterOf['target_price'].'5')->getValue());
+        // «Чистая прибыль» ссылается на «На р/с», маржа — на прибыль.
+        $this->assertStringContainsString($letterOf['to_settlement_account'].'5', (string) $sheet->getCell($letterOf['net_profit'].'5')->getValue());
+        $this->assertStringContainsString($letterOf['net_profit'].'5', (string) $sheet->getCell($letterOf['margin_percent'].'5')->getValue());
     }
 }
