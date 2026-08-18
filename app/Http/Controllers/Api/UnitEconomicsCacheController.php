@@ -3119,8 +3119,9 @@ class UnitEconomicsCacheController extends Controller
             $data['acquiring_per_unit'] = round((float) ($data['acquiring_per_unit'] ?? ($data['acquiring_amount'] ?? 0)), 2);
 
             // Платная приёмка на единицу — ручной ввод (WB её в юнит-экономику не отдаёт).
-            // Есть только на складских схемах: на FBS/DBS/EDBS приёмки нет.
-            $data['acceptance_cost'] = in_array(strtoupper((string) $cache->fulfillment_type), ['FBO', 'FBW'], true)
+            // FBO/FBW — приёмка поставки; FBS — платная приёмка отправлений на СЦ
+            // (дефолт ~25 ₽/ед кладёт расчёт в marketplace_data). На DBS/EDBS/DBW нет.
+            $data['acceptance_cost'] = in_array(strtoupper((string) $cache->fulfillment_type), ['FBO', 'FBW', 'FBS'], true)
                 ? round((float) ($settings?->acceptance_cost ?? $marketplaceData['acceptance_cost'] ?? 0), 2)
                 : 0.0;
 
