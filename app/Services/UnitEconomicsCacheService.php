@@ -2509,14 +2509,34 @@ class UnitEconomicsCacheService
 
     private function resolveWildberriesTariffBreakdown(int $integrationId, string $fulfillmentType, array $marketplaceData, array $existing, ?string $fbsMarketplaceGeo = null): array
     {
-        // FBS/DBW тарифицируются строкой «Маркетплейс: {ФО}» по округу СЦ
-        // привязки склада продавца (wb_fbs_marketplace_geo из настроек, кладёт
-        // синк) — в ней реальные КС (165% ЦФО) и base/liter FBS. Ветка стоит ДО
+        // Тарификация FBS/DBW. С 15.08.2026 WB отменил географию FBS: вместо строк
+        // «Маркетплейс: {ФО}» — единая строка «Свой склад РФ» (КС 170%, база
+        // 78,2 + 23,8/л; для СГТ отдельная строка с КС 100%). Ветка стоит ДО
         // раннего return: сохранённый breakdown обычно несёт ФБО-склад отгрузки
         // без marketplace-коэффициента, и КС на FBS схлопывался бы в 100%.
-        if ($fbsMarketplaceGeo !== null && in_array(strtoupper($fulfillmentType), ['FBS', 'DBW'], true)) {
+        if (in_array(strtoupper($fulfillmentType), ['FBS', 'DBW'], true)) {
             $this->warmWildberriesTariffSnapshotCache($integrationId);
-            $marketplaceRow = ($this->wildberriesTariffSnapshotCache[$integrationId]['box_by_warehouse'] ?? [])[$this->normalizeWildberriesWarehouseName('Маркетплейс: '.$fbsMarketplaceGeo)] ?? null;
+            $boxByWarehouse = $this->wildberriesTariffSnapshotCache[$integrationId]['box_by_warehouse'] ?? [];
+
+            // ponytail: СГТ-товары считаем по обычной строке (у товара нет признака СГТ);
+            // добавить выбор «Свой склад СГТ РФ» (КС 100%), когда появится флаг габаритов.
+            $unifiedRow = $boxByWarehouse[$this->normalizeWildberriesWarehouseName('Свой склад РФ')] ?? null;
+            if ($unifiedRow) {
+                return [
+                    'source' => 'wildberries_tariff_snapshots_fbs_unified',
+                    'effective_date' => optional($unifiedRow->effective_date)->toDateString(),
+                    'warehouse_name' => $unifiedRow->warehouse_name,
+                    'scheme' => strtoupper($fulfillmentType),
+                    'box' => $unifiedRow->payload ?? [],
+                    'return' => $this->wildberriesTariffSnapshotCache[$integrationId]['return'] ?? [],
+                ];
+            }
+
+            // Фолбэк (снапшоты до 15.08.2026): гео-строка «Маркетплейс: {ФО}» по округу
+            // СЦ привязки склада продавца (wb_fbs_marketplace_geo из настроек).
+            $marketplaceRow = $fbsMarketplaceGeo !== null
+                ? ($boxByWarehouse[$this->normalizeWildberriesWarehouseName('Маркетплейс: '.$fbsMarketplaceGeo)] ?? null)
+                : null;
             if ($marketplaceRow) {
                 return [
                     'source' => 'wildberries_tariff_snapshots_fbs_geo',

@@ -725,7 +725,20 @@ class StorageApi
                         }
                     }
                 }
-                
+
+                // С 15.08.2026 WB отменил географию FBS: единая строка «Свой склад РФ»
+                // (КС 170%; СГТ — отдельная строка 100%). Гео-строк «Маркетплейс: {ФО}»
+                // в тарифах больше нет — для новых ответов WB работает именно эта ветка.
+                if (!$tariff) {
+                    foreach ($tariffsByName as $name => $t) {
+                        if (mb_stripos($name, 'свой склад') !== false && mb_stripos($name, 'сгт') === false) {
+                            $tariff = $t;
+                            Log::debug('FBS using unified own-warehouse tariff', ['office' => $officeName]);
+                            break;
+                        }
+                    }
+                }
+
                 // Используем FBS тарифы (delivery_marketplace_*)
                 $coefPercent = $tariff['delivery_marketplace_coef_percent'] ?? 100;
                 $coef = $coefPercent / 100; // Преобразуем проценты в множитель
