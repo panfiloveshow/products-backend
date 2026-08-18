@@ -61,8 +61,8 @@ class WildberriesManualWarehouseCoefTest extends TestCase
         $this->assertSame(40.0, $result->metadata['base_logistics']);
     }
 
-    /** Платная приёмка: удерживается только на складской схеме и уменьшает прибыль. */
-    public function test_acceptance_cost_counts_on_fbo_and_is_dropped_on_fbs(): void
+    /** Платная приёмка: FBO/FBW и FBS (приёмка на СЦ с 2026-08-17); на своей доставке нет. */
+    public function test_acceptance_cost_counts_on_fbo_and_fbs_and_is_dropped_on_dbs(): void
     {
         $calculator = new WildberriesUnitEconomicsCalculator;
         $base = [
@@ -81,12 +81,16 @@ class WildberriesManualWarehouseCoefTest extends TestCase
 
         $fbo = $calculator->calculate(CalculationInput::fromArray($base + ['fulfillment_type' => 'FBO']));
         $fbs = $calculator->calculate(CalculationInput::fromArray($base + ['fulfillment_type' => 'FBS']));
+        $dbs = $calculator->calculate(
+            CalculationInput::fromArray(array_merge($base, ['fulfillment_type' => 'DBS', 'own_delivery_cost' => 100]))
+        );
         $fboNoAcceptance = $calculator->calculate(
             CalculationInput::fromArray(array_merge($base, ['fulfillment_type' => 'FBO', 'acceptance_cost' => 0]))
         );
 
         $this->assertSame(12.5, $fbo->metadata['acceptance_cost']);
-        $this->assertSame(0.0, $fbs->metadata['acceptance_cost']);
+        $this->assertSame(12.5, $fbs->metadata['acceptance_cost']);
+        $this->assertSame(0.0, $dbs->metadata['acceptance_cost']);
         // Приёмка вычитается из суммы к перечислению, а не просто показывается.
         $this->assertSame(
             12.5,

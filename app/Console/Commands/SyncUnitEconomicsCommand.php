@@ -1972,7 +1972,9 @@ class SyncUnitEconomicsCommand extends Command
                 }
 
                 // === ПРИЁМКА ===
-                $data['acceptance_cost'] = $wbData['acceptance_cost'] ?? 0;
+                // FBS: платная приёмка на СЦ, в среднем ~25 ₽/ед (решение 2026-08-17).
+                $data['acceptance_cost'] = $wbData['acceptance_cost']
+                    ?? ($fulfillmentType === 'FBS' ? 25.0 : 0);
 
                 // === СПП (Скидка постоянного покупателя) ===
                 // Приоритет: 1) из статистики продаж API, 2) wb_data, 3) дефолт 0
@@ -2026,7 +2028,7 @@ class SyncUnitEconomicsCommand extends Command
                     $data['redemption_source'] = 'manual';
                     $data['redemption_observed_at'] = $integrationSettings['manual_redemption_observed_at'] ?? null;
                 } else {
-                    $data['redemption_rate'] = 80; // WB обычно ниже выкуп чем Ozon
+                    $data['redemption_rate'] = 50; // дефолт WB без данных (решение 2026-08-17)
                     $data['redemption_source'] = 'default';
                     $data['redemption_observed_at'] = null;
                 }
@@ -2687,7 +2689,7 @@ class SyncUnitEconomicsCommand extends Command
                 'fulfillment_type' => $calculated['fulfillment_type'] ?? $data['fulfillment_type'] ?? 'FBO',
 
                 // === % ВЫКУПА 28д ===
-                'redemption_rate' => $calculated['redemption_rate'] ?? $data['redemption_rate'] ?? 80,
+                'redemption_rate' => $calculated['redemption_rate'] ?? $data['redemption_rate'] ?? 50,
                 'redemption_source' => $data['redemption_source'] ?? 'default',
                 'redemption_observed_at' => $data['redemption_observed_at'] ?? null,
                 'orders_count' => $data['orders_count'] ?? null,
