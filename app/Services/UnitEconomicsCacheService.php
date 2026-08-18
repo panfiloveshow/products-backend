@@ -2414,6 +2414,51 @@ class UnitEconomicsCacheService
         }
         $applyAcceptanceCoef($boxFallback);
 
+        // С 15.08.2026 WB унифицировал тарифы РФ: в /tariffs/box остались только
+        // «Свой склад РФ» (КС 170%), «Свой склад СГТ РФ» (КС 100%) и зарубежные
+        // склады; строки складов РФ (Коледино и т.п.) исчезли, а эндпоинт
+        // коэффициентов приёмки отключён (PLUG-404-20260815). Единый тариф лежит
+        // в marketplace-полях единой строки и действует и для FBW, и для FBS.
+        // Синтезируем из них FBO-поля и перезаписываем ими протухшие строки
+        // старых снапшотов — FBW-ветка и КС-отображение считаются по актуальному
+        // единому тарифу без изменения логики выбора строки.
+        // ponytail: СГТ-строку не подставляем — у товара нет признака СГТ.
+        $unified = $boxByWarehouse[$this->normalizeWildberriesWarehouseName('Свой склад РФ')] ?? null;
+        $unifiedPayload = is_array($unified?->payload) ? $unified->payload : [];
+        $mpBase = (float) str_replace(',', '.', (string) ($unifiedPayload['delivery_marketplace_base'] ?? 0));
+        if ($unified && $mpBase > 0) {
+            $unifiedPayload['delivery_base'] = $mpBase;
+            $unifiedPayload['delivery_liter'] = (float) str_replace(',', '.', (string) ($unifiedPayload['delivery_marketplace_liter'] ?? 0));
+            $unifiedPayload['delivery_coef_percent'] = (float) str_replace(',', '.', (string) ($unifiedPayload['delivery_marketplace_coef_percent'] ?? 0));
+            $unified->payload = $unifiedPayload;
+
+            foreach ($boxByWarehouse as $snapshot) {
+                if ($snapshot === $unified || ! $snapshot->effective_date || ! $unified->effective_date
+                    || ! $snapshot->effective_date->lt($unified->effective_date)) {
+                    continue;
+                }
+                $payload = is_array($snapshot->payload) ? $snapshot->payload : [];
+                foreach ([
+                    'delivery_base', 'delivery_liter', 'delivery_coef_percent',
+                    'delivery_marketplace_base', 'delivery_marketplace_liter', 'delivery_marketplace_coef_percent',
+                ] as $key) {
+                    $payload[$key] = $unifiedPayload[$key] ?? 0;
+                }
+                // Камелкейс-дубли (в т.ч. от оверлея приёмки выше) перебили бы
+                // синтезированные значения в firstNumeric — убираем.
+                unset(
+                    $payload['boxDeliveryBase'], $payload['boxDeliveryLiter'], $payload['boxDeliveryCoefExpr'],
+                    $payload['boxDeliveryMarketplaceBase'], $payload['boxDeliveryMarketplaceLiter'], $payload['boxDeliveryMarketplaceCoefExpr'],
+                );
+                $snapshot->payload = $payload;
+                $snapshot->effective_date = $unified->effective_date;
+            }
+
+            // Товар без совпадения по складу должен падать на единый тариф РФ,
+            // а не на первый попавшийся (зарубежный) склад с FBO-базой.
+            $boxFallback = $unified;
+        }
+
         $this->wildberriesTariffSnapshotCache[$integrationId] = [
             'box_by_warehouse' => $boxByWarehouse,
             'box_fallback' => $boxFallback,

@@ -511,6 +511,11 @@ class StorageApi
 
                 // Коэффициенты уже в процентах (100 = 1.0, 150 = 1.5)
                 $deliveryCoefPercent = (float)($wh['delivery_coef_percent'] ?? 100);
+                // С 15.08.2026 у единых строк «Свой склад …» FBO-поля пустые («-» → 0),
+                // единый КС (FBW=FBS) лежит в marketplace-поле — берём его.
+                if ($deliveryCoefPercent <= 0) {
+                    $deliveryCoefPercent = (float)($wh['delivery_marketplace_coef_percent'] ?? 0);
+                }
                 $storageCoefPercent = (float)($wh['storage_coef_percent'] ?? 100);
                 
                 $coefficients[$normalizedName] = [
