@@ -219,10 +219,18 @@ class UnitEconomicsCacheController extends Controller
 
         // Общая статистика. Без фильтров берём лёгкий cached aggregate по интеграции/схеме,
         // чтобы GET страницы не сканировал выборку на каждом открытии.
-        $stats = $this->canUseFastStats($validated)
+        $useFastStats = $this->canUseFastStats($validated);
+        $stats = $useFastStats
             ? $this->getStats((int) $validated['integration_id'], $marketplace, (string) $validated['fulfillment_type'])
             : $this->getStatsFromQuery($statsQuery);
-        $total = (int) ($stats['total_count'] ?? $itemsCollection->count());
+        // WB-листинг дополнительно фильтруется scheme_stock_only и дедупом баркодов
+        // (wbPrimaryBarcode) — кэшированный агрегат про них не знает, его total
+        // завышен, и последние страницы пагинации приходили пустыми («нет данных
+        // юнит экономики» на 3–4 странице, бегунок пропадал). Пагинации нужен
+        // реальный счёт отфильтрованного запроса — один COUNT(*).
+        $total = ($useFastStats && $marketplace === 'wildberries')
+            ? (clone $statsQuery)->count()
+            : (int) ($stats['total_count'] ?? $itemsCollection->count());
         $lastPage = max(1, (int) ceil($total / max(1, $limit)));
 
         return response()->json([
