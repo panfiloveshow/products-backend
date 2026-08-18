@@ -211,6 +211,7 @@ class WildberriesTariffRefresher
             }
 
             $updated = 0;
+            $matchedNames = [];
             $names = InventoryWarehouse::where('integration_id', $integration->id)
                 ->where('marketplace', 'wildberries')
                 ->whereNotNull('warehouse_name')
@@ -222,11 +223,26 @@ class WildberriesTariffRefresher
                 if ($coef === null) {
                     continue;
                 }
+                $matchedNames[] = $name;
 
                 $updated += InventoryWarehouse::where('integration_id', $integration->id)
                     ->where('marketplace', 'wildberries')
                     ->where('warehouse_name', $name)
                     ->update(['warehouse_coefficient' => $coef]);
+            }
+
+            // С 15.08.2026 складов РФ в /tariffs/box нет — КС единый (строка
+            // «Свой склад РФ», 170%). FBW-склады без совпадения по имени иначе
+            // навсегда остаются с гео-КС из снапшотов до 15.08 (Казань 220% и т.п.).
+            // Склады продавца (FBS/DBS…) не трогаем — их КС берётся из тарифной строки.
+            $unifiedCoef = $byName[$this->nameKey('Свой склад РФ')] ?? null;
+            if ($unifiedCoef !== null && $unifiedCoef > 0) {
+                $updated += InventoryWarehouse::where('integration_id', $integration->id)
+                    ->where('marketplace', 'wildberries')
+                    ->whereNotNull('warehouse_name')
+                    ->whereNotIn('warehouse_name', $matchedNames)
+                    ->whereIn('fulfillment_type', ['FBO', 'FBW'])
+                    ->update(['warehouse_coefficient' => $unifiedCoef]);
             }
 
             Log::info('WildberriesTariffRefresher: inventory coefficients refreshed', [

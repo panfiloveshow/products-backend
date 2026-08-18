@@ -511,6 +511,11 @@ class StorageApi
 
                 // Коэффициенты уже в процентах (100 = 1.0, 150 = 1.5)
                 $deliveryCoefPercent = (float)($wh['delivery_coef_percent'] ?? 100);
+                // С 15.08.2026 у единых строк «Свой склад …» FBO-поля пустые («-» → 0),
+                // единый КС (FBW=FBS) лежит в marketplace-поле — берём его.
+                if ($deliveryCoefPercent <= 0) {
+                    $deliveryCoefPercent = (float)($wh['delivery_marketplace_coef_percent'] ?? 0);
+                }
                 $storageCoefPercent = (float)($wh['storage_coef_percent'] ?? 100);
                 
                 $coefficients[$normalizedName] = [
@@ -725,7 +730,20 @@ class StorageApi
                         }
                     }
                 }
-                
+
+                // С 15.08.2026 WB отменил географию FBS: единая строка «Свой склад РФ»
+                // (КС 170%; СГТ — отдельная строка 100%). Гео-строк «Маркетплейс: {ФО}»
+                // в тарифах больше нет — для новых ответов WB работает именно эта ветка.
+                if (!$tariff) {
+                    foreach ($tariffsByName as $name => $t) {
+                        if (mb_stripos($name, 'свой склад') !== false && mb_stripos($name, 'сгт') === false) {
+                            $tariff = $t;
+                            Log::debug('FBS using unified own-warehouse tariff', ['office' => $officeName]);
+                            break;
+                        }
+                    }
+                }
+
                 // Используем FBS тарифы (delivery_marketplace_*)
                 $coefPercent = $tariff['delivery_marketplace_coef_percent'] ?? 100;
                 $coef = $coefPercent / 100; // Преобразуем проценты в множитель
