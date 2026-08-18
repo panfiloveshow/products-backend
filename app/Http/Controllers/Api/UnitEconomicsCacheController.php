@@ -1288,7 +1288,10 @@ class UnitEconomicsCacheController extends Controller
             $isInPromotion = (bool) ($item['is_in_promotion'] ?? false);
 
             if ($isWildberriesExport) {
-                $this->writeWildberriesExportRow($sheet, $currentRow, $item);
+                // Схема в строке = схема выгрузки (как чип на фронте): цифры посчитаны
+                // для запрошенной вкладки, фактическая схема товара тут только путает
+                // («в выгрузке FBS есть строки FBO»).
+                $this->writeWildberriesExportRow($sheet, $currentRow, $item, strtoupper((string) $validated['fulfillment_type']));
             } else {
             foreach ($columns as $col => $def) {
                 $field = $def['field'];
@@ -1601,10 +1604,11 @@ class UnitEconomicsCacheController extends Controller
      * СПП в прибыль не входит (его финансирует WB) — как в вебе и на сервере.
      * «Цена для цели» использует целевую маржу из редактируемой ячейки $E$3.
      */
-    private function writeWildberriesExportRow($sheet, int $r, array $item): void
+    private function writeWildberriesExportRow($sheet, int $r, array $item, ?string $exportScheme = null): void
     {
         $num = static fn ($key) => (float) ($item[$key] ?? 0);
-        $scheme = strtoupper((string) ($item['scheme_info']['code'] ?? $item['fulfillment_type'] ?? $item['scheme'] ?? 'FBW'));
+        $scheme = $exportScheme
+            ?? strtoupper((string) ($item['scheme_info']['code'] ?? $item['fulfillment_type'] ?? $item['scheme'] ?? 'FBW'));
 
         // Статичные значения (источник — рассчитанные поля строки).
         SafeSpreadsheetWriter::setText($sheet, "A{$r}", $this->resolveDisplayArticle($item));
