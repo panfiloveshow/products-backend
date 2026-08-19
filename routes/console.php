@@ -153,6 +153,16 @@ if ((bool) config('autoplanning.credential_notifications.enabled', true)) {
         ->name('autoplanning.ozon-credential-alerts');
 }
 
+// Сторожок свежести постингов Ozon: ловит «тихую смерть» эндпоинтов
+// (200 + пустой result, как /v3/posting/fbo/list 29.07.2026) — постинги молчат
+// N дней при живых продажах в аналитике → Log::error. 1 запрос аналитики
+// на интеграцию в сутки, лимитам не угрожает.
+\Illuminate\Support\Facades\Schedule::command('ozon:postings-freshness')
+    ->dailyAt('09:30')
+    ->withoutOverlapping()
+    ->appendOutputTo(storage_path('logs/ozon-postings-freshness.log'))
+    ->name('ozon.postings-freshness');
+
 // Sanity-check unit_economics_cache запускается через системный cron
 // (/etc/cron.d/ue-sanity-check) — не через Laravel scheduler, потому что
 // schedule:run на этом сервере не настроен. См. `php artisan ue:sanity-check`.
