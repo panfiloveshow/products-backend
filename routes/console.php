@@ -153,6 +153,15 @@ if ((bool) config('autoplanning.credential_notifications.enabled', true)) {
         ->name('autoplanning.ozon-credential-alerts');
 }
 
+// Ротация воронки WB (% выкупа): квота воронки ~час на токен и делится с
+// финсводкой, поэтому каждый час обновляем 2 самых протухших магазина — за
+// сутки очередь обходит все. Смещение :45 — мимо кронов :17 (сток/тарифы).
+\Illuminate\Support\Facades\Schedule::command('wb:refresh-sales-funnel --limit=2')
+    ->hourlyAt(45)
+    ->withoutOverlapping()
+    ->appendOutputTo(storage_path('logs/wb-sales-funnel.log'))
+    ->name('wb.sales-funnel-rotation');
+
 // Сторожок свежести постингов Ozon: ловит «тихую смерть» эндпоинтов
 // (200 + пустой result, как /v3/posting/fbo/list 29.07.2026) — постинги молчат
 // N дней при живых продажах в аналитике → Log::error. 1 запрос аналитики
