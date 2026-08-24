@@ -222,7 +222,7 @@ class UnitEconomicsCacheController extends Controller
         $useFastStats = $this->canUseFastStats($validated);
         $stats = $useFastStats
             ? $this->getStats((int) $validated['integration_id'], $marketplace, (string) $validated['fulfillment_type'])
-            : $this->getStatsFromQuery($statsQuery);
+            : $this->getStatsFromQuery($statsQuery, $marketplace);
         // WB-листинг дополнительно фильтруется scheme_stock_only и дедупом баркодов
         // (wbPrimaryBarcode) — кэшированный агрегат про них не знает, его total
         // завышен, и последние страницы пагинации приходили пустыми («нет данных
@@ -2353,38 +2353,89 @@ class UnitEconomicsCacheController extends Controller
     }
 
     /**
+     * WB: условие «товар в продаже» по остаткам складов WB из products.wb_data —
+     * тот же источник, что бейдж «В продаже» и сортировка наличия.
+     */
+    private function wbInSaleCondition(string $productsAlias): string
+    {
+        return "COALESCE((SELECT SUM((elem->>'quantity')::numeric) "
+            ."FROM json_array_elements("
+            ."CASE WHEN json_typeof({$productsAlias}.wb_data->'stock_warehouses') = 'array' "
+            ."THEN {$productsAlias}.wb_data->'stock_warehouses' ELSE '[]'::json END) AS elem), 0) > 0";
+    }
+
+    /**
+     * SELECT-агрегаты карточек. Для WB денежные суммы и маржа считаются ТОЛЬКО по
+     * товарам «в продаже» (просьба клиентов: товары без остатков видны в таблице
+     * и юнит по ним считается, но общую выручку/маржу не искажают). Счётчики
+     * (total/profitable) остаются полными — ими живут пагинация и фильтры.
+     */
+    private function statsSelectRaw(bool $wbInSaleOnly, string $productsAlias = 'sp'): string
+    {
+        if (! $wbInSaleOnly) {
+            return '
+                COUNT(*) as total_count,
+                SUM(CASE WHEN net_profit > 0 THEN 1 ELSE 0 END) as profitable_count,
+                SUM(CASE WHEN net_profit <= 0 THEN 1 ELSE 0 END) as unprofitable_count,
+                COUNT(*) as in_sale_count,
+                AVG(margin_percent) as avg_margin,
+                SUM(revenue) as total_revenue,
+                SUM(total_costs) as total_costs,
+                SUM(net_profit) as total_profit
+            ';
+        }
+
+        $inSale = $this->wbInSaleCondition($productsAlias);
+
+        return "
+            COUNT(*) as total_count,
+            SUM(CASE WHEN net_profit > 0 THEN 1 ELSE 0 END) as profitable_count,
+            SUM(CASE WHEN net_profit <= 0 THEN 1 ELSE 0 END) as unprofitable_count,
+            COUNT(*) FILTER (WHERE {$inSale}) as in_sale_count,
+            AVG(margin_percent) FILTER (WHERE {$inSale}) as avg_margin,
+            SUM(revenue) FILTER (WHERE {$inSale}) as total_revenue,
+            SUM(total_costs) FILTER (WHERE {$inSale}) as total_costs,
+            SUM(net_profit) FILTER (WHERE {$inSale}) as total_profit
+        ";
+    }
+
+    /**
+     * @param object|null $stats
+     * @return array<string, int|float>
+     */
+    private function formatStats(?object $stats): array
+    {
+        return [
+            'total_count' => (int) ($stats->total_count ?? 0),
+            'profitable_count' => (int) ($stats->profitable_count ?? 0),
+            'unprofitable_count' => (int) ($stats->unprofitable_count ?? 0),
+            'in_sale_count' => (int) ($stats->in_sale_count ?? 0),
+            'avg_margin' => round((float) ($stats->avg_margin ?? 0), 2),
+            'average_margin' => round((float) ($stats->avg_margin ?? 0), 2),
+            'total_revenue' => round((float) ($stats->total_revenue ?? 0), 2),
+            'total_costs' => round((float) ($stats->total_costs ?? 0), 2),
+            'total_profit' => round((float) ($stats->total_profit ?? 0), 2),
+        ];
+    }
+
+    /**
      * Получить статистику по схеме (оптимизировано: 1 запрос вместо 6)
      */
     private function getStats(int $integrationId, string $marketplace, string $fulfillmentType): array
     {
-        $cacheKey = "ue_stats_{$integrationId}_{$marketplace}_".strtoupper($fulfillmentType);
+        $cacheKey = "ue_stats_{$integrationId}_{$marketplace}_".strtoupper($fulfillmentType).'_v2';
 
         return Cache::remember($cacheKey, 60, function () use ($integrationId, $marketplace, $fulfillmentType) {
-            $stats = UnitEconomicsCache::where('integration_id', $integrationId)
-                ->where('marketplace', $marketplace)
+            $isWb = $marketplace === 'wildberries';
+            $stats = UnitEconomicsCache::where('unit_economics_cache.integration_id', $integrationId)
+                ->where('unit_economics_cache.marketplace', $marketplace)
                 ->where('fulfillment_type', strtoupper($fulfillmentType))
                 ->wbPrimaryBarcode($marketplace, $integrationId)
-                ->selectRaw('
-                    COUNT(*) as total_count,
-                    SUM(CASE WHEN net_profit > 0 THEN 1 ELSE 0 END) as profitable_count,
-                    SUM(CASE WHEN net_profit <= 0 THEN 1 ELSE 0 END) as unprofitable_count,
-                    AVG(margin_percent) as avg_margin,
-                    SUM(revenue) as total_revenue,
-                    SUM(total_costs) as total_costs,
-                    SUM(net_profit) as total_profit
-                ')
+                ->when($isWb, fn ($q) => $q->leftJoin('products as sp', 'sp.id', '=', 'unit_economics_cache.product_id'))
+                ->selectRaw($this->statsSelectRaw($isWb))
                 ->first();
 
-            return [
-                'total_count' => (int) ($stats->total_count ?? 0),
-                'profitable_count' => (int) ($stats->profitable_count ?? 0),
-                'unprofitable_count' => (int) ($stats->unprofitable_count ?? 0),
-                'avg_margin' => round((float) ($stats->avg_margin ?? 0), 2),
-                'average_margin' => round((float) ($stats->avg_margin ?? 0), 2),
-                'total_revenue' => round((float) ($stats->total_revenue ?? 0), 2),
-                'total_costs' => round((float) ($stats->total_costs ?? 0), 2),
-                'total_profit' => round((float) ($stats->total_profit ?? 0), 2),
-            ];
+            return $this->formatStats($stats);
         });
     }
 
@@ -2423,30 +2474,15 @@ class UnitEconomicsCacheController extends Controller
      * Агрегаты для текущей отфильтрованной выборки, но без пагинации.
      * Карточки на фронте не должны считаться только по первым 50 строкам.
      */
-    private function getStatsFromQuery($query): array
+    private function getStatsFromQuery($query, string $marketplace = ''): array
     {
+        $isWb = $marketplace === 'wildberries';
         $stats = $query
-            ->selectRaw('
-                COUNT(*) as total_count,
-                SUM(CASE WHEN net_profit > 0 THEN 1 ELSE 0 END) as profitable_count,
-                SUM(CASE WHEN net_profit <= 0 THEN 1 ELSE 0 END) as unprofitable_count,
-                AVG(margin_percent) as avg_margin,
-                SUM(revenue) as total_revenue,
-                SUM(total_costs) as total_costs,
-                SUM(net_profit) as total_profit
-            ')
+            ->when($isWb, fn ($q) => $q->leftJoin('products as stats_sp', 'stats_sp.id', '=', 'unit_economics_cache.product_id'))
+            ->selectRaw($this->statsSelectRaw($isWb, 'stats_sp'))
             ->first();
 
-        return [
-            'total_count' => (int) ($stats->total_count ?? 0),
-            'profitable_count' => (int) ($stats->profitable_count ?? 0),
-            'unprofitable_count' => (int) ($stats->unprofitable_count ?? 0),
-            'avg_margin' => round((float) ($stats->avg_margin ?? 0), 2),
-            'average_margin' => round((float) ($stats->avg_margin ?? 0), 2),
-            'total_revenue' => round((float) ($stats->total_revenue ?? 0), 2),
-            'total_costs' => round((float) ($stats->total_costs ?? 0), 2),
-            'total_profit' => round((float) ($stats->total_profit ?? 0), 2),
-        ];
+        return $this->formatStats($stats);
     }
 
     /**
