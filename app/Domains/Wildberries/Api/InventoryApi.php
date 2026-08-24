@@ -422,7 +422,100 @@ class InventoryApi implements InventoryApiInterface
             'pages' => $pages,
         ]);
 
+        // Фолбэк: stocks-report/wb-warehouses отдаёт 403 «token does not satisfy
+        // additional requirements» магазинам без подписки Джем (а старый
+        // supplier/stocks WB убил — 404 deprecated, release-note 494). Без фолбэка
+        // остатки таких магазинов замирали навсегда («в продаже» врал). Официальная
+        // общедоступная замена — async-отчёт /api/v1/warehouse_remains.
+        if ($result === []) {
+            $result = $this->getWarehouseRemainsReport();
+        }
+
         return $result;
+    }
+
+    /**
+     * Async-отчёт «Остатки на складах» /api/v1/warehouse_remains (create → poll → download).
+     * Доступен без Джема. Строки разворачиваются в формат stocks-report
+     * (barcode + warehouseName + quantity), агрегатные строки WB отбрасываются.
+     *
+     * @return array<int, array<string, mixed>>
+     */
+    private function getWarehouseRemainsReport(): array
+    {
+        try {
+            $create = $this->client->analyticsGet('/api/v1/warehouse_remains', [
+                'groupByBarcode' => 'true',
+                'groupBySa' => 'true',
+            ]);
+            $taskId = (string) ($create['data']['taskId'] ?? '');
+            if ($taskId === '') {
+                Log::warning('WB InventoryApi: warehouse_remains task not created', ['response' => $create]);
+
+                return [];
+            }
+
+            $status = '';
+            for ($attempt = 0; $attempt < 12; $attempt++) {
+                sleep(5);
+                $statusResponse = $this->client->analyticsGet("/api/v1/warehouse_remains/tasks/{$taskId}/status");
+                $status = (string) ($statusResponse['data']['status'] ?? '');
+                if ($status === 'done') {
+                    break;
+                }
+                if (in_array($status, ['error', 'canceled'], true)) {
+                    Log::warning('WB InventoryApi: warehouse_remains task failed', ['status' => $status]);
+
+                    return [];
+                }
+            }
+            if ($status !== 'done') {
+                Log::warning('WB InventoryApi: warehouse_remains task not ready in time');
+
+                return [];
+            }
+
+            $rows = $this->client->analyticsGet("/api/v1/warehouse_remains/tasks/{$taskId}/download") ?? [];
+
+            // Агрегаты и транзит WB — не физический сток склада.
+            $skipWarehouses = ['всего находится на складах', 'в пути до получателей', 'в пути возвраты на склад wb'];
+            $result = [];
+            foreach ($rows as $row) {
+                if (! is_array($row)) {
+                    continue;
+                }
+                $barcode = (string) ($row['barcode'] ?? '');
+                if ($barcode === '') {
+                    continue;
+                }
+                foreach (($row['warehouses'] ?? []) as $warehouse) {
+                    $name = trim((string) ($warehouse['warehouseName'] ?? ''));
+                    $qty = (int) ($warehouse['quantity'] ?? 0);
+                    if ($name === '' || $qty <= 0 || in_array(mb_strtolower($name), $skipWarehouses, true)) {
+                        continue;
+                    }
+                    $result[] = [
+                        'barcode' => $barcode,
+                        'supplierArticle' => $row['vendorCode'] ?? null,
+                        'warehouseId' => null,
+                        'warehouseName' => $name,
+                        'regionName' => null,
+                        'quantity' => $qty,
+                        'quantityFull' => $qty,
+                        'inWayToClient' => 0,
+                        'inWayFromClient' => 0,
+                    ];
+                }
+            }
+
+            Log::info('WB InventoryApi: warehouse_remains fallback loaded', ['rows' => count($result)]);
+
+            return $result;
+        } catch (\Throwable $e) {
+            Log::warning('WB InventoryApi: warehouse_remains fallback failed', ['error' => $e->getMessage()]);
+
+            return [];
+        }
     }
 
     /**
