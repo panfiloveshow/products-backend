@@ -444,10 +444,11 @@ class InventoryApi implements InventoryApiInterface
     private function getWarehouseRemainsReport(): array
     {
         try {
-            // Создание таска лимитировано WB (~1/мин): на null (429/ошибка) одна
-            // повторная попытка после паузы — фолбэк гоняется из cron, время есть.
+            // Создание таска жёстко лимитировано WB (наблюдали 429 и через минуту —
+            // окно ~5 минут): до 3 попыток с паузой 130с. Фолбэк гоняется из cron
+            // (раз в 3 часа) и только для магазинов без Джема — время есть.
             $taskId = '';
-            for ($createAttempt = 1; $createAttempt <= 2; $createAttempt++) {
+            for ($createAttempt = 1; $createAttempt <= 3; $createAttempt++) {
                 $create = $this->client->analyticsGet('/api/v1/warehouse_remains', [
                     'groupByBarcode' => 'true',
                     'groupBySa' => 'true',
@@ -456,8 +457,8 @@ class InventoryApi implements InventoryApiInterface
                 if ($taskId !== '') {
                     break;
                 }
-                if ($createAttempt < 2) {
-                    sleep(65);
+                if ($createAttempt < 3) {
+                    sleep(130);
                 }
             }
             if ($taskId === '') {
