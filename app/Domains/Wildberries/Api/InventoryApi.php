@@ -444,13 +444,24 @@ class InventoryApi implements InventoryApiInterface
     private function getWarehouseRemainsReport(): array
     {
         try {
-            $create = $this->client->analyticsGet('/api/v1/warehouse_remains', [
-                'groupByBarcode' => 'true',
-                'groupBySa' => 'true',
-            ]);
-            $taskId = (string) ($create['data']['taskId'] ?? '');
+            // Создание таска лимитировано WB (~1/мин): на null (429/ошибка) одна
+            // повторная попытка после паузы — фолбэк гоняется из cron, время есть.
+            $taskId = '';
+            for ($createAttempt = 1; $createAttempt <= 2; $createAttempt++) {
+                $create = $this->client->analyticsGet('/api/v1/warehouse_remains', [
+                    'groupByBarcode' => 'true',
+                    'groupBySa' => 'true',
+                ]);
+                $taskId = (string) ($create['data']['taskId'] ?? '');
+                if ($taskId !== '') {
+                    break;
+                }
+                if ($createAttempt < 2) {
+                    sleep(65);
+                }
+            }
             if ($taskId === '') {
-                Log::warning('WB InventoryApi: warehouse_remains task not created', ['response' => $create]);
+                Log::warning('WB InventoryApi: warehouse_remains task not created', ['response' => $create ?? null]);
 
                 return [];
             }
