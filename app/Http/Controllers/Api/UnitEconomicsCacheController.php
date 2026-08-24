@@ -2429,7 +2429,7 @@ class UnitEconomicsCacheController extends Controller
             $isWb = $marketplace === 'wildberries';
             $stats = UnitEconomicsCache::where('unit_economics_cache.integration_id', $integrationId)
                 ->where('unit_economics_cache.marketplace', $marketplace)
-                ->where('fulfillment_type', strtoupper($fulfillmentType))
+                ->where('unit_economics_cache.fulfillment_type', strtoupper($fulfillmentType))
                 ->wbPrimaryBarcode($marketplace, $integrationId)
                 ->when($isWb, fn ($q) => $q->leftJoin('products as sp', 'sp.id', '=', 'unit_economics_cache.product_id'))
                 ->selectRaw($this->statsSelectRaw($isWb))
