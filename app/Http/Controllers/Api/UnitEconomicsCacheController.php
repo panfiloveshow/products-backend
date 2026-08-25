@@ -235,7 +235,7 @@ class UnitEconomicsCacheController extends Controller
 
         // Мёртвый API-ключ: синки этот магазин пропускают (scope syncable),
         // данные замирают — фронт показывает баннер «обновите токен».
-        $integrationRow = Integration::find($integrationId);
+        $integrationRow = Integration::find((int) $validated['integration_id']);
         $credentialWarning = ($integrationRow && ! $integrationRow->hasUsableCredentials())
             ? 'API-ключ магазина недействителен (истёк или отозван). Синхронизация приостановлена, данные не обновляются. Выпустите новый ключ в кабинете маркетплейса и обновите его в настройках интеграции.'
             : null;
