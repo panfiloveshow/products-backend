@@ -237,8 +237,9 @@ class OzonUnitEconomicsCalculatorTest extends TestCase
             $result = $calculator->calculate($input)->toArray();
 
             $this->assertSame(250.0, $result['return_logistics'], $scheme);
-            // Оба плеча своей доставки: «туда» (250) + свой возврат (250).
-            $this->assertSame(500.0, $result['expected_return_cost'], $scheme);
+            // Оба плеча своей доставки («туда» 250 + свой возврат 250) × кап 3
+            // (no_sales: тот же worst-case фактор, что у низкого выкупа).
+            $this->assertSame(1500.0, $result['expected_return_cost'], $scheme);
             $this->assertSame(
                 $result['costs']['logistics'] + $result['expected_return_cost'],
                 $result['effective_logistics'],
@@ -383,8 +384,9 @@ class OzonUnitEconomicsCalculatorTest extends TestCase
         $this->assertSame(1.0, OzonUnitEconomicsCalculator::returnFractionPerSoldUnit(0.50));
         // Кап 3 возврата на продажу (выкуп 25%) и ниже.
         $this->assertSame(3.0, OzonUnitEconomicsCalculator::returnFractionPerSoldUnit(0.80));
-        // Продаж нет вообще — худший сценарий 100%, как до перевода на единицу выкупа.
-        $this->assertSame(1.0, OzonUnitEconomicsCalculator::returnFractionPerSoldUnit(1.0));
+        // Продаж нет вообще — тот же кап, что у низкого выкупа (монотонность:
+        // 0% выкупа не может быть дешевле 33%).
+        $this->assertSame(3.0, OzonUnitEconomicsCalculator::returnFractionPerSoldUnit(1.0));
     }
 
     public function test_cancelled_only_fbo_orders_do_not_apply_non_local_markup(): void
