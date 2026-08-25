@@ -233,6 +233,13 @@ class UnitEconomicsCacheController extends Controller
             : (int) ($stats['total_count'] ?? $itemsCollection->count());
         $lastPage = max(1, (int) ceil($total / max(1, $limit)));
 
+        // Мёртвый API-ключ: синки этот магазин пропускают (scope syncable),
+        // данные замирают — фронт показывает баннер «обновите токен».
+        $integrationRow = Integration::find($integrationId);
+        $credentialWarning = ($integrationRow && ! $integrationRow->hasUsableCredentials())
+            ? 'API-ключ магазина недействителен (истёк или отозван). Синхронизация приостановлена, данные не обновляются. Выпустите новый ключ в кабинете маркетплейса и обновите его в настройках интеграции.'
+            : null;
+
         return response()->json([
             'data' => [
                 'items' => $items,
@@ -247,6 +254,7 @@ class UnitEconomicsCacheController extends Controller
                 'actual_scheme' => $actualScheme,
                 'default_scheme' => $defaultScheme,
                 'stats' => $stats,
+                'credential_warning' => $credentialWarning,
             ],
             'stats' => $stats,
         ]);
