@@ -757,12 +757,11 @@ class OzonUnitEconomicsCalculatorTest extends TestCase
         $result = $calculator->calculate($input)->toArray();
 
         $this->assertSame(true, $result['is_local_sale']);
-        $this->assertSame(3.0, $result['locality_commission_discount_pp']);
-        $this->assertSame(15.0, $result['locality_commission_discount_amount']);
-        $this->assertSame(
-            round($result['commission_rate_base'] - 3.0, 2),
-            $result['commission_percent']
-        );
+        // Скидка за локальность отменена Ozon 24.08.2026 — вместо неё −3 п.п.
+        // в объявленных тарифах с 28.08 (global_adjustment_pp в таблице).
+        $this->assertSame(0.0, $result['locality_commission_discount_pp']);
+        $this->assertSame(0.0, $result['locality_commission_discount_amount']);
+        $this->assertSame($result['commission_rate_base'], $result['commission_percent']);
     }
 
     public function test_no_locality_commission_discount_before_august_30(): void
@@ -835,9 +834,9 @@ class OzonUnitEconomicsCalculatorTest extends TestCase
         $this->assertSame(0.0, $factual['locality_commission_discount_pp']);
         $this->assertSame(7.0, $factual['commission_percent']);
 
-        // Та же ставка, но заявленная как тарифная, скидку получает.
-        $this->assertSame(3.0, $tariff['locality_commission_discount_pp']);
-        $this->assertSame(4.0, $tariff['commission_percent']);
+        // После отмены скидки (24.08.2026) тарифная ставка тоже без вычета.
+        $this->assertSame(0.0, $tariff['locality_commission_discount_pp']);
+        $this->assertSame(7.0, $tariff['commission_percent']);
     }
 
     public function test_seller_below_fifty_units_gets_discount_on_non_local_orders_too(): void
@@ -870,7 +869,8 @@ class OzonUnitEconomicsCalculatorTest extends TestCase
         // Порог пройден — скидка только за локальность, а заказы нелокальные.
         $highVolume = $calculator->calculate(CalculationInput::fromArray($base + ['sales_7_days' => 80]))->toArray();
 
-        $this->assertSame(3.0, $lowVolume['locality_commission_discount_pp']);
+        // После отмены скидки (24.08.2026) порог 50 единиц больше ни на что не влияет.
+        $this->assertSame(0.0, $lowVolume['locality_commission_discount_pp']);
         $this->assertSame(0.0, $highVolume['locality_commission_discount_pp']);
     }
 
@@ -896,7 +896,8 @@ class OzonUnitEconomicsCalculatorTest extends TestCase
 
         // Сегодняшняя ставка — из интеграции, будущая — из таблицы с 28.08.
         $this->assertSame(12.0, $result['commission_percent']);
-        $this->assertSame(50.0, $result['commission_rate_from_2026_08_28']);
+        // Объявленные 50% минус 3 п.п. (Ozon 24.08.2026, global_adjustment_pp).
+        $this->assertSame(47.0, $result['commission_rate_from_2026_08_28']);
     }
 
     public function test_locality_commission_discount_is_weighted_by_local_orders_share(): void
@@ -936,8 +937,8 @@ class OzonUnitEconomicsCalculatorTest extends TestCase
         $result = $calculator->calculate($input)->toArray();
 
         $this->assertSame(50.0, $result['expected_locality_rate']);
-        // Скидку получают только локальные заказы: 3 п.п. × 50% = 1.5 п.п.
-        $this->assertSame(1.5, $result['locality_commission_discount_pp']);
+        // Скидка отменена (24.08.2026) — взвешивание даёт 0 при любой доле локальных.
+        $this->assertSame(0.0, $result['locality_commission_discount_pp']);
     }
 
     public function test_excluded_clusters_get_no_locality_discount(): void
@@ -974,8 +975,8 @@ class OzonUnitEconomicsCalculatorTest extends TestCase
             $base + ['sku' => 'sku-locality-moscow'] + $local('Москва, МО и Дальние регионы')
         ))->toArray();
 
-        // Ozon: у «Москва, МО и Дальние регионы», «СПб и СЗО» и Беларуси скидка 0%.
-        $this->assertSame(3.0, $kazan['locality_commission_discount_pp']);
+        // Скидка отменена (24.08.2026): 0 и для исключённых, и для обычных кластеров.
+        $this->assertSame(0.0, $kazan['locality_commission_discount_pp']);
         $this->assertSame(0.0, $moscow['locality_commission_discount_pp']);
         $this->assertSame($moscow['commission_rate_base'], $moscow['commission_percent']);
     }
@@ -1084,9 +1085,9 @@ class OzonUnitEconomicsCalculatorTest extends TestCase
 
     public function test_rules_in_effect_on_first_september_2026(): void
     {
-        // Приёмка на 01.09.2026: к этой дате у Ozon одновременно действуют
-        // таблица вознаграждений с 28.08, скидка 3 п.п. за локальность с 30.08
-        // и отменённая 09.07 наценка за нелокальность.
+        // Приёмка на 01.09.2026: действует таблица вознаграждений с 28.08
+        // (объявленные ставки −3 п.п., «Меры поддержки» 24.08), скидка за
+        // локальность отменена, наценка за нелокальность отменена 09.07.
         $calculator = new OzonUnitEconomicsCalculator();
         $base = [
             'sku' => 'sku-2026-09-01',
@@ -1117,16 +1118,16 @@ class OzonUnitEconomicsCalculatorTest extends TestCase
         $this->assertSame(0.0, $local['non_local_markup_percent']);
         $this->assertSame(0.0, $local['non_local_markup_amount']);
 
-        // Локальный FBO-заказ в неисключённом кластере получает скидку 3 п.п.
-        $this->assertSame(3.0, $local['locality_commission_discount_pp']);
+        // Скидки за локальность больше нет — комиссия равна базовой ставке.
+        $this->assertSame(0.0, $local['locality_commission_discount_pp']);
         $this->assertSame(
-            round($local['commission_rate_base'] - 3.0, 2),
+            round($local['commission_rate_base'], 2),
             round($local['commission_percent'], 2)
         );
 
-        // База — ставка официальной таблицы, действующей с 28.08.2026 (до неё
-        // на ту же категорию действовал резерв 15%).
-        $this->assertSame(54.0, $local['commission_rate_base']);
+        // База — ставка официальной таблицы с 28.08.2026 уже с поправкой −3 п.п.
+        // (объявленные 54%); до неё на ту же категорию действовал резерв 15%.
+        $this->assertSame(51.0, $local['commission_rate_base']);
         $beforeTable = $calculator->calculate(CalculationInput::fromArray(
             array_merge($base, ['order_date' => '2026-08-27'])
         ))->toArray();
@@ -1138,7 +1139,7 @@ class OzonUnitEconomicsCalculatorTest extends TestCase
             'commission_rate' => 31.0,
             'commission_observed_at' => '2026-08-05',
         ]))->toArray();
-        $this->assertSame(54.0, $stale['commission_rate_base']);
+        $this->assertSame(51.0, $stale['commission_rate_base']);
 
         // Ставка, снятая уже по новым правилам, остаётся в приоритете.
         $fresh = $calculator->calculate(CalculationInput::fromArray($base + [

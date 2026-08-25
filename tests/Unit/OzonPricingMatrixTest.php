@@ -109,56 +109,46 @@ class OzonPricingMatrixTest extends TestCase
         $this->assertSame(0.0, $logistics['non_local_markup_percent']);
     }
 
-    public function test_locality_commission_discount_starts_only_on_august_30(): void
+    public function test_locality_commission_discount_is_cancelled(): void
     {
         $matrix = new OzonPricingMatrix();
 
-        // Обещанные на 31.07 шесть пунктов Ozon отменил 27.07 — до 30.08 скидки нет.
-        $this->assertSame(0.0, $matrix->resolveLocalityCommissionDiscountPp('FBO', 'Казань', '2026-07-31'));
+        // Скидка за локальность отменена Ozon 24.08.2026 («Меры поддержки»):
+        // вместо 3 п.п. с 30.08 — минус 3 п.п. на объявленные тарифы с 28.08
+        // (global_adjustment_pp в таблице вознаграждений). Скидки нет ни на одну дату.
         $this->assertSame(0.0, $matrix->resolveLocalityCommissionDiscountPp('FBO', 'Казань', '2026-08-29'));
-
-        // С 30.08 — 3 п.п., и часть кластеров исключена.
-        $this->assertSame(3.0, $matrix->resolveLocalityCommissionDiscountPp('FBO', 'Казань', '2026-08-30'));
-        $this->assertSame(0.0, $matrix->resolveLocalityCommissionDiscountPp('FBO', 'Москва, МО и Дальние регионы', '2026-08-30'));
-        $this->assertSame(0.0, $matrix->resolveLocalityCommissionDiscountPp('FBO', 'Санкт-Петербург и СЗО', '2026-08-30'));
-        $this->assertSame(0.0, $matrix->resolveLocalityCommissionDiscountPp('FBO', 'Беларусь', '2026-08-30'));
-    }
-
-    public function test_locality_commission_discount_applies_to_fbo_only(): void
-    {
-        $matrix = new OzonPricingMatrix();
-
-        $this->assertSame(3.0, $matrix->resolveLocalityCommissionDiscountPp('FBO', 'Казань', '2026-08-30'));
+        $this->assertSame(0.0, $matrix->resolveLocalityCommissionDiscountPp('FBO', 'Казань', '2026-08-30'));
+        $this->assertSame(0.0, $matrix->resolveLocalityCommissionDiscountPp('FBO', 'Казань', '2026-09-15'));
         $this->assertSame(0.0, $matrix->resolveLocalityCommissionDiscountPp('FBS', 'Казань', '2026-08-30'));
-        $this->assertSame(0.0, $matrix->resolveLocalityCommissionDiscountPp('RFBS', 'Казань', '2026-08-30'));
     }
 
     public function test_official_category_table_applies_from_august_28(): void
     {
         $matrix = new OzonPricingMatrix();
 
-        // Спецусловия Ozon для дешёвых товаров: до 100 ₽ — 20%, 101–300 ₽ — 26%.
-        $this->assertSame(20.0, $matrix->resolveCommissionFromOfficialTable('FBO', 'Автозвук', 90));
-        $this->assertSame(26.0, $matrix->resolveCommissionFromOfficialTable('FBO', 'Автозвук', 300));
-        $this->assertSame(50.0, $matrix->resolveCommissionFromOfficialTable('FBO', 'Автозвук', 1500));
+        // Объявленные ставки минус 3 п.п. (Ozon 24.08.2026, global_adjustment_pp):
+        // спецусловия для дешёвых товаров 20/26 тоже становятся 17/23.
+        $this->assertSame(17.0, $matrix->resolveCommissionFromOfficialTable('FBO', 'Автозвук', 90));
+        $this->assertSame(23.0, $matrix->resolveCommissionFromOfficialTable('FBO', 'Автозвук', 300));
+        $this->assertSame(47.0, $matrix->resolveCommissionFromOfficialTable('FBO', 'Автозвук', 1500));
 
         // Матч по типу товара и по основной категории, регистр и пробелы не важны.
-        $this->assertSame(20.0, $matrix->resolveCommissionFromOfficialTable('FBS', '  автозвук  ', 90));
+        $this->assertSame(17.0, $matrix->resolveCommissionFromOfficialTable('FBS', '  автозвук  ', 90));
         $this->assertNull($matrix->resolveCommissionFromOfficialTable('FBO', 'Такой категории нет', 500));
 
         // Товар хранит категорию как «Основная категория > Категория» —
         // берём самую конкретную часть, а не строку целиком.
-        $this->assertSame(55.0, $matrix->resolveCommissionFromOfficialTable('FBO', 'Галантерея и аксессуары > Аксессуары', 1500));
-        $this->assertSame(50.0, $matrix->resolveCommissionFromOfficialTable('FBO', 'Автотовары > Запчасти для легковых автомобилей', 1500));
+        $this->assertSame(52.0, $matrix->resolveCommissionFromOfficialTable('FBO', 'Галантерея и аксессуары > Аксессуары', 1500));
+        $this->assertSame(47.0, $matrix->resolveCommissionFromOfficialTable('FBO', 'Автотовары > Запчасти для легковых автомобилей', 1500));
         // Если конкретная часть незнакома, откатываемся на основную категорию.
-        $this->assertSame(55.0, $matrix->resolveCommissionFromOfficialTable('FBO', 'Галантерея и аксессуары > Неизвестный тип', 1500));
+        $this->assertSame(52.0, $matrix->resolveCommissionFromOfficialTable('FBO', 'Галантерея и аксессуары > Неизвестный тип', 1500));
 
-        // До 28.08 расчёт остаётся на прежних ставках, с 28.08 — по таблице.
+        // До 28.08 расчёт остаётся на прежних ставках, с 28.08 — по таблице (−3 п.п.).
         $before = $matrix->resolveCommission('FBO', 'Автозвук', 1500, '2026-08-27');
         $after = $matrix->resolveCommission('FBO', 'Автозвук', 1500, '2026-08-28');
         $this->assertNotSame('ozon_category_table', $before['tariff_source']);
         $this->assertSame('ozon_category_table', $after['tariff_source']);
-        $this->assertSame(50.0, $after['sales_fee_percent']);
+        $this->assertSame(47.0, $after['sales_fee_percent']);
     }
 
     public function test_exposes_announcement_date_for_current_version(): void
