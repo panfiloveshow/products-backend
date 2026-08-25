@@ -14,11 +14,17 @@ class OzonFinanceTransaction extends Model
     public const OP_PICKUP = 'MarketplaceServiceItemPickup';
     public const OP_DROPOFF_FF = 'MarketplaceServiceItemDropoffFF';
 
+    // Новый синк (accrual/by-day, с 2026-08-25) пишет логистику этими типами.
+    public const OP_ACCRUAL_LOGISTIC = 'Logistic';
+    public const OP_ACCRUAL_B2C_LOGISTICS = 'B2CLogistics';
+
     public const LOGISTICS_OPERATION_TYPES = [
         self::OP_DIRECT_FLOW_LOGISTIC,
         self::OP_DELIVERY_TO_CUSTOMER,
         self::OP_PICKUP,
         self::OP_DROPOFF_FF,
+        self::OP_ACCRUAL_LOGISTIC,
+        self::OP_ACCRUAL_B2C_LOGISTICS,
     ];
 
     protected $table = 'ozon_finance_transactions';
