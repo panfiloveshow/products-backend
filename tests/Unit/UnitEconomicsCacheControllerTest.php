@@ -736,7 +736,7 @@ class UnitEconomicsCacheControllerTest extends TestCase
         // строки AH/AI, восстановленных из движка (при открытии файл == экран:
         // MIN(3;(100−80)/100+0.6)×75 = 0.8×75 = 60).
         $this->assertSame('=K5+L5+AG5+N5', $sheet->getCell('M5')->getValue());
-        $this->assertSame('=MIN(3,(100-Y5)/100+AI5)*AH5', $sheet->getCell('N5')->getValue());
+        $this->assertSame('=IF(F5=0,0,MIN(3,(100-Y5)/100+AI5)*AH5)', $sheet->getCell('N5')->getValue());
         $this->assertSame(75.0, $sheet->getCell('AH5')->getValue());
         $this->assertSame(0.6, $sheet->getCell('AI5')->getValue());
         $this->assertSame('=D5+J5+M5+(C5*P5/100)+(C5*Q5/100)+(C5*R5/100)+(C5*S5/100)+(C5*T5/100)', $sheet->getCell('AA5')->getValue());

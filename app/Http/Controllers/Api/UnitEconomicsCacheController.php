@@ -50,7 +50,7 @@ use Symfony\Component\HttpFoundation\StreamedResponse;
  */
 class UnitEconomicsCacheController extends Controller
 {
-    public const EXPORT_TEMPLATE_VERSION = '2026-08-26-01';
+    public const EXPORT_TEMPLATE_VERSION = '2026-08-26-02';
 
     private const EXPORT_TEMPLATE_FORMAT = 'v2';
 
@@ -1339,27 +1339,37 @@ class UnitEconomicsCacheController extends Controller
                 } elseif ($col === 'N') {
                     // N: Ожидаемые возвраты = доля возвратов × стоимость одного возврата.
                     // Доля = (100 − выкуп)/100 + пост-доставочные возвраты (AI), кап 3 —
-                    // как в движке Ozon (returnFractionPerSoldUnit).
-                    $sheet->setCellValue("N{$currentRow}", "=MIN(3,(100-Y{$currentRow})/100+AI{$currentRow})*AH{$currentRow}");
+                    // как в движке Ozon (returnFractionPerSoldUnit). IF(F=0;0;…) — гейт
+                    // «нет продаж» из движка (hasReturnRisk): без продаж возвраты 0,
+                    // но правка «% выкупа» (Y) у продаваемых товаров пересчитывает N,
+                    // потому что стоимость возврата (AH) заполнена всегда.
+                    $sheet->setCellValue("N{$currentRow}", "=IF(F{$currentRow}=0,0,MIN(3,(100-Y{$currentRow})/100+AI{$currentRow})*AH{$currentRow})");
                 } elseif ($col === 'AG') {
                     $sheet->setCellValue("AG{$currentRow}", round((float) ($item['processing_cost'] ?? 0), 2));
                 } elseif ($col === 'AH' || $col === 'AI') {
                     // Константы строки восстановлены из значений движка, чтобы файл при
-                    // открытии совпадал с экраном: N = cap3((100−Y)/100 + AI) × AH.
+                    // открытии совпадал с экраном: N = IF(F=0;0;cap3((100−Y)/100 + AI) × AH).
                     $expectedReturns = (float) ($item['expected_return_cost'] ?? 0);
                     $redemption = (float) ($item['redemption_rate'] ?? 100);
                     $nonRedeemed = max(0.0, (100.0 - min(100.0, $redemption)) / 100.0);
                     $unitReturnCost = (float) ($item['return_logistics_cost'] ?? 0) + (float) ($item['return_processing_cost'] ?? 0);
                     if ($unitReturnCost <= 0 && $expectedReturns > 0) {
-                        // Разложенных полей нет — восстанавливаем константы так, чтобы
-                        // формула N при открытии файла дала ровно значение движка.
+                        // Разложенных полей нет — восстанавливаем так, чтобы формула N
+                        // при открытии дала ровно значение движка.
                         $unitReturnCost = $nonRedeemed > 0
                             ? $expectedReturns / min(3.0, $nonRedeemed)
                             : $expectedReturns;
                     }
+                    if ($unitReturnCost <= 0) {
+                        // Возвратов у строки нет (нет продаж / гейт hasReturnRisk), но
+                        // стоимость возврата нужна ненулевой — иначе правка «% выкупа»
+                        // в Excel умножалась бы на 0 и ничего не меняла. По движку
+                        // обратная логистика Ozon = базовая логистика (+ обработка возврата).
+                        $unitReturnCost = (float) ($item['logistics_cost'] ?? 0)
+                            + (float) ($item['return_processing_cost'] ?? 0);
+                    }
                     if ($col === 'AH') {
-                        // Движок гейтит мусорные SKU (hasReturnRisk): N=0 → возвраты выключены.
-                        $sheet->setCellValue("AH{$currentRow}", $expectedReturns > 0 ? round($unitReturnCost, 2) : 0.0);
+                        $sheet->setCellValue("AH{$currentRow}", round($unitReturnCost, 2));
                     } else {
                         $postShare = ($expectedReturns > 0 && $unitReturnCost > 0)
                             ? max(0.0, $expectedReturns / $unitReturnCost - $nonRedeemed)
