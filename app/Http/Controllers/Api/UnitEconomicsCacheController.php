@@ -50,7 +50,7 @@ use Symfony\Component\HttpFoundation\StreamedResponse;
  */
 class UnitEconomicsCacheController extends Controller
 {
-    private const EXPORT_TEMPLATE_VERSION = '2026-08-18-01';
+    public const EXPORT_TEMPLATE_VERSION = '2026-08-24-01';
 
     private const EXPORT_TEMPLATE_FORMAT = 'v2';
 
@@ -1605,6 +1605,9 @@ class UnitEconomicsCacheController extends Controller
             'AI' => ['header' => 'Цена для цели, ₽',   'width' => 14, 'field' => 'target_price',              'format' => $money],
             // ponytail: артикул WB в конце, а не рядом с A — чтобы не сдвигать буквы основного блока
             'AJ' => ['header' => 'Артикул WB',         'width' => 12, 'field' => 'nm_id',                     'format' => '@'],
+            // Вход для живой формулы «Логистика» (N = AK × КС × ИЛ): базовый тариф WB
+            // по объёму, без коэффициентов. Правится руками при смене тарифов.
+            'AK' => ['header' => 'Тариф логистики (база), ₽', 'width' => 16, 'field' => 'base_logistics',    'format' => $money],
         ];
     }
 
@@ -1628,17 +1631,17 @@ class UnitEconomicsCacheController extends Controller
         $sheet->setCellValue("D{$r}", $num('volume_liters'));
         $sheet->setCellValue("E{$r}", $num('cost_price'));
         $sheet->setCellValue("F{$r}", $num('price'));
-        $sheet->setCellValue("H{$r}", $num('customer_price'));
         $sheet->setCellValue("I{$r}", $num('commission_percent'));
         $sheet->setCellValue("J{$r}", $num('spp_percent'));
-        $sheet->setCellValue("K{$r}", $num('spp_amount'));
         $sheet->setCellValue("L{$r}", $num('warehouse_coef_percent'));
         $sheet->setCellValue("M{$r}", (float) ($item['localization_index'] ?? 1));
-        $sheet->setCellValue("N{$r}", $num('logistics_cost'));
         $sheet->setCellValue("O{$r}", (float) ($item['return_logistics'] ?? $item['return_logistics_cost'] ?? 0));
         $sheet->setCellValue("P{$r}", $num('redemption_rate'));
-        $sheet->setCellValue("Q{$r}", $num('expected_return_cost'));
-        $sheet->setCellValue("R{$r}", (float) ($item['effective_logistics'] ?? $item['logistics_cost'] ?? 0));
+        // Базовый тариф логистики (без КС и ИЛ) — вход для живой формулы N.
+        // Восстанавливаем делением: logistics_cost = база × КС × ИЛ.
+        $ksMultiplier = $num('warehouse_coef_percent') > 0 ? $num('warehouse_coef_percent') / 100 : 1.0;
+        $ilMultiplier = (float) ($item['localization_index'] ?? 1) ?: 1.0;
+        $sheet->setCellValue("AK{$r}", round($num('logistics_cost') / max(0.01, $ksMultiplier * $ilMultiplier), 2));
         $sheet->setCellValue("S{$r}", $num('storage_cost'));
         $sheet->setCellValue("T{$r}", $num('acceptance_cost'));
         $sheet->setCellValue("U{$r}", (float) ($item['acquiring_percent'] ?? 0));
@@ -1649,7 +1652,17 @@ class UnitEconomicsCacheController extends Controller
         $sheet->setCellValueExplicit("AJ{$r}", (string) ($item['nm_id'] ?? ''), \PhpOffice\PhpSpreadsheet\Cell\DataType::TYPE_STRING);
 
         // Живые формулы (пересчитываются при ручной правке в Excel).
+        // Цепочка сквозная: правка цены (F), СПП% (J), КС (L), ИЛ (M), % выкупа (P),
+        // комиссии (I), эквайринга (U), ДРР (Y), налога (AA) или базового тарифа (AK)
+        // пересчитывает логистику, возвраты, «на р/с», прибыль, маржу и цену для цели.
         $sheet->setCellValue("G{$r}",  "=IF(E{$r}>0,F{$r}/E{$r},0)");
+        $sheet->setCellValue("K{$r}",  "=F{$r}*J{$r}/100");
+        $sheet->setCellValue("H{$r}",  "=F{$r}-K{$r}");
+        $sheet->setCellValue("N{$r}",  "=AK{$r}*L{$r}/100*M{$r}");
+        // Ожидаемые возвраты — как в движке: (логистика + обратная) × невыкуп-фактор,
+        // фактор = (100−P)/P с капом 3 (ReturnEconomics::fractionPerSoldUnit).
+        $sheet->setCellValue("Q{$r}",  "=MIN(3,(100-P{$r})/MAX(P{$r},0.01))*(N{$r}+O{$r})");
+        $sheet->setCellValue("R{$r}",  "=N{$r}+Q{$r}");
         $sheet->setCellValue("V{$r}",  "=F{$r}*U{$r}/100");
         $sheet->setCellValue("W{$r}",  "=IF(F{$r}>0,(F{$r}*I{$r}/100+R{$r}+S{$r}+T{$r}+F{$r}*U{$r}/100)/F{$r}*100,0)");
         $sheet->setCellValue("X{$r}",  "=F{$r}-(F{$r}*I{$r}/100)-R{$r}-S{$r}-T{$r}-(F{$r}*U{$r}/100)-Z{$r}-AB{$r}");

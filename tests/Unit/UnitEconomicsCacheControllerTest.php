@@ -762,6 +762,11 @@ class UnitEconomicsCacheControllerTest extends TestCase
             'tax_percent' => 6,
             'vat_percent' => 20,
             'our_share_percent' => 4,
+            'logistics_cost' => 153,
+            'warehouse_coef_percent' => 170,
+            'localization_index' => 1.0,
+            'redemption_rate' => 95,
+            'return_logistics' => 25,
         ]], 'Test', 'wildberries', 'FBO');
 
         $sheet = $spreadsheet->getActiveSheet();
@@ -770,19 +775,28 @@ class UnitEconomicsCacheControllerTest extends TestCase
         $this->assertSame('Цена покупателя, ₽', $sheet->getCell('H4')->getValue());
         $this->assertSame('СПП, %', $sheet->getCell('J4')->getValue());
         $this->assertSame('Логистика, ₽', $sheet->getCell('N4')->getValue());
-        $this->assertSame('Чистая прибыль, ₽', $sheet->getCell('AF4')->getValue());
-        $this->assertSame('Цена для цели, ₽', $sheet->getCell('AH4')->getValue());
-        $this->assertSame('Артикул WB', $sheet->getCell('AI4')->getValue());
+        $this->assertSame('Чистая прибыль, ₽', $sheet->getCell('AG4')->getValue());
+        $this->assertSame('Цена для цели, ₽', $sheet->getCell('AI4')->getValue());
+        $this->assertSame('Артикул WB', $sheet->getCell('AJ4')->getValue());
+        $this->assertSame('Тариф логистики (база), ₽', $sheet->getCell('AK4')->getValue());
 
-        // Значения
+        // Значения-входы
         $this->assertSame(1000.0, $sheet->getCell('F5')->getValue());
         $this->assertSame(7.0, $sheet->getCell('J5')->getValue());
         $this->assertSame(20, $sheet->getCell('E3')->getValue()); // целевая маржа для «Цены для цели»
+        // База логистики восстановлена: 153 / (1.7 × 1.0) = 90
+        $this->assertSame(90.0, $sheet->getCell('AK5')->getValue());
 
-        // Живые формулы. СПП НЕ вычитается из «На р/с» (его финансирует WB).
-        $this->assertSame('=F5-(F5*I5/100)-R5-S5-(F5*T5/100)-Y5-AA5', $sheet->getCell('W5')->getValue());
-        $this->assertSame('=W5-E5', $sheet->getCell('AF5')->getValue());
-        $this->assertSame('=IF(F5>0,AF5/F5*100,0)', $sheet->getCell('AG5')->getValue());
+        // Живые формулы: вся цепочка от входов (цена, СПП, КС, ИЛ, % выкупа, тариф).
+        $this->assertSame('=F5*J5/100', $sheet->getCell('K5')->getValue());
+        $this->assertSame('=F5-K5', $sheet->getCell('H5')->getValue());
+        $this->assertSame('=AK5*L5/100*M5', $sheet->getCell('N5')->getValue());
+        $this->assertSame('=MIN(3,(100-P5)/MAX(P5,0.01))*(N5+O5)', $sheet->getCell('Q5')->getValue());
+        $this->assertSame('=N5+Q5', $sheet->getCell('R5')->getValue());
+        // СПП НЕ вычитается из «На р/с» (его финансирует WB).
+        $this->assertSame('=F5-(F5*I5/100)-R5-S5-T5-(F5*U5/100)-Z5-AB5', $sheet->getCell('X5')->getValue());
+        $this->assertSame('=X5-E5', $sheet->getCell('AG5')->getValue());
+        $this->assertSame('=IF(F5>0,AG5/F5*100,0)', $sheet->getCell('AH5')->getValue());
     }
 
     public function test_excel_exports_store_external_product_text_as_strings(): void
@@ -844,7 +858,7 @@ class UnitEconomicsCacheControllerTest extends TestCase
 
         $this->assertSame('v2', $headers['X-Unit-Economics-Export-Format']);
         $this->assertSame('UnitEconomicsCacheController::exportExcel', $headers['X-Unit-Economics-Export-Source']);
-        $this->assertSame('2026-07-15-01', $headers['X-Unit-Economics-Export-Version']);
+        $this->assertSame(\App\Http\Controllers\Api\UnitEconomicsCacheController::EXPORT_TEMPLATE_VERSION, $headers['X-Unit-Economics-Export-Version']);
         $this->assertStringContainsString('X-Unit-Economics-Export-Version', $headers['Access-Control-Expose-Headers']);
     }
 
@@ -884,7 +898,7 @@ class UnitEconomicsCacheControllerTest extends TestCase
         $this->assertSame('Статус данных', $mainSheet->getCell('Z4')->getValue());
         $this->assertSame('Индекс цены', $mainSheet->getCell('AF4')->getValue());
         $this->assertSame('8206/brown', $mainSheet->getCell('A5')->getValue());
-        $this->assertSame('2026-07-15-01', $mainSheet->getCell('AZ1')->getValue());
+        $this->assertSame(\App\Http\Controllers\Api\UnitEconomicsCacheController::EXPORT_TEMPLATE_VERSION, $mainSheet->getCell('AZ1')->getValue());
         $this->assertFalse($mainSheet->getColumnDimension('AZ')->getVisible());
 
         $metadata = $spreadsheet->getSheetByName('Метаданные');
@@ -899,7 +913,7 @@ class UnitEconomicsCacheControllerTest extends TestCase
             }
         }
 
-        $this->assertSame('2026-07-15-01', $templateVersion);
+        $this->assertSame(\App\Http\Controllers\Api\UnitEconomicsCacheController::EXPORT_TEMPLATE_VERSION, $templateVersion);
     }
 
     public function test_excel_export_uses_period_snapshot_revenue_without_price_times_sales_formula(): void
