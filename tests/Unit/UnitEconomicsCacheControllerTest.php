@@ -739,11 +739,12 @@ class UnitEconomicsCacheControllerTest extends TestCase
         $this->assertSame('=MAX(0,MIN(3,(100-Y5)/100+AI5))*AH5', $sheet->getCell('N5')->getValue());
         $this->assertSame(75.0, $sheet->getCell('AH5')->getValue());
         $this->assertSame(0.6, $sheet->getCell('AI5')->getValue());
-        $this->assertSame('=D5+J5+M5+(C5*P5/100)+(C5*Q5/100)+(C5*R5/100)+(C5*S5/100)+(C5*T5/100)', $sheet->getCell('AA5')->getValue());
-        $this->assertSame('=C5-J5-M5-(C5*P5/100)-(C5*Q5/100)-(C5*R5/100)-(C5*S5/100)-(C5*T5/100)', $sheet->getCell('AE5')->getValue());
+        $this->assertSame('=D5+J5+M5+O5+(C5*P5/100)+(C5*Q5/100)+(C5*R5/100)+(IF(AJ5>0,AJ5,C5)*S5/100)+(C5*T5/100)', $sheet->getCell('AA5')->getValue());
+        $this->assertSame('=C5-J5-M5-O5-(C5*P5/100)-(C5*Q5/100)-(C5*R5/100)-(IF(AJ5>0,AJ5,C5)*S5/100)-(C5*T5/100)', $sheet->getCell('AE5')->getValue());
         $this->assertSame('Индекс цены', $sheet->getCell('AF4')->getValue());
         $this->assertSame('Обработка, ₽', $sheet->getCell('AG4')->getValue());
         $this->assertSame('Возврат 1 шт, ₽', $sheet->getCell('AH4')->getValue());
+        $this->assertSame('Налог. база, ₽', $sheet->getCell('AJ4')->getValue());
     }
 
     public function test_excel_export_wildberries_mirrors_web_layout_with_live_formulas(): void

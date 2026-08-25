@@ -50,7 +50,7 @@ use Symfony\Component\HttpFoundation\StreamedResponse;
  */
 class UnitEconomicsCacheController extends Controller
 {
-    public const EXPORT_TEMPLATE_VERSION = '2026-08-26-03';
+    public const EXPORT_TEMPLATE_VERSION = '2026-08-26-04';
 
     private const EXPORT_TEMPLATE_FORMAT = 'v2';
 
@@ -1168,6 +1168,9 @@ class UnitEconomicsCacheController extends Controller
             $columns['AG'] = ['header' => 'Обработка, ₽',        'width' => 12, 'field' => 'processing_cost',    'format' => '#,##0.00 "₽"'];
             $columns['AH'] = ['header' => 'Возврат 1 шт, ₽',     'width' => 13, 'field' => 'unit_return_cost',   'format' => '#,##0.00 "₽"'];
             $columns['AI'] = ['header' => 'Доля пост-возвратов', 'width' => 14, 'field' => 'post_returns_share', 'format' => '0.0000'];
+            // Налоговая база Ozon: факт. цена реализации («реализовано со скидкой»),
+            // 0 → налог считается от цены (как в calcOzonSettlement на экране).
+            $columns['AJ'] = ['header' => 'Налог. база, ₽',      'width' => 13, 'field' => 'tax_base_price',     'format' => '#,##0.00 "₽"'];
         }
         $lastCol = array_key_last($columns) ?: 'AF';
 
@@ -1394,9 +1397,10 @@ class UnitEconomicsCacheController extends Controller
                         ? "=D{$currentRow}+J{$currentRow}+M{$currentRow}+O{$currentRow}+AN{$currentRow}"
                             . "+(C{$currentRow}*P{$currentRow}/100)+(C{$currentRow}*Q{$currentRow}/100)"
                             . "+(C{$currentRow}*S{$currentRow}/100)"
-                        : "=D{$currentRow}+J{$currentRow}+M{$currentRow}"
+                        : "=D{$currentRow}+J{$currentRow}+M{$currentRow}+O{$currentRow}"
                             . "+(C{$currentRow}*P{$currentRow}/100)+(C{$currentRow}*Q{$currentRow}/100)"
-                            . "+(C{$currentRow}*R{$currentRow}/100)+(C{$currentRow}*S{$currentRow}/100)"
+                            . "+(C{$currentRow}*R{$currentRow}/100)"
+                            . "+(IF(AJ{$currentRow}>0,AJ{$currentRow},C{$currentRow})*S{$currentRow}/100)"
                             . "+(C{$currentRow}*T{$currentRow}/100)"
                     );
                 } elseif ($col === 'AB') {
@@ -1414,9 +1418,10 @@ class UnitEconomicsCacheController extends Controller
                         ? "=C{$currentRow}-J{$currentRow}-M{$currentRow}-O{$currentRow}-AN{$currentRow}"
                             . "-(C{$currentRow}*P{$currentRow}/100)-(C{$currentRow}*Q{$currentRow}/100)"
                             . "-(C{$currentRow}*S{$currentRow}/100)"
-                        : "=C{$currentRow}-J{$currentRow}-M{$currentRow}"
+                        : "=C{$currentRow}-J{$currentRow}-M{$currentRow}-O{$currentRow}"
                             . "-(C{$currentRow}*P{$currentRow}/100)-(C{$currentRow}*Q{$currentRow}/100)"
-                            . "-(C{$currentRow}*R{$currentRow}/100)-(C{$currentRow}*S{$currentRow}/100)"
+                            . "-(C{$currentRow}*R{$currentRow}/100)"
+                            . "-(IF(AJ{$currentRow}>0,AJ{$currentRow},C{$currentRow})*S{$currentRow}/100)"
                             . "-(C{$currentRow}*T{$currentRow}/100)"
                     );
                 } elseif ($col === 'U') {
