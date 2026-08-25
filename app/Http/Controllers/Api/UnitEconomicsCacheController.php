@@ -50,7 +50,7 @@ use Symfony\Component\HttpFoundation\StreamedResponse;
  */
 class UnitEconomicsCacheController extends Controller
 {
-    public const EXPORT_TEMPLATE_VERSION = '2026-08-26-02';
+    public const EXPORT_TEMPLATE_VERSION = '2026-08-26-03';
 
     private const EXPORT_TEMPLATE_FORMAT = 'v2';
 
@@ -1339,11 +1339,10 @@ class UnitEconomicsCacheController extends Controller
                 } elseif ($col === 'N') {
                     // N: Ожидаемые возвраты = доля возвратов × стоимость одного возврата.
                     // Доля = (100 − выкуп)/100 + пост-доставочные возвраты (AI), кап 3 —
-                    // как в движке Ozon (returnFractionPerSoldUnit). IF(F=0;0;…) — гейт
-                    // «нет продаж» из движка (hasReturnRisk): без продаж возвраты 0,
-                    // но правка «% выкупа» (Y) у продаваемых товаров пересчитывает N,
-                    // потому что стоимость возврата (AH) заполнена всегда.
-                    $sheet->setCellValue("N{$currentRow}", "=IF(F{$currentRow}=0,0,MIN(3,(100-Y{$currentRow})/100+AI{$currentRow})*AH{$currentRow})");
+                    // как в движке Ozon (returnFractionPerSoldUnit). AI — подгоночная
+                    // константа (может быть отрицательной у строк, где движок гейтит
+                    // возвраты), поэтому MAX(0;…) не даёт формуле уйти в минус.
+                    $sheet->setCellValue("N{$currentRow}", "=MAX(0,MIN(3,(100-Y{$currentRow})/100+AI{$currentRow}))*AH{$currentRow}");
                 } elseif ($col === 'AG') {
                     $sheet->setCellValue("AG{$currentRow}", round((float) ($item['processing_cost'] ?? 0), 2));
                 } elseif ($col === 'AH' || $col === 'AI') {
@@ -1371,10 +1370,13 @@ class UnitEconomicsCacheController extends Controller
                     if ($col === 'AH') {
                         $sheet->setCellValue("AH{$currentRow}", round($unitReturnCost, 2));
                     } else {
-                        $postShare = ($expectedReturns > 0 && $unitReturnCost > 0)
-                            ? max(0.0, $expectedReturns / $unitReturnCost - $nonRedeemed)
+                        // AI подобрана так, чтобы при открытии N дала ровно значение
+                        // движка: expected>0 → доля сверх (100−Y)/100; expected=0 при
+                        // Y<100 (движок гейтит возвраты) → минус эта доля, N=0.
+                        $adjustShare = $unitReturnCost > 0
+                            ? $expectedReturns / $unitReturnCost - $nonRedeemed
                             : 0.0;
-                        $sheet->setCellValue("AI{$currentRow}", round($postShare, 4));
+                        $sheet->setCellValue("AI{$currentRow}", round($adjustShare, 4));
                     }
                 } elseif ($col === 'AA') {
                     // AA: Итого затраты — та же модель, что на экране. Для WB отдельно
