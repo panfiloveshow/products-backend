@@ -50,7 +50,7 @@ use Symfony\Component\HttpFoundation\StreamedResponse;
  */
 class UnitEconomicsCacheController extends Controller
 {
-    public const EXPORT_TEMPLATE_VERSION = '2026-08-24-01';
+    public const EXPORT_TEMPLATE_VERSION = '2026-08-26-01';
 
     private const EXPORT_TEMPLATE_FORMAT = 'v2';
 
@@ -1153,6 +1153,13 @@ class UnitEconomicsCacheController extends Controller
             foreach (['AG', 'AH', 'AI', 'AJ', 'AK', 'AL', 'AM', 'AN', 'AO', 'AP', 'AQ'] as $wbColumn) {
                 unset($columns[$wbColumn]);
             }
+            // Входы живых формул логистики/возвратов (по аналогии с WB-экспортом):
+            // M = K + L + AG + N; N = MIN(3;(100−Y)/100+AI) × AH. Константы строки
+            // вычисляются из движка, поэтому при открытии файл равен экрану, а правка
+            // «% выкупа» (Y) или тарифов пересчитывает возвраты и всю цепочку.
+            $columns['AG'] = ['header' => 'Обработка, ₽',        'width' => 12, 'field' => 'processing_cost',    'format' => '#,##0.00 "₽"'];
+            $columns['AH'] = ['header' => 'Возврат 1 шт, ₽',     'width' => 13, 'field' => 'unit_return_cost',   'format' => '#,##0.00 "₽"'];
+            $columns['AI'] = ['header' => 'Доля пост-возвратов', 'width' => 14, 'field' => 'post_returns_share', 'format' => '0.0000'];
         }
         $lastCol = array_key_last($columns) ?: 'AF';
 
@@ -1325,9 +1332,40 @@ class UnitEconomicsCacheController extends Controller
                     // J: Комиссия ₽ — зависит от цены и комиссии %
                     $sheet->setCellValue("J{$currentRow}", "=C{$currentRow}*I{$currentRow}/100");
                 } elseif ($col === 'M') {
-                    // M: Эффективная логистика из API/UI. В Ozon она уже включает возвраты
-                    // и нелокальную наценку, поэтому N/W остаются детализацией, а не плюсуются повторно.
-                    $sheet->setCellValue("M{$currentRow}", (float) ($item['effective_logistics'] ?? 0));
+                    // M: Эффективная логистика = базовая (K, уже с нелок. наценкой) +
+                    // последняя миля (L) + обработка (AG) + ожидаемые возвраты (N).
+                    // Живая формула: правка любого слагаемого пересчитывает затраты и прибыль.
+                    $sheet->setCellValue("M{$currentRow}", "=K{$currentRow}+L{$currentRow}+AG{$currentRow}+N{$currentRow}");
+                } elseif ($col === 'N') {
+                    // N: Ожидаемые возвраты = доля возвратов × стоимость одного возврата.
+                    // Доля = (100 − выкуп)/100 + пост-доставочные возвраты (AI), кап 3 —
+                    // как в движке Ozon (returnFractionPerSoldUnit).
+                    $sheet->setCellValue("N{$currentRow}", "=MIN(3,(100-Y{$currentRow})/100+AI{$currentRow})*AH{$currentRow}");
+                } elseif ($col === 'AG') {
+                    $sheet->setCellValue("AG{$currentRow}", round((float) ($item['processing_cost'] ?? 0), 2));
+                } elseif ($col === 'AH' || $col === 'AI') {
+                    // Константы строки восстановлены из значений движка, чтобы файл при
+                    // открытии совпадал с экраном: N = cap3((100−Y)/100 + AI) × AH.
+                    $expectedReturns = (float) ($item['expected_return_cost'] ?? 0);
+                    $redemption = (float) ($item['redemption_rate'] ?? 100);
+                    $nonRedeemed = max(0.0, (100.0 - min(100.0, $redemption)) / 100.0);
+                    $unitReturnCost = (float) ($item['return_logistics_cost'] ?? 0) + (float) ($item['return_processing_cost'] ?? 0);
+                    if ($unitReturnCost <= 0 && $expectedReturns > 0) {
+                        // Разложенных полей нет — восстанавливаем константы так, чтобы
+                        // формула N при открытии файла дала ровно значение движка.
+                        $unitReturnCost = $nonRedeemed > 0
+                            ? $expectedReturns / min(3.0, $nonRedeemed)
+                            : $expectedReturns;
+                    }
+                    if ($col === 'AH') {
+                        // Движок гейтит мусорные SKU (hasReturnRisk): N=0 → возвраты выключены.
+                        $sheet->setCellValue("AH{$currentRow}", $expectedReturns > 0 ? round($unitReturnCost, 2) : 0.0);
+                    } else {
+                        $postShare = ($expectedReturns > 0 && $unitReturnCost > 0)
+                            ? max(0.0, $expectedReturns / $unitReturnCost - $nonRedeemed)
+                            : 0.0;
+                        $sheet->setCellValue("AI{$currentRow}", round($postShare, 4));
+                    }
                 } elseif ($col === 'AA') {
                     // AA: Итого затраты — та же модель, что на экране. Для WB отдельно
                     // учитываем СПП и хранение; для Ozon хранение/возвраты не дублируем,
@@ -1485,7 +1523,8 @@ class UnitEconomicsCacheController extends Controller
         $sumCols = array_values(array_intersect(
             $isWildberriesExport
                 ? ['E', 'F', 'K', 'N', 'O', 'Q', 'R', 'S', 'T', 'V', 'X', 'Z', 'AB', 'AD', 'AF', 'AG']
-                : ['C', 'F', 'G', 'J', 'K', 'L', 'M', 'N', 'O', 'AA', 'AB', 'AE', 'AH', 'AJ', 'AN', 'AO'],
+                // AH у Ozon теперь «Возврат 1 шт» (константа строки) — суммировать бессмысленно.
+                : ['C', 'F', 'G', 'J', 'K', 'L', 'M', 'N', 'O', 'AA', 'AB', 'AE', 'AO'],
             array_keys($columns)
         ));
         foreach ($sumCols as $col) {

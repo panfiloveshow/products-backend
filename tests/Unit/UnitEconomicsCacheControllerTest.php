@@ -711,8 +711,12 @@ class UnitEconomicsCacheControllerTest extends TestCase
             'commission_percent' => 10,
             'logistics_cost' => 40,
             'last_mile_cost' => 20,
+            'processing_cost' => 0,
             'effective_logistics' => 120,
             'expected_return_cost' => 60,
+            'redemption_rate' => 80,
+            'return_logistics_cost' => 70,
+            'return_processing_cost' => 5,
             'storage_cost' => 35,
             'acquiring_percent' => 1.5,
             'drr_percent' => 5,
@@ -727,11 +731,19 @@ class UnitEconomicsCacheControllerTest extends TestCase
 
         $sheet = $spreadsheet->getActiveSheet();
 
-        $this->assertSame(120.0, $sheet->getCell('M5')->getValue());
+        // Эффективная логистика и возвраты — живые формулы (как в WB-экспорте):
+        // M = базовая + миля + обработка + возвраты; N — от % выкупа (Y) и констант
+        // строки AH/AI, восстановленных из движка (при открытии файл == экран:
+        // MIN(3;(100−80)/100+0.6)×75 = 0.8×75 = 60).
+        $this->assertSame('=K5+L5+AG5+N5', $sheet->getCell('M5')->getValue());
+        $this->assertSame('=MIN(3,(100-Y5)/100+AI5)*AH5', $sheet->getCell('N5')->getValue());
+        $this->assertSame(75.0, $sheet->getCell('AH5')->getValue());
+        $this->assertSame(0.6, $sheet->getCell('AI5')->getValue());
         $this->assertSame('=D5+J5+M5+(C5*P5/100)+(C5*Q5/100)+(C5*R5/100)+(C5*S5/100)+(C5*T5/100)', $sheet->getCell('AA5')->getValue());
         $this->assertSame('=C5-J5-M5-(C5*P5/100)-(C5*Q5/100)-(C5*R5/100)-(C5*S5/100)-(C5*T5/100)', $sheet->getCell('AE5')->getValue());
         $this->assertSame('Индекс цены', $sheet->getCell('AF4')->getValue());
-        $this->assertSame('', (string) $sheet->getCell('AG4')->getValue());
+        $this->assertSame('Обработка, ₽', $sheet->getCell('AG4')->getValue());
+        $this->assertSame('Возврат 1 шт, ₽', $sheet->getCell('AH4')->getValue());
     }
 
     public function test_excel_export_wildberries_mirrors_web_layout_with_live_formulas(): void
