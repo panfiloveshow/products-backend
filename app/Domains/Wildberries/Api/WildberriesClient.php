@@ -80,7 +80,10 @@ class WildberriesClient
      */
     public static function fromIntegration(Integration $integration): self
     {
-        $credentials = $integration->getDecryptedCredentials();
+        // resolveCredentials, не getDecryptedCredentials: у части интеграций
+        // локальный api_key пуст и рабочий ключ приходит Sellico-фолбэком.
+        // Без него синк уходил в WB с пустым токеном (401 «empty main token»).
+        $credentials = $integration->resolveCredentials();
 
         return new self($credentials['api_key'] ?? null);
     }

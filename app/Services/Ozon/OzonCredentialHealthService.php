@@ -27,7 +27,7 @@ class OzonCredentialHealthService
             ];
         }
 
-        $credentials = $integration->getDecryptedCredentials();
+        $credentials = $integration->resolveCredentials();
         $oauthToken = $credentials['oauth_access_token'] ?? $credentials['access_token'] ?? null;
         $hasOAuth = is_string($oauthToken) && trim($oauthToken) !== '';
         $hasApiKey = trim((string) ($credentials['client_id'] ?? '')) !== ''

@@ -60,7 +60,8 @@ class ProbeIntegrationCredentialsCommand extends Command
     private function probe(Integration $integration, OzonCredentialHealthService $ozonHealth): ?string
     {
         try {
-            $credentials = $integration->getDecryptedCredentials();
+            // Тот же путь, что у синков: локальные креды + Sellico-фолбэк.
+            $credentials = $integration->resolveCredentials();
         } catch (\Throwable) {
             return 'missing'; // креды не расшифровываются (сменился APP_KEY / битая запись)
         }

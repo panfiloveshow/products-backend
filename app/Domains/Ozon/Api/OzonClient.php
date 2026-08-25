@@ -39,7 +39,8 @@ class OzonClient
      */
     public static function fromIntegration(Integration $integration): self
     {
-        $credentials = $integration->getDecryptedCredentials();
+        // resolveCredentials: локальные креды могут быть пустыми, рабочие — из Sellico.
+        $credentials = $integration->resolveCredentials();
         return new self(
             $credentials['client_id'] ?? null,
             $credentials['api_key'] ?? null,
