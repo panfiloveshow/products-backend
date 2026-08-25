@@ -12,11 +12,17 @@ return new class extends Migration
 {
     public function up(): void
     {
-        DB::statement('ALTER TABLE unit_economics ALTER COLUMN redemption_source TYPE varchar(40)');
+        // sqlite (CI) не знает ALTER COLUMN ... TYPE и не enforce-ит длину varchar —
+        // там миграция не нужна и валила бы весь тестовый прогон.
+        if (DB::connection()->getDriverName() === 'pgsql') {
+            DB::statement('ALTER TABLE unit_economics ALTER COLUMN redemption_source TYPE varchar(40)');
+        }
     }
 
     public function down(): void
     {
-        DB::statement('ALTER TABLE unit_economics ALTER COLUMN redemption_source TYPE varchar(20)');
+        if (DB::connection()->getDriverName() === 'pgsql') {
+            DB::statement('ALTER TABLE unit_economics ALTER COLUMN redemption_source TYPE varchar(20)');
+        }
     }
 };
