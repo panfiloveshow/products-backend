@@ -732,13 +732,17 @@ class UnitEconomicsCacheControllerTest extends TestCase
         $sheet = $spreadsheet->getActiveSheet();
 
         // Эффективная логистика и возвраты — живые формулы (как в WB-экспорте):
-        // M = базовая + миля + обработка + возвраты; N — от % выкупа (Y) и констант
-        // строки AH/AI, восстановленных из движка (при открытии файл == экран:
-        // MIN(3;(100−80)/100+0.6)×75 = 0.8×75 = 60).
+        // M = базовая + миля + обработка + возвраты; N — гипербола движка:
+        // L = (100−Y)/100 + AI, фактор = L/(1−L) с капом 3. Константы AH/AI
+        // восстановлены так, что при открытии файл == экран: L = 0.2+0.2444 =
+        // 0.4444 → фактор 0.8 → 0.8×75 = 60.
         $this->assertSame('=K5+L5+AG5+N5', $sheet->getCell('M5')->getValue());
-        $this->assertSame('=MAX(0,MIN(3,(100-Y5)/100+AI5))*AH5', $sheet->getCell('N5')->getValue());
+        $this->assertSame(
+            '=IF((100-Y5)/100+AI5>=1,3,MAX(0,MIN(3,((100-Y5)/100+AI5)/(1-((100-Y5)/100+AI5)))))*AH5',
+            $sheet->getCell('N5')->getValue()
+        );
         $this->assertSame(75.0, $sheet->getCell('AH5')->getValue());
-        $this->assertSame(0.6, $sheet->getCell('AI5')->getValue());
+        $this->assertSame(0.2444, $sheet->getCell('AI5')->getValue());
         $this->assertSame('=D5+J5+M5+O5+(C5*P5/100)+(C5*Q5/100)+(C5*R5/100)+(IF(AJ5>0,AJ5,C5)*S5/100)+(C5*T5/100)', $sheet->getCell('AA5')->getValue());
         $this->assertSame('=C5-J5-M5-O5-(C5*P5/100)-(C5*Q5/100)-(C5*R5/100)-(IF(AJ5>0,AJ5,C5)*S5/100)-(C5*T5/100)', $sheet->getCell('AE5')->getValue());
         $this->assertSame('Индекс цены', $sheet->getCell('AF4')->getValue());

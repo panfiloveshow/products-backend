@@ -50,7 +50,7 @@ use Symfony\Component\HttpFoundation\StreamedResponse;
  */
 class UnitEconomicsCacheController extends Controller
 {
-    public const EXPORT_TEMPLATE_VERSION = '2026-08-26-04';
+    public const EXPORT_TEMPLATE_VERSION = '2026-08-26-05';
 
     private const EXPORT_TEMPLATE_FORMAT = 'v2';
 
@@ -1348,12 +1348,16 @@ class UnitEconomicsCacheController extends Controller
                     // Живая формула: правка любого слагаемого пересчитывает затраты и прибыль.
                     $sheet->setCellValue("M{$currentRow}", "=K{$currentRow}+L{$currentRow}+AG{$currentRow}+N{$currentRow}");
                 } elseif ($col === 'N') {
-                    // N: Ожидаемые возвраты = доля возвратов × стоимость одного возврата.
-                    // Доля = (100 − выкуп)/100 + пост-доставочные возвраты (AI), кап 3 —
-                    // как в движке Ozon (returnFractionPerSoldUnit). AI — подгоночная
-                    // константа (может быть отрицательной у строк, где движок гейтит
-                    // возвраты), поэтому MAX(0;…) не даёт формуле уйти в минус.
-                    $sheet->setCellValue("N{$currentRow}", "=MAX(0,MIN(3,(100-Y{$currentRow})/100+AI{$currentRow}))*AH{$currentRow}");
+                    // N: Ожидаемые возвраты = фактор × стоимость одного возврата (AH).
+                    // Фактор — та же гипербола, что в движке (returnFractionPerSoldUnit):
+                    // потерянная доля L = (100−Y)/100 + пост-возвраты (AI), фактор =
+                    // L/(1−L) с капом 3 (L≥1 → сразу 3). Раньше формула была линейной
+                    // с подгонкой, и у строк с выкупом 0% правка Y почти не меняла N.
+                    $lost = "(100-Y{$currentRow})/100+AI{$currentRow}";
+                    $sheet->setCellValue(
+                        "N{$currentRow}",
+                        "=IF({$lost}>=1,3,MAX(0,MIN(3,({$lost})/(1-({$lost})))))*AH{$currentRow}"
+                    );
                 } elseif ($col === 'AG') {
                     $sheet->setCellValue("AG{$currentRow}", round((float) ($item['processing_cost'] ?? 0), 2));
                 } elseif ($col === 'AH' || $col === 'AI') {
@@ -1381,12 +1385,23 @@ class UnitEconomicsCacheController extends Controller
                     if ($col === 'AH') {
                         $sheet->setCellValue("AH{$currentRow}", round($unitReturnCost, 2));
                     } else {
-                        // AI подобрана так, чтобы при открытии N дала ровно значение
-                        // движка: expected>0 → доля сверх (100−Y)/100; expected=0 при
-                        // Y<100 (движок гейтит возвраты) → минус эта доля, N=0.
-                        $adjustShare = $unitReturnCost > 0
-                            ? $expectedReturns / $unitReturnCost - $nonRedeemed
-                            : 0.0;
+                        // AI = доля пост-доставочных возвратов (returns/orders), как в
+                        // движке. Если счётчиков нет — восстанавливаем из expected через
+                        // обратную гиперболу; у гейтнутых строк (expected=0 при Y<100)
+                        // AI уводит потерянную долю в ноль, чтобы открытие == экрану.
+                        $ordersCount = (int) ($item['redemption']['orders_count'] ?? 0);
+                        $returnsCount = (int) ($item['redemption']['returns_count'] ?? 0);
+                        if ($expectedReturns <= 0) {
+                            $adjustShare = $nonRedeemed < 1.0 ? -$nonRedeemed : 0.0;
+                        } elseif ($ordersCount > 0 && $returnsCount >= 0) {
+                            $adjustShare = min(1.0, $returnsCount / $ordersCount);
+                        } else {
+                            $fraction = $unitReturnCost > 0 ? $expectedReturns / $unitReturnCost : 0.0;
+                            $lostTotal = $fraction >= 3.0
+                                ? max(1.0, $nonRedeemed) // кап: любая L>=1 даёт фактор 3
+                                : $fraction / (1.0 + $fraction);
+                            $adjustShare = $lostTotal - $nonRedeemed;
+                        }
                         $sheet->setCellValue("AI{$currentRow}", round($adjustShare, 4));
                     }
                 } elseif ($col === 'AA') {
