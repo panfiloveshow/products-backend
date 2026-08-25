@@ -1366,20 +1366,26 @@ class UnitEconomicsCacheController extends Controller
                     $expectedReturns = (float) ($item['expected_return_cost'] ?? 0);
                     $redemption = (float) ($item['redemption_rate'] ?? 100);
                     $nonRedeemed = max(0.0, (100.0 - min(100.0, $redemption)) / 100.0);
-                    $unitReturnCost = (float) ($item['return_logistics_cost'] ?? 0) + (float) ($item['return_processing_cost'] ?? 0);
+                    // Стоимость одной невыкупленной поездки — как в движке: прямое
+                    // плечо (магистраль не возвращается) + обратное + обработка.
+                    $returnLegs = (float) ($item['return_logistics_cost'] ?? 0) + (float) ($item['return_processing_cost'] ?? 0);
+                    $unitReturnCost = $returnLegs > 0
+                        ? (float) ($item['logistics_cost'] ?? 0) + $returnLegs
+                        : 0.0;
                     if ($unitReturnCost <= 0 && $expectedReturns > 0) {
-                        // Разложенных полей нет — восстанавливаем так, чтобы формула N
-                        // при открытии дала ровно значение движка.
-                        $unitReturnCost = $nonRedeemed > 0
-                            ? $expectedReturns / min(3.0, $nonRedeemed)
-                            : $expectedReturns;
+                        // Разложенных полей нет — примем фактор из (100−выкуп) без
+                        // пост-возвратов; AI ниже восстановится согласованно, так что
+                        // при открытии N всё равно даст ровно значение движка.
+                        $assumedFactor = $nonRedeemed >= 1.0
+                            ? 3.0
+                            : ($nonRedeemed > 0 ? min(3.0, $nonRedeemed / (1.0 - $nonRedeemed)) : 1.0);
+                        $unitReturnCost = $expectedReturns / max(0.01, $assumedFactor);
                     }
                     if ($unitReturnCost <= 0) {
-                        // Возвратов у строки нет (нет продаж / гейт hasReturnRisk), но
-                        // стоимость возврата нужна ненулевой — иначе правка «% выкупа»
-                        // в Excel умножалась бы на 0 и ничего не меняла. По движку
-                        // обратная логистика Ozon = базовая логистика (+ обработка возврата).
-                        $unitReturnCost = (float) ($item['logistics_cost'] ?? 0)
+                        // Возвратов у строки нет (гейт hasReturnRisk), но стоимость
+                        // возврата нужна ненулевой — иначе правка «% выкупа» в Excel
+                        // умножалась бы на 0. По движку обратная = базовая логистика.
+                        $unitReturnCost = 2 * (float) ($item['logistics_cost'] ?? 0)
                             + (float) ($item['return_processing_cost'] ?? 0);
                     }
                     if ($col === 'AH') {
