@@ -29,7 +29,7 @@ class RefreshWildberriesTariffsCommand extends Command
 
     public function handle(WildberriesTariffRefresher $refresher): int
     {
-        $query = Integration::query()->active()->where('marketplace', 'wildberries');
+        $query = Integration::query()->syncable()->where('marketplace', 'wildberries');
 
         if ($id = $this->option('integration')) {
             $query->where('id', (int) $id);
@@ -49,7 +49,7 @@ class RefreshWildberriesTariffsCommand extends Command
         // их ОДИН раз — иначе запросы подряд упираются в 429 WB. Источником ключа
         // берём ЛЮБУЮ активную WB-интеграцию (не только отфильтрованную): если у
         // целевой #76 свой ключ в 429, тарифы возьмём с другого — они те же.
-        $fetchSources = Integration::query()->active()->where('marketplace', 'wildberries')->get();
+        $fetchSources = Integration::query()->syncable()->where('marketplace', 'wildberries')->get();
 
         $shared = ['snapshots' => [], 'coefMap' => []];
         foreach ($fetchSources as $candidate) {

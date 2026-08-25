@@ -29,7 +29,7 @@ class AutoSync extends Command
         }
         
         // Получаем все активные интеграции с включённой автосинхронизацией
-        $query = Integration::active()->autoSyncEnabled();
+        $query = Integration::syncable()->autoSyncEnabled();
         
         if ($marketplace) {
             $query->marketplace($marketplace);

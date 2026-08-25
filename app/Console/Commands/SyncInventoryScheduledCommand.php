@@ -46,7 +46,7 @@ class SyncInventoryScheduledCommand extends Command
             return self::SUCCESS;
         }
 
-        $query = Integration::query()->active()->whereIn('marketplace', self::SUPPORTED);
+        $query = Integration::query()->syncable()->whereIn('marketplace', self::SUPPORTED);
         if ($id = $this->option('integration')) {
             $query->where('id', (int) $id);
         }

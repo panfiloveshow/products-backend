@@ -25,7 +25,7 @@ class CalculateSupplyAnalyticsCommand extends Command
         $integrationId = $this->option('integration');
         $period = (int) $this->option('period');
 
-        $query = Integration::where('marketplace', 'ozon')->where('is_active', true);
+        $query = Integration::syncable()->where('marketplace', 'ozon');
         
         if ($integrationId) {
             $query->where('id', $integrationId);

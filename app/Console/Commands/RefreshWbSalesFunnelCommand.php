@@ -62,7 +62,7 @@ class RefreshWbSalesFunnelCommand extends Command
 
         foreach ($staleness as $row) {
             $integration = Integration::find($row->integration_id);
-            if (! $integration) {
+            if (! $integration || ! $integration->hasUsableCredentials()) {
                 continue;
             }
             $this->line("Интеграция #{$integration->id} ({$integration->name}): воронка от ".($row->latest ?: 'никогда'));

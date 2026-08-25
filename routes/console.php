@@ -156,6 +156,12 @@ if ((bool) config('autoplanning.credential_notifications.enabled', true)) {
 // Ротация воронки WB (% выкупа): квота воронки ~час на токен и делится с
 // финсводкой, поэтому каждый час обновляем 2 самых протухших магазина — за
 // сутки очередь обходит все. Смещение :45 — мимо кронов :17 (сток/тарифы).
+// Пробник ключей WB/Ozon: помечает credential_health, чтобы syncable-синки
+// не крутили мёртвые токены, а UI показывал «обновите токен».
+\Illuminate\Support\Facades\Schedule::command('integrations:probe-credentials')
+    ->everySixHours()
+    ->withoutOverlapping();
+
 \Illuminate\Support\Facades\Schedule::command('wb:refresh-sales-funnel --limit=2')
     ->hourlyAt(45)
     ->withoutOverlapping()

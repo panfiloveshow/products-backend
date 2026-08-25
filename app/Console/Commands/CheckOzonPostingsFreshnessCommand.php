@@ -34,7 +34,7 @@ class CheckOzonPostingsFreshnessCommand extends Command
         $alerts = 0;
         $checked = 0;
 
-        foreach (Integration::query()->where('marketplace', 'ozon')->get() as $integration) {
+        foreach (Integration::query()->syncable()->where('marketplace', 'ozon')->get() as $integration) {
             $lastPostingAt = DB::table('postings')
                 ->where('marketplace', 'ozon')
                 ->where('integration_id', $integration->id)

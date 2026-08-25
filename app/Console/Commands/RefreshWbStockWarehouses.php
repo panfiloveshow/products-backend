@@ -38,7 +38,7 @@ class RefreshWbStockWarehouses extends Command
         if ($id = $this->option('integration')) {
             $query->where('id', (int) $id);
         } elseif ($this->option('all')) {
-            $query->where('is_active', true);
+            $query->syncable();
         } else {
             $this->error('Укажите --integration=ID или --all');
 
