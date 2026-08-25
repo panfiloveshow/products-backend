@@ -50,7 +50,7 @@ use Symfony\Component\HttpFoundation\StreamedResponse;
  */
 class UnitEconomicsCacheController extends Controller
 {
-    private const EXPORT_TEMPLATE_VERSION = '2026-08-18-01';
+    public const EXPORT_TEMPLATE_VERSION = '2026-08-26-05';
 
     private const EXPORT_TEMPLATE_FORMAT = 'v2';
 
@@ -222,7 +222,7 @@ class UnitEconomicsCacheController extends Controller
         $useFastStats = $this->canUseFastStats($validated);
         $stats = $useFastStats
             ? $this->getStats((int) $validated['integration_id'], $marketplace, (string) $validated['fulfillment_type'])
-            : $this->getStatsFromQuery($statsQuery);
+            : $this->getStatsFromQuery($statsQuery, $marketplace);
         // WB-листинг дополнительно фильтруется scheme_stock_only и дедупом баркодов
         // (wbPrimaryBarcode) — кэшированный агрегат про них не знает, его total
         // завышен, и последние страницы пагинации приходили пустыми («нет данных
@@ -232,6 +232,13 @@ class UnitEconomicsCacheController extends Controller
             ? (clone $statsQuery)->count()
             : (int) ($stats['total_count'] ?? $itemsCollection->count());
         $lastPage = max(1, (int) ceil($total / max(1, $limit)));
+
+        // Мёртвый API-ключ: синки этот магазин пропускают (scope syncable),
+        // данные замирают — фронт показывает баннер «обновите токен».
+        $integrationRow = Integration::find((int) $validated['integration_id']);
+        $credentialWarning = ($integrationRow && ! $integrationRow->hasUsableCredentials())
+            ? 'API-ключ магазина недействителен (истёк или отозван). Синхронизация приостановлена, данные не обновляются. Выпустите новый ключ в кабинете маркетплейса и обновите его в настройках интеграции.'
+            : null;
 
         return response()->json([
             'data' => [
@@ -247,6 +254,7 @@ class UnitEconomicsCacheController extends Controller
                 'actual_scheme' => $actualScheme,
                 'default_scheme' => $defaultScheme,
                 'stats' => $stats,
+                'credential_warning' => $credentialWarning,
             ],
             'stats' => $stats,
         ]);
@@ -1153,6 +1161,16 @@ class UnitEconomicsCacheController extends Controller
             foreach (['AG', 'AH', 'AI', 'AJ', 'AK', 'AL', 'AM', 'AN', 'AO', 'AP', 'AQ'] as $wbColumn) {
                 unset($columns[$wbColumn]);
             }
+            // Входы живых формул логистики/возвратов (по аналогии с WB-экспортом):
+            // M = K + L + AG + N; N = MIN(3;(100−Y)/100+AI) × AH. Константы строки
+            // вычисляются из движка, поэтому при открытии файл равен экрану, а правка
+            // «% выкупа» (Y) или тарифов пересчитывает возвраты и всю цепочку.
+            $columns['AG'] = ['header' => 'Обработка, ₽',        'width' => 12, 'field' => 'processing_cost',    'format' => '#,##0.00 "₽"'];
+            $columns['AH'] = ['header' => 'Возврат 1 шт, ₽',     'width' => 13, 'field' => 'unit_return_cost',   'format' => '#,##0.00 "₽"'];
+            $columns['AI'] = ['header' => 'Доля пост-возвратов', 'width' => 14, 'field' => 'post_returns_share', 'format' => '0.0000'];
+            // Налоговая база Ozon: факт. цена реализации («реализовано со скидкой»),
+            // 0 → налог считается от цены (как в calcOzonSettlement на экране).
+            $columns['AJ'] = ['header' => 'Налог. база, ₽',      'width' => 13, 'field' => 'tax_base_price',     'format' => '#,##0.00 "₽"'];
         }
         $lastCol = array_key_last($columns) ?: 'AF';
 
@@ -1325,9 +1343,73 @@ class UnitEconomicsCacheController extends Controller
                     // J: Комиссия ₽ — зависит от цены и комиссии %
                     $sheet->setCellValue("J{$currentRow}", "=C{$currentRow}*I{$currentRow}/100");
                 } elseif ($col === 'M') {
-                    // M: Эффективная логистика из API/UI. В Ozon она уже включает возвраты
-                    // и нелокальную наценку, поэтому N/W остаются детализацией, а не плюсуются повторно.
-                    $sheet->setCellValue("M{$currentRow}", (float) ($item['effective_logistics'] ?? 0));
+                    // M: Эффективная логистика = базовая (K, уже с нелок. наценкой) +
+                    // последняя миля (L) + обработка (AG) + ожидаемые возвраты (N).
+                    // Живая формула: правка любого слагаемого пересчитывает затраты и прибыль.
+                    $sheet->setCellValue("M{$currentRow}", "=K{$currentRow}+L{$currentRow}+AG{$currentRow}+N{$currentRow}");
+                } elseif ($col === 'N') {
+                    // N: Ожидаемые возвраты = фактор × стоимость одного возврата (AH).
+                    // Фактор — та же гипербола, что в движке (returnFractionPerSoldUnit):
+                    // потерянная доля L = (100−Y)/100 + пост-возвраты (AI), фактор =
+                    // L/(1−L) с капом 3 (L≥1 → сразу 3). Раньше формула была линейной
+                    // с подгонкой, и у строк с выкупом 0% правка Y почти не меняла N.
+                    $lost = "(100-Y{$currentRow})/100+AI{$currentRow}";
+                    $sheet->setCellValue(
+                        "N{$currentRow}",
+                        "=IF({$lost}>=1,3,MAX(0,MIN(3,({$lost})/(1-({$lost})))))*AH{$currentRow}"
+                    );
+                } elseif ($col === 'AG') {
+                    $sheet->setCellValue("AG{$currentRow}", round((float) ($item['processing_cost'] ?? 0), 2));
+                } elseif ($col === 'AH' || $col === 'AI') {
+                    // Константы строки восстановлены из значений движка, чтобы файл при
+                    // открытии совпадал с экраном: N = IF(F=0;0;cap3((100−Y)/100 + AI) × AH).
+                    $expectedReturns = (float) ($item['expected_return_cost'] ?? 0);
+                    $redemption = (float) ($item['redemption_rate'] ?? 100);
+                    $nonRedeemed = max(0.0, (100.0 - min(100.0, $redemption)) / 100.0);
+                    // Стоимость одной невыкупленной поездки — как в движке: прямое
+                    // плечо (магистраль не возвращается) + обратное + обработка.
+                    $returnLegs = (float) ($item['return_logistics_cost'] ?? 0) + (float) ($item['return_processing_cost'] ?? 0);
+                    $unitReturnCost = $returnLegs > 0
+                        ? (float) ($item['logistics_cost'] ?? 0) + $returnLegs
+                        : 0.0;
+                    if ($unitReturnCost <= 0 && $expectedReturns > 0) {
+                        // Разложенных полей нет — примем фактор из (100−выкуп) без
+                        // пост-возвратов; AI ниже восстановится согласованно, так что
+                        // при открытии N всё равно даст ровно значение движка.
+                        $assumedFactor = $nonRedeemed >= 1.0
+                            ? 3.0
+                            : ($nonRedeemed > 0 ? min(3.0, $nonRedeemed / (1.0 - $nonRedeemed)) : 1.0);
+                        $unitReturnCost = $expectedReturns / max(0.01, $assumedFactor);
+                    }
+                    if ($unitReturnCost <= 0) {
+                        // Возвратов у строки нет (гейт hasReturnRisk), но стоимость
+                        // возврата нужна ненулевой — иначе правка «% выкупа» в Excel
+                        // умножалась бы на 0. По движку обратная = базовая логистика.
+                        $unitReturnCost = 2 * (float) ($item['logistics_cost'] ?? 0)
+                            + (float) ($item['return_processing_cost'] ?? 0);
+                    }
+                    if ($col === 'AH') {
+                        $sheet->setCellValue("AH{$currentRow}", round($unitReturnCost, 2));
+                    } else {
+                        // AI = доля пост-доставочных возвратов (returns/orders), как в
+                        // движке. Если счётчиков нет — восстанавливаем из expected через
+                        // обратную гиперболу; у гейтнутых строк (expected=0 при Y<100)
+                        // AI уводит потерянную долю в ноль, чтобы открытие == экрану.
+                        $ordersCount = (int) ($item['redemption']['orders_count'] ?? 0);
+                        $returnsCount = (int) ($item['redemption']['returns_count'] ?? 0);
+                        if ($expectedReturns <= 0) {
+                            $adjustShare = $nonRedeemed < 1.0 ? -$nonRedeemed : 0.0;
+                        } elseif ($ordersCount > 0 && $returnsCount >= 0) {
+                            $adjustShare = min(1.0, $returnsCount / $ordersCount);
+                        } else {
+                            $fraction = $unitReturnCost > 0 ? $expectedReturns / $unitReturnCost : 0.0;
+                            $lostTotal = $fraction >= 3.0
+                                ? max(1.0, $nonRedeemed) // кап: любая L>=1 даёт фактор 3
+                                : $fraction / (1.0 + $fraction);
+                            $adjustShare = $lostTotal - $nonRedeemed;
+                        }
+                        $sheet->setCellValue("AI{$currentRow}", round($adjustShare, 4));
+                    }
                 } elseif ($col === 'AA') {
                     // AA: Итого затраты — та же модель, что на экране. Для WB отдельно
                     // учитываем СПП и хранение; для Ozon хранение/возвраты не дублируем,
@@ -1336,9 +1418,10 @@ class UnitEconomicsCacheController extends Controller
                         ? "=D{$currentRow}+J{$currentRow}+M{$currentRow}+O{$currentRow}+AN{$currentRow}"
                             . "+(C{$currentRow}*P{$currentRow}/100)+(C{$currentRow}*Q{$currentRow}/100)"
                             . "+(C{$currentRow}*S{$currentRow}/100)"
-                        : "=D{$currentRow}+J{$currentRow}+M{$currentRow}"
+                        : "=D{$currentRow}+J{$currentRow}+M{$currentRow}+O{$currentRow}"
                             . "+(C{$currentRow}*P{$currentRow}/100)+(C{$currentRow}*Q{$currentRow}/100)"
-                            . "+(C{$currentRow}*R{$currentRow}/100)+(C{$currentRow}*S{$currentRow}/100)"
+                            . "+(C{$currentRow}*R{$currentRow}/100)"
+                            . "+(IF(AJ{$currentRow}>0,AJ{$currentRow},C{$currentRow})*S{$currentRow}/100)"
                             . "+(C{$currentRow}*T{$currentRow}/100)"
                     );
                 } elseif ($col === 'AB') {
@@ -1356,9 +1439,10 @@ class UnitEconomicsCacheController extends Controller
                         ? "=C{$currentRow}-J{$currentRow}-M{$currentRow}-O{$currentRow}-AN{$currentRow}"
                             . "-(C{$currentRow}*P{$currentRow}/100)-(C{$currentRow}*Q{$currentRow}/100)"
                             . "-(C{$currentRow}*S{$currentRow}/100)"
-                        : "=C{$currentRow}-J{$currentRow}-M{$currentRow}"
+                        : "=C{$currentRow}-J{$currentRow}-M{$currentRow}-O{$currentRow}"
                             . "-(C{$currentRow}*P{$currentRow}/100)-(C{$currentRow}*Q{$currentRow}/100)"
-                            . "-(C{$currentRow}*R{$currentRow}/100)-(C{$currentRow}*S{$currentRow}/100)"
+                            . "-(C{$currentRow}*R{$currentRow}/100)"
+                            . "-(IF(AJ{$currentRow}>0,AJ{$currentRow},C{$currentRow})*S{$currentRow}/100)"
                             . "-(C{$currentRow}*T{$currentRow}/100)"
                     );
                 } elseif ($col === 'U') {
@@ -1485,7 +1569,8 @@ class UnitEconomicsCacheController extends Controller
         $sumCols = array_values(array_intersect(
             $isWildberriesExport
                 ? ['E', 'F', 'K', 'N', 'O', 'Q', 'R', 'S', 'T', 'V', 'X', 'Z', 'AB', 'AD', 'AF', 'AG']
-                : ['C', 'F', 'G', 'J', 'K', 'L', 'M', 'N', 'O', 'AA', 'AB', 'AE', 'AH', 'AJ', 'AN', 'AO'],
+                // AH у Ozon теперь «Возврат 1 шт» (константа строки) — суммировать бессмысленно.
+                : ['C', 'F', 'G', 'J', 'K', 'L', 'M', 'N', 'O', 'AA', 'AB', 'AE', 'AO'],
             array_keys($columns)
         ));
         foreach ($sumCols as $col) {
@@ -1605,6 +1690,9 @@ class UnitEconomicsCacheController extends Controller
             'AI' => ['header' => 'Цена для цели, ₽',   'width' => 14, 'field' => 'target_price',              'format' => $money],
             // ponytail: артикул WB в конце, а не рядом с A — чтобы не сдвигать буквы основного блока
             'AJ' => ['header' => 'Артикул WB',         'width' => 12, 'field' => 'nm_id',                     'format' => '@'],
+            // Вход для живой формулы «Логистика» (N = AK × КС × ИЛ): базовый тариф WB
+            // по объёму, без коэффициентов. Правится руками при смене тарифов.
+            'AK' => ['header' => 'Тариф логистики (база), ₽', 'width' => 16, 'field' => 'base_logistics',    'format' => $money],
         ];
     }
 
@@ -1628,17 +1716,17 @@ class UnitEconomicsCacheController extends Controller
         $sheet->setCellValue("D{$r}", $num('volume_liters'));
         $sheet->setCellValue("E{$r}", $num('cost_price'));
         $sheet->setCellValue("F{$r}", $num('price'));
-        $sheet->setCellValue("H{$r}", $num('customer_price'));
         $sheet->setCellValue("I{$r}", $num('commission_percent'));
         $sheet->setCellValue("J{$r}", $num('spp_percent'));
-        $sheet->setCellValue("K{$r}", $num('spp_amount'));
         $sheet->setCellValue("L{$r}", $num('warehouse_coef_percent'));
         $sheet->setCellValue("M{$r}", (float) ($item['localization_index'] ?? 1));
-        $sheet->setCellValue("N{$r}", $num('logistics_cost'));
         $sheet->setCellValue("O{$r}", (float) ($item['return_logistics'] ?? $item['return_logistics_cost'] ?? 0));
         $sheet->setCellValue("P{$r}", $num('redemption_rate'));
-        $sheet->setCellValue("Q{$r}", $num('expected_return_cost'));
-        $sheet->setCellValue("R{$r}", (float) ($item['effective_logistics'] ?? $item['logistics_cost'] ?? 0));
+        // Базовый тариф логистики (без КС и ИЛ) — вход для живой формулы N.
+        // Восстанавливаем делением: logistics_cost = база × КС × ИЛ.
+        $ksMultiplier = $num('warehouse_coef_percent') > 0 ? $num('warehouse_coef_percent') / 100 : 1.0;
+        $ilMultiplier = (float) ($item['localization_index'] ?? 1) ?: 1.0;
+        $sheet->setCellValue("AK{$r}", round($num('logistics_cost') / max(0.01, $ksMultiplier * $ilMultiplier), 2));
         $sheet->setCellValue("S{$r}", $num('storage_cost'));
         $sheet->setCellValue("T{$r}", $num('acceptance_cost'));
         $sheet->setCellValue("U{$r}", (float) ($item['acquiring_percent'] ?? 0));
@@ -1649,7 +1737,17 @@ class UnitEconomicsCacheController extends Controller
         $sheet->setCellValueExplicit("AJ{$r}", (string) ($item['nm_id'] ?? ''), \PhpOffice\PhpSpreadsheet\Cell\DataType::TYPE_STRING);
 
         // Живые формулы (пересчитываются при ручной правке в Excel).
+        // Цепочка сквозная: правка цены (F), СПП% (J), КС (L), ИЛ (M), % выкупа (P),
+        // комиссии (I), эквайринга (U), ДРР (Y), налога (AA) или базового тарифа (AK)
+        // пересчитывает логистику, возвраты, «на р/с», прибыль, маржу и цену для цели.
         $sheet->setCellValue("G{$r}",  "=IF(E{$r}>0,F{$r}/E{$r},0)");
+        $sheet->setCellValue("K{$r}",  "=F{$r}*J{$r}/100");
+        $sheet->setCellValue("H{$r}",  "=F{$r}-K{$r}");
+        $sheet->setCellValue("N{$r}",  "=AK{$r}*L{$r}/100*M{$r}");
+        // Ожидаемые возвраты — как в движке: (логистика + обратная) × невыкуп-фактор,
+        // фактор = (100−P)/P с капом 3 (ReturnEconomics::fractionPerSoldUnit).
+        $sheet->setCellValue("Q{$r}",  "=MIN(3,(100-P{$r})/MAX(P{$r},0.01))*(N{$r}+O{$r})");
+        $sheet->setCellValue("R{$r}",  "=N{$r}+Q{$r}");
         $sheet->setCellValue("V{$r}",  "=F{$r}*U{$r}/100");
         $sheet->setCellValue("W{$r}",  "=IF(F{$r}>0,(F{$r}*I{$r}/100+R{$r}+S{$r}+T{$r}+F{$r}*U{$r}/100)/F{$r}*100,0)");
         $sheet->setCellValue("X{$r}",  "=F{$r}-(F{$r}*I{$r}/100)-R{$r}-S{$r}-T{$r}-(F{$r}*U{$r}/100)-Z{$r}-AB{$r}");
@@ -2353,38 +2451,89 @@ class UnitEconomicsCacheController extends Controller
     }
 
     /**
+     * WB: условие «товар в продаже» по остаткам складов WB из products.wb_data —
+     * тот же источник, что бейдж «В продаже» и сортировка наличия.
+     */
+    private function wbInSaleCondition(string $productsAlias): string
+    {
+        return "COALESCE((SELECT SUM((elem->>'quantity')::numeric) "
+            ."FROM json_array_elements("
+            ."CASE WHEN json_typeof({$productsAlias}.wb_data->'stock_warehouses') = 'array' "
+            ."THEN {$productsAlias}.wb_data->'stock_warehouses' ELSE '[]'::json END) AS elem), 0) > 0";
+    }
+
+    /**
+     * SELECT-агрегаты карточек. Для WB денежные суммы и маржа считаются ТОЛЬКО по
+     * товарам «в продаже» (просьба клиентов: товары без остатков видны в таблице
+     * и юнит по ним считается, но общую выручку/маржу не искажают). Счётчики
+     * (total/profitable) остаются полными — ими живут пагинация и фильтры.
+     */
+    private function statsSelectRaw(bool $wbInSaleOnly, string $productsAlias = 'sp'): string
+    {
+        if (! $wbInSaleOnly) {
+            return '
+                COUNT(*) as total_count,
+                SUM(CASE WHEN net_profit > 0 THEN 1 ELSE 0 END) as profitable_count,
+                SUM(CASE WHEN net_profit <= 0 THEN 1 ELSE 0 END) as unprofitable_count,
+                COUNT(*) as in_sale_count,
+                AVG(margin_percent) as avg_margin,
+                SUM(revenue) as total_revenue,
+                SUM(total_costs) as total_costs,
+                SUM(net_profit) as total_profit
+            ';
+        }
+
+        $inSale = $this->wbInSaleCondition($productsAlias);
+
+        return "
+            COUNT(*) as total_count,
+            SUM(CASE WHEN net_profit > 0 THEN 1 ELSE 0 END) as profitable_count,
+            SUM(CASE WHEN net_profit <= 0 THEN 1 ELSE 0 END) as unprofitable_count,
+            COUNT(*) FILTER (WHERE {$inSale}) as in_sale_count,
+            AVG(margin_percent) FILTER (WHERE {$inSale}) as avg_margin,
+            SUM(revenue) FILTER (WHERE {$inSale}) as total_revenue,
+            SUM(total_costs) FILTER (WHERE {$inSale}) as total_costs,
+            SUM(net_profit) FILTER (WHERE {$inSale}) as total_profit
+        ";
+    }
+
+    /**
+     * @param object|null $stats
+     * @return array<string, int|float>
+     */
+    private function formatStats(?object $stats): array
+    {
+        return [
+            'total_count' => (int) ($stats->total_count ?? 0),
+            'profitable_count' => (int) ($stats->profitable_count ?? 0),
+            'unprofitable_count' => (int) ($stats->unprofitable_count ?? 0),
+            'in_sale_count' => (int) ($stats->in_sale_count ?? 0),
+            'avg_margin' => round((float) ($stats->avg_margin ?? 0), 2),
+            'average_margin' => round((float) ($stats->avg_margin ?? 0), 2),
+            'total_revenue' => round((float) ($stats->total_revenue ?? 0), 2),
+            'total_costs' => round((float) ($stats->total_costs ?? 0), 2),
+            'total_profit' => round((float) ($stats->total_profit ?? 0), 2),
+        ];
+    }
+
+    /**
      * Получить статистику по схеме (оптимизировано: 1 запрос вместо 6)
      */
     private function getStats(int $integrationId, string $marketplace, string $fulfillmentType): array
     {
-        $cacheKey = "ue_stats_{$integrationId}_{$marketplace}_".strtoupper($fulfillmentType);
+        $cacheKey = "ue_stats_{$integrationId}_{$marketplace}_".strtoupper($fulfillmentType).'_v2';
 
         return Cache::remember($cacheKey, 60, function () use ($integrationId, $marketplace, $fulfillmentType) {
-            $stats = UnitEconomicsCache::where('integration_id', $integrationId)
-                ->where('marketplace', $marketplace)
-                ->where('fulfillment_type', strtoupper($fulfillmentType))
+            $isWb = $marketplace === 'wildberries';
+            $stats = UnitEconomicsCache::where('unit_economics_cache.integration_id', $integrationId)
+                ->where('unit_economics_cache.marketplace', $marketplace)
+                ->where('unit_economics_cache.fulfillment_type', strtoupper($fulfillmentType))
                 ->wbPrimaryBarcode($marketplace, $integrationId)
-                ->selectRaw('
-                    COUNT(*) as total_count,
-                    SUM(CASE WHEN net_profit > 0 THEN 1 ELSE 0 END) as profitable_count,
-                    SUM(CASE WHEN net_profit <= 0 THEN 1 ELSE 0 END) as unprofitable_count,
-                    AVG(margin_percent) as avg_margin,
-                    SUM(revenue) as total_revenue,
-                    SUM(total_costs) as total_costs,
-                    SUM(net_profit) as total_profit
-                ')
+                ->when($isWb, fn ($q) => $q->leftJoin('products as sp', 'sp.id', '=', 'unit_economics_cache.product_id'))
+                ->selectRaw($this->statsSelectRaw($isWb))
                 ->first();
 
-            return [
-                'total_count' => (int) ($stats->total_count ?? 0),
-                'profitable_count' => (int) ($stats->profitable_count ?? 0),
-                'unprofitable_count' => (int) ($stats->unprofitable_count ?? 0),
-                'avg_margin' => round((float) ($stats->avg_margin ?? 0), 2),
-                'average_margin' => round((float) ($stats->avg_margin ?? 0), 2),
-                'total_revenue' => round((float) ($stats->total_revenue ?? 0), 2),
-                'total_costs' => round((float) ($stats->total_costs ?? 0), 2),
-                'total_profit' => round((float) ($stats->total_profit ?? 0), 2),
-            ];
+            return $this->formatStats($stats);
         });
     }
 
@@ -2423,30 +2572,15 @@ class UnitEconomicsCacheController extends Controller
      * Агрегаты для текущей отфильтрованной выборки, но без пагинации.
      * Карточки на фронте не должны считаться только по первым 50 строкам.
      */
-    private function getStatsFromQuery($query): array
+    private function getStatsFromQuery($query, string $marketplace = ''): array
     {
+        $isWb = $marketplace === 'wildberries';
         $stats = $query
-            ->selectRaw('
-                COUNT(*) as total_count,
-                SUM(CASE WHEN net_profit > 0 THEN 1 ELSE 0 END) as profitable_count,
-                SUM(CASE WHEN net_profit <= 0 THEN 1 ELSE 0 END) as unprofitable_count,
-                AVG(margin_percent) as avg_margin,
-                SUM(revenue) as total_revenue,
-                SUM(total_costs) as total_costs,
-                SUM(net_profit) as total_profit
-            ')
+            ->when($isWb, fn ($q) => $q->leftJoin('products as stats_sp', 'stats_sp.id', '=', 'unit_economics_cache.product_id'))
+            ->selectRaw($this->statsSelectRaw($isWb, 'stats_sp'))
             ->first();
 
-        return [
-            'total_count' => (int) ($stats->total_count ?? 0),
-            'profitable_count' => (int) ($stats->profitable_count ?? 0),
-            'unprofitable_count' => (int) ($stats->unprofitable_count ?? 0),
-            'avg_margin' => round((float) ($stats->avg_margin ?? 0), 2),
-            'average_margin' => round((float) ($stats->avg_margin ?? 0), 2),
-            'total_revenue' => round((float) ($stats->total_revenue ?? 0), 2),
-            'total_costs' => round((float) ($stats->total_costs ?? 0), 2),
-            'total_profit' => round((float) ($stats->total_profit ?? 0), 2),
-        ];
+        return $this->formatStats($stats);
     }
 
     /**

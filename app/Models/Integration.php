@@ -103,6 +103,31 @@ class Integration extends Model
     }
 
     /**
+     * Credential health, при котором фоновые синки бессмысленны: маркетплейс
+     * отклоняет ключ, пока пользователь не выпустит новый. Обновление кредов
+     * через UI сбрасывает health в 'unknown' — интеграция сразу оживает.
+     */
+    public const DEAD_CREDENTIAL_HEALTH = ['invalid', 'expired', 'missing'];
+
+    /**
+     * Scope: активные интеграции с рабочими (или ещё не проверенными) кредами —
+     * только их имеет смысл крутить в фоновых синках.
+     */
+    public function scopeSyncable($query)
+    {
+        return $query->where('is_active', true)
+            ->where(function ($q) {
+                $q->whereNull('credential_health')
+                    ->orWhereNotIn('credential_health', self::DEAD_CREDENTIAL_HEALTH);
+            });
+    }
+
+    public function hasUsableCredentials(): bool
+    {
+        return ! in_array((string) $this->credential_health, self::DEAD_CREDENTIAL_HEALTH, true);
+    }
+
+    /**
      * Scope: с включённой автосинхронизацией
      */
     public function scopeAutoSyncEnabled($query)

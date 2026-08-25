@@ -39,7 +39,7 @@ class SyncMarketplaceConstraintsCommand extends Command
             }
         }
 
-        $query = Integration::query()->active()->whereIn('marketplace', $supported);
+        $query = Integration::query()->syncable()->whereIn('marketplace', $supported);
 
         if ($id = $this->option('integration')) {
             $query->where('id', (int) $id);

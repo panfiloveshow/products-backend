@@ -19,7 +19,7 @@ class RefreshOzonPlanningFactsCommand extends Command
     {
         $query = Integration::withoutGlobalScopes()
             ->where('marketplace', 'ozon')
-            ->where('is_active', true);
+            ->syncable();
 
         if ($this->option('integration')) {
             $query->whereKey((int) $this->option('integration'));

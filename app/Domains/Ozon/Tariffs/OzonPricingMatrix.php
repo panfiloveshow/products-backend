@@ -424,9 +424,14 @@ class OzonPricingMatrix
             return null;
         }
 
+        // Ozon 24.08.2026: объявленные с 28.08 тарифы снижены на 3 п.п. («Меры
+        // поддержки», вместо скидки за локальность). Поправка живёт в конфиге
+        // таблицы и обнуляется при перегенерации по новой официальной таблице.
+        $adjustmentPp = (float) ($this->commissionTable['global_adjustment_pp'] ?? 0.0);
+
         // RFBS в таблице — одна ставка на все ценовые сегменты.
         if (! is_array($rates)) {
-            return (float) $rates;
+            return max(0.0, (float) $rates + $adjustmentPp);
         }
 
         $tier = match (true) {
@@ -435,7 +440,7 @@ class OzonPricingMatrix
             default => 2,
         };
 
-        return isset($rates[$tier]) ? (float) $rates[$tier] : null;
+        return isset($rates[$tier]) ? max(0.0, (float) $rates[$tier] + $adjustmentPp) : null;
     }
 
     /**

@@ -16,8 +16,9 @@ use Illuminate\Queue\SerializesModels;
 use Illuminate\Support\Facades\Log;
 
 /**
- * Job для синхронизации стоимости хранения с маркетплейсов
- * Использует /v3/finance/transaction/list для получения фактических начислений за хранение
+ * Job для синхронизации стоимости хранения с маркетплейсов.
+ * Фактические начисления берёт из Excel-отчёта о размещении
+ * (getPlacementCostByProducts), а не из финансовых транзакций.
  */
 class SyncStorageCostJob implements ShouldQueue
 {

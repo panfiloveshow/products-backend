@@ -806,7 +806,10 @@ class SyncUnitEconomicsCommand extends Command
             }
 
             try {
-                $orderUnitEconomicsService->syncForIntegration($integrationId, $ozonSyncStartedAt);
+                // Окно с суточным перекрытием: постинги, залитые ДО старта команды
+                // (бэкфиллы, внешние синки), иначе никогда не попадали в OUE —
+                // выкуп считался по неполному множеству заказов. Upsert идемпотентен.
+                $orderUnitEconomicsService->syncForIntegration($integrationId, $ozonSyncStartedAt->copy()->subDay());
                 $orderEconomicsPreview = $orderUnitEconomicsService->summarizeForPreview($integrationId);
             } catch (\Throwable $orderEconomicsException) {
                 $this->warn('  Не удалось синхронизировать order-economics: '.$orderEconomicsException->getMessage());

@@ -156,6 +156,11 @@ class PostingService
                 ],
             ]);
 
+            // null = HTTP-ошибка клиента: бросаем, чтобы не продвинуть водяной знак.
+            if ($response === null) {
+                throw new \RuntimeException('Ozon FBS postings: пустой ответ API (HTTP-ошибка)');
+            }
+
             $postings = $response['result']['postings'] ?? [];
 
             DB::beginTransaction();
@@ -192,7 +197,10 @@ class PostingService
         $limit = 1000;
 
         do {
-            $response = $marketplace->getClient()->post('/v3/posting/fbo/list', [
+            // ВАЖНО: /v2/posting/fbo/list — /v3 у Ozon с ~29.07.2026 отдаёт HTTP 200
+            // с пустым result: постинги тихо замирали, а водяной знак уезжал вперёд
+            // (выкуп по постингам врал — «100%» без свежих отмен).
+            $response = $marketplace->getClient()->post('/v2/posting/fbo/list', [
                 'dir' => 'DESC',
                 'filter' => [
                     'since' => $since,
@@ -205,6 +213,12 @@ class PostingService
                     'financial_data' => true,
                 ],
             ]);
+
+            // null = HTTP-ошибка клиента (401/429/5xx): бросаем, чтобы НЕ продвинуть
+            // водяной знак и не потерять окно заказов навсегда.
+            if ($response === null) {
+                throw new \RuntimeException('Ozon FBO postings: пустой ответ API (HTTP-ошибка)');
+            }
 
             $postings = $response['result']['postings']
                 ?? $response['postings']

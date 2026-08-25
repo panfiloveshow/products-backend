@@ -31,7 +31,27 @@ class OzonActualRatesService
     private static array $cache = [];
 
     private const SALE_OPERATION = 'OperationAgentDeliveredToCustomer';
-    private const ACQUIRING_OPERATION = 'MarketplaceRedistributionOfAcquiringOperation';
+
+    /**
+     * Legacy transaction/list и новый accrual/by-day называют эквайринг по-разному;
+     * в 28-дневном окне могут встречаться оба (день пишется только одним источником,
+     * так что двойного счёта нет).
+     */
+    private const ACQUIRING_OPERATIONS = [
+        'MarketplaceRedistributionOfAcquiringOperation', // legacy /v3
+        'Acquiring',                                     // accrual type_id=1
+    ];
+
+    /**
+     * Последняя миля в новом синке — отдельные строки с operation_type из
+     * словаря accrual/types (в legacy она лежала услугой внутри строки продажи,
+     * см. lastMileOfRow).
+     */
+    private const LAST_MILE_OPERATIONS = [
+        'LastMile', 'LastMileCourier', 'LastMilePickUpPoint',
+        'DeliveryToHandoverPlaceByOzon', 'B2CDeliveryToHandoverPlaceByOzon',
+        'B2CCourierClientReinvoice', 'B2CPickUpPointClientReinvoice',
+    ];
 
     /**
      * @return array{
@@ -62,11 +82,13 @@ class OzonActualRatesService
         $from = now()->subDays($days + 1)->startOfDay();
         $to = now()->subDays(1)->endOfDay();
 
+        // units: legacy-строка = 1 постинг (quantity в raw нет → 1),
+        // строка realization/by-day = SKU-день с raw.quantity штук.
         $sales = DB::table('ozon_finance_transactions')
             ->where('integration_id', $integrationId)
             ->where('operation_type', self::SALE_OPERATION)
             ->whereBetween('operation_date', [$from, $to])
-            ->selectRaw('count(*) units, coalesce(sum(accruals_for_sale), 0) revenue')
+            ->selectRaw("coalesce(sum(coalesce(nullif(raw->>'quantity', '')::int, 1)), 0) units, coalesce(sum(accruals_for_sale), 0) revenue")
             ->first();
 
         $units = (int) ($sales->units ?? 0);
@@ -85,14 +107,14 @@ class OzonActualRatesService
             return $empty;
         }
 
-        $sum = fn (string $type): float => abs((float) DB::table('ozon_finance_transactions')
+        $sum = fn (array $types): float => abs((float) DB::table('ozon_finance_transactions')
             ->where('integration_id', $integrationId)
-            ->where('operation_type', $type)
+            ->whereIn('operation_type', $types)
             ->whereBetween('operation_date', [$from, $to])
             ->sum('amount'));
 
-        $acquiring = $sum(self::ACQUIRING_OPERATION);
-        $lastMile = $this->lastMileTotal($integrationId, $from, $to);
+        $acquiring = $sum(self::ACQUIRING_OPERATIONS);
+        $lastMile = $this->lastMileTotal($integrationId, $from, $to) + $sum(self::LAST_MILE_OPERATIONS);
 
         return [
             // Ставки-выбросы не пропускаем: Ozon не берёт больше 3% эквайринга,
@@ -161,15 +183,32 @@ class OzonActualRatesService
                 foreach ($rows as $row) {
                     $sku = (string) $row->sku;
                     $sums[$sku] = ($sums[$sku] ?? 0.0) + $this->lastMileOfRow($row);
-                    $counts[$sku] = ($counts[$sku] ?? 0) + 1;
+                    $counts[$sku] = ($counts[$sku] ?? 0) + max(1, (int) ($row->raw['quantity'] ?? 1));
                 }
+            });
+
+        // Новый синк (accrual/by-day) пишет последнюю милю отдельными строками
+        // со своим sku — суммируем их к legacy-значениям из raw.services.
+        DB::table('ozon_finance_transactions')
+            ->where('integration_id', $integrationId)
+            ->whereIn('operation_type', self::LAST_MILE_OPERATIONS)
+            ->whereBetween('operation_date', [$from, $to])
+            ->whereNotNull('sku')
+            ->where('sku', '!=', '')
+            ->groupBy('sku')
+            ->selectRaw('sku, abs(sum(amount)) total')
+            ->get()
+            ->each(function ($row) use (&$sums): void {
+                $sku = (string) $row->sku;
+                $sums[$sku] = ($sums[$sku] ?? 0.0) + (float) $row->total;
             });
 
         $map = [];
         foreach ($sums as $sku => $sum) {
             // 1-2 продажи — шум (акционная развозка, возвратная миля), не ставка.
-            if ($counts[$sku] >= 3 && $sum > 0) {
-                $map[$sku] = round($sum / $counts[$sku], 2);
+            $units = $counts[$sku] ?? 0;
+            if ($units >= 3 && $sum > 0) {
+                $map[$sku] = round($sum / $units, 2);
             }
         }
 

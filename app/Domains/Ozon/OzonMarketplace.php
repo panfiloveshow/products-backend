@@ -1033,32 +1033,6 @@ class OzonMarketplace implements MarketplaceInterface
     }
 
     /**
-     * Получить финансовые транзакции по хранению за период
-     * Использует /v3/finance/transaction/list с фильтром по типу операции
-     * Автоматически конвертирует product_id в offer_id (SKU продавца)
-     */
-    public function getStorageTransactions(string $dateFrom, string $dateTo): array
-    {
-        // Создаём маппинг ozon_sku → offer_id из Product
-        // API /v3/finance/transaction/list возвращает числовой SKU Ozon (ozon_data.sku), не product_id
-        $ozonSkuToOfferId = [];
-        if ($this->integration) {
-            $products = \App\Models\Product::where('integration_id', $this->integration->id)
-                ->whereNotNull('ozon_data')
-                ->get(['sku', 'ozon_data']);
-            
-            foreach ($products as $product) {
-                $ozonSku = $product->ozon_data['sku'] ?? null;
-                if ($ozonSku) {
-                    $ozonSkuToOfferId[(string)$ozonSku] = $product->sku;
-                }
-            }
-        }
-        
-        return $this->storage->getStorageTransactions($dateFrom, $dateTo, $ozonSkuToOfferId);
-    }
-
-    /**
      * Создать отчёт о стоимости размещения по товарам (асинхронно)
      */
     public function createPlacementReportByProducts(string $dateFrom, string $dateTo): ?string
