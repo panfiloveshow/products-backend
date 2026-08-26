@@ -57,14 +57,28 @@ class RefreshWbSalesFunnelCommand extends Command
             ->selectRaw("integration_id, max(wb_data->>'redemption_observed_at') as latest")
             ->groupBy('integration_id')
             ->get()
-            ->sortBy(fn ($row) => $row->latest ?? '')
-            ->take($limit);
+            ->sortBy(fn ($row) => $row->latest ?? '');
 
+        // Фильтры — ПОСЛЕ сортировки, слоты добираются следующими кандидатами.
+        // Раньше take() шёл до фильтров: магазины с мёртвыми кредами или вечно
+        // пустой воронкой (observed_at не двигается by design) занимали оба слота
+        // каждый час, и живые магазины не обновлялись неделями (int 85 — с 29.07).
+        // Метка «недавно пробовали» (4 ч) выкидывает пустых из головы очереди.
+        $picked = 0;
         foreach ($staleness as $row) {
-            $integration = Integration::find($row->integration_id);
-            if (! $integration || ! $integration->hasUsableCredentials()) {
+            if ($picked >= $limit) {
+                break;
+            }
+            $attemptKey = "wb_funnel_attempt_{$row->integration_id}";
+            if (\Illuminate\Support\Facades\Cache::has($attemptKey)) {
                 continue;
             }
+            $integration = Integration::find($row->integration_id);
+            if (! $integration || ! $integration->is_active || ! $integration->hasUsableCredentials()) {
+                continue;
+            }
+            \Illuminate\Support\Facades\Cache::put($attemptKey, now()->toIso8601String(), now()->addHours(4));
+            $picked++;
             $this->line("Интеграция #{$integration->id} ({$integration->name}): воронка от ".($row->latest ?: 'никогда'));
             $this->refreshIntegration($integration);
         }
