@@ -239,6 +239,11 @@ class UnitEconomicsCacheController extends Controller
         $credentialWarning = ($integrationRow && ! $integrationRow->hasUsableCredentials())
             ? 'API-ключ магазина недействителен (истёк или отозван). Синхронизация приостановлена, данные не обновляются. Выпустите новый ключ в кабинете маркетплейса и обновите его в настройках интеграции.'
             : null;
+        // Ozon отдаёт детальные финотчёты (источник фактических ставок эквайринга
+        // и последней мили) только с подпиской Premium Plus; флаг ставит финсинк.
+        $financeWarning = ($integrationRow && (bool) data_get($integrationRow->settings, 'ozon_premium_plus_required'))
+            ? 'Ozon отдаёт детальные финансовые отчёты только с подпиской Premium Plus. Фактические ставки (эквайринг, последняя миля) считаются по последним доступным данным; с 08.09.2026 без подписки они перестанут обновляться.'
+            : null;
 
         return response()->json([
             'data' => [
@@ -255,6 +260,7 @@ class UnitEconomicsCacheController extends Controller
                 'default_scheme' => $defaultScheme,
                 'stats' => $stats,
                 'credential_warning' => $credentialWarning,
+                'finance_warning' => $financeWarning,
             ],
             'stats' => $stats,
         ]);
