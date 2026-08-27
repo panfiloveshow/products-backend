@@ -29,6 +29,16 @@ class OzonFinanceTransaction extends Model
 
     protected $table = 'ozon_finance_transactions';
 
+    /**
+     * Колонка varchar(128), а Ozon отдаёт названия операций длиннее (например
+     * «Агентское вознаграждение за … международной перевозки») — вставка падала
+     * 22001 и весь дневной синк интеграции откатывался. Полный текст есть в raw.
+     */
+    public function setOperationTypeNameAttribute(?string $value): void
+    {
+        $this->attributes['operation_type_name'] = $value === null ? null : mb_substr($value, 0, 128);
+    }
+
     protected $fillable = [
         'integration_id',
         'operation_id',
