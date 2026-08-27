@@ -102,6 +102,33 @@ class Integration extends Model
         return $query->where('is_active', true);
     }
 
+    protected static function booted(): void
+    {
+        // Автопрогрев новой Ozon-интеграции: фактические ставки (эквайринг,
+        // последняя миля) живут в ozon_finance_transactions и без этого ждали
+        // ночного синка — новые магазины полдня считались по базовым ставкам.
+        // Товары синкает CRM-поток при подключении; UE-синк с задержкой, чтобы
+        // они успели появиться (иначе его догонит ночной прогон).
+        static::created(function (self $integration): void {
+            if ($integration->marketplace !== 'ozon' || app()->runningUnitTests()) {
+                return;
+            }
+            try {
+                // Окно 30 дней: дефолтные 2 дня не дают статистики для ставок.
+                \App\Domains\Locality\Jobs\SyncFinanceTransactionsJob::dispatch($integration->id, 30)
+                    ->onQueue('locality');
+                \App\Jobs\SyncUnitEconomicsJob::dispatch($integration->id)
+                    ->onQueue('unit-economics')
+                    ->delay(now()->addMinutes(30));
+            } catch (\Throwable $e) {
+                \Illuminate\Support\Facades\Log::warning('Integration warmup dispatch failed', [
+                    'integration_id' => $integration->id,
+                    'error' => $e->getMessage(),
+                ]);
+            }
+        });
+    }
+
     /**
      * Credential health, при котором фоновые синки бессмысленны: маркетплейс
      * отклоняет ключ, пока пользователь не выпустит новый. Обновление кредов
