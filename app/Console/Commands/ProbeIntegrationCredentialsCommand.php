@@ -30,7 +30,7 @@ class ProbeIntegrationCredentialsCommand extends Command
     {
         $query = Integration::query()
             ->where('is_active', true)
-            ->whereIn('marketplace', ['wildberries', 'ozon']);
+            ->whereIn('marketplace', ['wildberries', 'ozon', 'yandex', 'yandex_market']);
         if ($id = $this->option('integration')) {
             $query->whereKey((int) $id);
         }
@@ -71,6 +71,30 @@ class ProbeIntegrationCredentialsCommand extends Command
             $this->line("int {$integration->id} ({$integration->name}): " . ($result['health'] ?? '?'));
 
             return null;
+        }
+
+        if (in_array($integration->marketplace, ['yandex', 'yandex_market'], true)) {
+            $token = trim((string) ($credentials['token'] ?? $credentials['api_key'] ?? ''));
+            $campaign = trim((string) ($credentials['campaign_id'] ?? $credentials['client_id'] ?? ''));
+            if ($token === '' || $campaign === '') {
+                return 'missing';
+            }
+            try {
+                $status = Http::withHeaders(['Api-Key' => $token])
+                    ->timeout(15)
+                    ->get("https://api.partner.market.yandex.ru/v2/campaigns/{$campaign}")
+                    ->status();
+            } catch (\Throwable) {
+                return null;
+            }
+
+            return match (true) {
+                $status === 200 => 'healthy',
+                // 403 у YM — токен без доступа к кампании (типовой случай:
+                // в кредах client_id вместо campaign_id) — синкать бессмысленно.
+                $status === 401, $status === 403 => 'invalid',
+                default => null,
+            };
         }
 
         $token = trim((string) ($credentials['api_key'] ?? ''));

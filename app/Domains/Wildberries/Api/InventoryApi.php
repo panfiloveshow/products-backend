@@ -157,6 +157,15 @@ class InventoryApi implements InventoryApiInterface
      */
     private function getStocksFromFbsWarehouses(?Integration $integration, array $chrtIds = []): array
     {
+        // Основной путь с 08.2026: единый отчёт по складам продавца — один запрос
+        // без перечисления складов и chrtIds, доступен обычному токену «Аналитика»
+        // (дайджест WB API 25.08.2026). Старый обход складов через
+        // /api/v3/stocks/{warehouseId} остаётся фолбэком.
+        $reportStocks = $this->getSellerWarehousesStocksReport($integration);
+        if ($reportStocks !== []) {
+            return $reportStocks;
+        }
+
         $warehouses = $this->getWarehouses($integration);
 
         if (empty($warehouses)) {
@@ -230,6 +239,77 @@ class InventoryApi implements InventoryApiInterface
                 ];
                 $allStocks[$sku]['total'] += $quantity;
             }
+        }
+
+        return array_values($allStocks);
+    }
+
+    /**
+     * Отчёт «Остатки на складах продавца» — POST /api/analytics/v1/stocks-report/seller-warehouses.
+     * Замена обхода /api/v3/stocks/{warehouseId} (WB, 25.08.2026): один запрос без
+     * ID складов и chrtIds, данные обновляются раз в 30 минут, доступен персональному
+     * токену категории «Аналитика». Формат результата — как у getStocksFromFbsWarehouses.
+     *
+     * @return array<int, array<string, mixed>>
+     */
+    private function getSellerWarehousesStocksReport(?Integration $integration): array
+    {
+        $limit = 250000;
+        $offset = 0;
+        $pages = 0;
+        $sizeMeta = $this->getSizeMetadata($integration);
+        $allStocks = [];
+
+        do {
+            $response = $this->client->analyticsPost('/api/analytics/v1/stocks-report/seller-warehouses', [
+                'limit' => $limit,
+                'offset' => $offset,
+            ]);
+            $items = $response['data']['items'] ?? [];
+            if (! is_array($items) || $items === []) {
+                break;
+            }
+
+            foreach ($items as $item) {
+                $nmId = (int) ($item['nmId'] ?? 0);
+                $chrtId = (int) ($item['chrtId'] ?? 0);
+                $meta = ($nmId && $chrtId)
+                    ? ($sizeMeta['by_nm_chrt']["{$nmId}:{$chrtId}"] ?? $sizeMeta['by_nm'][(string) $nmId] ?? [])
+                    : ($nmId ? ($sizeMeta['by_nm'][(string) $nmId] ?? []) : []);
+                $sku = $item['barcode'] ?? ($meta['barcode'] ?? null) ?? ($meta['supplierArticle'] ?? null);
+                if (! $sku) {
+                    continue;
+                }
+
+                if (! isset($allStocks[$sku])) {
+                    $allStocks[$sku] = [
+                        'sku' => $sku,
+                        'chrtId' => $chrtId,
+                        'warehouses' => [],
+                        'total' => 0,
+                    ];
+                }
+
+                $quantity = (int) ($item['quantity'] ?? $item['amount'] ?? 0);
+                $allStocks[$sku]['warehouses'][] = [
+                    'warehouse_id' => $item['warehouseId'] ?? null,
+                    'warehouse_name' => $item['warehouseName'] ?? '',
+                    'quantity' => $quantity,
+                    'fulfillment_type' => 'FBS',
+                ];
+                $allStocks[$sku]['total'] += $quantity;
+            }
+
+            $count = count($items);
+            $offset += $count;
+            $pages++;
+        } while ($count === $limit && $pages < 20);
+
+        if ($allStocks !== []) {
+            Log::info('WB InventoryApi: seller-warehouses report loaded', [
+                'skus' => count($allStocks),
+                'pages' => $pages,
+            ]);
         }
 
         return array_values($allStocks);

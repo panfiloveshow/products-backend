@@ -125,6 +125,15 @@ class FinanceTransactionSyncer
                     ...$this->fetchAccrualRows($client, $integrationId, $date),
                 ];
             } catch (\Throwable $e) {
+                // by-day доступен только с подпиской Ozon Premium Plus: у магазинов
+                // без неё каждый день отвечает 403, и после миграции 25.08 их
+                // финданные замирали. Падаем на legacy /v3/finance/transaction/list
+                // (жив до 08.09.2026) и помечаем интеграцию для UI-предупреждения.
+                if (str_contains($e->getMessage(), 'HTTP 403')) {
+                    $this->markPremiumPlusRequired($integration, true);
+
+                    return $this->syncLegacyRange($client, $integration, $from, $to);
+                }
                 Log::channel('locality')->error('FinanceTransactionSyncer day failed', [
                     'integration_id' => $integrationId,
                     'date' => $date,
@@ -176,6 +185,128 @@ class FinanceTransactionSyncer
         }
 
         Log::channel('locality')->info('FinanceTransactionSyncer completed', [
+            'integration_id' => $integrationId,
+            'inserted' => $inserted,
+            'updated' => $updated,
+            'skipped' => $skipped,
+        ]);
+
+        $this->markPremiumPlusRequired($integration, false);
+
+        return new SyncResult($inserted, $updated, $skipped);
+    }
+
+    private function markPremiumPlusRequired(Integration $integration, bool $required): void
+    {
+        $settings = is_array($integration->settings) ? $integration->settings : [];
+        if (($settings['ozon_premium_plus_required'] ?? false) === $required) {
+            return;
+        }
+        $settings['ozon_premium_plus_required'] = $required;
+        $integration->forceFill(['settings' => $settings])->save();
+        Log::channel('locality')->info('Ozon Premium Plus flag changed', [
+            'integration_id' => $integration->id,
+            'required' => $required,
+        ]);
+    }
+
+    /**
+     * Legacy-фолбэк: POST /v3/finance/transaction/list (Ozon отключает 08.09.2026).
+     * Для магазинов без Premium Plus это единственный источник финопераций.
+     */
+    private function syncLegacyRange(OzonClient $client, Integration $integration, Carbon $from, Carbon $to): SyncResult
+    {
+        $integrationId = (int) $integration->id;
+        $page = 1;
+        $inserted = 0;
+        $updated = 0;
+        $skipped = 0;
+
+        Log::channel('locality')->info('FinanceTransactionSyncer legacy fallback', [
+            'integration_id' => $integrationId,
+            'from' => $from->toIso8601String(),
+            'to' => $to->toIso8601String(),
+        ]);
+
+        while (true) {
+            $response = $client->post('/v3/finance/transaction/list', [
+                'filter' => [
+                    'date' => [
+                        'from' => $from->toIso8601String(),
+                        'to' => $to->toIso8601String(),
+                    ],
+                    'transaction_type' => 'all',
+                ],
+                'page' => $page,
+                'page_size' => 1000,
+            ]);
+            if (! is_array($response) || isset($response['_error'])) {
+                Log::channel('locality')->error('FinanceTransactionSyncer legacy API error', [
+                    'integration_id' => $integrationId,
+                    'page' => $page,
+                ]);
+                break;
+            }
+
+            $operations = $response['result']['operations'] ?? [];
+            if (empty($operations)) {
+                break;
+            }
+
+            DB::transaction(function () use ($operations, $integrationId, &$inserted, &$updated, &$skipped) {
+                foreach ($operations as $op) {
+                    $operationId = $op['operation_id'] ?? null;
+                    if ($operationId === null) {
+                        $skipped++;
+
+                        continue;
+                    }
+
+                    $posting = $op['posting'] ?? [];
+                    $firstItem = ($op['items'] ?? [])[0] ?? [];
+                    $attrs = [
+                        'integration_id' => $integrationId,
+                        'operation_id' => (string) $operationId,
+                    ];
+                    $values = [
+                        'operation_type' => $op['operation_type'] ?? null,
+                        'operation_type_name' => $op['operation_type_name'] ?? null,
+                        'operation_date' => isset($op['operation_date'])
+                            ? Carbon::parse($op['operation_date'])->toDateTimeString()
+                            : null,
+                        'posting_number' => $posting['posting_number'] ?? null,
+                        'sku' => isset($firstItem['sku']) ? (string) $firstItem['sku'] : null,
+                        'offer_id' => $firstItem['offer_id'] ?? null,
+                        'amount' => (float) ($op['amount'] ?? 0),
+                        'accruals_for_sale' => isset($op['accruals_for_sale']) ? (float) $op['accruals_for_sale'] : null,
+                        'sale_commission' => isset($op['sale_commission']) ? (float) $op['sale_commission'] : null,
+                        'warehouse_id' => $posting['warehouse_id'] ?? null,
+                        'warehouse_name' => $posting['warehouse_name'] ?? null,
+                        'raw' => $op,
+                        'fetched_at' => now(),
+                    ];
+
+                    $existing = OzonFinanceTransaction::query()->where($attrs)->first();
+                    if ($existing === null) {
+                        OzonFinanceTransaction::query()->create(array_merge($attrs, $values));
+                        $inserted++;
+                    } elseif ($existing->fill($values)->isDirty()) {
+                        $existing->save();
+                        $updated++;
+                    } else {
+                        $skipped++;
+                    }
+                }
+            });
+
+            $totalPages = (int) ($response['result']['page_count'] ?? 0);
+            if (($totalPages > 0 && $page >= $totalPages) || count($operations) < 1000) {
+                break;
+            }
+            $page++;
+        }
+
+        Log::channel('locality')->info('FinanceTransactionSyncer legacy completed', [
             'integration_id' => $integrationId,
             'inserted' => $inserted,
             'updated' => $updated,

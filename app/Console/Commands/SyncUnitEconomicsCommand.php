@@ -723,17 +723,17 @@ class SyncUnitEconomicsCommand extends Command
                         }
                     }
 
-                    // Шаг 3: no_sales_28d sweep. Для SKU без ЛЮБЫХ данных ставим 0% —
-                    // user хочет честное «0% (нет продаж за 28 дней)» вместо 100%/85% дефолтов.
-                    // Этот 0% идёт и в юнит-экономику: expectedReturnCost = logistics × 100%
-                    // (нет продаж ⇒ считаем худший сценарий).
+                    // Шаг 3: no_sales_28d sweep. Для SKU без ЛЮБЫХ данных ставим 50% —
+                    // гипотеза «без данных считаем консервативно», как WB-дефолт.
+                    // Ноль (прежнее решение) загонял товары в worst-case возвраты ×3
+                    // и минусовую прибыль; source остаётся no_sales_28d для бейджа.
                     $noSalesCount = 0;
                     foreach ($ozonSkuToOfferIdMap as $ozonSku => $offerId) {
                         if (isset($redemptionData[$offerId]) || isset($redemptionData[$ozonSku])) {
                             continue;
                         }
                         $empty = [
-                            'redemption_rate' => 0,
+                            'redemption_rate' => 50,
                             'orders_count' => 0,
                             'delivered_count' => 0,
                             'cancelled_count' => 0,
@@ -749,7 +749,7 @@ class SyncUnitEconomicsCommand extends Command
                         $noSalesCount++;
                     }
                     if ($noSalesCount > 0) {
-                        $this->info("  Без продаж за 28д: {$noSalesCount} SKU → 0%");
+                        $this->info("  Без продаж за 28д: {$noSalesCount} SKU → 50% (гипотеза)");
                     }
 
                     // Шаг 4: реальные пост-доставочные возвраты (/v1/returns/list).

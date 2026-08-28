@@ -514,6 +514,14 @@ class UnitEconomicsCacheService
             $redemptionSource = 'default';
         }
 
+        // Ozon no_sales_28d: «нет данных» ≠ «выкуп 0%». Ноль загонял товар в
+        // worst-case возвраты ×3 и минусовую прибыль (жалоба 2026-08-25);
+        // считаем гипотезой 50% — как WB-дефолт «без данных консервативно».
+        // Источник остаётся no_sales_28d, фронт продолжает показывать бейдж.
+        if ($marketplace === 'ozon' && $redemptionSource === 'no_sales_28d' && $redemptionRate <= 0) {
+            $redemptionRate = 50.0;
+        }
+
         $redemptionPeriodDays = (int) ($redemption['period_days']
             ?? match ($redemptionSource) {
                 'postings_28d', 'analytics_api_28d', 'no_sales_28d' => 28,

@@ -156,6 +156,20 @@ if ((bool) config('autoplanning.credential_notifications.enabled', true)) {
 // Ротация воронки WB (% выкупа): квота воронки ~час на токен и делится с
 // финсводкой, поэтому каждый час обновляем 2 самых протухших магазина — за
 // сутки очередь обходит все. Смещение :45 — мимо кронов :17 (сток/тарифы).
+// Yandex Market: регулярного синка не было вообще (inventory:sync-scheduled
+// поддерживает только ozon/wb, sync:auto не был зашедулен) — YM-кэши замирали
+// на месяцы. sync:auto уважает sync_interval_hours и running-guard.
+\Illuminate\Support\Facades\Schedule::command('sync:auto --marketplace=yandex_market')
+    ->everyFourHours()
+    ->withoutOverlapping()
+    ->name('ym.auto-sync');
+
+// Сверка ставки «с 28.08» в кэше ЮЭ с официальной таблицей: старые снапшоты
+// затаскивали устаревшие ставки (55 вместо 52) — компенсатор чинит и логирует.
+\Illuminate\Support\Facades\Schedule::command('ozon:verify-upcoming-commissions')
+    ->hourlyAt(20)
+    ->withoutOverlapping();
+
 // Пробник ключей WB/Ozon: помечает credential_health, чтобы syncable-синки
 // не крутили мёртвые токены, а UI показывал «обновите токен».
 \Illuminate\Support\Facades\Schedule::command('integrations:probe-credentials')
