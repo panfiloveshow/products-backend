@@ -374,6 +374,8 @@ class WildberriesClient
      */
     public function post(string $endpoint, array $data = [], string $baseUrl = self::BASE_URL): ?array
     {
+        $this->lastResponseStatus = null;
+        $this->lastRateLimitRetryAfter = null;
         $requestId = uniqid('wb_req_', true);
         $apiName = $this->getApiName($baseUrl);
 
@@ -400,6 +402,7 @@ class WildberriesClient
 
                 $status = $response->status();
                 $body = $response->body();
+                $this->lastResponseStatus = $status;
 
                 Log::info('WB API Response', [
                     'request_id' => $requestId,
@@ -412,18 +415,36 @@ class WildberriesClient
                 ]);
 
                 if ($response->successful()) {
+                    $this->lastRateLimitRetryAfter = null;
+
                     return $response->json();
                 }
 
-                // Retry при 429 (rate limit)
-                if ($status === 429 && $attempt < $maxAttempts) {
-                    $delay = min(2 * pow(2, $attempt - 1), 15);
-                    Log::info('WB API 429 rate limit, retrying', [
-                        'request_id' => $requestId, 'attempt' => $attempt, 'delay_s' => $delay,
-                    ]);
-                    sleep($delay);
+                if ($status === 429) {
+                    $headerDelay = $this->rateLimitRetryAfter($response);
+                    $this->lastRateLimitRetryAfter = $headerDelay ?? 60;
 
-                    continue;
+                    // Короткий лимит можно переждать в текущем воркере. Длинный
+                    // Finance cooldown (до нескольких часов) отдаём очереди,
+                    // чтобы не блокировать worker и не делать бесполезные 2/4с retry.
+                    if ($attempt < $maxAttempts && ($headerDelay === null || $headerDelay <= 15)) {
+                        $delay = max(1, $headerDelay ?? min(2 * pow(2, $attempt - 1), 15));
+                        Log::info('WB API 429 rate limit, retrying', [
+                            'request_id' => $requestId,
+                            'attempt' => $attempt,
+                            'delay_s' => $delay,
+                            'retry_source' => $headerDelay === null ? 'fallback' : 'x-ratelimit-retry',
+                        ]);
+                        sleep($delay);
+
+                        continue;
+                    }
+
+                    Log::info('WB API 429 rate limit deferred to queue', [
+                        'request_id' => $requestId,
+                        'attempt' => $attempt,
+                        'delay_s' => $this->lastRateLimitRetryAfter,
+                    ]);
                 }
 
                 Log::warning('WB API error', [

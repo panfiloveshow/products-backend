@@ -1984,6 +1984,23 @@ class UnitEconomicsCacheService
     }
 
     /**
+     * Единый КС обычных товаров РФ после перехода WB 15.08.2026.
+     *
+     * Строка «Свой склад СГТ РФ» — отдельный тариф для крупногабарита и не может
+     * участвовать в среднем обычного товара. Зарубежные строки также применяются
+     * только при явном совпадении склада товара.
+     */
+    private function wildberriesUnifiedRfCoefficient(array $boxByWarehouse, bool $marketplace): ?float
+    {
+        $unified = $boxByWarehouse[$this->normalizeWildberriesWarehouseName('Свой склад РФ')] ?? null;
+
+        return $this->wildberriesCoefFromSnapshot($unified, $marketplace)
+            // warmWildberriesTariffSnapshotCache синтезирует FBO-поля из
+            // marketplace-полей, но этот фолбэк оставляем для старых снапшотов.
+            ?? $this->wildberriesCoefFromSnapshot($unified, ! $marketplace);
+    }
+
+    /**
      * КС магазина по ФАКТИЧЕСКИМ остаткам — корректный дефолт для товаров без остатка.
      *
      * Берёт средневзвешенный по количеству коэффициент складов, где у селлера реально
@@ -2039,40 +2056,19 @@ class UnitEconomicsCacheService
         $snapshotCache = $this->wildberriesTariffSnapshotCache[$integrationId] ?? ['box_by_warehouse' => []];
         $boxByWarehouse = is_array($snapshotCache['box_by_warehouse'] ?? null) ? $snapshotCache['box_by_warehouse'] : [];
 
-        $coefFromSnapshot = function ($snapshot, bool $marketplace): ?float {
-            if (! $snapshot) {
-                return null;
-            }
-            $payload = is_array($snapshot->payload) ? $snapshot->payload : [];
-            $keys = $marketplace
-                ? ['delivery_marketplace_coef_percent', 'boxDeliveryMarketplaceCoefExpr']
-                : ['delivery_coef_percent', 'boxDeliveryCoefExpr'];
-            foreach ($keys as $k) {
-                $v = $payload[$k] ?? null;
-                if ($v === null || $v === '') {
-                    continue;
-                }
-                $v = is_string($v) ? str_replace(',', '.', $v) : $v;
-                if (is_numeric($v) && (float) $v > 0) {
-                    return (float) $v / 100;
-                }
-            }
-
-            return null;
-        };
-
-        // Средний КС магазина — разумный дефолт для товаров без остатка.
-        // На схемах продавца усредняем коэффициент схемы «Маркетплейс»: склада
-        // продавца в тарифах WB нет, а FBO-коэффициент к FBS-логистике не относится.
+        // После унификации WB обычный товар РФ без точного совпадения склада
+        // должен брать «Свой склад РФ», а не среднее с СГТ/СНГ. До появления
+        // единой строки сохраняем прежний средний фолбэк.
         $wantsMarketplaceCoef = in_array(strtoupper($scheme), ['FBS', 'DBS', 'EDBS', 'DBW'], true);
         $allCoefs = [];
         foreach ($boxByWarehouse as $snap) {
-            $c = $coefFromSnapshot($snap, $wantsMarketplaceCoef);
+            $c = $this->wildberriesCoefFromSnapshot($snap, $wantsMarketplaceCoef);
             if ($c !== null) {
                 $allCoefs[] = $c;
             }
         }
-        $integrationAvgCoef = $allCoefs !== [] ? array_sum($allCoefs) / count($allCoefs) : 1.0;
+        $integrationAvgCoef = $this->wildberriesUnifiedRfCoefficient($boxByWarehouse, $wantsMarketplaceCoef)
+            ?? ($allCoefs !== [] ? array_sum($allCoefs) / count($allCoefs) : 1.0);
         // Дефолт для товара без остатка — КС магазина по фактическим остаткам, а не
         // среднее по всем складам WB (оно завышено зарубежными/удалёнными складами).
         $noStockDefaultCoef = $this->getIntegrationStockWeightedCoefficient($integrationId, $integrationAvgCoef);
@@ -2105,7 +2101,7 @@ class UnitEconomicsCacheService
             }
             $isMarketplace = in_array(strtoupper((string) ($w['fulfillment_type'] ?? '')), ['FBS', 'DBW', 'DBS', 'EDBS'], true);
             $snap = $boxByWarehouse[$this->normalizeWildberriesWarehouseName($name)] ?? null;
-            $coef = $coefFromSnapshot($snap, $isMarketplace) ?? $integrationAvgCoef;
+            $coef = $this->wildberriesCoefFromSnapshot($snap, $isMarketplace) ?? $integrationAvgCoef;
             $weightedSum += $coef * $qty;
             $totalQuantity += $qty;
             $details[] = [
@@ -2222,37 +2218,17 @@ class UnitEconomicsCacheService
         $snapshotCache = $this->wildberriesTariffSnapshotCache[$integration->id] ?? ['box_by_warehouse' => []];
         $boxByWarehouse = is_array($snapshotCache['box_by_warehouse'] ?? null) ? $snapshotCache['box_by_warehouse'] : [];
 
-        $coefFromSnapshot = function ($snapshot, bool $marketplace): ?float {
-            if (! $snapshot) {
-                return null;
-            }
-            $payload = is_array($snapshot->payload) ? $snapshot->payload : [];
-            $keys = $marketplace
-                ? ['delivery_marketplace_coef_percent', 'boxDeliveryMarketplaceCoefExpr']
-                : ['delivery_coef_percent', 'boxDeliveryCoefExpr'];
-            foreach ($keys as $k) {
-                $v = $payload[$k] ?? null;
-                if ($v === null || $v === '') {
-                    continue;
-                }
-                $v = is_string($v) ? str_replace(',', '.', $v) : $v;
-                if (is_numeric($v) && (float) $v > 0) {
-                    return (float) $v / 100;
-                }
-            }
-
-            return null;
-        };
-
-        // Средний КС магазина — разумный дефолт для товаров без остатка (вместо молчаливых 100%).
+        // После унификации РФ дефолт — строго «Свой склад РФ». СГТ и зарубежные
+        // тарифы используются только при явном совпадении склада товара.
         $allCoefs = [];
         foreach ($boxByWarehouse as $snap) {
-            $c = $coefFromSnapshot($snap, false);
+            $c = $this->wildberriesCoefFromSnapshot($snap, false);
             if ($c !== null) {
                 $allCoefs[] = $c;
             }
         }
-        $integrationAvgCoef = $allCoefs !== [] ? array_sum($allCoefs) / count($allCoefs) : 1.0;
+        $integrationAvgCoef = $this->wildberriesUnifiedRfCoefficient($boxByWarehouse, false)
+            ?? ($allCoefs !== [] ? array_sum($allCoefs) / count($allCoefs) : 1.0);
         // Дефолт для товаров без остатка — КС магазина по фактическим остаткам
         // (синхронно с resolveWildberriesWarehouseBreakdown).
         $noStockDefaultCoef = $this->getIntegrationStockWeightedCoefficient((int) $integration->id, $integrationAvgCoef);
@@ -2277,7 +2253,7 @@ class UnitEconomicsCacheService
                 }
                 $isMarketplace = in_array(strtoupper((string) ($w['fulfillment_type'] ?? '')), ['FBS', 'DBW', 'DBS', 'EDBS'], true);
                 $snap = $boxByWarehouse[$this->normalizeWildberriesWarehouseName($name)] ?? null;
-                $coef = $coefFromSnapshot($snap, $isMarketplace) ?? $integrationAvgCoef;
+                $coef = $this->wildberriesCoefFromSnapshot($snap, $isMarketplace) ?? $integrationAvgCoef;
                 $weightedSum += $coef * $qty;
                 $totalQuantity += $qty;
             }

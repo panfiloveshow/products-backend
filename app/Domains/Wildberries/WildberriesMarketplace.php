@@ -12,6 +12,7 @@ use App\Domains\Wildberries\Api\SalesApi;
 use App\Domains\Wildberries\Api\StorageApi;
 use App\Domains\Wildberries\Api\SuppliesApi;
 use App\Domains\Wildberries\Api\WildberriesClient;
+use App\Domains\Wildberries\Tariffs\FbsOfficeGeoMatcher;
 use App\Jobs\SyncInventoryJob;
 use App\Models\Integration;
 use App\Services\Marketplace\MarketplaceInterface as LegacyMarketplaceInterface;
@@ -746,6 +747,14 @@ class WildberriesMarketplace implements LegacyMarketplaceInterface, MarketplaceI
     }
 
     /**
+     * Единый снимок хранения и эквайринга из одного Finance-отчёта.
+     */
+    public function getStorageAndAcquiringBySku(int $weeks = 4): array
+    {
+        return $this->realizationReport->getStorageAndAcquiringBySku($weeks);
+    }
+
+    /**
      * Фактический эквайринг по SKU из отчёта реализации.
      *
      * @return array{by_sku: array<string,float>, avg: float}
@@ -855,7 +864,7 @@ class WildberriesMarketplace implements LegacyMarketplaceInterface, MarketplaceI
             if ($officeName === '') {
                 continue;
             }
-            $match = \App\Domains\Wildberries\Tariffs\FbsOfficeGeoMatcher::match($officeName, $tariffs);
+            $match = FbsOfficeGeoMatcher::match($officeName, $tariffs);
             if ($match !== null) {
                 $resolved[] = ['office_name' => $officeName, 'geo_name' => $match['geo_name']];
             }

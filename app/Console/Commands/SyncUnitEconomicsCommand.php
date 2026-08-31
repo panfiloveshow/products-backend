@@ -29,6 +29,7 @@ use App\Services\Ozon\OzonSupplySyncService;
 use App\Services\PostingService;
 use App\Services\SellicoApiService;
 use App\Services\UnitEconomicsService;
+use App\Services\Wildberries\WildberriesAcquiringSnapshotStore;
 use Illuminate\Console\Command;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Cache;
@@ -826,6 +827,7 @@ class SyncUnitEconomicsCommand extends Command
         $wbLocalizationByNmId = [];
         $wbCommissionsData = [];
         $existingWbSppBySku = collect();
+        $hasFreshWbAcquiring = false;
 
         if ($marketplace === 'wildberries') {
             // При временной недоступности обоих источников СПП не имеем права
@@ -836,6 +838,22 @@ class SyncUnitEconomicsCommand extends Command
                 ->selectRaw('sku, MAX(spp_percent) as spp_percent')
                 ->groupBy('sku')
                 ->pluck('spp_percent', 'sku');
+
+            // Storage job уже получает тот же Finance-отчёт. Если снимок свежий,
+            // используем его и не делаем второй запрос, который раньше получал 429.
+            $acquiringStore = app(WildberriesAcquiringSnapshotStore::class);
+            $persistedAcquiring = $acquiringStore->loadFresh($integrationId);
+            $hasFreshWbAcquiring = (bool) ($persistedAcquiring['is_fresh'] ?? false);
+            if ($hasFreshWbAcquiring) {
+                foreach (($persistedAcquiring['by_sku'] ?? []) as $acqKey => $acqPct) {
+                    $acquiringData[(string) $acqKey] = [
+                        'acquiring_percent' => (float) $acqPct,
+                        'observed_at' => $persistedAcquiring['observed_at'] ?? null,
+                    ];
+                }
+                $integrationSettings['wb_acquiring_avg'] = (float) ($persistedAcquiring['avg'] ?? 0);
+                $integrationSettings['wb_acquiring_observed_at'] = $persistedAcquiring['observed_at'] ?? null;
+            }
 
             try {
                 $wbApiKey = null;
@@ -1029,28 +1047,33 @@ class SyncUnitEconomicsCommand extends Command
                     // === ЭКВАЙРИНГ ПО ФАКТУ (отчёт реализации) ===
                     // acquiring_fee / выручка по каждому SKU. Заменяет дефолт 1.5%.
                     // Отчёт жёстко лимитирован (429) — getAcquiringBySku ретраит внутри.
-                    try {
-                        $wbAcquiring = $wbService->getAcquiringBySku(4);
-                        $wbAcquiringAvg = (float) ($wbAcquiring['avg'] ?? 0);
-                        foreach (($wbAcquiring['by_sku'] ?? []) as $acqKey => $acqPct) {
-                            $acquiringData[(string) $acqKey] = [
-                                'acquiring_percent' => (float) $acqPct,
-                                'observed_at' => $wbAcquiring['observed_at'] ?? null,
-                            ];
+                    if ($hasFreshWbAcquiring) {
+                        $this->info('  WB Эквайринг: свежий снимок Finance переиспользован без повторного API-запроса');
+                    } else {
+                        try {
+                            $wbAcquiring = $wbService->getAcquiringBySku(4);
+                            $wbAcquiringAvg = (float) ($wbAcquiring['avg'] ?? 0);
+                            foreach (($wbAcquiring['by_sku'] ?? []) as $acqKey => $acqPct) {
+                                $acquiringData[(string) $acqKey] = [
+                                    'acquiring_percent' => (float) $acqPct,
+                                    'observed_at' => $wbAcquiring['observed_at'] ?? null,
+                                ];
+                            }
+                            // Успешный прямой запуск тоже сохраняет снимок: следующий
+                            // sync в течение TTL не расходует Finance-лимит повторно.
+                            if (! empty($wbAcquiring['observed_at'])) {
+                                $acquiringStore->persist($integrationId, $wbAcquiring);
+                                $integrationSettings['wb_acquiring_avg'] = $wbAcquiringAvg;
+                                $integrationSettings['wb_acquiring_observed_at'] = $wbAcquiring['observed_at'];
+                            }
+                            if (! empty($wbAcquiring['by_sku'])) {
+                                $this->info('  WB Эквайринг (отчёт реализации): '.count($wbAcquiring['by_sku']).' SKU, средний '.$wbAcquiringAvg.'%');
+                            } else {
+                                $this->warn('  WB Эквайринг: отчёт реализации недоступен или пуст — оставляем текущие значения');
+                            }
+                        } catch (\Throwable $acqEx) {
+                            $this->warn('  WB Эквайринг: '.$acqEx->getMessage());
                         }
-                        // Средний по магазину — фолбэк для товаров без продаж за период.
-                        // Кладём в settings, чтобы он дошёл до buildCalculationData.
-                        if ($wbAcquiringAvg > 0) {
-                            $integrationSettings['wb_acquiring_avg'] = $wbAcquiringAvg;
-                            $integrationSettings['wb_acquiring_observed_at'] = $wbAcquiring['observed_at'] ?? null;
-                        }
-                        if (! empty($wbAcquiring['by_sku'])) {
-                            $this->info('  WB Эквайринг (отчёт реализации): '.count($wbAcquiring['by_sku']).' SKU, средний '.$wbAcquiringAvg.'%');
-                        } else {
-                            $this->warn('  WB Эквайринг: отчёт реализации недоступен (вероятно 429) — оставляем текущие значения');
-                        }
-                    } catch (\Throwable $acqEx) {
-                        $this->warn('  WB Эквайринг: '.$acqEx->getMessage());
                     }
                 } else {
                     $this->warn('  Нет credentials для WB API');
