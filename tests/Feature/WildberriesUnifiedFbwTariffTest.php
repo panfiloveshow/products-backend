@@ -75,6 +75,28 @@ class WildberriesUnifiedFbwTariffTest extends TestCase
             'fetched_at' => '2026-08-18 05:30:00',
         ]);
 
+        // СГТ — отдельный тариф. Он не должен попадать в средний фолбэк обычных
+        // FBO/FBS товаров, если у товара нет явного признака СГТ.
+        WildberriesTariffSnapshot::create([
+            'integration_id' => self::INTEGRATION_ID,
+            'marketplace' => 'wildberries',
+            'tariff_type' => 'box',
+            'effective_date' => '2026-08-18',
+            'warehouse_id' => 'name:unified-sgt',
+            'warehouse_name' => 'Свой склад СГТ РФ',
+            'payload' => [
+                'warehouse_name' => 'Свой склад СГТ РФ',
+                'geo_name' => 'Россия',
+                'delivery_base' => 0,
+                'delivery_liter' => 0,
+                'delivery_coef_percent' => 0,
+                'delivery_marketplace_base' => 46.0,
+                'delivery_marketplace_liter' => 14.0,
+                'delivery_marketplace_coef_percent' => 100,
+            ],
+            'fetched_at' => '2026-08-18 05:30:00',
+        ]);
+
         // Зарубежный склад остаётся в новом формате с FBO-полями — не перезаписывается.
         WildberriesTariffSnapshot::create([
             'integration_id' => self::INTEGRATION_ID,
@@ -154,5 +176,43 @@ class WildberriesUnifiedFbwTariffTest extends TestCase
 
         $this->assertSame('wildberries_tariff_snapshots_fbs_unified', $breakdown['source']);
         $this->assertEqualsWithDelta(78.2, (float) $breakdown['box']['delivery_marketplace_base'], 0.001);
+    }
+
+    public function test_warehouse_breakdown_uses_unified_170_for_unknown_rf_fbo_warehouse(): void
+    {
+        $this->seedSnapshots();
+
+        $service = new UnitEconomicsCacheService(
+            $this->createMock(UnitEconomicsOrchestrator::class)
+        );
+        $breakdown = $service->resolveWildberriesWarehouseBreakdown(self::INTEGRATION_ID, [
+            'stock_warehouses' => [[
+                'warehouse_name' => 'Электросталь',
+                'quantity' => 10,
+                'fulfillment_type' => 'FBO',
+            ]],
+        ], 'FBO');
+
+        $this->assertSame(170.0, $breakdown['percent']);
+        $this->assertSame(170.0, $breakdown['details'][0]['coefficient']);
+    }
+
+    public function test_warehouse_breakdown_does_not_average_sgt_into_fbs_fallback(): void
+    {
+        $this->seedSnapshots();
+
+        $service = new UnitEconomicsCacheService(
+            $this->createMock(UnitEconomicsOrchestrator::class)
+        );
+        $breakdown = $service->resolveWildberriesWarehouseBreakdown(self::INTEGRATION_ID, [
+            'stock_warehouses' => [[
+                'warehouse_name' => 'Мой склад',
+                'quantity' => 5,
+                'fulfillment_type' => 'FBS',
+            ]],
+        ], 'FBS');
+
+        $this->assertSame(170.0, $breakdown['percent']);
+        $this->assertSame(170.0, $breakdown['integration_avg'] * 100);
     }
 }
