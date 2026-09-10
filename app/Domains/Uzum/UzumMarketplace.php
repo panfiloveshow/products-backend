@@ -170,8 +170,11 @@ class UzumMarketplace implements MarketplaceInterface
     private function mapSkuToProduct(array $card, array $sku, int $shopId): ?array
     {
         $skuId = $sku['skuId'] ?? null;
-        $code = $sku['sellerItemCode'] ?? $sku['article'] ?? ($skuId !== null ? (string) $skuId : null);
-        if (! $code) {
+        // trim обязателен: продавцы вводят артикул с ведущим/хвостовым пробелом,
+        // и без нормализации синк создавал дубль-строку, а старая замерзала
+        // с протухшей ценой («в селике 13670, по факту 13810», int 78/93).
+        $code = trim((string) ($sku['sellerItemCode'] ?? $sku['article'] ?? ($skuId !== null ? (string) $skuId : '')));
+        if ($code === '') {
             return null;
         }
 
@@ -182,7 +185,7 @@ class UzumMarketplace implements MarketplaceInterface
 
         return [
             'sku' => (string) $code,
-            'vendor_code' => isset($sku['article']) ? (string) $sku['article'] : null,
+            'vendor_code' => isset($sku['article']) ? trim((string) $sku['article']) : null,
             'marketplace_id' => $skuId !== null ? (string) $skuId : null,
             // Реальное название товара: productTitle/card.title (описательное),
             // фолбэк на skuFullTitle (код «НБК-…»). sku остаётся артикулом (sellerItemCode).
