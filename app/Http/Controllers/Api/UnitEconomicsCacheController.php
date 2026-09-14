@@ -50,7 +50,7 @@ use Symfony\Component\HttpFoundation\StreamedResponse;
  */
 class UnitEconomicsCacheController extends Controller
 {
-    public const EXPORT_TEMPLATE_VERSION = '2026-08-26-05';
+    public const EXPORT_TEMPLATE_VERSION = '2026-09-14-01';
 
     private const EXPORT_TEMPLATE_FORMAT = 'v2';
 
@@ -1760,13 +1760,14 @@ class UnitEconomicsCacheController extends Controller
         $sheet->setCellValue("Z{$r}",  "=F{$r}*Y{$r}/100");
         $sheet->setCellValue("AB{$r}", "=F{$r}*AA{$r}/100");
         $sheet->setCellValue("AD{$r}", "=F{$r}*AC{$r}/100");
-        $sheet->setCellValue("AF{$r}", "=AG{$r}*AE{$r}/100");
-        $sheet->setCellValue("AG{$r}", "=X{$r}-E{$r}");
+        // Наша часть — % от ЦЕНЫ (F), не от прибыли, и вычитается из прибыли.
+        $sheet->setCellValue("AF{$r}", "=F{$r}*AE{$r}/100");
+        $sheet->setCellValue("AG{$r}", "=X{$r}-E{$r}-AF{$r}");
         $sheet->setCellValue("AH{$r}", "=IF(F{$r}>0,AG{$r}/F{$r}*100,0)");
         $sheet->setCellValue(
             "AI{$r}",
-            "=IF((1-(I{$r}+U{$r}+Y{$r}+AA{$r})/100-\$E\$3/100)>0,"
-            . "(R{$r}+S{$r}+T{$r}+E{$r})/(1-(I{$r}+U{$r}+Y{$r}+AA{$r})/100-\$E\$3/100),\"\")"
+            "=IF((1-(I{$r}+U{$r}+Y{$r}+AA{$r}+AE{$r})/100-\$E\$3/100)>0,"
+            . "(R{$r}+S{$r}+T{$r}+E{$r})/(1-(I{$r}+U{$r}+Y{$r}+AA{$r}+AE{$r})/100-\$E\$3/100),\"\")"
         );
     }
 
@@ -3677,7 +3678,10 @@ class UnitEconomicsCacheController extends Controller
         $taxAmount = round(($taxBasePrice > 0 ? $taxBasePrice : $price) * (float) ($data['tax_percent'] ?? 0) / 100, 2);
         // НДС и «наша часть» — только Ozon; у WB их нет.
         $vatAmount = $isWb ? 0.0 : round($price * (float) ($data['vat_percent'] ?? 0) / 100, 2);
-        $ourShareAmount = $isWb ? 0.0 : round($price * (float) ($data['our_share_percent'] ?? 0) / 100, 2);
+        // «Наша часть» — процент от выручки (цены) и для WB тоже: раньше WB
+        // жёстко получал 0 (в прибыли не участвовала), а Excel считал её от
+        // прибыли — жалоба клиента 2026-09-14.
+        $ourShareAmount = round($price * (float) ($data['our_share_percent'] ?? 0) / 100, 2);
 
         $toSettlement = round(
             $price - $commissionAmount - $effectiveLogistics - $acquiringAmount - $storageCost
