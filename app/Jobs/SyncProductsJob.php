@@ -474,10 +474,6 @@ class SyncProductsJob implements ShouldBeUnique, ShouldQueue
             if (empty($updateData['old_price']) && ! empty($existingProduct->old_price)) {
                 unset($updateData['old_price']);
             }
-            // card.wb.ru отвалился (403/таймаут) — не затираем прошлую цену покупателя
-            if (empty($updateData['buyer_price']) && ! empty($existingProduct->buyer_price)) {
-                unset($updateData['buyer_price']);
-            }
 
             if ($integrationChanged) {
                 Log::warning('Rebinding product to current integration during sync', [
@@ -642,7 +638,6 @@ class SyncProductsJob implements ShouldBeUnique, ShouldQueue
             'vendor_code',
             'price',
             'old_price',
-            'buyer_price',
             'stock',
             'barcode',
             'description',
