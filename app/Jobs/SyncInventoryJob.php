@@ -181,6 +181,14 @@ class SyncInventoryJob implements ShouldBeUnique, ShouldQueue
                 ]);
                 $this->syncLog->complete(0, 0);
 
+                // Пустой инвентарь — не повод пропускать юнит-экономику: у Uzum
+                // склады не приходят никогда, и новый магазин оставался без кэша
+                // ЮЭ до ночного прогона («в товарах есть, в юните нет»).
+                if ($this->syncLog->integration_id) {
+                    SyncUnitEconomicsJob::dispatch((int) $this->syncLog->integration_id)
+                        ->onQueue('unit-economics');
+                }
+
                 return;
             }
 

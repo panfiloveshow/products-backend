@@ -2778,6 +2778,10 @@ class UnitEconomicsCacheController extends Controller
         // Uzum seller API не отдаёт — только эту группу; логистику считает у себя.
         if ($cache->marketplace === 'uzum') {
             $data['dimensional_group'] = $product?->uzum_data['dimensional_group'] ?? null;
+            // ID товара/SKU Uzum: по артикулу продавца в кабинете искать нельзя,
+            // менеджерам нужен идентификатор Uzum рядом с артикулом.
+            $data['uzum_product_id'] = $product?->uzum_data['product_id'] ?? null;
+            $data['uzum_sku_id'] = $product?->uzum_data['sku_id'] ?? $product?->marketplace_id ?? null;
         }
 
         // Добавляем поля для совместимости с v1

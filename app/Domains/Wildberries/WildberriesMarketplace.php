@@ -166,6 +166,14 @@ class WildberriesMarketplace implements LegacyMarketplaceInterface, MarketplaceI
             'sample_keys' => array_slice(array_keys($prices), 0, 5),
         ]);
 
+        // Цена покупателя на витрине (после СПП) — из публичного card.wb.ru.
+        // Официальный Prices API отдаёт только цену продавца.
+        $buyerPrices = ! empty($nmIds) ? $this->card->getBuyerPricesByNmIds(array_values($nmIds)) : [];
+
+        Log::info('WB Marketplace: Buyer prices loaded', [
+            'count' => count($buyerPrices),
+        ]);
+
         // Получаем рейтинги карточек через официальный WB Analytics API
         // productRating = рейтинг карточки (качество заполнения, 0-10)
         // feedbackRating = рейтинг по отзывам (0-5)
@@ -224,12 +232,12 @@ class WildberriesMarketplace implements LegacyMarketplaceInterface, MarketplaceI
         // Маппинг WB cards к формату Product модели с обогащением ценами и остатками.
         // Для WB SKU в проекте — barcode, поэтому одна карточка может дать несколько Product.
         return collect($cards)
-            ->flatMap(fn ($card) => $this->mapCardToProducts($card, $commissionsByCategory, $prices, $stocks, $cardRatings, $sppByNmId))
+            ->flatMap(fn ($card) => $this->mapCardToProducts($card, $commissionsByCategory, $prices, $stocks, $cardRatings, $sppByNmId, $buyerPrices))
             ->values()
             ->all();
     }
 
-    private function mapCardToProducts(array $card, array $commissionsByCategory = [], array $prices = [], array $stocks = [], array $ratings = [], array $sppByNmId = []): array
+    private function mapCardToProducts(array $card, array $commissionsByCategory = [], array $prices = [], array $stocks = [], array $ratings = [], array $sppByNmId = [], array $buyerPrices = []): array
     {
         $sizes = $card['sizes'] ?? [];
         $sizeEntries = [];
@@ -253,7 +261,7 @@ class WildberriesMarketplace implements LegacyMarketplaceInterface, MarketplaceI
         }
 
         return array_map(
-            fn (array $sizeEntry) => $this->mapCardToProduct($card, $commissionsByCategory, $prices, $stocks, $ratings, $sppByNmId, $sizeEntry),
+            fn (array $sizeEntry) => $this->mapCardToProduct($card, $commissionsByCategory, $prices, $stocks, $ratings, $sppByNmId, $buyerPrices, $sizeEntry),
             $sizeEntries
         );
     }
@@ -262,7 +270,7 @@ class WildberriesMarketplace implements LegacyMarketplaceInterface, MarketplaceI
      * Маппинг WB карточки к формату Product модели
      * Аналогично Ozon сохраняем все данные API в wb_data
      */
-    private function mapCardToProduct(array $card, array $commissionsByCategory = [], array $prices = [], array $stocks = [], array $ratings = [], array $sppByNmId = [], ?array $sizeEntry = null): array
+    private function mapCardToProduct(array $card, array $commissionsByCategory = [], array $prices = [], array $stocks = [], array $ratings = [], array $sppByNmId = [], array $buyerPrices = [], ?array $sizeEntry = null): array
     {
         // Извлекаем габариты из sizes[0].dimensions или characteristics
         $dimensions = $this->extractDimensions($card);
@@ -380,6 +388,7 @@ class WildberriesMarketplace implements LegacyMarketplaceInterface, MarketplaceI
             'category' => $card['subjectName'] ?? '',
             'price' => $price,
             'old_price' => ($oldPrice !== null && $price !== null && $oldPrice > $price) ? $oldPrice : null,
+            'buyer_price' => $buyerPrices[(string) $nmId] ?? null, // что видит покупатель (после СПП)
             'stock' => $stock,
             'rating' => $rating,
             'reviews_count' => $reviewsCount,

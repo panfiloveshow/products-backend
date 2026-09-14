@@ -61,7 +61,7 @@ class YandexMarketUnitEconomicsCalculator implements UnitEconomicsCalculatorInte
                 $input->fulfillmentType,
                 $volume,
                 $weight,
-                ['own_delivery_cost' => $input->ownDeliveryCost ?? 0]
+                ['own_delivery_cost' => $input->ownDeliveryCost ?? 0, 'price' => $price]
             );
         }
 

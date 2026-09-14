@@ -55,6 +55,11 @@ class YandexMarketTariffs implements TariffsProviderInterface
      */
     private const RETURN_PROCESSING_FEE = 50.0;
 
+    // «Доставка покупателю» (фолбэк без tariffs/calculate): % от цены + за литраж.
+    private const DELIVERY_PRICE_PERCENT = 5.0;
+    private const DELIVERY_FIRST_LITER = 92.0;
+    private const DELIVERY_NEXT_LITER = 8.0;
+
     /**
      * Тариф хранения FBY (₽ за литр в день)
      */
@@ -112,17 +117,32 @@ class YandexMarketTariffs implements TariffsProviderInterface
      */
     public function calculateLogisticsCost(string $scheme, float $volume, float $weight, array $options = []): float
     {
-        // Yandex Market использует вес (объёмный или фактический, что больше)
-        $volumetricWeight = $volume / 5; // 1 литр = 0.2 кг объёмного веса
-        $calculatedWeight = max($weight, $volumetricWeight);
+        // Актуальная модель YM «Доставка покупателю»: процент от цены + плата за
+        // литраж (первый литр дороже, каждый следующий дешевле). Старые весовые
+        // таблицы (фикс ~130 ₽) не совпадали с фактическими списаниями продавца.
+        // Это фолбэк: приоритетный источник — фактические тарифы из
+        // POST /v2/tariffs/calculate (tariffBreakdown), считается только без них.
+        $price = (float) ($options['price'] ?? 0);
 
         return match (strtoupper($scheme)) {
-            'FBY' => $this->calculateFbyLogistics($calculatedWeight),
-            'FBS' => $this->calculateFbsLogistics($calculatedWeight),
+            'FBY', 'FBS' => $this->calculateDeliveryToCustomer($price, $volume),
             'DBS' => $options['own_delivery_cost'] ?? 0,
-            'EXPRESS' => $this->calculateExpressLogistics($calculatedWeight),
+            'EXPRESS' => $this->calculateDeliveryToCustomer($price, $volume) * 1.5,
             default => 0,
         };
+    }
+
+    /**
+     * «Доставка покупателю» YM: 5% от цены + 92 ₽ за первый литр + 8 ₽ за каждый
+     * следующий (литраж округляется вверх; минимум один литр).
+     */
+    private function calculateDeliveryToCustomer(float $price, float $volume): float
+    {
+        $liters = max(1, (int) ceil($volume));
+        $percentPart = $price * (self::DELIVERY_PRICE_PERCENT / 100);
+        $literPart = self::DELIVERY_FIRST_LITER + self::DELIVERY_NEXT_LITER * ($liters - 1);
+
+        return round($percentPart + $literPart, 2);
     }
 
     /**

@@ -366,7 +366,7 @@ class YandexMarketMarketplace implements MarketplaceInterface
             'stock' => 0, // Остатки получаем отдельно и обогащаем потом
             'description' => $offer['description'] ?? null,
             'images' => $offer['pictures'] ?? $offer['urls'] ?? [],
-            'category' => $offer['category'] ?? $mapping['categoryId'] ?? null,
+            'category' => $offer['category'] ?? $mapping['marketCategoryName'] ?? $mapping['marketCategoryId'] ?? $mapping['categoryId'] ?? null,
             'brand' => $offer['vendor'] ?? null,
             'rating' => null,
             'reviews_count' => 0,
@@ -384,7 +384,9 @@ class YandexMarketMarketplace implements MarketplaceInterface
                 'offerId' => $offer['offerId'] ?? null,
                 'shopSku' => $offer['shopSku'] ?? null,
                 'marketSku' => $mapping['marketSku'] ?? null,
-                'categoryId' => $mapping['categoryId'] ?? null,
+                // API отдаёт marketCategoryId (старое categoryId давно не приходит) —
+                // без него /v2/tariffs/calculate не считает и тарифы были пустыми.
+                'categoryId' => $mapping['marketCategoryId'] ?? $mapping['categoryId'] ?? null,
                 'modelId' => $mapping['modelId'] ?? null,
                 'vendorCode' => $offer['vendorCode'] ?? null,
                 'availability' => $offer['availability'] ?? null,
