@@ -22,6 +22,7 @@ class Product extends Model
         'barcode',
         'price',
         'old_price',
+        'buyer_price',
         'cost_price',
         'stock',
         'depth',
@@ -50,6 +51,7 @@ class Product extends Model
     protected $casts = [
         'price' => 'decimal:2',
         'old_price' => 'decimal:2',
+        'buyer_price' => 'decimal:2',
         'stock' => 'integer',
         'rating' => 'decimal:2',
         'reviews_count' => 'integer',
