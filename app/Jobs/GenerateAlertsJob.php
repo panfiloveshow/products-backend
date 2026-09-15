@@ -55,15 +55,23 @@ class GenerateAlertsJob implements ShouldQueue
         // Одной выборкой тянем все уже существующие активные алерты по данным SKU+warehouse_id.
         $skus = $warehouses->pluck('sku')->filter()->unique()->all();
         $warehouseIds = $warehouses->pluck('warehouse_id')->filter()->unique()->all();
-        $existingKeys = InventoryAlert::query()
-            ->whereIn('integration_id', $warehouses->pluck('integration_id')->filter()->unique()->all())
-            ->whereIn('sku', $skus)
-            ->whereIn('warehouse_id', $warehouseIds)
-            ->where('type', $alertType)
-            ->where('is_resolved', false)
-            ->get(['integration_id', 'sku', 'warehouse_id'])
-            ->map(fn ($row) => $row->integration_id.'||'.$row->sku.'||'.$row->warehouse_id)
-            ->flip(); // flip → O(1) проверка через isset
+        // SKU чанками: на больших каталогах суммарные биндинги whereIn
+        // превышали лимит Postgres 65535 и джоб падал (PDO HY000).
+        $existingKeys = collect();
+        $integrationIds = $warehouses->pluck('integration_id')->filter()->unique()->all();
+        foreach (array_chunk($skus, 5000) as $skuChunk) {
+            $existingKeys = $existingKeys->merge(
+                InventoryAlert::query()
+                    ->whereIn('integration_id', $integrationIds)
+                    ->whereIn('sku', $skuChunk)
+                    ->whereIn('warehouse_id', $warehouseIds)
+                    ->where('type', $alertType)
+                    ->where('is_resolved', false)
+                    ->get(['integration_id', 'sku', 'warehouse_id'])
+                    ->map(fn ($row) => $row->integration_id.'||'.$row->sku.'||'.$row->warehouse_id)
+            );
+        }
+        $existingKeys = $existingKeys->flip(); // flip → O(1) проверка через isset
 
         $created = 0;
         foreach ($warehouses as $warehouse) {
@@ -112,12 +120,18 @@ class GenerateAlertsJob implements ShouldQueue
         $warehouseIds = $activeAlerts->pluck('warehouse_id')->filter()->unique()->all();
 
         // Ключ "{sku}||{warehouse_id}" → stock_status.
-        $warehouseStatus = InventoryWarehouse::query()
-            ->whereIn('integration_id', $activeAlerts->pluck('integration_id')->filter()->unique()->all())
-            ->whereIn('sku', $skus)
-            ->whereIn('warehouse_id', $warehouseIds)
-            ->get(['integration_id', 'sku', 'warehouse_id', 'stock_status'])
-            ->mapWithKeys(fn ($row) => [$row->integration_id.'||'.$row->sku.'||'.$row->warehouse_id => $row->stock_status]);
+        $warehouseStatus = collect();
+        $alertIntegrationIds = $activeAlerts->pluck('integration_id')->filter()->unique()->all();
+        foreach (array_chunk($skus, 5000) as $skuChunk) {
+            $warehouseStatus = $warehouseStatus->union(
+                InventoryWarehouse::query()
+                    ->whereIn('integration_id', $alertIntegrationIds)
+                    ->whereIn('sku', $skuChunk)
+                    ->whereIn('warehouse_id', $warehouseIds)
+                    ->get(['integration_id', 'sku', 'warehouse_id', 'stock_status'])
+                    ->mapWithKeys(fn ($row) => [$row->integration_id.'||'.$row->sku.'||'.$row->warehouse_id => $row->stock_status])
+            );
+        }
 
         foreach ($activeAlerts as $alert) {
             $key = $alert->integration_id.'||'.$alert->sku.'||'.$alert->warehouse_id;
