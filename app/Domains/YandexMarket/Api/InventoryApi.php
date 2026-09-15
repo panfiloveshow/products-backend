@@ -62,7 +62,7 @@ class InventoryApi implements InventoryApiInterface
 
         do {
             $query = array_filter([
-                'limit' => 200,
+                'limit' => 100, // YM с 04.08.2026: max limit = 100 (был 200)
                 'page_token' => $pageToken,
             ]);
 
