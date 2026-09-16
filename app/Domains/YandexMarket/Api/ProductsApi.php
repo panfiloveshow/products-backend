@@ -72,7 +72,7 @@ class ProductsApi implements ProductsApiInterface
         $pageToken = null;
 
         do {
-            $params = ['limit' => 200];
+            $params = ['limit' => 100];
             if ($pageToken) {
                 $params['page_token'] = $pageToken;
             }
@@ -147,7 +147,7 @@ class ProductsApi implements ProductsApiInterface
      */
     public function getPricesWithPagination(?string $pageToken = null): array
     {
-        $params = ['limit' => 200];
+        $params = ['limit' => 100];
         if ($pageToken) {
             $params['page_token'] = $pageToken;
         }

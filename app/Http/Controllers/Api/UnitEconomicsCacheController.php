@@ -50,7 +50,7 @@ use Symfony\Component\HttpFoundation\StreamedResponse;
  */
 class UnitEconomicsCacheController extends Controller
 {
-    public const EXPORT_TEMPLATE_VERSION = '2026-08-26-05';
+    public const EXPORT_TEMPLATE_VERSION = '2026-09-16-01';
 
     private const EXPORT_TEMPLATE_FORMAT = 'v2';
 
@@ -1756,17 +1756,19 @@ class UnitEconomicsCacheController extends Controller
         $sheet->setCellValue("R{$r}",  "=N{$r}+Q{$r}");
         $sheet->setCellValue("V{$r}",  "=F{$r}*U{$r}/100");
         $sheet->setCellValue("W{$r}",  "=IF(F{$r}>0,(F{$r}*I{$r}/100+R{$r}+S{$r}+T{$r}+F{$r}*U{$r}/100)/F{$r}*100,0)");
-        $sheet->setCellValue("X{$r}",  "=F{$r}-(F{$r}*I{$r}/100)-R{$r}-S{$r}-T{$r}-(F{$r}*U{$r}/100)-Z{$r}-AB{$r}");
+        // «На р/с» вычитает и нашу часть (AF) — решение 2026-09-16.
+        $sheet->setCellValue("X{$r}",  "=F{$r}-(F{$r}*I{$r}/100)-R{$r}-S{$r}-T{$r}-(F{$r}*U{$r}/100)-Z{$r}-AB{$r}-AF{$r}");
         $sheet->setCellValue("Z{$r}",  "=F{$r}*Y{$r}/100");
         $sheet->setCellValue("AB{$r}", "=F{$r}*AA{$r}/100");
         $sheet->setCellValue("AD{$r}", "=F{$r}*AC{$r}/100");
-        $sheet->setCellValue("AF{$r}", "=AG{$r}*AE{$r}/100");
+        // Наша часть — % от цены (F); вычтена в X («на р/с»), прибыль = X − себестоимость.
+        $sheet->setCellValue("AF{$r}", "=F{$r}*AE{$r}/100");
         $sheet->setCellValue("AG{$r}", "=X{$r}-E{$r}");
         $sheet->setCellValue("AH{$r}", "=IF(F{$r}>0,AG{$r}/F{$r}*100,0)");
         $sheet->setCellValue(
             "AI{$r}",
-            "=IF((1-(I{$r}+U{$r}+Y{$r}+AA{$r})/100-\$E\$3/100)>0,"
-            . "(R{$r}+S{$r}+T{$r}+E{$r})/(1-(I{$r}+U{$r}+Y{$r}+AA{$r})/100-\$E\$3/100),\"\")"
+            "=IF((1-(I{$r}+U{$r}+Y{$r}+AA{$r}+AE{$r})/100-\$E\$3/100)>0,"
+            . "(R{$r}+S{$r}+T{$r}+E{$r})/(1-(I{$r}+U{$r}+Y{$r}+AA{$r}+AE{$r})/100-\$E\$3/100),\"\")"
         );
     }
 
@@ -3617,6 +3619,15 @@ class UnitEconomicsCacheController extends Controller
             + $cachedVatAmount
         );
 
+        // Yandex: «наша часть» вычитается из «на р/с» (решение 2026-09-16);
+        // кэш её туда не включает, вычитаем при отдаче.
+        if (in_array($cache->marketplace, ['yandex', 'yandex_market'], true)
+            && array_key_exists('to_settlement_account', $data)
+            && (float) $data['our_share_amount'] > 0
+        ) {
+            $data['to_settlement_account'] = round((float) $data['to_settlement_account'] - (float) $data['our_share_amount'], 2);
+        }
+
         if (abs($manualCostsDelta) >= 0.005) {
             $data['total_costs'] = round((float) $cache->total_costs + $manualCostsDelta, 2);
             $data['net_profit'] = round((float) $cache->net_profit - $manualCostsDelta, 2);
@@ -3677,14 +3688,19 @@ class UnitEconomicsCacheController extends Controller
         $taxAmount = round(($taxBasePrice > 0 ? $taxBasePrice : $price) * (float) ($data['tax_percent'] ?? 0) / 100, 2);
         // НДС и «наша часть» — только Ozon; у WB их нет.
         $vatAmount = $isWb ? 0.0 : round($price * (float) ($data['vat_percent'] ?? 0) / 100, 2);
-        $ourShareAmount = $isWb ? 0.0 : round($price * (float) ($data['our_share_percent'] ?? 0) / 100, 2);
+        // «Наша часть» — процент от выручки (цены) и для WB тоже: раньше WB
+        // жёстко получал 0 (в прибыли не участвовала), а Excel считал её от
+        // прибыли — жалоба клиента 2026-09-14.
+        $ourShareAmount = round($price * (float) ($data['our_share_percent'] ?? 0) / 100, 2);
 
+        // «Наша часть» вычитается прямо из «На р/с» (решение 2026-09-16, все МП) —
+        // прибыль от этого не меняется, только группировка удержаний.
         $toSettlement = round(
             $price - $commissionAmount - $effectiveLogistics - $acquiringAmount - $storageCost
-            - $acceptanceCost - $drrAmount,
+            - $acceptanceCost - $drrAmount - $ourShareAmount,
             2
         );
-        $netProfit = round($toSettlement - $costPrice - $taxAmount - $vatAmount - $ourShareAmount, 2);
+        $netProfit = round($toSettlement - $costPrice - $taxAmount - $vatAmount, 2);
         $totalCosts = round(
             $costPrice + $commissionAmount + $effectiveLogistics + $acquiringAmount
             + $storageCost + $acceptanceCost + $drrAmount + $taxAmount + $vatAmount + $ourShareAmount,

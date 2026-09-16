@@ -36,6 +36,9 @@ use Illuminate\Support\Facades\Log;
  */
 class FinanceTransactionSyncer
 {
+    /** true, если realization/by-day ответил 403 «Premium plus required» в этом прогоне. */
+    private bool $realizationBlocked = false;
+
     private const ENDPOINT_REALIZATION_BY_DAY = '/v1/finance/realization/by-day';
     private const ENDPOINT_ACCRUAL_BY_DAY = '/v1/finance/accrual/by-day';
 
@@ -125,15 +128,6 @@ class FinanceTransactionSyncer
                     ...$this->fetchAccrualRows($client, $integrationId, $date),
                 ];
             } catch (\Throwable $e) {
-                // by-day доступен только с подпиской Ozon Premium Plus: у магазинов
-                // без неё каждый день отвечает 403, и после миграции 25.08 их
-                // финданные замирали. Падаем на legacy /v3/finance/transaction/list
-                // (жив до 08.09.2026) и помечаем интеграцию для UI-предупреждения.
-                if (str_contains($e->getMessage(), 'HTTP 403')) {
-                    $this->markPremiumPlusRequired($integration, true);
-
-                    return $this->syncLegacyRange($client, $integration, $from, $to);
-                }
                 Log::channel('locality')->error('FinanceTransactionSyncer day failed', [
                     'integration_id' => $integrationId,
                     'date' => $date,
@@ -191,9 +185,99 @@ class FinanceTransactionSyncer
             'skipped' => $skipped,
         ]);
 
-        $this->markPremiumPlusRequired($integration, false);
+        $this->markPremiumPlusRequired($integration, $this->realizationBlocked);
+        if ($this->realizationBlocked) {
+            // Продажные строки (units/revenue — знаменатель фактических ставок
+            // OzonActualRatesService) добираем из месячного отчёта о реализации:
+            // он доступен без Premium Plus. Legacy /v3/finance/transaction/list
+            // Ozon отключил 08.09.2026 («obsolete method cannot be used»).
+            [$mi, $mu] = $this->syncMonthlyRealizationSales($client, $integrationId);
+            $inserted += $mi;
+            $updated += $mu;
+        }
+        $this->realizationBlocked = false;
 
         return new SyncResult($inserted, $updated, $skipped);
+    }
+
+    /**
+     * Продажи последнего закрытого месяца из /v2/finance/realization одной
+     * строкой на SKU (operation_date = последний день месяца, raw.quantity —
+     * штук за месяц). operation_id с ':' — новый формат, чистка legacy не тронет.
+     *
+     * @return array{0:int,1:int} [inserted, updated]
+     */
+    private function syncMonthlyRealizationSales(OzonClient $client, int $integrationId): array
+    {
+        $inserted = 0;
+        $updated = 0;
+
+        foreach ([1, 2] as $monthsBack) {
+            $period = now()->subMonthsNoOverflow($monthsBack);
+            usleep(self::REQUEST_PAUSE_US);
+            $response = $client->post('/v2/finance/realization', [
+                'month' => $period->month,
+                'year' => $period->year,
+            ]);
+            $rows = is_array($response) ? data_get($response, 'result.rows', $response['rows'] ?? []) : [];
+            if (! is_array($rows) || $rows === []) {
+                continue; // отчёт месяца ещё не готов — пробуем на месяц раньше
+            }
+
+            $monthKey = $period->format('Y-m');
+            $operationDate = $period->copy()->endOfMonth()->startOfDay()->toDateTimeString();
+            foreach ($rows as $row) {
+                if (! is_array($row)) {
+                    continue;
+                }
+                $sku = trim((string) data_get($row, 'item.sku', ''));
+                $offerId = trim((string) data_get($row, 'item.offer_id', ''));
+                $amount = (float) data_get($row, 'delivery_commission.amount', 0);
+                $quantity = (int) data_get($row, 'delivery_commission.quantity', 0);
+                if ($quantity <= 0 || $amount <= 0 || ($sku === '' && $offerId === '')) {
+                    continue;
+                }
+
+                $attrs = [
+                    'integration_id' => $integrationId,
+                    'operation_id' => "real:{$monthKey}:" . ($sku !== '' ? $sku : $offerId),
+                ];
+                $values = [
+                    'operation_type' => 'OperationAgentDeliveredToCustomer',
+                    'operation_type_name' => 'Продажа (realization v2, месяц)',
+                    'operation_date' => $operationDate,
+                    'sku' => $sku !== '' ? $sku : null,
+                    'offer_id' => $offerId !== '' ? $offerId : null,
+                    'amount' => round($amount, 2),
+                    'accruals_for_sale' => round($amount, 2),
+                    'raw' => [
+                        'source' => 'realization_v2_month',
+                        'month' => $monthKey,
+                        'quantity' => $quantity,
+                    ],
+                    'fetched_at' => now(),
+                ];
+
+                $existing = OzonFinanceTransaction::query()->where($attrs)->first();
+                if ($existing === null) {
+                    OzonFinanceTransaction::query()->create(array_merge($attrs, $values));
+                    $inserted++;
+                } elseif ($existing->fill($values)->isDirty()) {
+                    $existing->save();
+                    $updated++;
+                }
+            }
+
+            Log::channel('locality')->info('Monthly realization sales synced', [
+                'integration_id' => $integrationId,
+                'month' => $monthKey,
+                'rows' => count($rows),
+            ]);
+
+            break; // хватило одного закрытого месяца
+        }
+
+        return [$inserted, $updated];
     }
 
     private function markPremiumPlusRequired(Integration $integration, bool $required): void
@@ -210,111 +294,7 @@ class FinanceTransactionSyncer
         ]);
     }
 
-    /**
-     * Legacy-фолбэк: POST /v3/finance/transaction/list (Ozon отключает 08.09.2026).
-     * Для магазинов без Premium Plus это единственный источник финопераций.
-     */
-    private function syncLegacyRange(OzonClient $client, Integration $integration, Carbon $from, Carbon $to): SyncResult
-    {
-        $integrationId = (int) $integration->id;
-        $page = 1;
-        $inserted = 0;
-        $updated = 0;
-        $skipped = 0;
 
-        Log::channel('locality')->info('FinanceTransactionSyncer legacy fallback', [
-            'integration_id' => $integrationId,
-            'from' => $from->toIso8601String(),
-            'to' => $to->toIso8601String(),
-        ]);
-
-        while (true) {
-            $response = $client->post('/v3/finance/transaction/list', [
-                'filter' => [
-                    'date' => [
-                        'from' => $from->toIso8601String(),
-                        'to' => $to->toIso8601String(),
-                    ],
-                    'transaction_type' => 'all',
-                ],
-                'page' => $page,
-                'page_size' => 1000,
-            ]);
-            if (! is_array($response) || isset($response['_error'])) {
-                Log::channel('locality')->error('FinanceTransactionSyncer legacy API error', [
-                    'integration_id' => $integrationId,
-                    'page' => $page,
-                ]);
-                break;
-            }
-
-            $operations = $response['result']['operations'] ?? [];
-            if (empty($operations)) {
-                break;
-            }
-
-            DB::transaction(function () use ($operations, $integrationId, &$inserted, &$updated, &$skipped) {
-                foreach ($operations as $op) {
-                    $operationId = $op['operation_id'] ?? null;
-                    if ($operationId === null) {
-                        $skipped++;
-
-                        continue;
-                    }
-
-                    $posting = $op['posting'] ?? [];
-                    $firstItem = ($op['items'] ?? [])[0] ?? [];
-                    $attrs = [
-                        'integration_id' => $integrationId,
-                        'operation_id' => (string) $operationId,
-                    ];
-                    $values = [
-                        'operation_type' => $op['operation_type'] ?? null,
-                        'operation_type_name' => $op['operation_type_name'] ?? null,
-                        'operation_date' => isset($op['operation_date'])
-                            ? Carbon::parse($op['operation_date'])->toDateTimeString()
-                            : null,
-                        'posting_number' => $posting['posting_number'] ?? null,
-                        'sku' => isset($firstItem['sku']) ? (string) $firstItem['sku'] : null,
-                        'offer_id' => $firstItem['offer_id'] ?? null,
-                        'amount' => (float) ($op['amount'] ?? 0),
-                        'accruals_for_sale' => isset($op['accruals_for_sale']) ? (float) $op['accruals_for_sale'] : null,
-                        'sale_commission' => isset($op['sale_commission']) ? (float) $op['sale_commission'] : null,
-                        'warehouse_id' => $posting['warehouse_id'] ?? null,
-                        'warehouse_name' => $posting['warehouse_name'] ?? null,
-                        'raw' => $op,
-                        'fetched_at' => now(),
-                    ];
-
-                    $existing = OzonFinanceTransaction::query()->where($attrs)->first();
-                    if ($existing === null) {
-                        OzonFinanceTransaction::query()->create(array_merge($attrs, $values));
-                        $inserted++;
-                    } elseif ($existing->fill($values)->isDirty()) {
-                        $existing->save();
-                        $updated++;
-                    } else {
-                        $skipped++;
-                    }
-                }
-            });
-
-            $totalPages = (int) ($response['result']['page_count'] ?? 0);
-            if (($totalPages > 0 && $page >= $totalPages) || count($operations) < 1000) {
-                break;
-            }
-            $page++;
-        }
-
-        Log::channel('locality')->info('FinanceTransactionSyncer legacy completed', [
-            'integration_id' => $integrationId,
-            'inserted' => $inserted,
-            'updated' => $updated,
-            'skipped' => $skipped,
-        ]);
-
-        return new SyncResult($inserted, $updated, $skipped);
-    }
 
     /**
      * Продажи/возвраты дня из /v1/finance/realization/by-day.
@@ -336,6 +316,14 @@ class FinanceTransactionSyncer
         if (! is_array($response) || isset($response['_error'])) {
             // 404/пусто для свежего дня — норма (отчёт ещё не сформирован).
             $status = is_array($response) ? ($response['_http_status'] ?? null) : null;
+            if ($status === 403) {
+                // Дневная реализация доступна только с Ozon Premium Plus. Не роняем
+                // день: accrual/by-day открыт всем — услуги (эквайринг, логистика)
+                // продолжают качаться, а продажи доберём месячным /v2/finance/realization.
+                $this->realizationBlocked = true;
+
+                return [];
+            }
             if ($status !== null && $status !== 404) {
                 throw new \RuntimeException("realization/by-day HTTP {$status}");
             }

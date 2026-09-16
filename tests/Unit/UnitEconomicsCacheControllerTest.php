@@ -811,7 +811,9 @@ class UnitEconomicsCacheControllerTest extends TestCase
         $this->assertSame('=MIN(3,(100-P5)/MAX(P5,0.01))*(N5+O5)', $sheet->getCell('Q5')->getValue());
         $this->assertSame('=N5+Q5', $sheet->getCell('R5')->getValue());
         // СПП НЕ вычитается из «На р/с» (его финансирует WB).
-        $this->assertSame('=F5-(F5*I5/100)-R5-S5-T5-(F5*U5/100)-Z5-AB5', $sheet->getCell('X5')->getValue());
+        $this->assertSame('=F5-(F5*I5/100)-R5-S5-T5-(F5*U5/100)-Z5-AB5-AF5', $sheet->getCell('X5')->getValue());
+        // Наша часть (AF) — % от цены и вычитается из прибыли (жалоба 2026-09-14).
+        $this->assertSame('=F5*AE5/100', $sheet->getCell('AF5')->getValue());
         $this->assertSame('=X5-E5', $sheet->getCell('AG5')->getValue());
         $this->assertSame('=IF(F5>0,AG5/F5*100,0)', $sheet->getCell('AH5')->getValue());
     }
