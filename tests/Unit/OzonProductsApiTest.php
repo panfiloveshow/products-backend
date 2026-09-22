@@ -46,6 +46,8 @@ class OzonProductsApiTest extends TestCase
                 ],
                 'cursor' => '',
             ]),
+            // без этого GET /v1/actions уходил в реальный Ozon
+            'https://api-seller.ozon.ru/v1/actions' => Http::response(['result' => []]),
         ]);
 
         $api = new ProductsApi(new OzonClient('client', 'key'));
@@ -86,9 +88,29 @@ class OzonProductsApiTest extends TestCase
         $this->assertSame(990.50, $result['7856197312']['competitor_price']);
         $this->assertSame('available', $result['7856197312']['status']);
         $this->assertSame('pricing_strategy_product_info', $result['7856197312']['source']);
+        $this->assertSame('https://example.test/product', $result['7856197312']['strategy_competitor_product_url']);
+        // strategy_competitor_id устарел — не протаскиваем его дальше.
+        $this->assertArrayNotHasKey('strategy_competitor_id', $result['7856197312']);
 
         Http::assertSent(fn ($request) => $request->url() === 'https://api-seller.ozon.ru/v1/pricing-strategy/product/info'
             && $request['product_id'] === 7856197312);
+    }
+
+    public function test_get_product_by_sku_uses_v3_product_info_list(): void
+    {
+        // /v2/product/info удалён 10.03.2025.
+        Http::fake([
+            'https://api-seller.ozon.ru/v3/product/info/list' => Http::response([
+                'items' => [['id' => 7856197312, 'offer_id' => 'ART-1', 'name' => 'Чайник']],
+            ]),
+        ]);
+
+        $api = new ProductsApi(new OzonClient('client', 'key'));
+
+        $this->assertSame('Чайник', $api->getProductBySku('ART-1')['name']);
+        Http::assertSent(fn ($request) => $request->url() === 'https://api-seller.ozon.ru/v3/product/info/list'
+            && $request['offer_id'] === ['ART-1']);
+        Http::assertNotSent(fn ($request) => str_contains($request->url(), '/v2/product/info'));
     }
 
     public function test_get_pricing_strategy_product_info_does_not_return_rows_for_api_errors(): void

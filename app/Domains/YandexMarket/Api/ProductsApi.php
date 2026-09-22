@@ -9,8 +9,8 @@ use App\Models\Integration;
  * API для работы с товарами Yandex Market
  *
  * Endpoints (Partner API v2):
- * - POST /v2/businesses/{businessId}/offer-mappings — список товаров в каталоге
- * - GET /v2/campaigns/{campaignId}/offer-prices — цены
+ * - POST /v2/businesses/{businessId}/offer-mappings — список товаров в каталоге (цена — offer.basicPrice)
+ * - POST /v2/businesses/{businessId}/offer-prices — цены для всех магазинов
  */
 class ProductsApi implements ProductsApiInterface
 {
@@ -64,27 +64,24 @@ class ProductsApi implements ProductsApiInterface
     }
 
     /**
-     * Получить цены товаров
+     * Получить цены товаров (цены для всех магазинов кабинета)
+     *
+     * POST /v2/businesses/{businessId}/offer-prices — limit (≤ 500) и page_token в query.
+     * GET /v2/campaigns/{campaignId}/offer-prices устарел (отключение 05.04.2027).
      */
     public function getPrices(?Integration $integration = null, array $skus = []): array
     {
+        $businessId = $this->client->resolveBusinessId();
         $allPrices = [];
         $pageToken = null;
+        $pages = 0;
 
         do {
-            $params = ['limit' => 100];
-            if ($pageToken) {
-                $params['page_token'] = $pageToken;
-            }
-
-            $response = $this->client->get(
-                '/v2/campaigns/{campaignId}/offer-prices',
-                $params
+            $response = $this->client->post(
+                '/v2/businesses/'.$businessId.'/offer-prices',
+                [],
+                array_filter(['limit' => 500, 'page_token' => $pageToken])
             );
-
-            if (! $response) {
-                break;
-            }
 
             $items = $response['result']['offers'] ?? [];
             $pageToken = $response['result']['paging']['nextPageToken'] ?? null;
@@ -99,74 +96,31 @@ class ProductsApi implements ProductsApiInterface
                     continue;
                 }
 
-                $priceData = $this->extractPrice($item);
+                $priceData = $this->extractPrice($item['price'] ?? []);
                 if ($priceData === null) {
                     continue;
                 }
 
                 $allPrices[$sku] = $priceData;
             }
-
-        } while (! empty($items) && $pageToken);
+        } while (! empty($items) && $pageToken && ++$pages < 200);
 
         return $allPrices;
     }
 
-    private function extractPrice(array $item): ?array
+    /** @param array{value?: float, discountBase?: float, currencyId?: string} $price OfferDefaultPriceDTO */
+    private function extractPrice(array $price): ?array
     {
-        $price = null;
-        $oldPrice = null;
-        $currency = 'RUR';
-
-        if (isset($item['basicPrice']['value'])) {
-            $price = (float) $item['basicPrice']['value'];
-            $oldPrice = isset($item['basicPrice']['discountBase'])
-                ? (float) $item['basicPrice']['discountBase']
-                : null;
-            $currency = $item['basicPrice']['currencyId'] ?? $currency;
-        } elseif (isset($item['price']['value'])) {
-            $price = (float) $item['price']['value'];
-            $currency = $item['price']['currencyId'] ?? $currency;
-        }
-
-        if ($price === null || $price <= 0) {
+        $value = isset($price['value']) ? (float) $price['value'] : null;
+        if ($value === null || $value <= 0) {
             return null;
         }
 
         return [
-            'price' => $price,
-            'actual_price' => $price,
-            'old_price' => $oldPrice,
-            'currency' => $currency,
-        ];
-    }
-
-    /**
-     * Получить цены товаров с полной пагинацией (для getProducts)
-     * Возвращает items + paging для ручной обработки
-     */
-    public function getPricesWithPagination(?string $pageToken = null): array
-    {
-        $params = ['limit' => 100];
-        if ($pageToken) {
-            $params['page_token'] = $pageToken;
-        }
-
-        $response = $this->client->get(
-            '/v2/campaigns/{campaignId}/offer-prices',
-            $params
-        );
-
-        if (! $response) {
-            return [
-                'items' => [],
-                'paging' => null,
-            ];
-        }
-
-        return [
-            'items' => $response['result']['offers'] ?? [],
-            'paging' => $response['result']['paging'] ?? null,
+            'price' => $value,
+            'actual_price' => $value,
+            'old_price' => isset($price['discountBase']) ? (float) $price['discountBase'] : null,
+            'currency' => $price['currencyId'] ?? 'RUR',
         ];
     }
 

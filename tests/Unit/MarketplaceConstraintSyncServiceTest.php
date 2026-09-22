@@ -17,7 +17,7 @@ use Tests\TestCase;
  */
 class MarketplaceConstraintSyncServiceTest extends TestCase
 {
-    private const ACCEPTANCE_URL = 'common-api.wildberries.ru/api/tariffs/v1/acceptance/coefficients*';
+    private const BOX_TARIFFS_URL = 'common-api.wildberries.ru/api/v1/tariffs/box*';
 
     protected function setUp(): void
     {
@@ -70,108 +70,56 @@ class MarketplaceConstraintSyncServiceTest extends TestCase
         ]);
     }
 
-    /** Сырой формат записи коэффициентов приёмки WB (как отдаёт common-api). */
-    private function acceptanceItem(string $whId, string $name, string $date, float $coef, bool $allow, float $storage, float $delivery): array
-    {
-        return [
-            'date' => $date,
-            'warehouseID' => $whId,
-            'warehouseName' => $name,
-            'coefficient' => $coef,
-            'allowUnload' => $allow,
-            'boxTypeID' => 2,
-            'isSortingCenter' => false,
-            'storageCoef' => $storage,
-            'deliveryCoef' => $delivery,
-        ];
-    }
-
-    public function test_maps_free_and_paid_warehouses_with_coefficients(): void
+    /** Тарифы коробов WB (common-api /api/v1/tariffs/box), проценты строками. */
+    private function fakeBoxTariffs(array $warehouses): void
     {
         Http::fake([
-            self::ACCEPTANCE_URL => Http::response([
-                // Коледино: бесплатное (0) и базовое (1) окно → доступен; несём min коэф = 0.
-                $this->acceptanceItem('507', 'Коледино', '2026-06-12', 0, true, 1.0, 1.2),
-                $this->acceptanceItem('507', 'Коледино', '2026-06-14', 1, true, 0.9, 1.1),
-                // Подольск: только платный коэффициент 2 → доступен, но дорогой (штраф costScore).
-                $this->acceptanceItem('117501', 'Подольск', '2026-06-13', 2, true, 1.5, 1.4),
+            self::BOX_TARIFFS_URL => Http::response([
+                'response' => ['data' => ['warehouseList' => $warehouses]],
             ], 200),
+        ]);
+    }
+
+    public function test_wb_uses_box_tariffs_while_acceptance_is_disabled(): void
+    {
+        // «Тарифы на поставку» WB временно отключил с 15.08.2026: метод не зовём,
+        // склады не блокируем, коэффициенты — из тарифов коробов, статус partial.
+        $this->fakeBoxTariffs([
+            ['warehouseName' => 'Коледино', 'boxDeliveryCoefExpr' => '160', 'boxStorageCoefExpr' => '115'],
+            ['warehouseName' => 'Подольск', 'boxDeliveryCoefExpr' => '200', 'boxStorageCoefExpr' => '180'],
         ]);
 
         $snapshot = (new MarketplaceConstraintSyncService())->syncIntegration($this->makeWbIntegration());
 
-        $this->assertSame('ok', $snapshot->sync_status);
+        $this->assertSame('partial', $snapshot->sync_status);
+        $this->assertTrue($snapshot->isUsable());
         $this->assertNull($snapshot->cluster_constraints_json);
 
         $records = collect($snapshot->warehouse_constraints_json);
         $this->assertCount(2, $records);
 
-        $koledino = $records->firstWhere('warehouse_id', '507');
-        $this->assertNotNull($koledino);
+        $koledino = $records->firstWhere('warehouse_name', 'Коледино');
         $this->assertTrue($koledino['is_available']);
-        // assertEquals (не assertSame): целые float теряют .0 через JSON-сериализацию в БД.
-        $this->assertEquals(0.0, $koledino['acceptance_coefficient']); // min(0,1) = бесплатно
-        $this->assertEquals(0.9, $koledino['storage_coefficient']);   // min по горизонту
-        $this->assertEquals(1.1, $koledino['delivery_coefficient']);  // min по горизонту
-        $this->assertNull($koledino['max_qty']);                    // WB API не отдаёт лимит штук
-        $this->assertNull($koledino['need_qty']);
+        $this->assertNull($koledino['acceptance_coefficient']);
+        // assertEquals (не assertSame): float идёт через JSON-сериализацию в БД.
+        $this->assertEquals(1.6, $koledino['delivery_coefficient']);
+        $this->assertEquals(1.15, $koledino['storage_coefficient']);
+        $this->assertNull($koledino['max_qty']);
         $this->assertSame('marketplace_constraint', $koledino['source_type']);
-        $this->assertSame('Коледино', $koledino['warehouse_name']);
-
-        // Платное окно: доступно, коэффициент несётся как штраф (>1), не блок.
-        $podolsk = $records->firstWhere('warehouse_id', '117501');
-        $this->assertNotNull($podolsk);
-        $this->assertTrue($podolsk['is_available']);
-        $this->assertEquals(2.0, $podolsk['acceptance_coefficient']);
 
         $summary = $snapshot->summary_json;
         $this->assertSame(2, $summary['warehouses_total']);
-        $this->assertSame(2, $summary['warehouses_available']);
         $this->assertSame(0, $summary['warehouses_blocked']);
-        $this->assertSame(14, $summary['horizon_days']);
+        $this->assertStringContainsString('временно отключил', $summary['reason']);
+        $this->assertTrue($snapshot->sources_json['acceptance_coefficients']['disabled']);
+
+        Http::assertNotSent(fn ($request) => str_contains($request->url(), 'acceptance/coefficients'));
     }
 
-    public function test_blocks_warehouse_only_when_no_unloadable_slot(): void
+    public function test_status_error_when_box_tariffs_return_no_data(): void
     {
         Http::fake([
-            self::ACCEPTANCE_URL => Http::response([
-                // Разгрузка запрещена (allowUnload=false) и коэффициент -1 (приёмки нет) → реально недоступен.
-                $this->acceptanceItem('999', 'Закрытый', '2026-06-12', -1, false, 1.0, 1.0),
-                $this->acceptanceItem('999', 'Закрытый', '2026-06-13', 3, false, 1.0, 1.0),
-            ], 200),
-        ]);
-
-        $snapshot = (new MarketplaceConstraintSyncService())->syncIntegration($this->makeWbIntegration());
-
-        $records = collect($snapshot->warehouse_constraints_json);
-        $blocked = $records->firstWhere('warehouse_id', '999');
-        $this->assertNotNull($blocked);
-        $this->assertFalse($blocked['is_available']);
-        $this->assertNull($blocked['acceptance_coefficient']);
-        $this->assertSame(1, $snapshot->summary_json['warehouses_blocked']);
-    }
-
-    public function test_filters_slots_outside_horizon(): void
-    {
-        Http::fake([
-            self::ACCEPTANCE_URL => Http::response([
-                $this->acceptanceItem('507', 'Коледино', '2026-06-12', 0, true, 1.0, 1.0),
-                // За пределами горизонта (+14 дней = 2026-06-25): склад не должен попасть.
-                $this->acceptanceItem('888', 'Будущее', '2026-07-30', 0, true, 1.0, 1.0),
-            ], 200),
-        ]);
-
-        $snapshot = (new MarketplaceConstraintSyncService())->syncIntegration($this->makeWbIntegration());
-
-        $records = collect($snapshot->warehouse_constraints_json);
-        $this->assertCount(1, $records);
-        $this->assertSame('507', $records->first()['warehouse_id']);
-    }
-
-    public function test_status_error_when_acceptance_api_returns_no_data(): void
-    {
-        Http::fake([
-            self::ACCEPTANCE_URL => Http::response('', 500),
+            self::BOX_TARIFFS_URL => Http::response('', 500),
         ]);
 
         $snapshot = (new MarketplaceConstraintSyncService())->syncIntegration($this->makeWbIntegration());
@@ -251,10 +199,8 @@ class MarketplaceConstraintSyncServiceTest extends TestCase
 
     public function test_upsert_is_idempotent(): void
     {
-        Http::fake([
-            self::ACCEPTANCE_URL => Http::response([
-                $this->acceptanceItem('507', 'Коледино', '2026-06-12', 0, true, 1.0, 1.0),
-            ], 200),
+        $this->fakeBoxTariffs([
+            ['warehouseName' => 'Коледино', 'boxDeliveryCoefExpr' => '100', 'boxStorageCoefExpr' => '100'],
         ]);
 
         $service = new MarketplaceConstraintSyncService();

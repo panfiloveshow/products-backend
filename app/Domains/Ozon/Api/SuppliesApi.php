@@ -8,27 +8,21 @@ use App\Exceptions\OzonPreconditionException;
 
 /**
  * API для работы с поставками Ozon (FBO Supplies)
- * 
- * Endpoints (Legacy - до 16.02.2026):
- * - POST /v1/supply/order/list — список заказов на поставку
- * - POST /v1/supply/order/get — детали заказа на поставку
- * - POST /v1/supply/draft/create — создать черновик поставки
- * - POST /v1/supply/timeslot/list — доступные слоты
- * - POST /v1/supply/timeslot/set — забронировать слот
- * - POST /v1/supply/cargo/create — создать грузоместа
- * - POST /v1/supply/driver/set — назначить водителя
- * - POST /v1/warehouse/list — список складов
- * 
- * Endpoints (New - с 16.02.2026):
+ *
+ * Старое API /v1/supply/* и /v1/draft/create* Ozon отключил (16.03.2026):
+ * слотов без черновика и «черновика на склад» больше нет.
+ *
+ * Endpoints:
  * - POST /v1/cluster/list — список макролокальных кластеров
  * - POST /v1/draft/direct/create — черновик прямой поставки
  * - POST /v1/draft/crossdock/create — черновик кросс-док поставки
  * - POST /v1/draft/multi-cluster/create — черновик мультикластерной поставки
  * - POST /v2/draft/create/info — статус и расчёты черновика
  * - POST /v2/draft/timeslot/info — таймслоты для черновика
- * - POST /v2/draft/supply/create/status — статус создания поставки
+ * - POST /v2/draft/supply/create, /v2/draft/supply/create/status — заявка из черновика
+ * - POST /v3/supply-order/list, /v3/supply-order/get — заявки на поставку
  * - POST /v1/cargoes/get — грузоместа в поставках FBO (бета)
- * - POST /v1/warehouse/fbo/list — список складов FBO
+ * - POST /v1/warehouse/fbo/list — точки отгрузки FBO
  * - POST /v1/warehouse/fbo/seller/list — список складов продавца
  * 
  * @see https://docs.ozon.ru/api/seller
@@ -56,92 +50,40 @@ class SuppliesApi implements SuppliesApiInterface
     ) {}
 
     /**
-     * Получить список заказов на поставку
-     * 
-     * POST /v1/supply/order/list
-     * 
-     * @param array $filters [
-     *   'limit' => int,
-     *   'offset' => int,
-     *   'statuses' => string[],
-     *   'date_from' => string (Y-m-d),
-     *   'date_to' => string (Y-m-d),
-     * ]
+     * Список заявок: /v1/supply/order/list отключён, используйте
+     * getSupplyOrdersList() + getSupplyOrdersDetails() (/v3/supply-order/*).
      */
     public function getSupplies(array $filters = []): array
     {
-        $body = [
-            'limit' => $filters['limit'] ?? 100,
-            'offset' => $filters['offset'] ?? 0,
-        ];
-
-        if (!empty($filters['statuses'])) {
-            $body['filter']['status'] = $filters['statuses'];
-        }
-
-        if (!empty($filters['date_from'])) {
-            $body['filter']['created_at']['from'] = $filters['date_from'] . 'T00:00:00Z';
-        }
-
-        if (!empty($filters['date_to'])) {
-            $body['filter']['created_at']['to'] = $filters['date_to'] . 'T23:59:59Z';
-        }
-
-        $response = $this->client->post('/v1/supply/order/list', $body);
-
-        if (!$response) {
-            return [];
-        }
-
-        $orders = $response['result']['orders'] ?? $response['orders'] ?? [];
-        
-        return array_map(fn($order) => $this->mapSupply($order), $orders);
+        $this->legacySupplyApiRemoved('список поставок /v1/supply/order/list');
     }
 
     /**
-     * Получить детали заказа на поставку
-     * 
-     * POST /v1/supply/order/get
+     * Получить детали заявки на поставку
+     *
+     * POST /v3/supply-order/get
      */
     public function getSupplyDetails(string $supplyId): ?array
     {
-        $response = $this->client->post('/v1/supply/order/get', [
-            'supply_order_id' => (int) $supplyId,
-        ]);
-
-        if (!$response || empty($response['result'])) {
-            return null;
+        $response = $this->getSupplyOrdersDetails([(int) $supplyId]);
+        if (! empty($response['_error'])) {
+            throw new \RuntimeException('Ozon /v3/supply-order/get: ' . json_encode($response, JSON_UNESCAPED_UNICODE));
         }
 
-        return $this->mapSupply($response['result']);
+        $order = collect($response['orders'] ?? [])->first(
+            fn (array $item): bool => (string) ($item['order_id'] ?? '') === $supplyId
+        );
+
+        return is_array($order) ? $this->mapSupply($order) : null;
     }
 
     /**
-     * Получить товары в поставке
-     * 
-     * POST /v1/supply/order/items
+     * Товары заявки: /v1/supply/order/items отключён, состав заявки —
+     * FboSupplyOrdersApi::getBundle() (/v1/supply-order/bundle).
      */
     public function getSupplyProducts(string $supplyId): array
     {
-        $response = $this->client->post('/v1/supply/order/items', [
-            'supply_order_id' => (int) $supplyId,
-        ]);
-
-        if (!$response) {
-            return [];
-        }
-
-        $items = $response['result']['items'] ?? $response['items'] ?? [];
-        
-        return array_map(fn($item) => [
-            'sku' => $item['offer_id'] ?? $item['sku'] ?? null,
-            'product_id' => $item['product_id'] ?? null,
-            'name' => $item['name'] ?? null,
-            'quantity' => $item['quantity'] ?? 0,
-            'quantity_accepted' => $item['quantity_accepted'] ?? 0,
-            'quantity_rejected' => $item['quantity_rejected'] ?? 0,
-            'barcode' => $item['barcode'] ?? null,
-        ], $items);
+        $this->legacySupplyApiRemoved('товары поставки /v1/supply/order/items');
     }
 
     /**
@@ -174,44 +116,12 @@ class SuppliesApi implements SuppliesApiInterface
     }
 
     /**
-     * Получить доступные слоты для приёмки
-     * 
-     * POST /v1/supply/timeslot/list
+     * Слоты склада без черновика: /v1/supply/timeslot/list отключён, замены нет.
+     * Слоты теперь есть только у черновика — getDraftTimeslots() (/v2/draft/timeslot/info).
      */
     public function getAcceptanceSlots(string $warehouseId, ?string $dateFrom = null, ?string $dateTo = null): array
     {
-        $body = [
-            'warehouse_id' => (int) $warehouseId,
-        ];
-
-        if ($dateFrom) {
-            $body['date_from'] = $dateFrom . 'T00:00:00Z';
-        }
-
-        if ($dateTo) {
-            $body['date_to'] = $dateTo . 'T23:59:59Z';
-        }
-
-        $response = $this->client->post('/v1/supply/timeslot/list', $body);
-
-        if (!$response) {
-            return [];
-        }
-
-        $slots = $response['result']['timeslots'] ?? $response['timeslots'] ?? [];
-        
-        return array_map(fn($slot) => [
-            'id' => $slot['timeslot_id'] ?? null,
-            'warehouse_id' => $warehouseId,
-            'date' => substr($slot['from'] ?? '', 0, 10),
-            'time_from' => substr($slot['from'] ?? '', 11, 5),
-            'time_to' => substr($slot['to'] ?? '', 11, 5),
-            'from_datetime' => $slot['from'] ?? null,
-            'to_datetime' => $slot['to'] ?? null,
-            'is_available' => $slot['is_available'] ?? true,
-            'capacity' => $slot['capacity'] ?? null,
-            'capacity_used' => $slot['capacity_used'] ?? 0,
-        ], $slots);
+        $this->legacySupplyApiRemoved('слоты склада без черновика /v1/supply/timeslot/list');
     }
 
     /**
@@ -226,119 +136,38 @@ class SuppliesApi implements SuppliesApiInterface
     }
 
     /**
-     * Создать черновик поставки
-     * 
-     * POST /v1/supply/draft/create
-     * 
-     * @param array $data [
-     *   'warehouse_id' => int,
-     *   'items' => [['offer_id' => string, 'quantity' => int], ...],
-     * ]
+     * Черновик «на склад»: /v1/supply/draft/create отключён. Черновик теперь
+     * создаётся на кластер по Ozon SKU — createDirectDraft()/createCrossdockDraft().
      */
     public function createSupplyDraft(array $data): array
     {
-        $body = [
-            'warehouse_id' => (int) ($data['warehouse_id'] ?? 0),
-        ];
-
-        if (!empty($data['items'])) {
-            $body['items'] = array_map(fn($item) => [
-                'offer_id' => $item['sku'] ?? $item['offer_id'] ?? '',
-                'quantity' => $item['quantity'] ?? 0,
-            ], $data['items']);
-        }
-
-        $response = $this->client->post('/v1/supply/draft/create', $body);
-
-        if (!$response || empty($response['result'])) {
-            throw new \RuntimeException(
-                'Не удалось создать черновик поставки: ' . 
-                ($response['error']['message'] ?? 'Unknown error')
-            );
-        }
-
-        return [
-            'id' => (string) ($response['result']['supply_order_id'] ?? null),
-            'status' => 'draft',
-            'warehouse_id' => (string) ($data['warehouse_id'] ?? null),
-            'created_at' => now()->toIso8601String(),
-        ];
+        $this->legacySupplyApiRemoved('черновик на склад /v1/supply/draft/create');
     }
 
     /**
-     * Добавить товары в поставку
-     * 
-     * POST /v1/supply/order/items/add
+     * /v1/supply/order/items/add отключён. Состав готовой заявки меняется через
+     * /v1/supply-order/content/update — updateSupplyOrderContent().
      */
     public function addItemsToSupply(string $supplyId, array $items): bool
     {
-        $body = [
-            'supply_order_id' => (int) $supplyId,
-            'items' => array_map(fn($item) => [
-                'offer_id' => $item['sku'] ?? $item['offer_id'] ?? '',
-                'quantity' => $item['quantity'] ?? 0,
-            ], $items),
-        ];
-
-        $response = $this->client->post('/v1/supply/order/items/add', $body);
-
-        return $response !== null && empty($response['error']);
+        $this->legacySupplyApiRemoved('добавление товаров /v1/supply/order/items/add');
     }
 
     /**
-     * Забронировать слот приёмки
-     * 
-     * POST /v1/supply/timeslot/set
+     * Бронь слота по timeslot_id: /v1/supply/timeslot/set отключён. Слот выбирается
+     * при создании заявки из черновика (createSupplyFromDraft), у готовой заявки —
+     * /v1/supply-order/timeslot/update по интервалу from/to, а не по ID.
      */
     public function bookAcceptanceSlot(string $supplyId, string $slotId): array
     {
-        $response = $this->client->post('/v1/supply/timeslot/set', [
-            'supply_order_id' => (int) $supplyId,
-            'timeslot_id' => (int) $slotId,
-        ]);
-
-        if (!$response || !empty($response['error'])) {
-            throw new \RuntimeException(
-                'Не удалось забронировать слот: ' . 
-                ($response['error']['message'] ?? 'Unknown error')
-            );
-        }
-
-        return [
-            'success' => true,
-            'supply_id' => $supplyId,
-            'slot_id' => $slotId,
-            'booked_at' => now()->toIso8601String(),
-        ];
+        $this->legacySupplyApiRemoved('бронь слота /v1/supply/timeslot/set');
     }
 
-    /**
-     * Забронировать слот приёмки по ID (возвращает структурированный ответ)
-     * 
-     * POST /v1/supply/timeslot/set
-     */
-    public function bookAcceptanceSlotById(string $supplyOrderId, int $timeslotId): array
+    private function legacySupplyApiRemoved(string $what): never
     {
-        $body = [
-            'supply_order_id' => (int) $supplyOrderId,
-            'timeslot_id' => $timeslotId,
-        ];
-
-        \Illuminate\Support\Facades\Log::info('Ozon supply/timeslot/set request', ['body' => $body]);
-
-        $response = $this->client->post('/v1/supply/timeslot/set', $body);
-
-        \Illuminate\Support\Facades\Log::info('Ozon supply/timeslot/set response', [
-            'response_keys' => $response ? array_keys($response) : [],
-            'has_error' => !empty($response['error']) || !empty($response['code']),
-        ]);
-
-        return [
-            'success' => empty($response['error']) && empty($response['code']),
-            'response' => $response,
-            'error' => $response['error'] ?? $response['message'] ?? null,
-            '_http_status' => $response['_http_status'] ?? null,
-        ];
+        throw new \RuntimeException(
+            "Ozon отключил {$what} (старое API поставок). Создавайте поставку через черновик в разделе «Поставки»."
+        );
     }
 
     /**
@@ -518,51 +347,6 @@ class SuppliesApi implements SuppliesApiInterface
             'data' => $response,
         ];
     }
-    
-    /**
-     * Скачать PDF с этикетками
-     * 
-     * GET /v1/cargoes-label/file/{file_guid}
-     * 
-     * @return string URL для скачивания или содержимое файла
-     */
-    public function downloadCargoLabels(string $fileGuid): string
-    {
-        // Возвращаем URL для прямого скачивания через Ozon API
-        return $this->client->getBaseUrl() . '/v1/cargoes-label/file/' . $fileGuid;
-    }
-
-    /**
-     * Назначить водителя
-     * 
-     * POST /v1/supply/driver/set
-     */
-    public function setDriver(string $supplyId, array $driverData): array
-    {
-        $body = [
-            'supply_order_id' => (int) $supplyId,
-            'driver' => [
-                'name' => $driverData['name'] ?? '',
-                'phone' => $driverData['phone'] ?? '',
-                'car_number' => $driverData['car_number'] ?? '',
-                'car_model' => $driverData['car_model'] ?? '',
-            ],
-        ];
-
-        $response = $this->client->post('/v1/supply/driver/set', $body);
-
-        if (!$response || !empty($response['error'])) {
-            throw new \RuntimeException(
-                'Не удалось назначить водителя: ' . 
-                ($response['error']['message'] ?? 'Unknown error')
-            );
-        }
-
-        return [
-            'success' => true,
-            'supply_id' => $supplyId,
-        ];
-    }
 
     /**
      * Получить статусы поставок
@@ -577,50 +361,49 @@ class SuppliesApi implements SuppliesApiInterface
      */
     public function supportsFeature(string $feature): bool
     {
+        // Методы интерфейса на старом /v1/supply/* отключены Ozon — только через черновик.
         $supported = [
-            'get_supplies' => true,
+            'get_supplies' => false,
             'get_supply_details' => true,
-            'get_supply_products' => true,
+            'get_supply_products' => false,
             'get_warehouses' => true,
-            'get_acceptance_slots' => true,
+            'get_acceptance_slots' => false,
             'get_acceptance_coefficients' => false, // Ozon не использует КС
             'get_transit_tariffs' => false,
-            'create_supply' => true,                // Поддерживается!
-            'add_items' => true,                    // Поддерживается!
-            'book_slot' => true,                    // Поддерживается!
+            'create_supply' => false,
+            'add_items' => false,
+            'book_slot' => false,
             'create_cargo' => true,
-            'set_driver' => true,
+            'set_driver' => false,
         ];
 
         return $supported[$feature] ?? false;
     }
 
     /**
-     * Маппинг поставки Ozon к унифицированному формату
+     * Маппинг заявки /v3/supply-order/get (orders[]) к унифицированному формату
      */
     private function mapSupply(array $order): array
     {
-        $status = $order['status'] ?? 'DRAFT';
-        
+        $status = (string) ($order['state'] ?? 'UNSPECIFIED');
+        $orderId = $order['order_id'] ?? null;
+        $supply = $order['supplies'][0] ?? [];
+
         return [
-            'id' => (string) ($order['supply_order_id'] ?? $order['id'] ?? null),
-            'external_id' => $order['supply_order_id'] ?? null,
-            'name' => $order['name'] ?? "Поставка #{$order['supply_order_id']}",
+            'id' => (string) $orderId,
+            'external_id' => $orderId,
+            'name' => $order['order_number'] ?? "Поставка #{$orderId}",
             'status' => self::SUPPLY_STATUSES[$status] ?? strtolower($status),
             'status_code' => $status,
             'marketplace' => 'ozon',
-            'warehouse_id' => (string) ($order['warehouse_id'] ?? null),
-            'warehouse_name' => $order['warehouse_name'] ?? null,
-            'macrolocal_cluster_id' => $order['macrolocal_cluster_id'] ?? null,
-            'cluster_name' => $order['cluster_name'] ?? null,
-            'created_at' => $order['created_at'] ?? null,
-            'timeslot_from' => $order['timeslot']['from'] ?? null,
-            'timeslot_to' => $order['timeslot']['to'] ?? null,
-            'items_count' => $order['items_count'] ?? 0,
-            'total_quantity' => $order['total_quantity'] ?? 0,
-            'supply_type' => $order['supply_type'] ?? 'FBO',
-            'supply_method' => $order['supply_method'] ?? null,
-            'delivery_scheme' => $order['delivery_scheme'] ?? null,
+            'warehouse_id' => (string) ($supply['storage_warehouse']['warehouse_id'] ?? $order['dropoff_warehouse']['warehouse_id'] ?? ''),
+            'warehouse_name' => $supply['storage_warehouse']['name'] ?? $order['dropoff_warehouse']['name'] ?? null,
+            'macrolocal_cluster_id' => $supply['macrolocal_cluster_id'] ?? null,
+            'created_at' => $order['created_date'] ?? null,
+            'timeslot_from' => $order['timeslot']['timeslot']['from'] ?? null,
+            'timeslot_to' => $order['timeslot']['timeslot']['to'] ?? null,
+            'supply_type' => 'FBO',
+            'supply_method' => ! empty($supply['is_crossdock']) ? 'crossdock' : 'direct',
             'raw_data' => $order,
         ];
     }
@@ -661,6 +444,7 @@ class SuppliesApi implements SuppliesApiInterface
             // Типы: FULL_FILLMENT (РФЦ), CROSS_DOCK (кроссдокинг), SORTING_CENTER (сортировка), ORDERS_RECEIVING_POINT (ПВЗ)
             $acceptingWarehousesCount = 0;
             $allWarehouseIds = [];
+            $warehouseTypes = [];
             $acceptingWarehouseIds = [];
             $acceptingWarehouses = [];
             
@@ -676,7 +460,8 @@ class SuppliesApi implements SuppliesApiInterface
                     $whName = $wh['name'] ?? '';
                     
                     $allWarehouseIds[] = $whId;
-                    
+                    $warehouseTypes[$whId] = $whType;
+
                     // Считаем только склады фулфилмента (FULL_FILLMENT)
                     if ($whType === 'FULL_FILLMENT') {
                         // Исключаем специализированные склады (ветаптека, ювелирный, негабарит, паллетный, шины, КГТ)
@@ -701,8 +486,8 @@ class SuppliesApi implements SuppliesApiInterface
                 }
             }
             
-            // id — это ID кластера для API /v1/draft/create
-            // macrolocal_cluster_id — дополнительный идентификатор
+            // id — ID кластера (так он хранится у нас: поставки, ozon_warehouse_clusters),
+            // macrolocal_cluster_id — ID для /v1/draft/* и /v2/draft/* (resolveMacrolocalClusterId)
             $clusterId = $cluster['id'] ?? null;
             $macrolocalClusterId = $cluster['macrolocal_cluster_id'] ?? null;
             
@@ -714,6 +499,7 @@ class SuppliesApi implements SuppliesApiInterface
                 'warehouses_count' => $acceptingWarehousesCount,
                 'warehouse_ids' => $acceptingWarehouseIds,
                 'all_warehouse_ids' => $allWarehouseIds,
+                'warehouse_types' => $warehouseTypes,
                 'is_active' => true,
                 'warehouses' => $acceptingWarehouses,
             ];
@@ -763,167 +549,158 @@ class SuppliesApi implements SuppliesApiInterface
         return $out;
     }
 
-    private function buildClusterWarehouses(): array
-    {
-        $clusters = $this->getClusters();
-        $warehouses = [];
-
-        foreach ($clusters as $cluster) {
-            foreach ($cluster['warehouses'] ?? [] as $warehouse) {
-                $warehouses[] = [
-                    'id' => (string) ($warehouse['id'] ?? $warehouse['warehouse_id'] ?? null),
-                    'name' => $warehouse['name'] ?? null,
-                    'type' => $warehouse['type'] ?? null,
-                    'cluster_id' => (string) ($cluster['id'] ?? null),
-                    'cluster_name' => $cluster['name'] ?? null,
-                    'is_active' => $cluster['is_active'] ?? true,
-                ];
-            }
-        }
-
-        return $warehouses;
-    }
-
     /**
-     * Создать черновик прямой поставки (на конкретный склад)
-     * 
+     * Создать черновик прямой поставки в кластер
+     *
      * POST /v1/draft/direct/create
-     * 
+     *
      * @param array $data [
-     *   'cluster_id' => string,
-     *   'macrolocal_cluster_id' => string,
-     *   'items' => [['sku' => string, 'quantity' => int], ...],
+     *   'cluster_id' | 'macrolocal_cluster_id' => string|int,
+     *   'items' => [['sku' => int, 'quantity' => int], ...],
+     *   'deletion_sku_mode' => 'PARTIAL'|'FULL' (по умолчанию PARTIAL),
      * ]
      */
     public function createDirectDraft(array $data): array
     {
-        $items = [];
-        if (!empty($data['items'])) {
-            $items = array_map(fn($item) => [
-                'sku' => (int) ($item['sku'] ?? $item['product_id'] ?? 0),
-                'quantity' => (int) ($item['quantity'] ?? 0),
-            ], $data['items']);
-        }
-
-        // Используем актуальный эндпоинт /v1/draft/create
-        // Пробуем передать cluster_ids как массив int64 (числа)
+        $items = $this->draftItems($data['items'] ?? []);
         $clusterId = (int) ($data['cluster_id'] ?? $data['macrolocal_cluster_id'] ?? 0);
         if ($clusterId <= 0 || $items === []) {
             throw new OzonPreconditionException('Для прямого черновика нужны cluster_id и товары.');
         }
-        $body = [
-            'cluster_ids' => [$clusterId],
-            'items' => $items,
-            'type' => 'CREATE_TYPE_DIRECT',
-        ];
 
-        \Illuminate\Support\Facades\Log::info('Ozon draft/create request', [
-            'body' => $body,
+        $result = $this->createDraftVia('/v1/draft/direct/create', [
+            'cluster_info' => [
+                'items' => $items,
+                'macrolocal_cluster_id' => $this->resolveMacrolocalClusterId(0, $clusterId, null) ?? $clusterId,
+            ],
+            'deletion_sku_mode' => $data['deletion_sku_mode'] ?? 'PARTIAL',
         ]);
 
-        $response = $this->client->post('/v1/draft/create', $body);
-
-        \Illuminate\Support\Facades\Log::info('Ozon draft/create response', [
-            'response' => $response,
-        ]);
-
-        if (!$response || empty($response['operation_id'])) {
-            throw new OzonAmbiguousRemoteStateException(
-                'Не удалось создать черновик поставки: ' . 
-                json_encode($response)
-            );
-        }
-
-        $operationId = $response['operation_id'];
-
-        // Создание асинхронное. Делаем один неблокирующий poll; дальнейшее
-        // ожидание выполняет очередь ExecuteOzonSupplyDraftJob.
-        $draftInfo = $this->getDraftCreateInfo($operationId);
-        
-        \Illuminate\Support\Facades\Log::info('Ozon draft/create/info response', [
-            'operation_id' => $operationId,
-            'draft_info' => $draftInfo,
-        ]);
-
-        $draftId = null;
-        $errors = [];
-        $status = $draftInfo['status'] ?? 'UNKNOWN';
-        
-        // Сначала проверяем draft_id на верхнем уровне
-        if (!empty($draftInfo['draft_id']) && $draftInfo['draft_id'] !== 0) {
-            $draftId = (string) $draftInfo['draft_id'];
-        }
-        
-        // Если нет — ищем в clusters
-        if (!$draftId && !empty($draftInfo['clusters'])) {
-            foreach ($draftInfo['clusters'] as $cluster) {
-                if (!empty($cluster['draft_id']) && $cluster['draft_id'] !== 0) {
-                    $draftId = (string) $cluster['draft_id'];
-                    break;
-                }
-            }
-        }
-
-        // Обрабатываем ошибки
-        if (!empty($draftInfo['errors'])) {
-            foreach ($draftInfo['errors'] as $error) {
-                if (!empty($error['items_validation'])) {
-                    foreach ($error['items_validation'] as $item) {
-                        $reasons = $item['reasons'] ?? [];
-                        $sku = $item['sku'] ?? 'unknown';
-                        foreach ($reasons as $reason) {
-                            $errors[] = $this->translateOzonError($reason, $sku);
-                        }
-                    }
-                }
-                if (!empty($error['unknown_cluster_ids'])) {
-                    $errors[] = 'Неизвестные кластеры: ' . implode(', ', $error['unknown_cluster_ids']);
-                }
-                if (!empty($error['error_message'])) {
-                    $errors[] = $error['error_message'];
-                }
-            }
-        }
-
-        return [
-            'draft_id' => $draftId,
-            'operation_id' => $operationId,
-            'status' => match ($status) {
-                'CALCULATION_STATUS_SUCCESS' => 'draft',
-                'CALCULATION_STATUS_FAILED' => 'failed',
-                default => 'pending',
-            },
+        return $result + [
             'supply_method' => 'direct',
             'macrolocal_cluster_id' => $data['macrolocal_cluster_id'] ?? null,
-            'errors' => $errors,
             'created_at' => now()->toIso8601String(),
         ];
     }
 
+    /** @return list<array{sku:int, quantity:int}> */
+    private function draftItems(array $items): array
+    {
+        return array_values(array_map(fn ($item) => [
+            'sku' => (int) ($item['sku'] ?? $item['product_id'] ?? 0),
+            'quantity' => (int) ($item['quantity'] ?? 0),
+        ], $items));
+    }
+
     /**
-     * Перевод ошибок Ozon API на русский
+     * Общий шаг /v1/draft/{direct|crossdock|multi-cluster}/create: черновик создаётся
+     * сразу (draft_id), а расчёт складов асинхронный — делаем один неблокирующий poll
+     * /v2/draft/create/info, дальнейшее ожидание выполняет очередь ExecuteOzonSupplyDraftJob.
+     *
+     * draft_id отдаём только после status=SUCCESS (до этого слотов и складов нет),
+     * id созданного черновика — в pending_draft_id, по нему дальше идёт poll.
+     */
+    private function createDraftVia(string $endpoint, array $body): array
+    {
+        \Illuminate\Support\Facades\Log::info("Ozon {$endpoint} request", ['body' => $body]);
+        $response = $this->client->post($endpoint, $body);
+        \Illuminate\Support\Facades\Log::info("Ozon {$endpoint} response", ['response' => $response]);
+
+        if (! is_array($response) || ! empty($response['_error'])) {
+            throw new OzonAmbiguousRemoteStateException(
+                'Не удалось создать черновик поставки: ' . json_encode($response, JSON_UNESCAPED_UNICODE)
+            );
+        }
+
+        $draftId = (int) ($response['draft_id'] ?? 0);
+        $errors = $this->draftErrors($response['errors'] ?? []);
+        if ($draftId <= 0) {
+            // HTTP 200 без draft_id — Ozon отклонил состав, черновика нет.
+            return [
+                'draft_id' => null,
+                'pending_draft_id' => null,
+                'status' => 'failed',
+                'errors' => $errors ?: ['Ozon не создал черновик.'],
+            ];
+        }
+
+        return $this->pollDraftCreation((string) $draftId, $errors);
+    }
+
+    /**
+     * Poll /v2/draft/create/info по id созданного черновика.
+     *
+     * @param list<string> $knownErrors ошибки из ответа create
+     */
+    public function pollDraftCreation(string $draftId, array $knownErrors = []): array
+    {
+        $info = $this->getDraftCreateInfo($draftId);
+        $status = empty($info['_error']) ? ($info['status'] ?? null) : null;
+
+        return [
+            'draft_id' => $status === 'SUCCESS' ? $draftId : null,
+            'pending_draft_id' => $draftId,
+            'status' => match ($status) {
+                'SUCCESS' => 'draft',
+                'FAILED' => 'failed',
+                default => 'pending',
+            },
+            'errors' => array_values(array_unique(array_merge($knownErrors, $this->draftErrors($info['errors'] ?? [])))),
+            'draft_info' => $info,
+        ];
+    }
+
+    /** @return list<string> */
+    private function draftErrors(array $errors): array
+    {
+        $messages = [];
+        foreach ($errors as $error) {
+            foreach ($error['items_validation'] ?? [] as $validation) {
+                foreach ($validation['rejected_items'] ?? [] as $item) {
+                    foreach ($item['reasons'] ?? [] as $reason) {
+                        $messages[] = $this->translateOzonError((string) $reason, $item['sku'] ?? 'unknown');
+                    }
+                }
+            }
+            foreach ($error['error_reasons'] ?? [] as $reason) {
+                $messages[] = (string) $reason;
+            }
+            $message = $error['message'] ?? $error['error_message'] ?? null;
+            if (is_string($message) && $message !== '') {
+                $messages[] = $message;
+            }
+        }
+
+        return array_values(array_unique($messages));
+    }
+
+    /**
+     * Перевод причин отклонения товара (errors[].items_validation[].rejected_items[].reasons)
      */
     private function translateOzonError(string $reason, $sku): string
     {
         $translations = [
-            'ITEM_REJECTION_REASON_OUT_OF_ASSORTMENT' => "Товар SKU {$sku} не в ассортименте FBO (возможно, товар настроен только для FBS)",
-            'ITEM_REJECTION_REASON_NO_STOCK' => "Товар SKU {$sku} нет на складе",
-            'ITEM_REJECTION_REASON_BLOCKED' => "Товар SKU {$sku} заблокирован",
-            'ITEM_REJECTION_REASON_UNKNOWN' => "Товар SKU {$sku} отклонён по неизвестной причине",
+            'OUT_OF_ASSORTMENT' => "Товар SKU {$sku} не в ассортименте FBO (возможно, товар настроен только для FBS)",
+            'INVALID' => "Товар SKU {$sku} недействителен",
+            'INCOMPATIBLE_WAREHOUSE' => "Товар SKU {$sku} нельзя разместить на складах кластера",
+            'MULTIPLICITY' => "Товар SKU {$sku}: количество не кратно квантам",
+            'NO_PRICE' => "Товар SKU {$sku}: нет цены",
+            'EMPTY_BARCODE' => "Товар SKU {$sku}: нет штрихкода",
+            'SKU_IS_RESTRICTED' => "Товар SKU {$sku} ограничен к поставке",
         ];
 
         return $translations[$reason] ?? "Товар SKU {$sku}: {$reason}";
     }
 
     /**
-     * Получить информацию о созданном черновике
-     * 
-     * POST /v1/draft/create/info
+     * Статус и расчёт черновика
+     *
+     * POST /v2/draft/create/info
      */
-    public function getDraftCreateInfo(string $operationId): array
+    public function getDraftCreateInfo(string $draftId): array
     {
-        $response = $this->client->post('/v1/draft/create/info', [
-            'operation_id' => $operationId,
+        $response = $this->client->post('/v2/draft/create/info', [
+            'draft_id' => (int) $draftId,
         ]);
 
         return $response ?? [];
@@ -934,40 +711,19 @@ class SuppliesApi implements SuppliesApiInterface
      *
      * POST /v2/draft/timeslot/info
      */
-    public function getDraftTimeslots(int $draftId, int $warehouseId, ?int $clusterId = null, ?string $warehouseName = null): array
-    {
-        // Запрашиваем слоты на ближайшие 28 дней
+    public function getDraftTimeslots(
+        int $draftId,
+        int $warehouseId,
+        ?int $clusterId = null,
+        ?string $warehouseName = null,
+        string $supplyMethod = 'direct'
+    ): array {
+        // Слоты на ближайшие 28 дней (максимум Ozon — 28 дней с текущей даты)
         $dateFrom = now()->toDateString();
         $dateTo = now()->addDays(27)->toDateString();
 
-        $clusterIdHint = $clusterId
-            ?? \App\Models\OzonWarehouseCluster::getClusterIdByWarehouse($warehouseName ?? '')
-            ?? \App\Models\OzonWarehouseCluster::getClusterIdByWarehouse((string) $warehouseId);
-
-        $resolvedClusterId = $clusterIdHint ? (int) $clusterIdHint : null;
-        $macrolocalClusterId = null;
-
-        foreach ($this->getClusters() as $cluster) {
-            $warehouseIds = $cluster['warehouse_ids'] ?? $cluster['all_warehouse_ids'] ?? [];
-            $warehouseIds = array_map('strval', $warehouseIds);
-            $clusterIdValue = (string) ($cluster['id'] ?? '');
-            $macroIdValue = (string) ($cluster['macrolocal_cluster_id'] ?? '');
-
-            if (
-                in_array((string) $warehouseId, $warehouseIds, true)
-                || ($clusterIdHint && ((string) $clusterIdHint === $clusterIdValue || (string) $clusterIdHint === $macroIdValue))
-            ) {
-                $resolvedClusterId = (int) ($cluster['id'] ?? $clusterIdHint ?? 0);
-                $macrolocalClusterId = (int) ($cluster['macrolocal_cluster_id'] ?? $cluster['id'] ?? 0);
-                break;
-            }
-        }
-
-        if (!$macrolocalClusterId && $resolvedClusterId) {
-            $macrolocalClusterId = $resolvedClusterId;
-        }
-
-        if (!$macrolocalClusterId) {
+        $macrolocalClusterId = $this->resolveMacrolocalClusterId($warehouseId, $clusterId, $warehouseName);
+        if (! $macrolocalClusterId) {
             \Illuminate\Support\Facades\Log::warning('Ozon draft timeslots: cluster_id not resolved', [
                 'draft_id' => $draftId,
                 'warehouse_id' => $warehouseId,
@@ -977,115 +733,60 @@ class SuppliesApi implements SuppliesApiInterface
             return [];
         }
 
-        $response = $this->client->post('/v2/draft/timeslot/info', [
-            'draft_id' => (int) $draftId,
-            'date_from' => $dateFrom,
-            'date_to' => $dateTo,
-            'selected_cluster_warehouses' => [[
-                'macrolocal_cluster_id' => (int) $macrolocalClusterId,
-                'storage_warehouse_id' => (int) $warehouseId,
-            ]],
-        ]);
-
-        $groups = $response['result']['drop_off_warehouse_timeslots']
-            ?? $response['drop_off_warehouse_timeslots']
-            ?? $response['result']['warehouses']
-            ?? $response['warehouses']
-            ?? [];
-        $flatSlots = $response['result']['timeslots'] ?? $response['timeslots'] ?? [];
-        $shouldFallback = !$response
-            || !empty($response['_error'])
-            || !empty($response['error_reason'])
-            || (empty($groups) && empty($flatSlots));
-
-        if ($shouldFallback) {
-            $fallbackResponse = $this->client->post('/v1/draft/timeslot/info', [
-                'draft_id' => (int) $draftId,
-                'warehouse_ids' => [(string) $warehouseId],
-                'date_from' => $dateFrom . 'T00:00:00Z',
-                'date_to' => $dateTo . 'T23:59:59Z',
-            ]);
-
-            \Illuminate\Support\Facades\Log::info('Ozon draft/timeslot/info v1 fallback', [
-                'draft_id' => $draftId,
-                'warehouse_id' => $warehouseId,
-                'cluster_id' => $resolvedClusterId,
-                'macrolocal_cluster_id' => $macrolocalClusterId,
-                'response' => $fallbackResponse,
-            ]);
-
-            $response = $fallbackResponse ?: $response;
-            $groups = $response['result']['drop_off_warehouse_timeslots']
-                ?? $response['drop_off_warehouse_timeslots']
-                ?? $response['result']['warehouses']
-                ?? $response['warehouses']
-                ?? [];
-            $flatSlots = $response['result']['timeslots'] ?? $response['timeslots'] ?? [];
+        $supplyType = $this->ozonSupplyType($supplyMethod);
+        $selected = ['macrolocal_cluster_id' => $macrolocalClusterId];
+        if ($supplyType === 'DIRECT') {
+            // storage_warehouse_id — только для прямых поставок
+            $selected['storage_warehouse_id'] = $warehouseId;
         }
 
-        \Illuminate\Support\Facades\Log::info('Ozon draft/timeslot/info v2 response', [
+        $response = $this->client->post('/v2/draft/timeslot/info', [
+            'draft_id' => $draftId,
+            'date_from' => $dateFrom,
+            'date_to' => $dateTo,
+            'supply_type' => $supplyType,
+            'selected_cluster_warehouses' => [$selected],
+        ]);
+
+        \Illuminate\Support\Facades\Log::info('Ozon /v2/draft/timeslot/info response', [
             'draft_id' => $draftId,
             'warehouse_id' => $warehouseId,
-            'cluster_id' => $resolvedClusterId,
             'macrolocal_cluster_id' => $macrolocalClusterId,
             'response' => $response,
         ]);
 
-        $slots = [];
+        if (! is_array($response) || ! empty($response['_error']) || ! empty($response['error_reason'])) {
+            \Illuminate\Support\Facades\Log::warning('Ozon draft timeslots: Ozon не вернул слоты', [
+                'draft_id' => $draftId,
+                'error_reason' => $response['error_reason'] ?? null,
+                'http_status' => $response['_http_status'] ?? null,
+            ]);
 
-        foreach ($groups as $group) {
-            $groupWarehouseId = (string) ($group['storage_warehouse_id']
-                ?? $group['drop_off_warehouse_id']
-                ?? $warehouseId);
-            $groupClusterId = (string) ($group['macrolocal_cluster_id'] ?? $resolvedClusterId ?? $macrolocalClusterId);
-
-            foreach ($group['days'] ?? [] as $day) {
-                $date = $day['date_in_timezone'] ?? $day['date'] ?? null;
-                foreach ($day['timeslots'] ?? [] as $slot) {
-                    $from = $slot['from_in_timezone'] ?? $slot['from'] ?? null;
-                    $to = $slot['to_in_timezone'] ?? $slot['to'] ?? null;
-                    $slotId = $slot['timeslot_id'] ?? $slot['id'] ?? null;
-                    if (!$slotId && $from && $to) {
-                        $slotId = substr(sha1($groupWarehouseId . '|' . $from . '|' . $to), 0, 32);
-                    }
-
-                    $slots[] = [
-                        'id' => $slotId,
-                        'warehouse_id' => $groupWarehouseId,
-                        'cluster_id' => $groupClusterId,
-                        'date' => $date ? substr($date, 0, 10) : substr((string) $from, 0, 10),
-                        'time_from' => $from ? substr($from, 11, 5) : null,
-                        'time_to' => $to ? substr($to, 11, 5) : null,
-                        'from_datetime' => $from,
-                        'to_datetime' => $to,
-                        'is_available' => $slot['is_available'] ?? true,
-                        'capacity' => $slot['capacity'] ?? null,
-                    ];
-                }
-            }
+            return [];
         }
 
-        if (empty($slots)) {
-            $flatSlots = $response['result']['timeslots'] ?? $response['timeslots'] ?? [];
-            foreach ($flatSlots as $slot) {
-                $from = $slot['from_in_timezone'] ?? $slot['from'] ?? null;
-                $to = $slot['to_in_timezone'] ?? $slot['to'] ?? null;
-                $slotId = $slot['timeslot_id'] ?? $slot['id'] ?? null;
-                if (!$slotId && $from && $to) {
-                    $slotId = substr(sha1($warehouseId . '|' . $from . '|' . $to), 0, 32);
+        // result.drop_off_warehouse_timeslots — один объект: days[].timeslots[] в часовом поясе склада.
+        $slots = [];
+        foreach ($response['result']['drop_off_warehouse_timeslots']['days'] ?? [] as $day) {
+            foreach ($day['timeslots'] ?? [] as $slot) {
+                $from = $slot['from_in_timezone'] ?? null;
+                $to = $slot['to_in_timezone'] ?? null;
+                if (! $from || ! $to) {
+                    continue;
                 }
 
                 $slots[] = [
-                    'id' => $slotId,
+                    // У слотов v2 нет ID — стабильный ключ из склада и интервала.
+                    'id' => substr(sha1($warehouseId . '|' . $from . '|' . $to), 0, 32),
                     'warehouse_id' => (string) $warehouseId,
-                    'cluster_id' => (string) $resolvedClusterId,
-                    'date' => substr((string) $from, 0, 10),
-                    'time_from' => $from ? substr($from, 11, 5) : null,
-                    'time_to' => $to ? substr($to, 11, 5) : null,
+                    'cluster_id' => (string) ($clusterId ?? $macrolocalClusterId),
+                    'date' => substr((string) ($day['date_in_timezone'] ?? $from), 0, 10),
+                    'time_from' => substr($from, 11, 5),
+                    'time_to' => substr($to, 11, 5),
                     'from_datetime' => $from,
                     'to_datetime' => $to,
-                    'is_available' => $slot['is_available'] ?? true,
-                    'capacity' => $slot['capacity'] ?? null,
+                    'is_available' => true,
+                    'capacity' => null,
                 ];
             }
         }
@@ -1093,9 +794,19 @@ class SuppliesApi implements SuppliesApiInterface
         return $slots;
     }
 
+    /** Тип поставки для /v2/draft/* (supply_type) по supply_method поставки. */
+    private function ozonSupplyType(string $supplyMethod): string
+    {
+        return match (strtolower($supplyMethod)) {
+            'crossdock' => 'CROSSDOCK',
+            'multi_cluster', 'multi-cluster' => 'MULTI_CLUSTER',
+            default => 'DIRECT',
+        };
+    }
+
     /**
-     * Резолв macrolocal_cluster_id по складу (для v2 эндпоинтов поставки).
-     * Та же логика, что в getDraftTimeslots. Возвращает id или null.
+     * Резолв macrolocal_cluster_id по складу или ID кластера из /v1/cluster/list
+     * (для /v1/draft/* и /v2/draft/*). Возвращает id или null.
      */
     private function resolveMacrolocalClusterId(int $warehouseId, ?int $clusterId, ?string $warehouseName): ?int
     {
@@ -1149,7 +860,7 @@ class SuppliesApi implements SuppliesApiInterface
             'from_in_timezone' => $timeslotFrom,
             'to_in_timezone' => $timeslotTo,
         ];
-        $ozonSupplyType = strtoupper($supplyType) === 'CROSSDOCK' ? 'CROSSDOCK' : 'DIRECT';
+        $ozonSupplyType = $this->ozonSupplyType($supplyType);
         $macrolocalClusterId = $this->resolveMacrolocalClusterId($warehouseId, $clusterId, $warehouseName);
 
         if (! $macrolocalClusterId || $draftId <= 0 || $warehouseId <= 0) {
@@ -1290,141 +1001,76 @@ class SuppliesApi implements SuppliesApiInterface
      * POST /v1/draft/crossdock/create
      * 
      * @param array $data [
-     *   'macrolocal_cluster_id' => string,
+     *   'macrolocal_cluster_id' => string (ID кластера),
      *   'delivery_scheme' => 'drop_off' | 'pick_up',
      *   'point_id' => string (для drop_off — ID точки из /v1/warehouse/fbo/list),
-     *   'point_type' => string (для drop_off — тип точки),
+     *   'point_type' => string (для drop_off — тип точки; если нет — берём из /v1/cluster/list),
      *   'seller_warehouse_id' => string (для pick_up — ID склада продавца),
-     *   'items' => [['sku' => string, 'quantity' => int], ...],
+     *   'items' => [['sku' => int, 'quantity' => int], ...],
      * ]
      */
     public function createCrossdockDraft(array $data): array
     {
-        $clusterId = $data['macrolocal_cluster_id'] ?? '';
-        
-        // Items array per Ozon API spec
-        $items = [];
-        if (!empty($data['items'])) {
-            $items = array_map(fn($item) => [
-                'sku' => (int) ($item['sku'] ?? $item['offer_id'] ?? 0),
-                'quantity' => (int) ($item['quantity'] ?? 0),
-            ], $data['items']);
-        }
-        
-        // Use /v1/draft/create endpoint with correct format
-        // type: CREATE_TYPE_CROSSDOCK or CREATE_TYPE_DIRECT
-        // drop_off_point_warehouse_id: warehouse ID for crossdock
-        $body = [
-            'cluster_ids' => !empty($clusterId) ? [(string) $clusterId] : [],
-            'type' => 'CREATE_TYPE_CROSSDOCK',
-            'items' => $items,
-        ];
-
-        // Add drop_off_point_warehouse_id for crossdock
-        $pointId = $data['point_id'] ?? '';
-        if (!empty($pointId)) {
-            $body['drop_off_point_warehouse_id'] = (int) $pointId;
-        }
-        if (empty($clusterId) || $items === [] || empty($pointId)) {
-            throw new OzonPreconditionException(
-                'Для crossdock-черновика нужны кластер, товары и drop-off point.'
-            );
+        $clusterId = (int) ($data['macrolocal_cluster_id'] ?? 0);
+        $items = $this->draftItems($data['items'] ?? []);
+        if ($clusterId <= 0 || $items === []) {
+            throw new OzonPreconditionException('Для crossdock-черновика нужны кластер и товары.');
         }
 
-        \Log::info('Ozon crossdock draft request', [
-            'endpoint' => '/v1/draft/create',
-            'body' => $body,
-            'input_data' => $data,
+        $result = $this->createDraftVia('/v1/draft/crossdock/create', [
+            'cluster_info' => [
+                'items' => $items,
+                'macrolocal_cluster_id' => $this->resolveMacrolocalClusterId(0, $clusterId, null) ?? $clusterId,
+            ],
+            'deletion_sku_mode' => $data['deletion_sku_mode'] ?? 'PARTIAL',
+            'delivery_info' => $this->draftDeliveryInfo($data),
         ]);
 
-        $response = $this->client->post('/v1/draft/create', $body);
-        $operationId = $response['operation_id']
-            ?? $response['result']['operation_id']
-            ?? null;
-        if (! $operationId) {
-            $errorMsg = $response['error']['message']
-                ?? $response['message']
-                ?? ($response['error'] ?? 'Unknown error');
-            $errorText = is_array($errorMsg) ? json_encode($errorMsg) : (string) $errorMsg;
-            throw new OzonAmbiguousRemoteStateException(
-                'Не удалось создать черновик кросс-док поставки: ' . $errorText
-            );
-        }
-
-        $draftInfo = $this->getDraftCreateInfo((string) $operationId);
-        $draftId = $draftInfo['draft_id'] ?? null;
-        if (! $draftId) {
-            foreach (($draftInfo['clusters'] ?? []) as $cluster) {
-                if (! empty($cluster['draft_id'])) {
-                    $draftId = $cluster['draft_id'];
-                    break;
-                }
-            }
-        }
-
-        return [
-            'draft_id' => $draftId ? (string) $draftId : null,
-            'operation_id' => (string) $operationId,
-            'status' => $draftId
-                ? 'draft'
-                : (($draftInfo['status'] ?? null) === 'CALCULATION_STATUS_FAILED' ? 'failed' : 'pending'),
+        return $result + [
             'supply_method' => 'crossdock',
             'delivery_scheme' => $data['delivery_scheme'] ?? 'drop_off',
             'macrolocal_cluster_id' => $data['macrolocal_cluster_id'] ?? null,
-            'draft_info' => $draftInfo,
             'created_at' => now()->toIso8601String(),
         ];
     }
 
     /**
      * Создать черновик мультикластерной поставки
-     * 
+     *
      * POST /v1/draft/multi-cluster/create
-     * 
+     *
+     * Товары задаются по кластерам (clusters_info[].items), поэтому общий список
+     * товаров принимаем только для одного кластера.
+     *
      * @param array $data [
      *   'cluster_ids' => string[] (массив ID кластеров),
      *   'delivery_scheme' => 'drop_off' | 'pick_up',
      *   'point_id' => string (для drop_off),
      *   'point_type' => string (для drop_off),
      *   'seller_warehouse_id' => string (для pick_up),
-     *   'items' => [['sku' => string, 'quantity' => int], ...],
+     *   'items' => [['sku' => int, 'quantity' => int], ...],
      * ]
      */
     public function createMultiClusterDraft(array $data): array
     {
-        $body = [
-            'macrolocal_cluster_ids' => $data['cluster_ids'] ?? [],
-            'delivery_scheme' => strtoupper($data['delivery_scheme'] ?? 'DROP_OFF'),
-        ];
-
-        if (($data['delivery_scheme'] ?? '') === 'drop_off') {
-            $body['drop_off_point'] = [
-                'id' => $data['point_id'] ?? '',
-                'type' => $data['point_type'] ?? '',
-            ];
-        } else {
-            $body['seller_warehouse_id'] = $data['seller_warehouse_id'] ?? '';
-        }
-
-        if (!empty($data['items'])) {
-            $body['items'] = array_map(fn($item) => [
-                'sku' => $item['sku'] ?? $item['offer_id'] ?? '',
-                'quantity' => $item['quantity'] ?? 0,
-            ], $data['items']);
-        }
-
-        $response = $this->client->post('/v1/draft/multi-cluster/create', $body);
-
-        if (!$response || empty($response['result'])) {
-            throw new \RuntimeException(
-                'Не удалось создать черновик мультикластерной поставки: ' . 
-                ($response['error']['message'] ?? 'Unknown error')
+        $clusterIds = array_values(array_filter(array_map('intval', (array) ($data['cluster_ids'] ?? []))));
+        $items = $this->draftItems($data['items'] ?? []);
+        if (count($clusterIds) !== 1 || $items === []) {
+            throw new OzonPreconditionException(
+                'Для мультикластерного черновика нужен товарный состав по каждому кластеру; поддержан один кластер с товарами.'
             );
         }
 
-        return [
-            'draft_id' => (string) ($response['result']['draft_id'] ?? null),
-            'status' => 'draft',
+        $result = $this->createDraftVia('/v1/draft/multi-cluster/create', [
+            'clusters_info' => [[
+                'items' => $items,
+                'macrolocal_cluster_id' => $this->resolveMacrolocalClusterId(0, $clusterIds[0], null) ?? $clusterIds[0],
+            ]],
+            'deletion_sku_mode' => $data['deletion_sku_mode'] ?? 'PARTIAL',
+            'delivery_info' => $this->draftDeliveryInfo($data),
+        ]);
+
+        return $result + [
             'supply_method' => 'multi_cluster',
             'delivery_scheme' => $data['delivery_scheme'] ?? 'drop_off',
             'cluster_ids' => $data['cluster_ids'] ?? [],
@@ -1432,507 +1078,117 @@ class SuppliesApi implements SuppliesApiInterface
         ];
     }
 
+    /** delivery_info для /v1/draft/crossdock/create и /v1/draft/multi-cluster/create */
+    private function draftDeliveryInfo(array $data): array
+    {
+        if (($data['delivery_scheme'] ?? 'drop_off') === 'pick_up') {
+            $sellerWarehouseId = (int) ($data['seller_warehouse_id'] ?? 0);
+            if ($sellerWarehouseId <= 0) {
+                throw new OzonPreconditionException('Для отгрузки курьером (PICKUP) нужен склад продавца.');
+            }
+
+            return ['type' => 'PICKUP', 'seller_warehouse_id' => $sellerWarehouseId];
+        }
+
+        $pointId = (int) ($data['point_id'] ?? 0);
+        $pointType = $pointId > 0 ? $this->dropOffWarehouseType($data['point_type'] ?? null, $pointId) : null;
+        if ($pointType === null) {
+            throw new OzonPreconditionException(
+                'Для отгрузки в пункт приёма (DROPOFF) нужны ID и тип точки отгрузки (warehouse_type).'
+            );
+        }
+
+        return [
+            'type' => 'DROPOFF',
+            'drop_off_warehouse' => ['warehouse_id' => $pointId, 'warehouse_type' => $pointType],
+        ];
+    }
+
+    /**
+     * Тип точки для delivery_info.drop_off_warehouse.warehouse_type. Принимает тип из
+     * /v1/warehouse/fbo/list (WAREHOUSE_TYPE_*) или наш короткий (pvz/sc/crossdock/rfc);
+     * если не передан — ищет точку среди складов /v1/cluster/list.
+     */
+    private function dropOffWarehouseType(?string $pointType, int $pointId): ?string
+    {
+        $allowed = ['DELIVERY_POINT', 'SORTING_CENTER', 'CROSS_DOCK', 'ORDERS_RECEIVING_POINT', 'FULL_FILLMENT'];
+        $type = str_replace('WAREHOUSE_TYPE_', '', strtoupper(trim((string) $pointType)));
+        $type = ['PVZ' => 'DELIVERY_POINT', 'SC' => 'SORTING_CENTER', 'CROSSDOCK' => 'CROSS_DOCK', 'RFC' => 'FULL_FILLMENT'][$type] ?? $type;
+        if (in_array($type, $allowed, true)) {
+            return $type;
+        }
+
+        foreach ($this->getClusters() as $cluster) {
+            $type = $cluster['warehouse_types'][(string) $pointId] ?? null;
+            if (in_array($type, $allowed, true)) {
+                return $type;
+            }
+        }
+
+        return null;
+    }
+
     /**
      * Получить статус и расчёты черновика
-     * 
+     *
      * POST /v2/draft/create/info
-     * 
+     *
      * @param string $draftId ID черновика
-     * @return array Статус, ошибки и расчёты по складам
+     * @return array status (SUCCESS|IN_PROGRESS|FAILED), errors, clusters[].warehouses[]
+     *               (storage_warehouse, availability_status, bundle_id) как в ответе Ozon
      */
     public function getDraftInfo(string $draftId): array
     {
-        $response = $this->client->post('/v2/draft/create/info', [
-            'draft_id' => $draftId,
-        ]);
+        $response = $this->getDraftCreateInfo($draftId);
 
-        if (!$response) {
+        if ($response === [] || ! empty($response['_error'])) {
             return [];
         }
 
-        $result = $response['result'] ?? [];
-        
         return [
             'draft_id' => $draftId,
-            'status' => $result['status'] ?? 'unknown',
-            'errors' => $result['errors'] ?? [],
-            'warehouses' => array_map(fn($wh) => [
-                'warehouse_id' => (string) ($wh['warehouse_id'] ?? null),
-                'warehouse_name' => $wh['warehouse_name'] ?? null,
-                'cluster_id' => $wh['macrolocal_cluster_id'] ?? null,
-                'items_count' => $wh['items_count'] ?? 0,
-                'total_quantity' => $wh['total_quantity'] ?? 0,
-                'estimated_cost' => $wh['estimated_cost'] ?? null,
-                'is_available' => $wh['is_available'] ?? true,
-            ], $result['warehouses'] ?? []),
+            'status' => $response['status'] ?? 'UNSPECIFIED',
+            'errors' => $response['errors'] ?? [],
+            'clusters' => $response['clusters'] ?? [],
         ];
     }
 
-    // Метод getDraftTimeslots определён выше
-
-    // Метод createSupplyFromDraft определён выше
-
-    // Метод getSupplyCreateStatus определён выше
-
     /**
-     * Fetch real warehouse coordinates from /v1/warehouse/list API
-     * Uses file cache to avoid rate limiting (cached for 24 hours)
-     */
-    private function fetchWarehouseCoordinates(): array
-    {
-        $cacheFile = storage_path('app/ozon_warehouse_coordinates.json');
-        $cacheTtl = 86400; // 24 hours
-
-        if (file_exists($cacheFile)) {
-            $mtime = filemtime($cacheFile);
-            if ($mtime && (time() - $mtime) < $cacheTtl) {
-                $cached = json_decode(file_get_contents($cacheFile), true);
-                if (is_array($cached)) {
-                    return $cached;
-                }
-            }
-        }
-
-        $coordinates = [];
-        // Keep minimal to avoid rate limit spikes
-        $searchTerms = ['Москва', 'Санкт-Петербург', 'Екатеринбург'];
-
-        foreach ($searchTerms as $search) {
-            try {
-                if (!empty($coordinates)) {
-                    sleep(1); // 1 request/sec
-                }
-
-                $response = $this->client->post('/v1/warehouse/list', [
-                    'search' => $search,
-                ]);
-
-                if (!$response) {
-                    continue;
-                }
-
-                $errorMessage = $response['error']['message']
-                    ?? $response['message']
-                    ?? null;
-                if ($errorMessage && str_contains(mb_strtolower($errorMessage), 'rate limit')) {
-                    \Log::warning('Ozon rate limit while fetching coordinates', [
-                        'search' => $search,
-                        'message' => $errorMessage,
-                    ]);
-                    break;
-                }
-
-                $result = $response['result'] ?? $response;
-                $warehouses = $result['search'] ?? $result['warehouses'] ?? [];
-
-                foreach ($warehouses as $wh) {
-                    $whId = (string) ($wh['warehouse_id'] ?? $wh['id'] ?? null);
-                    $rawCoords = $wh['coordinates'] ?? null;
-
-                    if ($whId && is_array($rawCoords)) {
-                        $lat = $rawCoords['latitude'] ?? null;
-                        $lng = $rawCoords['longitude'] ?? null;
-                        if ($lat !== null && $lng !== null) {
-                            $coordinates[$whId] = [
-                                'lat' => (float) $lat,
-                                'lng' => (float) $lng,
-                            ];
-                        }
-                    }
-                }
-            } catch (\Exception $e) {
-                \Log::warning('Failed to fetch warehouse coordinates for: ' . $search, [
-                    'error' => $e->getMessage(),
-                ]);
-            }
-        }
-
-        if (!empty($coordinates)) {
-            file_put_contents($cacheFile, json_encode($coordinates));
-        }
-
-        \Log::info('Fetched warehouse coordinates', [
-            'count' => count($coordinates),
-        ]);
-
-        return $coordinates;
-    }
-
-    /**
-     * Получить список складов FBO
-     * 
-     * POST /v1/warehouse/fbo/list
-     */
-    public function getFboWarehouses(array $params = []): array
-    {
-        // First get all warehouses from /v1/cluster/list (no coordinates)
-        $response = $this->client->post('/v1/cluster/list', [
-            'cluster_type' => 'CLUSTER_TYPE_OZON',
-        ]);
-
-        \Log::info('Ozon FBO warehouses response (from cluster/list)', [
-            'response_keys' => is_array($response) ? array_keys($response) : 'not_array',
-        ]);
-        
-        // Then get real coordinates from /v1/warehouse/list by searching major cities
-        $warehouseCoordinates = $this->fetchWarehouseCoordinates();
-
-        if (!$response) {
-            return $this->buildClusterWarehouses();
-        }
-
-        $result = $response['result'] ?? $response;
-        $clusters = $result['clusters'] ?? [];
-        
-        // Flatten all warehouses from all clusters
-        $warehouses = [];
-        foreach ($clusters as $cluster) {
-            $clusterId = $cluster['macrolocal_cluster_id'] ?? $cluster['id'] ?? null;
-            $clusterName = $cluster['name'] ?? null;
-            $logisticClusters = $cluster['logistic_clusters'] ?? [];
-            
-            foreach ($logisticClusters as $lc) {
-                $lcWarehouses = $lc['warehouses'] ?? [];
-                foreach ($lcWarehouses as $wh) {
-                    $wh['_cluster_id'] = $clusterId;
-                    $wh['_cluster_name'] = $clusterName;
-                    $warehouses[] = $wh;
-                }
-            }
-        }
-        
-        \Log::info('Ozon FBO warehouses parsed', [
-            'clusters_count' => count($clusters),
-            'warehouses_count' => count($warehouses),
-            'sample_types' => array_unique(array_column(array_slice($warehouses, 0, 50), 'type')),
-        ]);
-        
-        if (empty($warehouses)) {
-            return $this->buildClusterWarehouses();
-        }
-        
-        // Static coordinates for Russian cities (extracted from warehouse names)
-        $cityCoordinates = [
-            'МОСКВА' => [55.7558, 37.6173],
-            'МСК' => [55.7558, 37.6173],
-            'МО' => [55.7558, 37.6173],
-            'САНКТ-ПЕТЕРБУРГ' => [59.9343, 30.3351],
-            'СПБ' => [59.9343, 30.3351],
-            'ЕКАТЕРИНБУРГ' => [56.8389, 60.6057],
-            'ЕКБ' => [56.8389, 60.6057],
-            'НОВОСИБИРСК' => [55.0084, 82.9357],
-            'КАЗАНЬ' => [55.7887, 49.1221],
-            'НИЖНИЙ НОВГОРОД' => [56.2965, 43.9361],
-            'ЧЕЛЯБИНСК' => [55.1644, 61.4368],
-            'САМАРА' => [53.1959, 50.1002],
-            'РОСТОВ' => [47.2357, 39.7015],
-            'УФА' => [54.7388, 55.9721],
-            'КРАСНОЯРСК' => [56.0153, 92.8932],
-            'ВОРОНЕЖ' => [51.6720, 39.1843],
-            'ПЕРМЬ' => [58.0105, 56.2502],
-            'ВОЛГОГРАД' => [48.7080, 44.5133],
-            'КРАСНОДАР' => [45.0355, 38.9753],
-            'САРАТОВ' => [51.5336, 46.0343],
-            'ТЮМЕНЬ' => [57.1522, 65.5272],
-            'ТОЛЬЯТТИ' => [53.5078, 49.4204],
-            'ИЖЕВСК' => [56.8527, 53.2114],
-            'БАРНАУЛ' => [53.3548, 83.7698],
-            'УЛЬЯНОВСК' => [54.3142, 48.4031],
-            'ИРКУТСК' => [52.2978, 104.2964],
-            'ХАБАРОВСК' => [48.4827, 135.0838],
-            'ЯРОСЛАВЛЬ' => [57.6261, 39.8845],
-            'ВЛАДИВОСТОК' => [43.1332, 131.9113],
-            'МАХАЧКАЛА' => [42.9849, 47.5047],
-            'ТОМСК' => [56.4977, 84.9744],
-            'ОРЕНБУРГ' => [51.7727, 55.0988],
-            'КЕМЕРОВО' => [55.3908, 86.0779],
-            'НОВОКУЗНЕЦК' => [53.7596, 87.1216],
-            'РЯЗАНЬ' => [54.6269, 39.6916],
-            'АСТРАХАНЬ' => [46.3497, 48.0408],
-            'ПЕНЗА' => [53.1959, 45.0183],
-            'ЛИПЕЦК' => [52.6031, 39.5708],
-            'КИРОВ' => [58.6035, 49.6668],
-            'ЧЕБОКСАРЫ' => [56.1322, 47.2519],
-            'ТУЛА' => [54.1961, 37.6182],
-            'КАЛИНИНГРАД' => [54.7104, 20.4522],
-            'КУРСК' => [51.7373, 36.1874],
-            'СТАВРОПОЛЬ' => [45.0428, 41.9734],
-            'НЕВИННОМЫССК' => [44.6333, 41.9333],
-            'СОЧИ' => [43.5855, 39.7231],
-            'БЕЛГОРОД' => [50.5997, 36.5986],
-            'БРЯНСК' => [53.2521, 34.3717],
-            'ИВАНОВО' => [56.9966, 40.9715],
-            'ВЛАДИМИР' => [56.1366, 40.3966],
-            'АРХАНГЕЛЬСК' => [64.5401, 40.5433],
-            'СУРГУТ' => [61.2500, 73.4167],
-            'СМОЛЕНСК' => [54.7903, 32.0503],
-            'КУРГАН' => [55.4500, 65.3333],
-            'ОМСК' => [54.9885, 73.3242],
-            'ДОМОДЕДОВО' => [55.4200, 37.7633],
-            'ХОРУГВИНО' => [56.0500, 37.0833],
-            'НОГИНСК' => [55.8667, 38.4333],
-            'ПУШКИНО' => [56.0167, 37.8500],
-            'ВАТУТИНКИ' => [55.5000, 37.3333],
-            'КОСТРОМА' => [57.7678, 40.9269],
-            'ТВЕРЬ' => [56.8587, 35.9176],
-            'ВОЛОГДА' => [59.2181, 39.8886],
-            'МУРМАНСК' => [68.9585, 33.0827],
-            'ПЕТРОЗАВОДСК' => [61.7849, 34.3469],
-            'СЫКТЫВКАР' => [61.6688, 50.8364],
-            'КАЛУГА' => [54.5293, 36.2754],
-            'ОРЕЛ' => [52.9651, 36.0785],
-            'ТАМБОВ' => [52.7212, 41.4523],
-            'ПСКОВ' => [57.8136, 28.3496],
-            'ВЕЛИКИЙ НОВГОРОД' => [58.5228, 31.2749],
-            'ЙОШКАР-ОЛА' => [56.6344, 47.8995],
-            'САРАНСК' => [54.1838, 45.1749],
-            'АДЫГЕЙСК' => [44.8783, 39.1908],
-            'АЛМАТЫ' => [43.2220, 76.8512],
-            'АСТАНА' => [51.1694, 71.4491],
-            'БАТАЙСК' => [47.1389, 39.7444],
-            'ГРИВНО' => [55.4167, 37.3333],
-            'ДАВЫДОВСКОЕ' => [55.7500, 37.8333],
-            'ДЗЕРЖИНСК' => [56.2389, 43.4611],
-            'ЖУКОВСКИЙ' => [55.5953, 38.1200],
-            'ЗЕЛЕНОДОЛЬСК' => [55.8500, 48.5167],
-            'КОЛЕДИНО' => [55.3167, 37.4333],
-            'СОФЬИНО' => [55.4833, 37.9500],
-            'ТРОИЦКИЙ' => [55.5000, 37.3000],
-            'НИКОЛЬСКОЕ' => [59.7000, 30.7833],
-            'СОЛНЕЧНОГОРСК' => [56.1833, 36.9833],
-            'СУХАРЕВО' => [55.9500, 37.4167],
-            'ЩЕЛКОВО' => [55.9167, 37.9667],
-            'ПЕРВОУРАЛЬСК' => [56.9000, 59.9500],
-            'ПЫШМА' => [56.9667, 60.5833],
-            'КОЛЬЦОВО' => [56.7500, 60.8000],
-            'АПЕЛЬСИН' => [56.8389, 60.6057],
-            'ЧЕРНЯХОВСКОГО' => [56.8389, 60.6057],
-            'ВОЛЖСКИЙ' => [48.7833, 44.7667],
-            'ВИДНОЕ' => [55.5500, 37.7000],
-            'ПОДОЛЬСК' => [55.4311, 37.5456],
-            'ЛЮБЕРЦЫ' => [55.6833, 37.8833],
-            'БАЛАШИХА' => [55.8000, 37.9500],
-            'МЫТИЩИ' => [55.9167, 37.7333],
-            'КОРОЛЁВ' => [55.9167, 37.8167],
-            'ХИМКИ' => [55.8833, 37.4333],
-            'ОДИНЦОВО' => [55.6667, 37.2667],
-            'РЕУТОВ' => [55.7500, 37.8500],
-            'ДОЛГОПРУДНЫЙ' => [55.9333, 37.5000],
-            'ЛОБНЯ' => [56.0000, 37.4833],
-            'ДМИТРОВ' => [56.3500, 37.5167],
-            'СЕРГИЕВ ПОСАД' => [56.3000, 38.1333],
-            'КЛИН' => [56.3333, 36.7333],
-            'ЭЛЕКТРОСТАЛЬ' => [55.7833, 38.4500],
-            'КОЛОМНА' => [55.0833, 38.7833],
-            'СЕРПУХОВ' => [54.9167, 37.4167],
-            'ЧЕХОВ' => [55.1500, 37.4667],
-            'РАМЕНСКОЕ' => [55.5667, 38.2333],
-            'ЖЕЛЕЗНОДОРОЖНЫЙ' => [55.7500, 38.0167],
-            'КРАСНОГОРСК' => [55.8167, 37.3333],
-            'НАРО-ФОМИНСК' => [55.3833, 36.7333],
-            'ОБНИНСК' => [55.1000, 36.6167],
-            'ЖУЛЕБИНО' => [55.6833, 37.8500],
-            'ВНУКОВО' => [55.6000, 37.2833],
-            'ШЕРЕМЕТЬЕВО' => [55.9667, 37.4167],
-            'БЫКОВО' => [55.6167, 38.0667],
-            'ИСТРА' => [55.9167, 36.8667],
-            'ЗВЕНИГОРОД' => [55.7333, 36.8500],
-            'МОЖАЙСК' => [55.5000, 36.0167],
-            'РУЗА' => [55.7000, 36.1833],
-            'ВОЛОКОЛАМСК' => [56.0333, 35.9500],
-            'ШАТУРА' => [55.5667, 39.5333],
-            'ЕГОРЬЕВСК' => [55.3833, 39.0333],
-            'ПАВЛОВСКИЙ ПОСАД' => [55.7833, 38.6500],
-            'ОРЕХОВО-ЗУЕВО' => [55.8000, 38.9667],
-            'СТУПИНО' => [54.9000, 38.0667],
-            'КАШИРА' => [54.8333, 38.1500],
-            'ЗАРАЙСК' => [54.7500, 38.8833],
-            'ЛУХОВИЦЫ' => [54.9667, 39.0333],
-            'ТАЛДОМ' => [56.7333, 37.5333],
-            'ДУБНА' => [56.7333, 37.1667],
-            'КИМРЫ' => [56.8667, 37.3500],
-            'КОНАКОВО' => [56.7000, 36.7667],
-            'ТОРЖОК' => [57.0333, 34.9500],
-            'РЖЕВ' => [56.2667, 34.3167],
-            'ВЫШНИЙ ВОЛОЧЁК' => [57.5833, 34.5500],
-            'БОЛОГОЕ' => [57.8833, 34.0500],
-            'УДОМЛЯ' => [57.8833, 35.0000],
-            'ОСТАШКОВ' => [57.1500, 33.1000],
-            'НЕЛИДОВО' => [56.2167, 32.7833],
-            'ЗАПАДНАЯ ДВИНА' => [56.2500, 32.0833],
-            'АНДРЕАПОЛЬ' => [56.6500, 32.2667],
-            'ПЕНО' => [56.9167, 32.7667],
-            'СЕЛИЖАРОВО' => [56.8500, 33.4333],
-            'КУВШИНОВО' => [57.0333, 34.1667],
-            'ЛИХОСЛАВЛЬ' => [57.1333, 35.4667],
-            'СПИРОВО' => [57.4167, 35.0000],
-            'МАКСАТИХА' => [57.7833, 35.9167],
-            'РАМЕШКИ' => [57.3333, 36.0000],
-            'КЕСОВА ГОРА' => [57.5500, 36.8333],
-            'СОНКОВО' => [57.7667, 37.1333],
-            'БЕЖЕЦК' => [57.7833, 36.6833],
-            'КРАСНЫЙ ХОЛМ' => [58.0667, 37.1000],
-            'ВЕСЬЕГОНСК' => [58.6667, 37.2667],
-            'САНДОВО' => [58.4667, 36.4167],
-            'МОЛОКОВО' => [57.5667, 36.5500],
-            'СТАРИЦА' => [56.5167, 34.9333],
-            'ЗУБЦОВ' => [56.1667, 34.5833],
-            'ОЛЕНИНО' => [56.3833, 33.3000],
-            'БЕЛЫЙ' => [55.8500, 32.9333],
-            'ЖАРКОВСКИЙ' => [55.8500, 32.3000],
-            'НОВОРОССИЙСК' => [44.7167, 37.7667],
-            'АНАПА' => [44.8944, 37.3167],
-            'ГЕЛЕНДЖИК' => [44.5611, 38.0778],
-            'ТУАПСЕ' => [44.1000, 39.0833],
-            'АРМАВИР' => [44.9833, 41.1167],
-            'КРОПОТКИН' => [45.4333, 40.5667],
-            'ТИХОРЕЦК' => [45.8500, 40.1333],
-            'ЕЙСК' => [46.7000, 38.2667],
-            'СЛАВЯНСК-НА-КУБАНИ' => [45.2500, 38.1167],
-            'ТЕМРЮК' => [45.2667, 37.3833],
-            'КРЫМСК' => [44.9333, 37.9833],
-            'АБИНСК' => [44.8667, 38.1500],
-            'ТИМАШЁВСК' => [45.6167, 38.9500],
-            'КОРЕНОВСК' => [45.4667, 39.4500],
-            'УСТЬ-ЛАБИНСК' => [45.2167, 39.6833],
-            'ЛАБИНСК' => [44.6333, 40.7333],
-            'КУРГАНИНСК' => [44.8833, 40.6000],
-            'БЕЛОРЕЧЕНСК' => [44.7667, 39.8667],
-            'АПШЕРОНСК' => [44.4667, 39.7333],
-            'ХАДЫЖЕНСК' => [44.4167, 39.5333],
-            'ГОРЯЧИЙ КЛЮЧ' => [44.6333, 39.1333],
-            'ПРИМОРСКО-АХТАРСК' => [46.0500, 38.1833],
-            'ТБИЛИССКАЯ' => [45.3667, 40.1833],
-            'ВЫСЕЛКИ' => [45.8500, 39.6500],
-            'НОВОКУБАНСК' => [45.1167, 41.0333],
-            'ГУЛЬКЕВИЧИ' => [45.3500, 40.7000],
-            'КАВКАЗСКАЯ' => [45.4500, 40.6667],
-            'УСПЕНСКОЕ' => [44.9000, 41.3833],
-            'ОТРАДНАЯ' => [44.3833, 41.5167],
-            'МОСТОВСКОЙ' => [44.4167, 40.7833],
-            'ПСЕБАЙ' => [44.1333, 40.8000],
-            'КОМИ' => [61.6688, 50.8364],
-            'FRESH' => [55.7558, 37.6173],
-            'РЯБИНОВАЯ' => [55.7558, 37.6173],
-            'НИНО' => [56.2965, 43.9361],
-        ];
-        
-        $mapped = array_map(function($wh) use ($cityCoordinates, $warehouseCoordinates) {
-            $warehouseId = (string) ($wh['warehouse_id'] ?? $wh['id'] ?? null);
-            $coordinates = null;
-            
-            // First try to get real coordinates from /v1/warehouse/list cache
-            if (isset($warehouseCoordinates[$warehouseId])) {
-                $coordinates = $warehouseCoordinates[$warehouseId];
-            }
-            
-            // Then try coordinates from cluster/list response
-            if (!$coordinates) {
-                $rawCoords = $wh['coordinates'] ?? ($wh['address']['coordinates'] ?? null);
-                if (is_array($rawCoords)) {
-                    $lat = $rawCoords['latitude'] ?? $rawCoords['lat'] ?? null;
-                    $lng = $rawCoords['longitude'] ?? $rawCoords['lng'] ?? $rawCoords['lon'] ?? null;
-                    if ($lat !== null && $lng !== null) {
-                        $coordinates = [
-                            'lat' => (float) $lat,
-                            'lng' => (float) $lng,
-                        ];
-                    }
-                }
-            }
-            
-            // Fallback: extract from warehouse name using city coordinates
-            if (!$coordinates) {
-                $whName = strtoupper($wh['name'] ?? '');
-                foreach ($cityCoordinates as $city => $coords) {
-                    if (str_contains($whName, $city)) {
-                        $offset = (crc32($warehouseId ?? $wh['name'] ?? '') % 100) / 10000;
-                        $coordinates = [
-                            'lat' => $coords[0] + $offset,
-                            'lng' => $coords[1] + $offset,
-                        ];
-                        break;
-                    }
-                }
-            }
-            
-            // Determine point type for frontend based on warehouse_type
-            $warehouseType = $wh['warehouse_type'] ?? $wh['type'] ?? '';
-            $pointType = 'sc'; // default = sorting center
-            
-            // Map Ozon warehouse types to frontend types
-            if (str_contains($warehouseType, 'DELIVERY_POINT') || str_contains($warehouseType, 'ORDERS_RECEIVING')) {
-                $pointType = 'pvz'; // ПВЗ
-            } elseif (str_contains($warehouseType, 'SORTING_CENTER')) {
-                $pointType = 'sc'; // СЦ
-            } elseif (str_contains($warehouseType, 'CROSS_DOCK')) {
-                $pointType = 'crossdock'; // Кросс-док
-            } elseif (str_contains($warehouseType, 'FULL_FILLMENT')) {
-                $pointType = 'rfc'; // РФЦ
-            }
-            
-            // Normalize warehouse_type to full Ozon format
-            $fullWarehouseType = $warehouseType;
-            if (!str_starts_with($warehouseType, 'WAREHOUSE_TYPE_')) {
-                $fullWarehouseType = 'WAREHOUSE_TYPE_' . $warehouseType;
-            }
-            
-            return [
-                'id' => (string) ($wh['warehouse_id'] ?? $wh['id'] ?? null),
-                'name' => $wh['name'] ?? null,
-                'type' => $pointType,
-                'warehouse_type' => $fullWarehouseType,
-                'address' => is_array($wh['address'] ?? null)
-                    ? ($wh['address']['address'] ?? null)
-                    : ($wh['address'] ?? null),
-                'city' => $wh['city'] ?? ($wh['address']['city'] ?? null),
-                'region' => $wh['region'] ?? ($wh['address']['region'] ?? null),
-                'cluster_id' => $wh['_cluster_id'] ?? $wh['macrolocal_cluster_id'] ?? ($wh['address']['macrolocal_cluster_id'] ?? null),
-                'cluster_name' => $wh['_cluster_name'] ?? $wh['cluster_name'] ?? null,
-                'coordinates' => $coordinates,
-                'is_active' => $wh['is_active'] ?? true,
-            ];
-        }, $warehouses);
-
-        $hasClusterInfo = collect($mapped)->contains(function ($wh) {
-            return !empty($wh['cluster_id']) || !empty($wh['address']);
-        });
-
-        return $hasClusterInfo ? $mapped : $this->buildClusterWarehouses();
-    }
-
-    /**
-     * Получить точки отгрузки для кросс-докинга (ПВЗ и СЦ)
-     * 
-     * POST /v1/warehouse/list
-     * 
-     * Возвращает ПВЗ (WAREHOUSE_TYPE_DELIVERY_POINT) и СЦ (WAREHOUSE_TYPE_SORTING_CENTER)
-     * для отгрузки товаров при кросс-докинге.
+     * Получить точки отгрузки для кросс-докинга (ПВЗ, СЦ, кросс-док)
+     *
+     * POST /v1/warehouse/fbo/list — поиск по названию, search обязателен (от 4 символов).
+     * (/v1/warehouse/list — это склады FBS продавца, для точек FBO он не подходит.)
      */
     public function getCrossdockDropOffPoints(string $search = ''): array
     {
-        $body = [
-            'filter_by_supply_type' => ['CREATE_TYPE_CROSSDOCK'],
-        ];
-        
-        if (!empty($search) && strlen($search) >= 4) {
-            $body['search'] = $search;
+        $search = trim($search);
+        if (mb_strlen($search) < 4) {
+            // Без поиска Ozon точки не отдаёт — не зовём API заведомо невалидным запросом.
+            return [];
         }
 
-        $response = $this->client->post('/v1/warehouse/list', $body);
+        $body = [
+            'filter_by_supply_type' => ['CREATE_TYPE_CROSSDOCK'],
+            'search' => $search,
+        ];
+
+        $response = $this->client->post('/v1/warehouse/fbo/list', $body);
 
         \Log::info('Ozon crossdock drop-off points response', [
             'request_body' => $body,
             'response' => $response,
         ]);
 
-        if (!$response) {
+        if (! is_array($response) || ! empty($response['_error'])) {
+            \Log::warning('Ozon /v1/warehouse/fbo/list: ошибка, точек отгрузки нет', [
+                'http_status' => $response['_http_status'] ?? null,
+            ]);
+
             return [];
         }
 
-        $result = $response['result'] ?? $response;
-        $warehouses = $result['search'] ?? $result['warehouses'] ?? $result ?? [];
-        
+        $warehouses = $response['search'] ?? [];
+
         return array_map(function($wh) {
             $rawCoords = $wh['coordinates'] ?? null;
             $coordinates = null;
@@ -2093,61 +1349,6 @@ class SuppliesApi implements SuppliesApiInterface
         \Illuminate\Support\Facades\Log::info('Ozon supply-order/details response', [
             'order_id' => $supplyOrderId,
             'response_keys' => $response ? array_keys($response) : [],
-        ]);
-
-        if (!$response || !empty($response['error']) || !empty($response['code'])) {
-            return $response ?? [];
-        }
-
-        return $response['result'] ?? $response;
-    }
-
-    /**
-     * Получить доступные таймслоты для заявки
-     * 
-     * POST /v1/supply-order/timeslot/get
-     */
-    public function getSupplyOrderTimeslot(string $supplyOrderId, array $payload = []): array
-    {
-        $body = [
-            'supply_order_id' => (int) $supplyOrderId,
-        ];
-        
-        // Добавляем даты если указаны
-        if (!empty($payload['date_from'])) {
-            $body['date_from'] = $payload['date_from'];
-        }
-        if (!empty($payload['date_to'])) {
-            $body['date_to'] = $payload['date_to'];
-        }
-
-        \Illuminate\Support\Facades\Log::info('Ozon supply-order/timeslot/get request', ['body' => $body]);
-
-        // Retry логика для rate limit
-        $maxAttempts = 3;
-        $response = null;
-        
-        for ($attempt = 1; $attempt <= $maxAttempts; $attempt++) {
-            if ($attempt > 1) {
-                $delay = 2 * $attempt; // 4, 6 секунд
-                \Illuminate\Support\Facades\Log::warning("Ozon timeslot/get rate limit, waiting {$delay}s before attempt {$attempt}");
-                sleep($delay);
-            }
-            
-            $response = $this->client->post('/v1/supply-order/timeslot/get', $body);
-            
-            $httpStatus = $response['_http_status'] ?? null;
-            $errorCode = $response['code'] ?? null;
-            
-            if ($httpStatus !== 429 && (int) $errorCode !== 8) {
-                break;
-            }
-        }
-
-        \Illuminate\Support\Facades\Log::info('Ozon supply-order/timeslot/get response', [
-            'order_id' => $supplyOrderId,
-            'response_keys' => $response ? array_keys($response) : [],
-            'first_timeslot' => ($response['result']['timeslots'][0] ?? $response['timeslots'][0] ?? null),
         ]);
 
         if (!$response || !empty($response['error']) || !empty($response['code'])) {
@@ -2529,69 +1730,6 @@ class SuppliesApi implements SuppliesApiInterface
         return $analytics['items'] ?? [];
     }
 
-    /**
-     * Получить склады кластера
-     * 
-     * POST /v1/cluster/warehouses
-     * 
-     * @param string $clusterId ID кластера
-     * @return array Список складов в кластере
-     */
-    public function getClusterWarehouses(string $clusterId): array
-    {
-        $response = $this->client->post('/v1/cluster/warehouses', [
-            'macrolocal_cluster_id' => $clusterId,
-        ]);
-
-        if (!$response) {
-            // Fallback: получаем все FBO склады и фильтруем по кластеру
-            $allWarehouses = $this->getFboWarehouses();
-            return array_filter($allWarehouses, fn($wh) => $wh['cluster_id'] === $clusterId);
-        }
-
-        $warehouses = $response['result']['warehouses'] ?? $response['warehouses'] ?? [];
-        
-        return array_map(fn($wh) => [
-            'id' => (string) ($wh['warehouse_id'] ?? $wh['id'] ?? null),
-            'name' => $wh['name'] ?? null,
-            'type' => $wh['type'] ?? 'fbo',
-            'address' => $wh['address'] ?? null,
-            'city' => $wh['city'] ?? null,
-            'is_active' => $wh['is_active'] ?? true,
-            'accepts_supplies' => $wh['accepts_supplies'] ?? true,
-        ], $warehouses);
-    }
-
-    /**
-     * Универсальный метод создания черновика (автовыбор типа)
-     * 
-     * @param array $data [
-     *   'supply_method' => 'direct' | 'crossdock' | 'multi_cluster',
-     *   'macrolocal_cluster_id' => string (для direct/crossdock),
-     *   'cluster_ids' => string[] (для multi_cluster),
-     *   'warehouse_id' => string (legacy, для обратной совместимости),
-     *   'delivery_scheme' => 'drop_off' | 'pick_up' (для crossdock/multi_cluster),
-     *   'items' => [['sku' => string, 'quantity' => int], ...],
-     *   ...
-     * ]
-     */
-    public function createDraft(array $data): array
-    {
-        $supplyMethod = $data['supply_method'] ?? null;
-        
-        // Обратная совместимость: если передан warehouse_id без supply_method
-        if (!$supplyMethod && !empty($data['warehouse_id'])) {
-            return $this->createSupplyDraft($data);
-        }
-
-        return match ($supplyMethod) {
-            'direct' => $this->createDirectDraft($data),
-            'crossdock' => $this->createCrossdockDraft($data),
-            'multi_cluster' => $this->createMultiClusterDraft($data),
-            default => $this->createSupplyDraft($data), // Legacy fallback
-        };
-    }
-
     // ========================================================================
     // ДОПОЛНИТЕЛЬНЫЕ МЕТОДЫ ДЛЯ РАБОТЫ С ЗАЯВКАМИ
     // ========================================================================
@@ -2599,55 +1737,6 @@ class SuppliesApi implements SuppliesApiInterface
     // ponytail: getSupplyOrderDetails() на POST /v2/supply-order/get удалён.
     // Вызывающих не было, а трекинг читает заявки через getSupplyOrdersDetails()
     // на /v3/supply-order/get — держать рядом мёртвый v2-путь опасно.
-
-    /**
-     * Получить зоны размещения товаров по SKU перед поставкой
-     * 
-     * POST /v1/supply/placement/get
-     * 
-     * Определяет, в какую зону попадёт товар:
-     * - SORTABLE — сортируемый товар (обычный)
-     * - OVERSIZED — негабаритный товар
-     * - и другие зоны
-     * 
-     * @param array $skus Массив SKU товаров
-     * @return array Массив с зонами размещения
-     */
-    public function getPlacementZones(array $skus): array
-    {
-        $response = $this->client->post('/v1/supply/placement/get', [
-            'sku' => $skus,
-        ]);
-
-        if (!$response) {
-            return [];
-        }
-
-        $placements = $response['placement_element'] ?? $response['result']['placement_element'] ?? [];
-        
-        return array_map(fn($item) => [
-            'sku' => (string) ($item['sku'] ?? ''),
-            'zone' => $item['zone'] ?? 'UNKNOWN',
-            'zone_name' => $this->getZoneName($item['zone'] ?? ''),
-        ], $placements);
-    }
-
-    /**
-     * Получить человекочитаемое название зоны размещения
-     */
-    private function getZoneName(string $zone): string
-    {
-        return match ($zone) {
-            'SORTABLE' => 'Сортируемый',
-            'OVERSIZED' => 'Негабаритный',
-            'JEWELRY' => 'Ювелирный',
-            'VETERINARY' => 'Ветеринарный',
-            'PALLET' => 'Паллетный',
-            'TIRES' => 'Шины',
-            'KGT' => 'Крупногабаритный',
-            default => $zone,
-        };
-    }
 
     /**
      * Получить информацию о грузоместах заявки
@@ -2689,92 +1778,6 @@ class SuppliesApi implements SuppliesApiInterface
             ], $cargoes),
             'total_cargoes' => count($cargoes),
         ];
-    }
-
-    /**
-     * Получить информацию о ценах товаров
-     * 
-     * POST /v1/product/info/prices
-     * 
-     * @param array $skus Массив SKU товаров (до 1000)
-     * @return array Информация о ценах
-     */
-    public function getProductPrices(array $skus): array
-    {
-        $response = $this->client->post('/v1/product/info/prices', [
-            'sku' => array_slice($skus, 0, 1000),
-        ]);
-
-        if (!$response) {
-            return [];
-        }
-
-        $items = $response['result'] ?? $response['items'] ?? [];
-        
-        return array_map(fn($item) => [
-            'sku' => (string) ($item['sku'] ?? ''),
-            'offer_id' => $item['offer_id'] ?? null,
-            'price' => $item['price'] ?? null,
-            'old_price' => $item['old_price'] ?? null,
-            'premium_price' => $item['premium_price'] ?? null,
-            'min_price' => $item['min_price'] ?? null,
-            'marketing_price' => $item['marketing_price'] ?? null,
-        ], $items);
-    }
-
-    /**
-     * Получить список заявок на поставку
-     * 
-     * POST /v2/supply-order/list
-     * 
-     * @param array $filters [
-     *   'status' => string[] — фильтр по статусам,
-     *   'warehouse_ids' => string[] — фильтр по складам,
-     *   'from_date' => string — дата начала (ISO 8601),
-     *   'to_date' => string — дата окончания (ISO 8601),
-     * ]
-     * @param int $limit Количество записей (макс. 1000)
-     * @param int $offset Смещение
-     * @return array Список заявок
-     */
-    public function getSupplyOrderList(array $filters = [], int $limit = 100, int $offset = 0): array
-    {
-        $body = [
-            'limit' => min($limit, 1000),
-            'offset' => $offset,
-        ];
-
-        if (!empty($filters['status'])) {
-            $body['status'] = $filters['status'];
-        }
-        if (!empty($filters['warehouse_ids'])) {
-            $body['warehouse_ids'] = $filters['warehouse_ids'];
-        }
-        if (!empty($filters['from_date'])) {
-            $body['from_date'] = $filters['from_date'];
-        }
-        if (!empty($filters['to_date'])) {
-            $body['to_date'] = $filters['to_date'];
-        }
-
-        $response = $this->client->post('/v2/supply-order/list', $body);
-
-        if (!$response) {
-            return [];
-        }
-
-        $orders = $response['result']['orders'] ?? $response['orders'] ?? [];
-        
-        return array_map(fn($order) => [
-            'supply_id' => $order['supply_id'] ?? null,
-            'status' => $order['status'] ?? null,
-            'created_at' => $order['created_at'] ?? null,
-            'warehouse_id' => $order['warehouse_id'] ?? null,
-            'warehouse_name' => $order['warehouse_name'] ?? null,
-            'total_items' => $order['total_items'] ?? 0,
-            'total_quantity' => $order['total_quantity'] ?? 0,
-            'timeslot' => $order['timeslot'] ?? null,
-        ], $orders);
     }
 
 }

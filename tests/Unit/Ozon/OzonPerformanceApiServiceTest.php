@@ -145,6 +145,36 @@ class OzonPerformanceApiServiceTest extends TestCase
         $this->assertSame(1, $result['bid_limits']['groups_count']);
     }
 
+    public function test_advertising_summary_reads_placement_and_weekly_budget(): void
+    {
+        // ProductAdvPlacements удалён 22.05.2026, dailyBudget устарел → placement и weeklyBudget.
+        Http::fake([
+            'https://api-performance.ozon.ru/api/client/token' => Http::response(['access_token' => 'token-value', 'expires_in' => 1800]),
+            'https://api-performance.ozon.ru/api/client/campaign' => Http::response([
+                'total' => 2,
+                'list' => [
+                    ['id' => '201', 'state' => 'CAMPAIGN_STATE_RUNNING', 'placement' => 'PLACEMENT_TOP_PROMOTION', 'weeklyBudget' => '7000000000'],
+                    // старый ответ — остаётся фолбэком
+                    ['id' => '202', 'state' => 'CAMPAIGN_STATE_RUNNING', 'ProductAdvPlacements' => ['PLACEMENT_SEARCH_AND_CATEGORY'], 'dailyBudget' => '1000000000'],
+                ],
+            ]),
+            'https://api-performance.ozon.ru/*' => Http::response('', 404),
+        ]);
+
+        $result = (new OzonPerformanceApiService())->advertisingSummary([
+            'performance_api_key' => 'performance-client-id',
+            'performance_client_secret' => 'performance-secret',
+        ], '2026-09-01', '2026-09-21');
+
+        $this->assertSame(
+            ['PLACEMENT_SEARCH_AND_CATEGORY' => 1, 'PLACEMENT_TOP_PROMOTION' => 1],
+            $result['campaigns']['placements']
+        );
+        $this->assertSame('PLACEMENT_TOP_PROMOTION', $result['campaigns']['sample'][0]['placement']);
+        $this->assertSame('7000000000', $result['campaigns']['sample'][0]['weekly_budget']);
+        $this->assertSame('1000000000', $result['campaigns']['sample'][1]['daily_budget']);
+    }
+
     public function test_product_advertising_impact_maps_cpc_csv_by_ozon_sku_and_repeated_campaign_ids(): void
     {
         Http::fake([

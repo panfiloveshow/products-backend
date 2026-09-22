@@ -20,7 +20,8 @@ class SalesApi
     public function getSalesStats(string $dateFrom, string $dateTo): array
     {
         try {
-            $response = $this->client->post('/v1/analytics/data', [
+            // Строки: dimensions + metrics по именам (revenue, ordered_units).
+            return (new AnalyticsDataClient($this->client))->fetch([
                 'date_from' => $dateFrom,
                 'date_to' => $dateTo,
                 'metrics' => ['revenue', 'ordered_units'],
@@ -29,9 +30,7 @@ class SalesApi
                 'sort' => [['key' => 'revenue', 'order' => 'DESC']],
                 'limit' => 1000,
                 'offset' => 0,
-            ]);
-
-            return $response['result']['data'] ?? [];
+            ])['rows'];
         } catch (\Exception $e) {
             Log::error('Ozon getSalesStats error', ['error' => $e->getMessage()]);
             return [];
@@ -51,7 +50,7 @@ class SalesApi
             $dateFrom = now()->subDays($days)->format('Y-m-d');
             $dateTo = now()->format('Y-m-d');
 
-            $response = $this->client->post('/v1/analytics/data', [
+            $report = (new AnalyticsDataClient($this->client))->fetch([
                 'date_from' => $dateFrom,
                 'date_to' => $dateTo,
                 'metrics' => ['ordered_units', 'revenue'],
@@ -63,7 +62,7 @@ class SalesApi
             ]);
 
             $salesData = [];
-            foreach ($response['result']['data'] ?? [] as $row) {
+            foreach ($report['rows'] as $row) {
                 // SKU здесь - это числовой product_id Ozon, НЕ offer_id
                 $productId = $row['dimensions'][0]['id'] ?? null;
                 if (!$productId) continue;
@@ -72,7 +71,7 @@ class SalesApi
                 $offerId = $productIdToOfferId[$productId] ?? null;
                 if (!$offerId) continue;
 
-                $orderedUnits = (int)($row['metrics'][0] ?? 0);
+                $orderedUnits = (int)($row['metrics']['ordered_units'] ?? 0);
                 $avgDailySales = $days > 0 ? $orderedUnits / $days : 0;
 
                 $salesData[$offerId] = [
@@ -80,7 +79,7 @@ class SalesApi
                     'sales_14_days' => (int)round($orderedUnits * 14 / $days),
                     'sales_7_days' => (int)round($orderedUnits * 7 / $days),
                     'avg_daily_sales' => round($avgDailySales, 2),
-                    'revenue_30_days' => (float)($row['metrics'][1] ?? 0) * 30 / $days,
+                    'revenue_30_days' => (float)($row['metrics']['revenue'] ?? 0) * 30 / $days,
                 ];
             }
 
@@ -497,48 +496,37 @@ class SalesApi
         return $this->fetchMetricBySku('cancellations', $dateFrom, $dateTo);
     }
 
+    /**
+     * Метрика по SKU за период. Премиум-метрики (returns, cancellations) запрашиваем
+     * только при подтверждённой подписке — иначе [] без запроса (лимит 50/сутки).
+     */
     private function fetchMetricBySku(string $metric, string $dateFrom, string $dateTo): array
     {
         $result = [];
-        $pageSize = 1000;
-        $offset = 0;
-        $maxPages = 50;
-        $page = 0;
 
         try {
-            while ($page < $maxPages) {
-                $response = $this->client->post('/v1/analytics/data', [
-                    'date_from' => $dateFrom,
-                    'date_to' => $dateTo,
-                    'metrics' => [$metric],
-                    'dimension' => ['sku'],
-                    'filters' => [],
-                    'sort' => [['key' => $metric, 'order' => 'DESC']],
-                    'limit' => $pageSize,
-                    'offset' => $offset,
-                ]);
+            $report = (new AnalyticsDataClient($this->client))->fetch([
+                'date_from' => $dateFrom,
+                'date_to' => $dateTo,
+                'metrics' => [$metric],
+                'dimension' => ['sku'],
+                'filters' => [],
+                'sort' => [['key' => $metric, 'order' => 'DESC']],
+                'limit' => 1000,
+                'offset' => 0,
+            ], 50);
 
-                $rows = $response['result']['data'] ?? [];
-                foreach ($rows as $row) {
-                    $sku = $row['dimensions'][0]['id'] ?? null;
-                    if ($sku) {
-                        $result[$sku] = (int) ($row['metrics'][0] ?? 0);
-                    }
+            foreach ($report['rows'] as $row) {
+                $sku = $row['dimensions'][0]['id'] ?? null;
+                if ($sku) {
+                    $result[$sku] = (int) ($row['metrics'][$metric] ?? 0);
                 }
-
-                if (count($rows) < $pageSize) {
-                    break;
-                }
-
-                $offset += $pageSize;
-                $page++;
             }
 
             return $result;
         } catch (\Exception $e) {
             Log::error("Ozon fetchMetricBySku({$metric}) error", [
                 'error' => $e->getMessage(),
-                'offset' => $offset,
                 'partial_count' => count($result),
             ]);
             return $result;

@@ -730,17 +730,13 @@ class AutoSupplyPlanCreateTest extends TestCase
     public function test_sync_constraints_endpoint_triggers_wb_sync(): void
     {
         Config::set('services.sellico.skip_permission_check', true);
+        // Коэффициенты приёмки WB временно отключены (15.08.2026) — синк идёт по
+        // тарифам коробов и отдаёт partial, а не error.
         \Illuminate\Support\Facades\Http::fake([
-            'common-api.wildberries.ru/api/tariffs/v1/acceptance/coefficients*' => \Illuminate\Support\Facades\Http::response([
-                [
-                    'date' => now()->addDay()->toDateString(),
-                    'warehouseID' => '507',
-                    'warehouseName' => 'Коледино',
-                    'coefficient' => 0,
-                    'allowUnload' => true,
-                    'storageCoef' => 1.0,
-                    'deliveryCoef' => 1.0,
-                ],
+            'common-api.wildberries.ru/api/v1/tariffs/box*' => \Illuminate\Support\Facades\Http::response([
+                'response' => ['data' => ['warehouseList' => [
+                    ['warehouseName' => 'Коледино', 'boxDeliveryCoefExpr' => '100', 'boxStorageCoefExpr' => '100'],
+                ]]],
             ], 200),
         ]);
 
@@ -757,13 +753,13 @@ class AutoSupplyPlanCreateTest extends TestCase
 
         $response
             ->assertOk()
-            ->assertJsonPath('data.sync_status', 'ok')
+            ->assertJsonPath('data.sync_status', 'partial')
             ->assertJsonPath('data.summary.warehouses_total', 1);
 
         $this->assertDatabaseHas('marketplace_constraint_snapshots', [
             'integration_id' => $integration->id,
             'marketplace' => 'wildberries',
-            'sync_status' => 'ok',
+            'sync_status' => 'partial',
         ]);
     }
 

@@ -868,126 +868,21 @@ class LegacySupplyRecommendationService
      * - average_delivery_time_hours: среднее время доставки
      * - attention_level: уровень внимания (LOW, ATTENTION_MEDIUM, ATTENTION_HI)
      * - delivery_cluster_id/name: кластер доставки
-     * 
+     *
+     * Источник — /v1/analytics/average-delivery-time и /details, Ozon удалил их 19.05.2026,
+     * прямой замены нет. Рекомендации считаются без данных Ozon (поля ozon_* пустые).
+     *
      * @return array<string, array> Данные по SKU
      */
     protected function getOzonDeliveryAnalytics(Integration $integration): array
     {
-        if ($integration->marketplace !== 'ozon') {
-            return [];
+        if ($integration->marketplace === 'ozon') {
+            Log::info('Ozon delivery analytics: источник удалён Ozon (average-delivery-time, 19.05.2026), считаем без него', [
+                'integration_id' => $integration->id,
+            ]);
         }
 
-        try {
-            $marketplace = \App\Domains\Marketplace\MarketplaceFactory::create(
-                $integration->marketplace,
-                $integration->getDecryptedCredentials(),
-                $integration
-            );
-            $client = $marketplace->api();
-
-            // Получаем список кластеров
-            $clusterList = $client->post('/v1/cluster/list', ['cluster_type' => 'CLUSTER_TYPE_OZON']);
-            $clusterNames = [];
-            foreach ($clusterList['clusters'] ?? [] as $c) {
-                $clusterNames[$c['id']] = $c['name'] ?? "Кластер {$c['id']}";
-            }
-
-            // Получаем общую аналитику для списка кластеров
-            $overallResponse = $client->post('/v1/analytics/average-delivery-time', [
-                'filters' => [
-                    'delivery_schema' => 'FBO',
-                    'supply_period' => 'EIGHT_WEEKS',
-                ]
-            ]);
-
-            $overallData = $overallResponse['data'] ?? [];
-            $deliveryClusterIds = [];
-            foreach ($overallData as $item) {
-                $clusterId = $item['delivery_cluster_id'] ?? null;
-                if ($clusterId) {
-                    $deliveryClusterIds[] = $clusterId;
-                }
-            }
-            $deliveryClusterIds = array_unique($deliveryClusterIds);
-
-            // Собираем данные по товарам из всех кластеров
-            $result = [];
-            
-            foreach ($deliveryClusterIds as $clusterId) {
-                $detailsResponse = $client->post('/v1/analytics/average-delivery-time/details', [
-                    'cluster_id' => $clusterId,
-                    'limit' => 1000,
-                    'offset' => 0,
-                    'filters' => [
-                        'delivery_schema' => 'FBO',
-                        'supply_period' => 'EIGHT_WEEKS',
-                    ],
-                ]);
-
-                foreach ($detailsResponse['data'] ?? [] as $item) {
-                    $itemData = $item['item'] ?? [];
-                    $metrics = $item['metrics'] ?? [];
-                    $ordersCount = $metrics['orders_count'] ?? [];
-                    
-                    $sku = $itemData['offer_id'] ?? null;
-                    if (!$sku) continue;
-
-                    // Сохраняем данные по каждому кластеру доставки отдельно
-                    // Ключ: SKU + cluster_id (для уникальности)
-                    $avgTime = $metrics['average_delivery_time'] ?? 0;
-                    $attentionLevel = $metrics['attention_level'] ?? 'LOW';
-                    $recSupply = $metrics['recommended_supply'] ?? 0;
-                    $lostProfit = $metrics['lost_profit'] ?? 0;
-                    
-                    if (!isset($result[$sku])) {
-                        $result[$sku] = [
-                            'clusters' => [],
-                            // Агрегированные данные для общего отображения
-                            'total_recommended_supply' => 0,
-                            'total_lost_profit' => 0,
-                            'max_delivery_time' => 0,
-                            'max_attention_level' => 'LOW',
-                        ];
-                    }
-                    
-                    // Агрегируем для общего отображения
-                    $result[$sku]['total_recommended_supply'] += $recSupply;
-                    $result[$sku]['total_lost_profit'] += $lostProfit;
-                    if ($avgTime > $result[$sku]['max_delivery_time']) {
-                        $result[$sku]['max_delivery_time'] = $avgTime;
-                    }
-                    $attentionOrder = ['LOW' => 0, 'ATTENTION_MEDIUM' => 1, 'ATTENTION_HI' => 2];
-                    if (($attentionOrder[$attentionLevel] ?? 0) > ($attentionOrder[$result[$sku]['max_attention_level']] ?? 0)) {
-                        $result[$sku]['max_attention_level'] = $attentionLevel;
-                    }
-
-                    // Сохраняем данные по каждому кластеру
-                    $result[$sku]['clusters'][$clusterId] = [
-                        'cluster_id' => $clusterId,
-                        'cluster_name' => $clusterNames[$clusterId] ?? "Кластер {$clusterId}",
-                        'recommended_supply' => $recSupply,
-                        'lost_profit' => $lostProfit,
-                        'average_delivery_time' => $avgTime,
-                        'attention_level' => $attentionLevel,
-                    ];
-                }
-            }
-
-            Log::info("Ozon delivery analytics loaded", [
-                'integration_id' => $integration->id,
-                'skus_count' => count($result),
-                'clusters_count' => count($deliveryClusterIds),
-            ]);
-
-            return $result;
-
-        } catch (\Exception $e) {
-            Log::warning("Failed to load Ozon delivery analytics", [
-                'integration_id' => $integration->id,
-                'error' => $e->getMessage(),
-            ]);
-            return [];
-        }
+        return [];
     }
 
     /**

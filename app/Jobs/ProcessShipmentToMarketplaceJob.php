@@ -20,7 +20,7 @@ use Illuminate\Support\Facades\Log;
  * Создаёт поставку на стороне маркетплейса после submit().
  * Поддерживает ретраи с экспоненциальным backoff.
  * 
- * Ozon: полная поддержка создания поставок через API
+ * Ozon: старое API поставок отключено — падаем явно (см. processOzon)
  * WB: не поддерживает создание через API (только чтение)
  */
 class ProcessShipmentToMarketplaceJob implements ShouldQueue
@@ -133,9 +133,12 @@ class ProcessShipmentToMarketplaceJob implements ShouldQueue
         $marketplace = OzonMarketplace::fromIntegration($integration);
         $suppliesApi = $marketplace->supplies();
 
-        // Проверяем поддержку создания поставок
+        // Старое создание поставки на склад (/v1/supply/draft/create + /v1/supply/timeslot/set)
+        // Ozon отключил; новое — черновик на кластер по Ozon SKU через SupplyService.
         if (!$suppliesApi->supportsFeature('create_supply')) {
-            throw new \RuntimeException('Ozon API does not support supply creation');
+            throw new \RuntimeException(
+                'Ozon отключил создание поставки на склад через API. Создайте поставку через черновик в разделе «Поставки».'
+            );
         }
 
         // Подготавливаем данные для создания

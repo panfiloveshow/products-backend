@@ -10,14 +10,14 @@ use App\Models\Integration;
  * 
  * Endpoints для чтения:
  * - POST /v3/product/list - список товаров
- * - POST /v2/product/info - информация о товаре
+ * - POST /v3/product/info/list - информация о товаре
  * - POST /v5/product/info/prices - цены товаров
- * 
+ * - GET /v1/actions, POST /v2/actions/products - акционные цены
+ *
  * Endpoints для записи (выгрузка на маркетплейс):
  * - POST /v3/product/import - создание/обновление товаров
- * - POST /v1/product/import/stocks - обновление остатков FBS
- * - POST /v1/product/pictures/import - загрузка изображений
- * - POST /v4/product/info/prices - обновление цен
+ * - POST /v2/products/stocks - обновление остатков FBS
+ * - POST /v1/product/import/prices - обновление цен
  * - POST /v1/product/attributes/update - обновление атрибутов
  * 
  * @see https://docs.ozon.ru/api/seller
@@ -57,15 +57,16 @@ class ProductsApi implements ProductsApiInterface
     }
 
     /**
-     * Получить товар по SKU (offer_id)
+     * Получить товар по SKU (offer_id).
+     * /v2/product/info удалён 10.03.2025 → /v3/product/info/list (items без обёртки result).
      */
     public function getProductBySku(string $sku, ?Integration $integration = null): ?array
     {
-        $response = $this->client->post('/v2/product/info', [
-            'offer_id' => $sku,
+        $response = $this->client->post('/v3/product/info/list', [
+            'offer_id' => [$sku],
         ]);
 
-        return $response['result'] ?? null;
+        return $response['items'][0] ?? null;
     }
 
     /**
@@ -354,9 +355,9 @@ class ProductsApi implements ProductsApiInterface
 
     /**
      * Акционные цены товаров из API акций.
-     * GET /v1/actions — доступные акции; POST /v1/actions/products — товары,
-     * уже участвующие в акции. Hot Sale эндпоинты (/v1/actions/hotsales/*)
-     * Ozon удалил — возвращают 404, их не запрашиваем.
+     * GET /v1/actions — доступные акции; POST /v2/actions/products — товары,
+     * уже участвующие в акции (/v1/actions/products отключается 13.10.2026).
+     * Hot Sale эндпоинты (/v1/actions/hotsales/*) Ozon удалил — не запрашиваем.
      *
      * @return array<int, float> product_id => минимальная акционная цена
      */
@@ -376,7 +377,7 @@ class ProductsApi implements ProductsApiInterface
                     continue;
                 }
 
-                $this->collectActionProducts($prices, '/v1/actions/products', ['action_id' => $actionId]);
+                $this->collectActionProducts($prices, (int) $actionId);
             }
         } catch (\Throwable $e) {
             \Illuminate\Support\Facades\Log::warning('Ozon getActionPrices failed', [
@@ -388,23 +389,38 @@ class ProductsApi implements ProductsApiInterface
     }
 
     /**
+     * /v2/actions/products: курсор last_id (offset v1 устарел — читались только
+     * первые 100 товаров акции), ответ без обёртки result, цены — {amount, currency}.
+     *
      * @param  array<int, float>  $prices  аккумулятор product_id => цена
      */
-    private function collectActionProducts(array &$prices, string $endpoint, array $params): void
+    private function collectActionProducts(array &$prices, int $actionId): void
     {
-        $offset = 0;
+        $lastId = '';
+        $maxPages = 1000; // защита от зацикливания курсора
 
         do {
-            $response = $this->client->post($endpoint, $params + [
+            $response = $this->client->post('/v2/actions/products', [
+                'action_id' => $actionId,
                 'limit' => 100,
-                'offset' => $offset,
+                'last_id' => $lastId,
             ]) ?? [];
 
-            $products = $response['result']['products'] ?? [];
+            if (! empty($response['_error'])) {
+                \Illuminate\Support\Facades\Log::warning('Ozon /v2/actions/products error', [
+                    'action_id' => $actionId,
+                    'status' => $response['_http_status'] ?? null,
+                    'message' => $response['message'] ?? null,
+                ]);
+
+                return;
+            }
+
+            $products = $response['products'] ?? [];
 
             foreach ($products as $product) {
                 $productId = (int) ($product['id'] ?? 0);
-                $actionPrice = (float) ($product['action_price'] ?? 0);
+                $actionPrice = (float) ($product['action_price']['amount'] ?? 0);
 
                 if ($productId && $actionPrice > 0) {
                     $prices[$productId] = isset($prices[$productId])
@@ -413,9 +429,10 @@ class ProductsApi implements ProductsApiInterface
                 }
             }
 
-            $offset += count($products);
-            $total = (int) ($response['result']['total'] ?? 0);
-        } while (count($products) === 100 && $offset < $total);
+            $nextLastId = (string) ($response['last_id'] ?? '');
+            $moved = $nextLastId !== '' && $nextLastId !== $lastId;
+            $lastId = $nextLastId;
+        } while ($products !== [] && $moved && --$maxPages > 0);
     }
 
     private function normalizePriceIndexes(mixed $priceIndexes): array
@@ -549,7 +566,8 @@ class ProductsApi implements ProductsApiInterface
                     'competitor_price' => $price,
                     'strategy_product_price' => $price,
                     'price_downloaded_at' => $info['price_downloaded_at'] ?? null,
-                    'strategy_competitor_id' => $info['strategy_competitor_id'] ?? null,
+                    // strategy_competitor_id устарел (19.06.2025) — конкурента
+                    // определяем только по ссылке на его товар.
                     'strategy_competitor_product_url' => $info['strategy_competitor_product_url'] ?? null,
                     'source' => 'pricing_strategy_product_info',
                     'status' => $price !== null && $price > 0
@@ -765,35 +783,6 @@ class ProductsApi implements ProductsApiInterface
             return [
                 'success' => false,
                 'error' => 'Failed to update stocks on Ozon',
-            ];
-        }
-
-        return [
-            'success' => true,
-            'result' => $response['result'] ?? [],
-        ];
-    }
-
-    /**
-     * Загрузить изображения товара
-     * 
-     * POST /v1/product/pictures/import
-     * 
-     * @param string $productId ID товара на Ozon
-     * @param array $images Массив URL изображений
-     * @return array Результат загрузки
-     */
-    public function importImages(string $productId, array $images): array
-    {
-        $response = $this->client->post('/v1/product/pictures/import', [
-            'product_id' => (int) $productId,
-            'images' => $images,
-        ]);
-
-        if (!$response) {
-            return [
-                'success' => false,
-                'error' => 'Failed to import images to Ozon',
             ];
         }
 

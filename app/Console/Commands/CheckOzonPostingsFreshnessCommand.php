@@ -2,6 +2,7 @@
 
 namespace App\Console\Commands;
 
+use App\Domains\Ozon\Api\AnalyticsDataClient;
 use App\Domains\Ozon\OzonMarketplace;
 use App\Models\Integration;
 use Illuminate\Console\Command;
@@ -90,7 +91,9 @@ class CheckOzonPostingsFreshnessCommand extends Command
                 'api_key' => $creds['api_key'],
             ], $integration);
 
-            $response = $marketplace->getClient()->post('/v1/analytics/data', [
+            // Лимиты /v1/analytics/data (1 раз в минуту, 50 в сутки без подписки,
+            // 429 без ретраев) соблюдает AnalyticsDataClient.
+            $report = (new AnalyticsDataClient($marketplace->getClient()))->fetch([
                 'date_from' => now()->subDays($days)->format('Y-m-d'),
                 'date_to' => now()->format('Y-m-d'),
                 'metrics' => ['ordered_units'],
@@ -100,14 +103,13 @@ class CheckOzonPostingsFreshnessCommand extends Command
                 'offset' => 0,
             ]);
 
-            $rows = $response['result']['data'] ?? null;
-            if (! is_array($rows)) {
+            if ($report['status'] !== 'ok') {
                 return null;
             }
 
             $units = 0;
-            foreach ($rows as $row) {
-                $units += (int) ($row['metrics'][0] ?? 0);
+            foreach ($report['rows'] as $row) {
+                $units += (int) ($row['metrics']['ordered_units'] ?? 0);
             }
 
             return $units;

@@ -14,64 +14,67 @@ class AnalyticsApi
     ) {}
 
     /**
-     * Проверка Premium статуса аккаунта
-     * Premium аккаунты имеют доступ к расширенной аналитике
+     * Проверка Premium статуса аккаунта: премиум-метрики /v1/analytics/data
+     * без Premium Plus/Pro Ozon отклоняет (400/403). Итог кэшируется на сутки
+     * по Client-Id (AnalyticsDataClient), отказ повторно не проверяем.
      */
     public function checkPremiumStatus(): array
     {
-        try {
-            $response = $this->client->post('/v1/analytics/data', [
-                'date_from' => now()->subDays(7)->format('Y-m-d'),
-                'date_to' => now()->format('Y-m-d'),
-                'metrics' => ['ordered_units', 'delivered_units', 'returns', 'cancellations'],
-                'dimension' => ['sku'],
-                'filters' => [],
-                'limit' => 1,
-                'offset' => 0,
-            ]);
+        $premiumMetrics = ['ordered_units', 'delivered_units', 'returns', 'cancellations'];
+        $analytics = new AnalyticsDataClient($this->client);
 
-            $rows = $response['result']['data'] ?? [];
-            
-            if (empty($rows)) {
-                return [
-                    'is_premium' => null,
-                    'available_metrics' => ['ordered_units'],
-                    'reason' => 'No data to determine premium status',
-                ];
-            }
-
-            $metrics = $rows[0]['metrics'] ?? [];
-            $metricsCount = count($metrics);
-            $isPremium = $metricsCount >= 4;
-
-            // Дополнительная проверка
-            if ($isPremium && $metricsCount >= 4) {
-                $orderedUnits = (int)($metrics[0] ?? 0);
-                $deliveredUnits = (int)($metrics[1] ?? 0);
-                $returns = (int)($metrics[2] ?? 0);
-                
-                if ($orderedUnits > 100 && $deliveredUnits === 0 && $returns === 0) {
-                    $isPremium = false;
-                }
-            }
-
-            return [
-                'is_premium' => $isPremium,
-                'available_metrics' => $isPremium 
-                    ? ['ordered_units', 'delivered_units', 'returns', 'cancellations']
-                    : ['ordered_units'],
-                'reason' => $isPremium 
-                    ? 'Full analytics access (Premium)' 
-                    : 'Limited analytics access',
-            ];
-        } catch (\Exception $e) {
-            Log::error('Ozon checkPremiumStatus error', ['error' => $e->getMessage()]);
+        if ($analytics->premiumKnown() === false) {
             return [
                 'is_premium' => false,
-                'available_metrics' => [],
-                'reason' => 'Error: ' . $e->getMessage(),
+                'available_metrics' => AnalyticsDataClient::BASIC_METRICS,
+                'reason' => 'Premium-метрики отклонены Ozon (кэш на сутки)',
             ];
         }
+
+        $report = $analytics->fetch([
+            'date_from' => now()->subDays(7)->format('Y-m-d'),
+            'date_to' => now()->format('Y-m-d'),
+            'metrics' => $premiumMetrics,
+            'dimension' => ['sku'],
+            'filters' => [],
+            'limit' => 1,
+            'offset' => 0,
+        ], 1, true, false);
+
+        if ($report['status'] === 'premium_required') {
+            return [
+                'is_premium' => false,
+                'available_metrics' => AnalyticsDataClient::BASIC_METRICS,
+                'reason' => 'Limited analytics access',
+            ];
+        }
+        if ($report['status'] !== 'ok') {
+            // 429/сбой — статус неизвестен, вызывающий оставит сохранённый.
+            return [
+                'is_premium' => null,
+                'available_metrics' => [],
+                'reason' => 'Analytics unavailable: '.$report['status'],
+            ];
+        }
+
+        $row = $report['rows'][0]['metrics'] ?? null;
+        if ($row === null) {
+            return [
+                'is_premium' => null,
+                'available_metrics' => ['ordered_units'],
+                'reason' => 'No data to determine premium status',
+            ];
+        }
+
+        // Бывало, что без подписки Ozon отдавал нули вместо отказа.
+        $isPremium = ! ($row['ordered_units'] > 100 && $row['delivered_units'] == 0 && $row['returns'] == 0);
+        $analytics->rememberPremium($isPremium);
+
+        return [
+            'is_premium' => $isPremium,
+            'available_metrics' => $isPremium ? $premiumMetrics : AnalyticsDataClient::BASIC_METRICS,
+            'reason' => $isPremium ? 'Full analytics access (Premium)' : 'Limited analytics access',
+        ];
     }
 
     /**
@@ -93,110 +96,92 @@ class AnalyticsApi
 
         $result = [];
         $pageSize = 1000;
-        $offset = 0;
         $maxPages = 50; // hard-cap: 50 000 SKU — страхует от зависания при кривом ответе API
-        $page = 0;
 
         // Premium-метрики (delivered_units/returns/cancellations) доступны только Premium-продавцам;
-        // у не-Premium Ozon отклоняет весь запрос («deprecated metrics used») → пагинация спамила 400.
-        // Не дёргаем analytics-выкуп для не-Premium — он возьмётся из другого источника (postings/финансы).
-        $premium = $this->checkPremiumStatus();
-        if (($premium['is_premium'] ?? false) !== true) {
-            Log::info('Ozon getRedemptionRateFromAnalytics: не-Premium — analytics-выкуп пропущен (fallback на другой источник)', [
-                'reason' => $premium['reason'] ?? null,
-            ]);
+        // у не-Premium Ozon отклоняет весь запрос. Вызывающий зовёт метод только при
+        // сохранённом Premium; отдельную пробу не делаем (лимит 1 запрос/мин, 50/сутки).
+        $analytics = new AnalyticsDataClient($this->client);
+        if ($analytics->premiumKnown() === false) {
+            Log::info('Ozon getRedemptionRateFromAnalytics: не-Premium — analytics-выкуп пропущен (fallback на другой источник)');
 
             return [];
         }
 
         try {
-            while ($page < $maxPages) {
-                $response = $this->client->post('/v1/analytics/data', [
-                    'date_from' => $dateFrom,
-                    'date_to' => $dateTo,
-                    'metrics' => ['ordered_units', 'delivered_units', 'returns', 'cancellations'],
-                    'dimension' => ['sku'],
-                    'filters' => [],
-                    'sort' => [['key' => 'ordered_units', 'order' => 'DESC']],
-                    'limit' => $pageSize,
-                    'offset' => $offset,
-                ]);
+            $report = $analytics->fetch([
+                'date_from' => $dateFrom,
+                'date_to' => $dateTo,
+                'metrics' => ['ordered_units', 'delivered_units', 'returns', 'cancellations'],
+                'dimension' => ['sku'],
+                'filters' => [],
+                'sort' => [['key' => 'ordered_units', 'order' => 'DESC']],
+                'limit' => $pageSize,
+                'offset' => 0,
+            ], $maxPages, true, false);
 
-                $rawData = $response['result']['data'] ?? [];
-
-                if ($page === 0 && !empty($rawData)) {
-                    Log::info('Ozon getRedemptionRateFromAnalytics sample data', [
-                        'sample_rows' => array_slice($rawData, 0, 3),
-                        'map_keys_sample' => array_slice(array_keys($productIdToSkuMap), 0, 5),
-                    ]);
-                }
-
-                foreach ($rawData as $row) {
-                    $ozonSku = $row['dimensions'][0]['id'] ?? null;
-                    if (!$ozonSku) continue;
-
-                    $ordered = (int)($row['metrics'][0] ?? 0);
-                    $delivered = (int)($row['metrics'][1] ?? 0);
-                    $returns = (int)($row['metrics'][2] ?? 0);
-                    $cancellations = (int)($row['metrics'][3] ?? 0);
-
-                    // Выкуп в Ozon Seller считаем как:
-                    // (ordered - cancellations - returns) / ordered.
-                    // delivered_units из analytics API часто не совпадает с блоком
-                    // "Выкуплено товаров" в ЛК, поэтому для buyout не используем его напрямую.
-                    $redemptionRate = 100;
-                    $notRedeemed = 0;
-                    if ($ordered > 0) {
-                        $notRedeemed = min($ordered, max(0, $cancellations) + max(0, $returns));
-                        $redemptionRate = round((($ordered - $notRedeemed) / $ordered) * 100, 2);
-                    }
-
-                    $data = [
-                        'ozon_sku' => $ozonSku,
-                        'ordered_units' => $ordered,
-                        'delivered_units' => $delivered,
-                        'returns' => $returns,
-                        'cancellations' => $cancellations,
-                        'redemption_rate' => $redemptionRate,
-                        'orders_count' => $ordered,
-                        'returns_count' => $returns,
-                        // delivered_count в нашем API = "выкуплено" (как в виджете Ozon),
-                        // а сырой delivered_units сохраняем отдельно для отладки.
-                        'delivered_count' => max(0, $ordered - $notRedeemed),
-                        'delivered_units_raw' => $delivered,
-                        'cancelled_count' => $cancellations,
-                        'cancellations_count' => $cancellations,
-                        'source' => 'api',
-                        'has_full_data' => ($delivered + $returns) > 0 || $ordered > 0,
-                    ];
-
-                    $result[(string)$ozonSku] = $data;
-
-                    if (isset($productIdToSkuMap[(string)$ozonSku])) {
-                        $offerSku = $productIdToSkuMap[(string)$ozonSku];
-                        $result[$offerSku] = $data;
-                    }
-                }
-
-                $batchSize = count($rawData);
-                if ($batchSize < $pageSize) {
-                    break;
-                }
-
-                $offset += $pageSize;
-                $page++;
+            if ($report['status'] === 'premium_required') {
+                return [];
             }
 
-            if ($page >= $maxPages) {
-                Log::warning('Ozon getRedemptionRateFromAnalytics hit page cap', [
-                    'max_pages' => $maxPages,
-                    'page_size' => $pageSize,
+            if ($report['rows'] !== []) {
+                Log::info('Ozon getRedemptionRateFromAnalytics sample data', [
+                    'sample_rows' => array_slice($report['rows'], 0, 3),
+                    'map_keys_sample' => array_slice(array_keys($productIdToSkuMap), 0, 5),
                 ]);
+            }
+
+            foreach ($report['rows'] as $row) {
+                $ozonSku = $row['dimensions'][0]['id'] ?? null;
+                if (!$ozonSku) continue;
+
+                $ordered = (int) ($row['metrics']['ordered_units'] ?? 0);
+                $delivered = (int) ($row['metrics']['delivered_units'] ?? 0);
+                $returns = (int) ($row['metrics']['returns'] ?? 0);
+                $cancellations = (int) ($row['metrics']['cancellations'] ?? 0);
+
+                // Выкуп в Ozon Seller считаем как:
+                // (ordered - cancellations - returns) / ordered.
+                // delivered_units из analytics API часто не совпадает с блоком
+                // "Выкуплено товаров" в ЛК, поэтому для buyout не используем его напрямую.
+                $redemptionRate = 100;
+                $notRedeemed = 0;
+                if ($ordered > 0) {
+                    $notRedeemed = min($ordered, max(0, $cancellations) + max(0, $returns));
+                    $redemptionRate = round((($ordered - $notRedeemed) / $ordered) * 100, 2);
+                }
+
+                $data = [
+                    'ozon_sku' => $ozonSku,
+                    'ordered_units' => $ordered,
+                    'delivered_units' => $delivered,
+                    'returns' => $returns,
+                    'cancellations' => $cancellations,
+                    'redemption_rate' => $redemptionRate,
+                    'orders_count' => $ordered,
+                    'returns_count' => $returns,
+                    // delivered_count в нашем API = "выкуплено" (как в виджете Ozon),
+                    // а сырой delivered_units сохраняем отдельно для отладки.
+                    'delivered_count' => max(0, $ordered - $notRedeemed),
+                    'delivered_units_raw' => $delivered,
+                    'cancelled_count' => $cancellations,
+                    'cancellations_count' => $cancellations,
+                    'source' => 'api',
+                    'has_full_data' => ($delivered + $returns) > 0 || $ordered > 0,
+                ];
+
+                $result[(string)$ozonSku] = $data;
+
+                if (isset($productIdToSkuMap[(string)$ozonSku])) {
+                    $offerSku = $productIdToSkuMap[(string)$ozonSku];
+                    $result[$offerSku] = $data;
+                }
             }
 
             Log::info('Ozon getRedemptionRateFromAnalytics success', [
                 'count' => count($result),
-                'pages_fetched' => $page + 1,
+                'status' => $report['status'],
+                'rows' => count($report['rows']),
                 'date_from' => $dateFrom,
                 'date_to' => $dateTo,
                 'result_keys_sample' => array_slice(array_keys($result), 0, 10),
@@ -206,7 +191,6 @@ class AnalyticsApi
         } catch (\Exception $e) {
             Log::error('Ozon getRedemptionRateFromAnalytics error', [
                 'error' => $e->getMessage(),
-                'offset' => $offset,
                 'partial_count' => count($result),
             ]);
             return $result;
@@ -214,116 +198,55 @@ class AnalyticsApi
     }
 
     /**
-     * Получить эквайринг по SKU
-     */
-    public function getAcquiringBySku(?string $dateFrom = null, ?string $dateTo = null): array
-    {
-        $dateFrom = $dateFrom ?? now()->subDays(30)->format('Y-m-d');
-        $dateTo = $dateTo ?? now()->format('Y-m-d');
-
-        try {
-            $response = $this->client->post('/v1/finance/realization', [
-                'date_from' => $dateFrom,
-                'date_to' => $dateTo,
-            ]);
-
-            $result = [];
-            foreach ($response['result']['rows'] ?? [] as $row) {
-                $sku = $row['offer_id'] ?? null;
-                if (!$sku) continue;
-
-                $result[$sku] = [
-                    'acquiring_fee' => (float)($row['acquiring_fee'] ?? 0),
-                    'sale_commission' => (float)($row['sale_commission'] ?? 0),
-                ];
-            }
-
-            return $result;
-        } catch (\Exception $e) {
-            Log::error('Ozon getAcquiringBySku error', ['error' => $e->getMessage()]);
-            return [];
-        }
-    }
-
-    /**
-     * Получить индекс локализации (среднее время доставки)
-     * С апреля 2025 Ozon заменил индекс локализации на среднее время доставки
-     * API: POST /v1/analytics/average-delivery-time/summary
-     * 
-     * @return array ['average_delivery_time' => int, 'tariff_coefficient' => float, 'additional_fee_percent' => float]
+     * Индекс локальности продаж и переплата за нелокальную логистику.
+     * API: POST /v1/analytics/local-sale/total (бета, «Локальность продаж»).
+     *
+     * /v1/analytics/average-delivery-time/summary Ozon удалил 19.05.2026. В local-sale нет
+     * среднего времени доставки, коэффициента и доп. % тарифа — для них остаются дефолты
+     * (tariff_status = UNKNOWN), вместо них отдаём индекс локальности и переплату (в рублях).
+     *
+     * @return array{average_delivery_time:int, tariff_coefficient:float, additional_fee_percent:float|int,
+     *   tariff_status:string, local_sales_index:?float, local_quantity:?int, total_quantity:?int,
+     *   overpayment_total:?float, overpayment_non_local:?float}
      */
     public function getLocalizationIndex(): array
     {
-        try {
-            // API для среднего времени доставки (требует пустой JSON объект {})
-            $response = $this->client->post('/v1/analytics/average-delivery-time/summary', [], true);
-            
-            if ($response && isset($response['average_delivery_time'])) {
-                $avgTime = (int) $response['average_delivery_time'];
-                $tariff = $response['current_tariff'] ?? [];
-                
-                // tariff_value — коэффициент в % (например 16 = 16% = 1.16x)
-                // Преобразуем в множитель: 16% -> 1.16
-                $tariffValue = $tariff['tariff_value'] ?? null;
-                $coefficient = $tariffValue !== null ? (1 + $tariffValue / 100) : $this->calculateDeliveryCoefficient($avgTime);
-                
-                // fee — дополнительный % от цены товара
-                $additionalPercent = $tariff['fee'] ?? $this->calculateAdditionalPercent($avgTime);
-                
-                Log::info('Ozon localization index fetched from API', [
-                    'average_delivery_time' => $avgTime,
-                    'tariff_value_percent' => $tariffValue,
-                    'coefficient' => $coefficient,
-                    'fee_percent' => $additionalPercent,
-                    'tariff_status' => $tariff['tariff_status'] ?? 'UNKNOWN',
-                ]);
-                
-                return [
-                    'average_delivery_time' => $avgTime,
-                    'tariff_coefficient' => round($coefficient, 2),
-                    'additional_fee_percent' => round($additionalPercent, 2),
-                    'tariff_status' => $tariff['tariff_status'] ?? 'ACTIVE',
-                ];
-            }
-            
-            // Fallback: возвращаем дефолтные значения
-            Log::info('Ozon localization index API returned no data, using defaults');
-            return $this->getDefaultLocalizationIndex();
-        } catch (\Exception $e) {
-            Log::warning('Ozon getLocalizationIndex error, using defaults', ['error' => $e->getMessage()]);
-            return $this->getDefaultLocalizationIndex();
+        $index = $this->getDefaultLocalizationIndex() + [
+            'local_sales_index' => null,
+            'local_quantity' => null,
+            'total_quantity' => null,
+            'overpayment_total' => null,
+            'overpayment_non_local' => null,
+        ];
+
+        $response = $this->client->post('/v1/analytics/local-sale/total', [
+            'period' => [
+                'from' => now()->subDays(28)->toDateString(),
+                'to' => now()->subDay()->toDateString(),
+            ],
+        ]);
+
+        if (! is_array($response) || ! empty($response['_error']) || ! isset($response['local_data']['index'])) {
+            Log::warning('Ozon local-sale/total: индекс локальности не получен, остаются дефолты', [
+                'http_status' => $response['_http_status'] ?? null,
+            ]);
+
+            return $index;
         }
+
+        $index = array_merge($index, [
+            'local_sales_index' => round((float) $response['local_data']['index'], 2),
+            'local_quantity' => (int) ($response['local_data']['local_quantity'] ?? 0),
+            'total_quantity' => (int) ($response['local_data']['total_quantity'] ?? 0),
+            'overpayment_total' => round((float) ($response['overpayment']['total'] ?? 0), 2),
+            'overpayment_non_local' => round((float) ($response['overpayment']['non_local_delivery'] ?? 0), 2),
+        ]);
+
+        Log::info('Ozon local sales index fetched from API', $index);
+
+        return $index;
     }
-    
-    /**
-     * Рассчитать коэффициент по времени доставки (таблица Ozon декабрь 2025)
-     */
-    private function calculateDeliveryCoefficient(int $hours): float
-    {
-        // Таблица коэффициентов Ozon FBO (декабрь 2025)
-        // https://seller-edu.ozon.ru/docs/fbo/tarify-fbo.html
-        return match (true) {
-            $hours <= 24 => 1.0,    // До 24 часов
-            $hours <= 36 => 1.2,    // 24-36 часов
-            $hours <= 48 => 1.4,    // 36-48 часов
-            $hours <= 72 => 1.6,    // 48-72 часов
-            default => 1.8,         // Более 72 часов
-        };
-    }
-    
-    /**
-     * Рассчитать дополнительный % от цены по времени доставки
-     */
-    private function calculateAdditionalPercent(int $hours): float
-    {
-        // Дополнительный % для дорогих товаров при долгой доставке
-        return match (true) {
-            $hours <= 36 => 0,
-            $hours <= 48 => 1.0,
-            default => 2.0,
-        };
-    }
-    
+
     /**
      * Дефолтные значения индекса локализации
      */

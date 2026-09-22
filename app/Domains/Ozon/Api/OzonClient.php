@@ -51,8 +51,9 @@ class OzonClient
     /**
      * POST запрос к API (основной метод для Ozon)
      * @param bool $forceObject Если true и $data пустой, отправляет {} вместо []
+     * @param bool $retryRateLimit false — на 429 не ретраить (методы с лимитом «раз в минуту/сутки»)
      */
-    public function post(string $endpoint, array $data = [], bool $forceObject = false): ?array
+    public function post(string $endpoint, array $data = [], bool $forceObject = false, bool $retryRateLimit = true): ?array
     {
         $requestId = uniqid('ozon_req_', true);
         $maxAttempts = 3;
@@ -94,7 +95,7 @@ class OzonClient
                     return $response->json();
                 }
 
-                if ($response->status() === 429 && $attempt < $maxAttempts) {
+                if ($response->status() === 429 && $retryRateLimit && $attempt < $maxAttempts) {
                     $delay = $attempt * 1500000;
                     Log::warning('Ozon API rate limit, retry', [
                         'request_id' => $requestId,

@@ -2053,7 +2053,8 @@ class OzonPerformanceApiService
     {
         $counts = [];
         foreach ($campaigns as $campaign) {
-            $placements = $campaign['ProductAdvPlacements'] ?? $campaign['placement'] ?? [];
+            // ProductAdvPlacements Ozon удалил 22.05.2026 — актуально поле placement.
+            $placements = $campaign['placement'] ?? $campaign['ProductAdvPlacements'] ?? [];
             if (! is_array($placements)) {
                 $placements = [$placements];
             }
@@ -2082,8 +2083,11 @@ class OzonPerformanceApiService
             'title' => $campaign['title'] ?? null,
             'state' => $campaign['state'] ?? null,
             'type' => $campaign['advObjectType'] ?? null,
-            'placement' => $campaign['ProductAdvPlacements'] ?? $campaign['placement'] ?? null,
+            'placement' => $campaign['placement'] ?? $campaign['ProductAdvPlacements'] ?? null,
             'budget' => $campaign['budget'] ?? null,
+            // dailyBudget устарел 22.05.2026 (замена — weeklyBudget); оставлен фолбэком
+            // для кампаний, у которых задан только дневной бюджет.
+            'weekly_budget' => $campaign['weeklyBudget'] ?? null,
             'daily_budget' => $campaign['dailyBudget'] ?? null,
         ];
     }

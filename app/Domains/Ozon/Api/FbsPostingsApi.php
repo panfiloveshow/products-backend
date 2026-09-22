@@ -10,11 +10,10 @@ use Illuminate\Support\Facades\Log;
  * Endpoints:
  * - POST /v4/posting/fbs/list — список отправлений
  * - POST /v3/posting/fbs/get — детали отправления
- * - POST /v3/posting/fbs/ship — отгрузка
- * - POST /v2/posting/fbs/package-label — этикетки
  * - POST /v2/posting/fbs/cancel — отмена
- * - POST /v1/posting/fbs/cancel-reason/list — причины отмены
- * - POST /v2/posting/fbs/act/create — создание акта
+ * - POST /v2/posting/fbs/cancel-reason/list — причины отмены
+ *
+ * Сборка (/v4/posting/fbs/ship), этикетки и отгрузка — в PostingService.
  */
 class FbsPostingsApi
 {
@@ -77,54 +76,6 @@ class FbsPostingsApi
     }
 
     /**
-     * Отгрузка отправления (перевод в статус "Собирается")
-     */
-    public function ship(string $postingNumber, array $packages): array
-    {
-        $response = $this->client->post('/v3/posting/fbs/ship', [
-            'posting_number' => $postingNumber,
-            'packages' => $packages,
-        ]);
-
-        Log::info('Ozon FBS posting/ship', [
-            'posting_number' => $postingNumber,
-            'packages_count' => count($packages),
-        ]);
-
-        return $response['result'] ?? [];
-    }
-
-    /**
-     * Получение этикетки отправления
-     */
-    public function getPackageLabel(string $postingNumber): array
-    {
-        $response = $this->client->post('/v2/posting/fbs/package-label', [
-            'posting_number' => [$postingNumber],
-        ]);
-
-        return [
-            'content' => $response['content'] ?? null,
-            'content_type' => $response['content_type'] ?? 'application/pdf',
-        ];
-    }
-
-    /**
-     * Массовое получение этикеток
-     */
-    public function getPackageLabels(array $postingNumbers): array
-    {
-        $response = $this->client->post('/v2/posting/fbs/package-label', [
-            'posting_number' => $postingNumbers,
-        ]);
-
-        return [
-            'content' => $response['content'] ?? null,
-            'content_type' => $response['content_type'] ?? 'application/pdf',
-        ];
-    }
-
-    /**
      * Отмена отправления
      */
     public function cancel(string $postingNumber, int $cancelReasonId, string $message = ''): array
@@ -146,34 +97,19 @@ class FbsPostingsApi
     }
 
     /**
-     * Получение списка причин отмены
+     * Причины отмены для всех отправлений FBS: id, title, type_id,
+     * is_available_for_cancellation. /v1/posting/fbs/cancel-reason/list убран
+     * из документации — v2 без тела запроса.
      */
     public function getCancelReasons(): array
     {
-        $response = $this->client->post('/v1/posting/fbs/cancel-reason/list', []);
+        $response = $this->client->post('/v2/posting/fbs/cancel-reason/list', [], true);
+
+        if (! is_array($response) || ! empty($response['_error'])) {
+            throw new \RuntimeException('Ozon /v2/posting/fbs/cancel-reason/list: '.($response['message'] ?? $response['error']['message'] ?? 'нет ответа'));
+        }
 
         return $response['result'] ?? [];
-    }
-
-    /**
-     * Создание акта приёма-передачи
-     */
-    public function createAct(int $containersCount, string $departureDate): array
-    {
-        $response = $this->client->post('/v2/posting/fbs/act/create', [
-            'containers_count' => $containersCount,
-            'delivery_method_id' => 0,
-            'departure_date' => $departureDate,
-        ]);
-
-        Log::info('Ozon FBS act/create', [
-            'containers_count' => $containersCount,
-            'departure_date' => $departureDate,
-        ]);
-
-        return [
-            'id' => $response['result']['id'] ?? null,
-        ];
     }
 
     /**

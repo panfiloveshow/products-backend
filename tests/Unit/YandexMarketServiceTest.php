@@ -93,8 +93,10 @@ class YandexMarketServiceTest extends TestCase
         });
     }
 
-    public function test_domain_marketplace_reads_basic_price_from_offer_prices(): void
+    public function test_domain_marketplace_reads_basic_price_from_offer_mappings(): void
     {
+        // Цена приходит в offer-mappings (offer.basicPrice); устаревший
+        // GET /v2/campaigns/{id}/offer-prices (отключение 05.04.2027) не зовём.
         Http::fake([
             'https://api.partner.market.yandex.ru/v2/campaigns/98765' => Http::response([
                 'campaign' => [
@@ -110,22 +112,13 @@ class YandexMarketServiceTest extends TestCase
                                 'shopSku' => 'YM-1',
                                 'name' => 'Yandex Product',
                                 'category' => 'Category',
+                                'basicPrice' => [
+                                    'value' => 1990.5,
+                                    'discountBase' => 2490,
+                                ],
                             ],
                             'mapping' => [
                                 'marketSku' => '10001',
-                            ],
-                        ],
-                    ],
-                ],
-            ], 200),
-            'https://api.partner.market.yandex.ru/v2/campaigns/98765/offer-prices*' => Http::response([
-                'result' => [
-                    'offers' => [
-                        [
-                            'offerId' => 'YM-1',
-                            'basicPrice' => [
-                                'value' => 1990.5,
-                                'discountBase' => 2490,
                             ],
                         ],
                     ],
@@ -149,6 +142,7 @@ class YandexMarketServiceTest extends TestCase
         $this->assertCount(1, $products);
         $this->assertSame(1990.5, $products[0]['price']);
         $this->assertSame(2490.0, $products[0]['old_price']);
+        Http::assertNotSent(fn ($request) => str_contains($request->url(), '/offer-prices'));
     }
 
     public function test_inventory_api_prefers_available_stock_over_fit_to_avoid_double_counting(): void

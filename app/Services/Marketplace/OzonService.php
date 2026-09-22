@@ -327,37 +327,20 @@ class OzonService implements MarketplaceInterface
     }
 
     /**
-     * Получение списка складов
-     * Актуальный эндпоинт: POST /v2/warehouse/list
+     * Получение списка складов FBS/rFBS
+     * POST /v2/warehouse/list (limit обязателен, cursor, ответ warehouses[]) — через WarehousesApi
      */
     public function getWarehouses(): array
     {
-        try {
-            $response = Http::withHeaders([
-                'Client-Id' => $this->clientId,
-                'Api-Key' => $this->apiKey,
-            ])->post("{$this->baseUrl}/v2/warehouse/list", []);
+        $warehouses = (new \App\Domains\Ozon\Api\WarehousesApi(
+            new \App\Domains\Ozon\Api\OzonClient($this->clientId, $this->apiKey, '')
+        ))->getWarehouses();
 
-            if (!$response->successful()) {
-                Log::error('Ozon getWarehouses error', [
-                    'status' => $response->status(),
-                ]);
-                return [];
-            }
-
-            $data = $response->json();
-            return array_map(function ($wh) {
-                return [
-                    'id' => $wh['warehouse_id'],
-                    'name' => $wh['name'],
-                    'is_rfbs' => $wh['is_rfbs'] ?? false,
-                ];
-            }, $data['result'] ?? []);
-            
-        } catch (\Exception $e) {
-            Log::error('Ozon getWarehouses error', ['error' => $e->getMessage()]);
-            return [];
-        }
+        return array_map(fn (array $wh): array => [
+            'id' => $wh['warehouse_id'] ?? null,
+            'name' => $wh['name'] ?? null,
+            'is_rfbs' => $wh['is_rfbs'] ?? false,
+        ], $warehouses);
     }
 
     /**
@@ -367,23 +350,20 @@ class OzonService implements MarketplaceInterface
     public function getSalesStats(string $dateFrom, string $dateTo): array
     {
         try {
-            $response = Http::withHeaders([
-                'Client-Id' => $this->clientId,
-                'Api-Key' => $this->apiKey,
-            ])->post("{$this->baseUrl}/v1/analytics/data", [
+            // returns — метрика Premium Plus/Pro: без подтверждённой подписки
+            // AnalyticsDataClient её не запросит (лимит 50/сутки, 1/мин, окно 3 мес).
+            // Строки: dimensions + metrics по именам.
+            $analytics = new \App\Domains\Ozon\Api\AnalyticsDataClient(
+                new \App\Domains\Ozon\Api\OzonClient($this->clientId, $this->apiKey, '')
+            );
+
+            return $analytics->fetch([
                 'date_from' => $dateFrom,
                 'date_to' => $dateTo,
                 'metrics' => ['revenue', 'ordered_units', 'returns'],
                 'dimension' => ['sku'],
                 'limit' => 1000,
-            ]);
-
-            if (!$response->successful()) {
-                return [];
-            }
-
-            return $response->json()['result']['data'] ?? [];
-            
+            ])['rows'];
         } catch (\Exception $e) {
             Log::error('Ozon getSalesStats error', ['error' => $e->getMessage()]);
             return [];
@@ -575,108 +555,6 @@ class OzonService implements MarketplaceInterface
             return $result;
         } catch (\Exception $e) {
             Log::error('Ozon getSalesBySkuAndWarehouse error', ['error' => $e->getMessage()]);
-            return [];
-        }
-    }
-
-    /**
-     * Остатки FBS по складам продавца через /v1/product/info/stocks-by-warehouse/fbs.
-     * Возвращает формат совместимый с SyncInventoryJob.
-     */
-    public function getInventoryFbsPerWarehouse(): array
-    {
-        try {
-            // Получаем список всех offer_id через /v3/product/list
-            $allOfferIds = [];
-            $lastId      = '';
-            do {
-                $body = ['filter' => ['visibility' => 'ALL'], 'limit' => 1000];
-                if ($lastId) {
-                    $body['last_id'] = $lastId;
-                }
-                $resp = Http::withHeaders([
-                    'Client-Id' => $this->clientId,
-                    'Api-Key'   => $this->apiKey,
-                ])->post("{$this->baseUrl}/v3/product/list", $body);
-
-                if (!$resp->successful()) {
-                    break;
-                }
-                $items  = $resp->json()['result']['items'] ?? [];
-                $lastId = $resp->json()['result']['last_id'] ?? '';
-                foreach ($items as $item) {
-                    if (!empty($item['offer_id'])) {
-                        $allOfferIds[] = $item['offer_id'];
-                    }
-                }
-            } while (!empty($items) && !empty($lastId));
-
-            if (empty($allOfferIds)) {
-                Log::info('Ozon getInventoryFbsPerWarehouse: нет offer_id');
-                return [];
-            }
-
-            // Запрашиваем FBS-остатки по всем offer_id
-            $resp = Http::withHeaders([
-                'Client-Id' => $this->clientId,
-                'Api-Key'   => $this->apiKey,
-            ])->post("{$this->baseUrl}/v1/product/info/stocks-by-warehouse/fbs", [
-                'offer_id' => $allOfferIds,
-            ]);
-
-            if (!$resp->successful()) {
-                Log::error('Ozon getInventoryFbsPerWarehouse API error', [
-                    'status' => $resp->status(),
-                    'body'   => $resp->body(),
-                ]);
-                return [];
-            }
-
-            $rows    = $resp->json()['result'] ?? [];
-            $grouped = [];
-
-            foreach ($rows as $row) {
-                $offerId     = $row['offer_id'] ?? null;
-                $whId        = (string)($row['warehouse_id'] ?? '');
-                $whName      = $row['warehouse_name'] ?? ('FBS-склад ' . $whId);
-                $qty         = (int)($row['present'] ?? 0);
-                $reserved    = (int)($row['reserved'] ?? 0);
-
-                if (!$offerId || !$whId) {
-                    continue;
-                }
-
-                // warehouse_id: стабильный хэш от имени склада (как в FBO)
-                $warehouseId = 'ozonfbs_' . substr(md5($whName ?: $whId), 0, 12);
-
-                if (!isset($grouped[$offerId])) {
-                    $grouped[$offerId] = [
-                        'sku'              => $offerId,
-                        'warehouses'       => [],
-                        'total'            => 0,
-                        'fulfillment_type' => 'FBS',
-                    ];
-                }
-
-                $grouped[$offerId]['warehouses'][] = [
-                    'warehouse_id'     => $warehouseId,
-                    'warehouse_name'   => $whName,
-                    'warehouse_type'   => 'fbs',
-                    'quantity'         => $qty,
-                    'reserved'         => $reserved,
-                    'fulfillment_type' => 'FBS',
-                ];
-                $grouped[$offerId]['total'] += $qty;
-            }
-
-            Log::info('Ozon getInventoryFbsPerWarehouse загружено', [
-                'rows' => count($rows),
-                'skus' => count($grouped),
-            ]);
-
-            return array_values($grouped);
-        } catch (\Exception $e) {
-            Log::error('Ozon getInventoryFbsPerWarehouse error', ['error' => $e->getMessage()]);
             return [];
         }
     }

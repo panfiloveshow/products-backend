@@ -117,15 +117,21 @@ class OzonApiContractsTest extends TestCase
         $this->assertSame(2, $row['active_days']);
     }
 
-    public function test_draft_creation_keeps_operation_separate_until_draft_is_ready(): void
+    public function test_draft_creation_keeps_pending_draft_separate_until_calculation_is_ready(): void
     {
+        Http::preventStrayRequests();
         Http::fake([
-            'api-seller.ozon.ru/v1/draft/create' => Http::response([
-                'operation_id' => 'operation-42',
+            'api-seller.ozon.ru/v1/cluster/list' => Http::response([
+                'clusters' => [['id' => 101, 'macrolocal_cluster_id' => 4039, 'name' => 'Москва', 'logistic_clusters' => []]],
             ]),
-            'api-seller.ozon.ru/v1/draft/create/info' => Http::response([
-                'status' => 'CALCULATION_STATUS_IN_PROGRESS',
-                'draft_id' => 0,
+            'api-seller.ozon.ru/v1/draft/direct/create' => Http::response([
+                'draft_id' => 42,
+                'errors' => [],
+            ]),
+            'api-seller.ozon.ru/v2/draft/create/info' => Http::response([
+                'status' => 'IN_PROGRESS',
+                'clusters' => [],
+                'errors' => [],
             ]),
         ]);
 
@@ -136,13 +142,22 @@ class OzonApiContractsTest extends TestCase
             ]);
 
         $this->assertNull($result['draft_id']);
-        $this->assertSame('operation-42', $result['operation_id']);
+        $this->assertSame('42', $result['pending_draft_id']);
         $this->assertSame('pending', $result['status']);
-        Http::assertSentCount(2);
+        Http::assertSent(fn ($request): bool => $request->url() === 'https://api-seller.ozon.ru/v1/draft/direct/create'
+            && $request['cluster_info'] === [
+                'items' => [['sku' => 700001, 'quantity' => 5]],
+                'macrolocal_cluster_id' => 4039,
+            ]
+            && $request['deletion_sku_mode'] === 'PARTIAL');
+        Http::assertSent(fn ($request): bool => $request->url() === 'https://api-seller.ozon.ru/v2/draft/create/info'
+            && $request['draft_id'] === 42);
+        Http::assertSentCount(3);
     }
 
     public function test_supply_creation_never_falls_back_to_a_second_money_path_request(): void
     {
+        Http::preventStrayRequests();
         Http::fake([
             'api-seller.ozon.ru/v1/cluster/list' => Http::response([
                 'clusters' => [],

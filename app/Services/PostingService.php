@@ -387,28 +387,61 @@ class PostingService
         };
     }
 
+    private const WB_ORDERS_LIMIT = 1000;
+
     /**
      * Синхронизация отправлений Wildberries
+     *
+     * GET /api/v3/orders: с 21.07.2026 отдаёт только задания моложе 3 месяцев,
+     * период dateFrom–dateTo — не больше 30 дней за запрос, пагинация limit ≤ 1000
+     * + next из ответа. Архив (/api/marketplace/v3/fbs/orders/archive) не грузим:
+     * синк отправлений работает с недавними заданиями.
      */
     private function syncWildberriesPostings(Integration $integration, ?string $status, ?string $dateFrom): array
     {
         $marketplace = WildberriesMarketplace::fromIntegration($integration);
         $client = $marketplace->getClient();
 
-        // WB API: GET /api/v3/orders
-        $params = [
-            'limit' => 1000,
-            'next' => 0,
-            'dateFrom' => $dateFrom ? strtotime($dateFrom) : strtotime('-30 days'),
-        ];
-
-        $response = $client->get('/api/v3/orders', $params);
-
-        if (!$response || !isset($response['orders'])) {
-            Log::warning('No orders returned from WB API', [
+        $now = now();
+        $oldest = $now->copy()->subMonths(3)->addDay(); // запас на сутки до границы WB
+        $from = $dateFrom ? Carbon::parse($dateFrom) : $now->copy()->subDays(30);
+        if ($from->lt($oldest)) {
+            Log::info('WB postings: dateFrom старше 3 месяцев обрезан, архив WB не загружаем', [
                 'integration_id' => $integration->id,
+                'date_from' => $from->toDateTimeString(),
             ]);
-            return ['total' => 0, 'created' => 0, 'updated' => 0];
+            $from = $oldest;
+        }
+
+        $orders = [];
+        for ($windowFrom = $from->copy(); $windowFrom->lt($now); $windowFrom = $windowTo) {
+            $windowTo = $windowFrom->copy()->addDays(30);
+            if ($windowTo->gt($now)) {
+                $windowTo = $now->copy();
+            }
+
+            $next = 0;
+            for ($page = 0; $page < 100; $page++) {
+                $response = $client->get('/api/v3/orders', [
+                    'limit' => self::WB_ORDERS_LIMIT,
+                    'next' => $next,
+                    'dateFrom' => $windowFrom->timestamp,
+                    'dateTo' => $windowTo->timestamp,
+                ]);
+
+                // Ошибку API не выдаём за «заданий нет»
+                if (! is_array($response) || ! isset($response['orders'])) {
+                    throw new \RuntimeException('WB GET /api/v3/orders: ошибка API (HTTP '.($client->getLastResponseStatus() ?? 'нет ответа').')');
+                }
+
+                array_push($orders, ...$response['orders']);
+
+                $prev = $next;
+                $next = (int) ($response['next'] ?? 0);
+                if (count($response['orders']) < self::WB_ORDERS_LIMIT || $next === 0 || $next === $prev) {
+                    break;
+                }
+            }
         }
 
         $created = 0;
@@ -416,7 +449,7 @@ class PostingService
 
         DB::beginTransaction();
         try {
-            foreach ($response['orders'] as $wbOrder) {
+            foreach ($orders as $wbOrder) {
                 $result = $this->upsertWildberriesPosting($integration, $wbOrder);
                 if ($result === 'created') {
                     $created++;
@@ -691,34 +724,93 @@ class PostingService
     private function getOzonLabel(Integration $integration, Posting $posting): array
     {
         $marketplace = OzonMarketplace::fromIntegration($integration);
-        $client = $marketplace->getClient();
 
-        // POST /v2/posting/fbs/package-label
-        $response = $client->post('/v2/posting/fbs/package-label', [
-            'posting_number' => [$posting->posting_number],
+        return $this->fetchOzonPackageLabel($marketplace->getClient(), [$posting->posting_number]);
+    }
+
+    private const OZON_LABEL_POLL_ATTEMPTS = 10;
+
+    /**
+     * Этикетки FBS: /v2/posting/fbs/package-label отключается 02.11.2026 →
+     * асинхронно /v3/posting/fbs/package-label/create (задания) и
+     * /v2/posting/fbs/package-label/get (статус + file_url). Параметра scanit
+     * у этих методов нет: штрихкод scanit — поле отправления (/v4/posting/fbs/list).
+     */
+    private function fetchOzonPackageLabel(\App\Domains\Ozon\Api\OzonClient $client, array $postingNumbers): array
+    {
+        if ($postingNumbers === []) {
+            throw new \RuntimeException('Отправления для печати этикеток не найдены');
+        }
+
+        $created = $client->post('/v3/posting/fbs/package-label/create', [
+            'posting_numbers' => array_values($postingNumbers),
         ]);
+        if (! is_array($created) || ! empty($created['_error'])) {
+            throw new \RuntimeException('Ozon не создал задание на этикетки: '.($created['message'] ?? $created['error']['message'] ?? 'нет ответа'));
+        }
 
-        return [
-            'type' => 'pdf',
-            'content_base64' => $response['content'] ?? null,
-            'url' => $response['url'] ?? null,
-        ];
+        // Обычная этикетка — big_label; small_label берём, только если другой нет.
+        $tasks = collect($created['tasks'] ?? []);
+        $taskId = (int) (($tasks->firstWhere('task_type', 'big_label') ?? $tasks->first())['task_id'] ?? 0);
+        if ($taskId <= 0) {
+            throw new \RuntimeException('Ozon не вернул задание на этикетки');
+        }
+
+        for ($attempt = 1; $attempt <= self::OZON_LABEL_POLL_ATTEMPTS; $attempt++) {
+            $label = $client->post('/v2/posting/fbs/package-label/get', ['task_id' => $taskId]);
+            if (! is_array($label) || ! empty($label['_error'])) {
+                throw new \RuntimeException('Ozon: ошибка получения этикеток: '.($label['message'] ?? $label['error']['message'] ?? 'нет ответа'));
+            }
+
+            $status = $label['status']['code'] ?? null;
+            if ($status === 'completed' && ! empty($label['file_url'])) {
+                return [
+                    'type' => 'pdf',
+                    'content_base64' => null,
+                    'url' => $label['file_url'],
+                    'task_id' => $taskId,
+                    'unprinted_postings' => $label['status']['unprinted_postings'] ?? [],
+                ];
+            }
+            if ($status === 'error' || $status === 'completed') {
+                $reasons = collect($label['status']['unprinted_postings'] ?? [])
+                    ->map(fn ($p) => trim(($p['posting_number'] ?? '').': '.($p['message'] ?? '')))
+                    ->implode('; ');
+                throw new \RuntimeException('Ozon не сформировал этикетки: '.($label['error']['message'] ?? ($reasons !== '' ? $reasons : 'файл не получен')));
+            }
+
+            if ($attempt < self::OZON_LABEL_POLL_ATTEMPTS) {
+                \Illuminate\Support\Sleep::for(1)->second();
+            }
+        }
+
+        throw new \RuntimeException("Этикетки ещё формируются (задание {$taskId}), повторите через несколько секунд");
     }
 
     /**
      * Получить этикетку WB
+     *
+     * POST /api/v3/orders/stickers?type=png&width=58&height=40, тело {"orders":[id]}
+     * (стикеры есть только у заданий в статусах confirm/complete).
      */
     private function getWildberriesLabel(Integration $integration, Posting $posting): array
     {
         $marketplace = WildberriesMarketplace::fromIntegration($integration);
         $client = $marketplace->getClient();
 
-        // GET /api/v3/orders/{orderId}/stickers
-        $response = $client->get("/api/v3/orders/{$posting->posting_number}/stickers", [
-            'type' => 'png',
-            'width' => 58,
-            'height' => 40,
+        $response = $client->post('/api/v3/orders/stickers?type=png&width=58&height=40', [
+            'orders' => [(int) $posting->posting_number],
         ]);
+
+        if ($response === null) {
+            $status = $client->getLastResponseStatus();
+            // 409 CustomsDeclarationIsRequired (с 18.08.2026): без номера ДТ стикер не выдаётся.
+            if ($status === 409) {
+                throw new \RuntimeException('WB не выдаёт стикер: к сборочному заданию не привязан обязательный номер декларации на товары (ДТ). Укажите ДТ в кабинете WB и повторите.');
+            }
+
+            throw new \RuntimeException('WB не вернул стикер сборочного задания (HTTP '.($status ?? 'нет ответа').')');
+        }
 
         return [
             'type' => 'png',
@@ -738,19 +830,11 @@ class PostingService
 
         if ($integration->marketplace === 'ozon') {
             $marketplace = OzonMarketplace::fromIntegration($integration);
-            $client = $marketplace->getClient();
 
-            $postingNumbers = $postings->pluck('posting_number')->toArray();
-
-            $response = $client->post('/v2/posting/fbs/package-label', [
-                'posting_number' => $postingNumbers,
-            ]);
-
-            return [
-                'type' => 'pdf',
-                'content_base64' => $response['content'] ?? null,
-                'url' => $response['url'] ?? null,
-            ];
+            return $this->fetchOzonPackageLabel(
+                $marketplace->getClient(),
+                $postings->pluck('posting_number')->toArray()
+            );
         }
 
         // Для WB собираем по одной
@@ -814,13 +898,25 @@ class PostingService
             $marketplace = OzonMarketplace::fromIntegration($integration);
             $client = $marketplace->getClient();
 
-            // POST /v2/posting/fbs/act/create
-            $response = $client->post('/v2/posting/fbs/act/create', [
-                'departure_date' => $departureDate,
+            // /v2/posting/fbs/act/create отключён 07.09.2026 → /v1/carriage/create
+            // (отгрузка из всех «Готов к отгрузке») + /v1/carriage/approve.
+            $created = $client->post('/v1/carriage/create', [
+                'departure_date' => Carbon::parse($departureDate)->utc()->format('Y-m-d\TH:i:s\Z'),
             ]);
+            $carriageId = (int) (is_array($created) ? ($created['carriage_id'] ?? 0) : 0);
+            if ($carriageId <= 0 || ! empty($created['_error'])) {
+                throw new \RuntimeException('Ozon не создал отгрузку: '.($created['message'] ?? $created['error']['message'] ?? 'нет ответа'));
+            }
 
+            $approved = $client->post('/v1/carriage/approve', ['carriage_id' => $carriageId]);
+            if (! is_array($approved) || ! empty($approved['_error'])) {
+                throw new \RuntimeException("Отгрузка {$carriageId} создана, но не подтверждена: ".($approved['message'] ?? $approved['error']['message'] ?? 'нет ответа'));
+            }
+
+            // Идентификатор перевозки — он же id для /v2/posting/fbs/act/check-status и get-pdf.
             return [
-                'act_id' => $response['id'] ?? null,
+                'act_id' => $carriageId,
+                'carriage_id' => $carriageId,
             ];
         }
 

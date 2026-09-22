@@ -765,14 +765,6 @@ class OzonMarketplace implements MarketplaceInterface
     }
 
     /**
-     * Загрузить изображения товара на Ozon
-     */
-    public function importImages(string $productId, array $images): array
-    {
-        return $this->products->importImages($productId, $images);
-    }
-
-    /**
      * Обновить атрибуты товаров на Ozon
      */
     public function updateAttributes(array $items): array
@@ -820,7 +812,7 @@ class OzonMarketplace implements MarketplaceInterface
     }
 
     /**
-     * Остатки по FBS-складам продавца через /v1/product/info/stocks-by-warehouse/fbs
+     * Остатки по FBS-складам продавца через /v2/product/info/stocks-by-warehouse/fbs
      * Возвращает формат, совместимый с SyncInventoryJob:
      * [['sku' => offer_id, 'warehouses' => [...], 'fulfillment_type' => 'FBS']]
      */
@@ -953,11 +945,6 @@ class OzonMarketplace implements MarketplaceInterface
         return $this->analytics->getRedemptionRateFromAnalytics($dateFrom, $dateTo, $productIdToSkuMap);
     }
 
-    public function getAcquiringBySku(?string $dateFrom = null, ?string $dateTo = null): array
-    {
-        return $this->analytics->getAcquiringBySku($dateFrom, $dateTo);
-    }
-
     public function getLocalizationIndex(): array
     {
         return $this->analytics->getLocalizationIndex();
@@ -1002,16 +989,6 @@ class OzonMarketplace implements MarketplaceInterface
     public function getStorageCostBySku(): array
     {
         return $this->storage->getStorageCostBySku();
-    }
-
-    public function getProductTariffs(array $productIds = []): array
-    {
-        return $this->storage->getProductTariffs($productIds);
-    }
-
-    public function getActualCostsBySku(?string $dateFrom = null, ?string $dateTo = null): array
-    {
-        return $this->storage->getActualCostsBySku($dateFrom, $dateTo);
     }
 
     /**

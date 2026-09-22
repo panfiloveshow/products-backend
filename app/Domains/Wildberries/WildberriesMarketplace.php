@@ -716,11 +716,6 @@ class WildberriesMarketplace implements LegacyMarketplaceInterface, MarketplaceI
         return $this->storage->getSupplyTariffs();
     }
 
-    public function getStorageTariffs(): array
-    {
-        return $this->storage->getStorageTariffs();
-    }
-
     public function getTariffSnapshots(?string $date = null): array
     {
         return $this->storage->getTariffSnapshots($date);
@@ -762,14 +757,6 @@ class WildberriesMarketplace implements LegacyMarketplaceInterface, MarketplaceI
     public function getAcquiringBySku(int $weeks = 4): array
     {
         return $this->realizationReport->getAcquiringBySku($weeks);
-    }
-
-    /**
-     * Получить детализацию отчёта реализации за период
-     */
-    public function getRealizationReport(string $dateFrom, string $dateTo, string $periodicity = 'weekly'): array
-    {
-        return $this->realizationReport->getReportDetailByPeriod($dateFrom, $dateTo, $periodicity);
     }
 
     /**

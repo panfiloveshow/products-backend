@@ -19,11 +19,13 @@ class WildberriesClient
 
     private const CONTENT_URL = 'https://content-api.wildberries.ru';
 
-    private const SUPPLIERS_URL = 'https://suppliers-api.wildberries.ru';
+    // Поставки FBW (07-orders-fbw). Старые suppliers-api.wildberries.ru и
+    // advert-api.wb.ru мертвы (домены wb.ru отключены 15.04.2025).
+    private const SUPPLIES_URL = 'https://supplies-api.wildberries.ru';
 
     private const STATISTICS_URL = 'https://statistics-api.wildberries.ru';
 
-    private const ADVERT_URL = 'https://advert-api.wb.ru';
+    private const ADVERT_URL = 'https://advert-api.wildberries.ru';
 
     private const COMMON_URL = 'https://common-api.wildberries.ru';
 
@@ -788,6 +790,22 @@ class WildberriesClient
     }
 
     /**
+     * GET к Supplies API (поставки FBW)
+     */
+    public function suppliesGet(string $endpoint, array $params = []): ?array
+    {
+        return $this->get($endpoint, $params, self::SUPPLIES_URL);
+    }
+
+    /**
+     * POST к Supplies API (поставки FBW). Query-параметры — в $endpoint.
+     */
+    public function suppliesPost(string $endpoint, array $data = []): ?array
+    {
+        return $this->post($endpoint, $data, self::SUPPLIES_URL);
+    }
+
+    /**
      * GET запрос к Prices API (цены и скидки)
      */
     public function pricesGet(string $endpoint, array $params = []): ?array
@@ -890,7 +908,7 @@ class WildberriesClient
             self::FINANCE_URL => 'Finance',
             self::COMMON_URL => 'Common',
             self::ADVERT_URL => 'Advert',
-            self::SUPPLIERS_URL => 'Suppliers',
+            self::SUPPLIES_URL => 'Supplies',
             default => 'Unknown',
         };
     }

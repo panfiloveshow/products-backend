@@ -14,18 +14,37 @@ class WarehousesApi
     ) {}
 
     /**
-     * Получить список складов
+     * Получить список складов FBS/rFBS продавца
+     *
+     * POST /v2/warehouse/list: limit ≤ 200 (обязателен), cursor, ответ warehouses[] + has_next.
      */
     public function getWarehouses(): array
     {
-        try {
-            $response = $this->client->post('/v1/warehouse/list', []);
+        $warehouses = [];
+        $cursor = '';
 
-            return $response['result'] ?? [];
-        } catch (\Exception $e) {
-            Log::error('Ozon getWarehouses error', ['error' => $e->getMessage()]);
-            return [];
-        }
+        do {
+            $body = ['limit' => 200];
+            if ($cursor !== '') {
+                $body['cursor'] = $cursor;
+            }
+
+            $response = $this->client->post('/v2/warehouse/list', $body);
+            if (! is_array($response) || ! empty($response['_error'])) {
+                Log::error('Ozon /v2/warehouse/list error', [
+                    'http_status' => $response['_http_status'] ?? null,
+                    'loaded' => count($warehouses),
+                ]);
+                break;
+            }
+
+            $warehouses = array_merge($warehouses, $response['warehouses'] ?? []);
+            $next = (string) ($response['cursor'] ?? '');
+            $hasNext = ! empty($response['has_next']) && $next !== '' && $next !== $cursor;
+            $cursor = $next;
+        } while ($hasNext);
+
+        return $warehouses;
     }
 
     /**

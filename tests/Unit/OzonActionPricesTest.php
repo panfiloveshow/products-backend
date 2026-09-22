@@ -23,6 +23,11 @@ class OzonActionPricesTest extends TestCase
         return new ProductsApi($client);
     }
 
+    private function money(float $amount): array
+    {
+        return ['amount' => (string) $amount, 'currency' => 'RUB'];
+    }
+
     public function test_get_action_prices_collects_participating_actions(): void
     {
         $api = $this->makeApi([
@@ -33,19 +38,43 @@ class OzonActionPricesTest extends TestCase
                 ]],
             ],
             'post' => [
-                '/v1/actions/products' => ['result' => [
+                // v2: без обёртки result, цены — {amount, currency}
+                '/v2/actions/products' => [
                     'products' => [
-                        ['id' => 111, 'action_price' => 250.0],
-                        ['id' => 222, 'action_price' => 90.0],
+                        ['id' => 111, 'action_price' => $this->money(250.0)],
+                        ['id' => 222, 'action_price' => $this->money(90.0)],
                     ],
+                    'last_id' => '',
                     'total' => 2,
-                ]],
+                ],
             ],
         ]);
 
         $prices = $api->getActionPrices();
 
         $this->assertSame([111 => 250.0, 222 => 90.0], $prices);
+    }
+
+    public function test_action_products_paginate_by_last_id_cursor(): void
+    {
+        // v1 листал offset'ом, который Ozon игнорирует, — читалась только первая сотня.
+        $client = Mockery::mock(OzonClient::class);
+        $client->shouldReceive('get')->with('/v1/actions')
+            ->andReturn(['result' => [['id' => 10, 'is_participating' => true]]]);
+        $client->shouldReceive('post')->once()
+            ->with('/v2/actions/products', ['action_id' => 10, 'limit' => 100, 'last_id' => ''])
+            ->andReturn(['products' => [['id' => 1, 'action_price' => $this->money(100.0)]], 'last_id' => 'c1', 'total' => 3]);
+        $client->shouldReceive('post')->once()
+            ->with('/v2/actions/products', ['action_id' => 10, 'limit' => 100, 'last_id' => 'c1'])
+            ->andReturn(['products' => [
+                ['id' => 2, 'action_price' => $this->money(200.0)],
+                ['id' => 3, 'action_price' => $this->money(300.0)],
+            ], 'last_id' => '', 'total' => 3]);
+        $client->shouldNotReceive('post')->with('/v1/actions/products', Mockery::any());
+
+        $prices = (new ProductsApi($client))->getActionPrices();
+
+        $this->assertSame([1 => 100.0, 2 => 200.0, 3 => 300.0], $prices);
     }
 
     public function test_get_prices_uses_action_price_as_actual_price(): void
@@ -57,10 +86,11 @@ class OzonActionPricesTest extends TestCase
                 ]],
             ],
             'post' => [
-                '/v1/actions/products' => ['result' => [
-                    'products' => [['id' => 111, 'action_price' => 300.0]],
+                '/v2/actions/products' => [
+                    'products' => [['id' => 111, 'action_price' => $this->money(300.0)]],
+                    'last_id' => '',
                     'total' => 1,
-                ]],
+                ],
                 '/v5/product/info/prices' => [
                     'items' => [[
                         'offer_id' => '3-02/3516',
@@ -93,10 +123,11 @@ class OzonActionPricesTest extends TestCase
                 ]],
             ],
             'post' => [
-                '/v1/actions/products' => ['result' => [
-                    'products' => [['id' => 111, 'action_price' => 420.0]],
+                '/v2/actions/products' => [
+                    'products' => [['id' => 111, 'action_price' => $this->money(420.0)]],
+                    'last_id' => '',
                     'total' => 1,
-                ]],
+                ],
                 '/v5/product/info/prices' => [
                     'items' => [[
                         'offer_id' => 'A65',

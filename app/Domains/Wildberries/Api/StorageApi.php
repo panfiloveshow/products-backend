@@ -233,21 +233,6 @@ class StorageApi
     }
 
     /**
-     * Получить тарифы на хранение
-     */
-    public function getStorageTariffs(): array
-    {
-        try {
-            $response = $this->client->get("/api/v1/tariffs/return");
-
-            return $response['response']['data'] ?? [];
-        } catch (\Exception $e) {
-            Log::error('WB getStorageTariffs error', ['error' => $e->getMessage()]);
-            return [];
-        }
-    }
-
-    /**
      * Получить комиссии по категориям
      * 
      * ВАЖНО: Эндпоинт /api/v1/tariffs/commission устарел (404).
@@ -414,51 +399,9 @@ class StorageApi
             Log::warning('WB getTariffSnapshots: pallet block failed', ['error' => $e->getMessage()]);
         }
 
-        try {
-            $acceptance = $this->client->commonGet('/api/tariffs/v1/acceptance/coefficients', [
-                'date' => $date,
-            ]) ?? [];
-            // Эндпоинт отдаёт плоский массив строк (склад × дата × тип короба) —
-            // берём его как фолбэк, если ответ не завёрнут в coefficients/data.
-            $acceptanceRows = $acceptance['coefficients']
-                ?? $acceptance['response']['data']
-                ?? $acceptance['data']
-                ?? (is_array($acceptance) && array_is_list($acceptance) ? $acceptance : []);
-            // Дедуп по складу: эндпоинт отдаёт строку на (склад × дата × тип короба),
-            // а deliveryCoef/storageCoef — на уровне склада (одинаков по типам/датам).
-            // Отдаём ОДНУ строку на склад, иначе ключ конфликта снапшота
-            // (integration, tariff_type, effective_date, warehouse_id, …) совпадает у
-            // всех коробов склада → upsert падает Cardinality violation. Приоритет —
-            // строка с валидным deliveryCoef.
-            $acceptanceByWarehouse = [];
-            foreach ($acceptanceRows as $key => $row) {
-                if (! is_array($row)) {
-                    continue;
-                }
-                $warehouseId = isset($row['warehouseID'])
-                    ? (string) $row['warehouseID']
-                    : (isset($row['warehouseId']) ? (string) $row['warehouseId'] : 'row:'.(string) $key);
-
-                $existing = $acceptanceByWarehouse[$warehouseId] ?? null;
-                $hasCoef = isset($row['deliveryCoef']) && is_numeric(str_replace(',', '.', (string) $row['deliveryCoef']));
-                if ($existing !== null && ! $hasCoef) {
-                    continue; // уже есть строка склада — не перетираем строкой без коэффициента
-                }
-                $acceptanceByWarehouse[$warehouseId] = [
-                    'tariff_type' => 'acceptance',
-                    'effective_date' => $date,
-                    'warehouse_id' => $warehouseId,
-                    'warehouse_name' => $row['warehouseName'] ?? null,
-                    'payload' => $row,
-                    'fetched_at' => $fetchedAt,
-                ];
-            }
-            foreach ($acceptanceByWarehouse as $snapshot) {
-                $snapshots[] = $snapshot;
-            }
-        } catch (\Throwable $e) {
-            Log::warning('WB getTariffSnapshots: acceptance block failed', ['error' => $e->getMessage()]);
-        }
+        // Снапшоты приёмки (GET /api/tariffs/v1/acceptance/coefficients) не собираем:
+        // WB временно отключил метод с 15.08.2026 (RN-570), замены пока нет.
+        // КС склада берётся из box-тарифов выше.
 
         return $snapshots;
     }

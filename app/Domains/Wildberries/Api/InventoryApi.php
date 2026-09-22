@@ -388,9 +388,17 @@ class InventoryApi implements InventoryApiInterface
                 'chrtIds' => $chunk,
             ]);
 
-            if ($response && isset($response['stocks'])) {
-                $allStocks = array_merge($allStocks, $response['stocks']);
+            // Ошибка склада не лечится следующей пачкой, а каждый 4XX
+            // marketplace-api считает за 10 запросов — прекращаем обход склада.
+            if ($response === null) {
+                Log::warning('WB InventoryApi: stocks request failed, skipping warehouse', [
+                    'warehouse_id' => $warehouseId,
+                    'status' => $this->client->getLastResponseStatus(),
+                ]);
+                break;
             }
+
+            $allStocks = array_merge($allStocks, $response['stocks'] ?? []);
         }
 
         return $allStocks;
@@ -406,7 +414,7 @@ class InventoryApi implements InventoryApiInterface
      * - Используйте склады с cargoType: 1 для мелкогабаритных товаров
      *
      * @param  string  $warehouseId  ID склада
-     * @param  array  $stocks  Массив [{sku: string, amount: int}, ...]
+     * @param  array  $stocks  Массив [{chrtId: int, amount: int}, ...] (sku отключён WB)
      *
      * @see https://dev.wildberries.ru/openapi/work-with-products
      */

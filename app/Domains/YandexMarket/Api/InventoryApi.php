@@ -8,18 +8,14 @@ use App\Models\Integration;
 /**
  * API для работы с остатками Yandex Market
  *
- * Актуальные Endpoints (обновлено 2024-12):
+ * Endpoints:
  *
  * Остатки:
- * - GET /api/v2/stocks/warehouse - остатки по складам с пагинацией
- * - GET /campaigns/{campaignId}/offers/stocks - остатки по кампании
+ * - POST /v2/campaigns/{campaignId}/offers/stocks - остатки по кампании (limit/page_token в query)
  *
  * Склады:
- * - POST /v2/businesses/{businessId}/warehouses - список складов бизнеса
- * - GET /campaigns/{campaignId}/warehouses - склады кампании
- *
- * Отчёты:
- * - POST /reports/generateStocksOnWarehousesReport - генерация отчёта
+ * - POST /v2/businesses/{businessId}/warehouses - кабинеты с группами складов
+ * - POST /v3/businesses/{businessId}/warehouses - кабинеты без групп складов
  *
  * Типы остатков (WarehouseStockType):
  * - FIT: доступен для продажи или зарезервирован
@@ -145,40 +141,54 @@ class InventoryApi implements InventoryApiInterface
     }
 
     /**
-     * Получить список складов
+     * Получить список складов кабинета ({id, name, ...})
      *
-     * Пробуем два эндпоинта:
-     * 1. GET /campaigns/{campaignId}/warehouses — для кампаний с собственными складами
-     * 2. POST /businesses/{businessId}/warehouses — fallback через businessId (FBS/FBY)
+     * POST /v2/businesses/{businessId}/warehouses — для кабинетов с группами складов,
+     * POST /v3/businesses/{businessId}/warehouses — для кабинетов без групп.
+     * Модель кабинета заранее не знаем: берём v2, пусто или ошибка — v3.
+     * GET /campaigns/{campaignId}/warehouses в API нет (404) — не зовём.
      */
     public function getWarehouses(?Integration $integration = null): array
     {
-        $cid = $this->client->getCampaignId();
-        if ($cid === '') {
-            return [];
-        }
-
-        // 1. Пробуем campaign-level эндпоинт
-        try {
-            $response = $this->client->get('/campaigns/{campaignId}/warehouses');
-            $warehouses = $response['warehouses'] ?? $response['result']['warehouses'] ?? [];
-            if (! empty($warehouses)) {
-                return $warehouses;
-            }
-        } catch (\Exception $e) {
-            // 404/400 — нормально для FBY/FBS, пробуем бизнес-эндпоинт
-        }
-
-        // 2. Fallback: бизнес-склады через resolveBusinessId
         try {
             $businessId = $this->client->resolveBusinessId();
-            $response = $this->client->post("/v2/businesses/{$businessId}/warehouses", []);
-            $warehouses = $response['result']['warehouses'] ?? $response['warehouses'] ?? [];
-
-            return $warehouses;
         } catch (\Exception $e) {
             return [];
         }
+
+        foreach (['v2', 'v3'] as $version) {
+            try {
+                $warehouses = $this->fetchWarehousePages("/{$version}/businesses/{$businessId}/warehouses");
+            } catch (\Exception $e) {
+                $warehouses = [];
+            }
+            if ($warehouses !== []) {
+                return $warehouses;
+            }
+        }
+
+        return [];
+    }
+
+    /**
+     * Все страницы списка складов: limit (≤ 30) и page_token — в query.
+     */
+    private function fetchWarehousePages(string $endpoint): array
+    {
+        $warehouses = [];
+        $pageToken = null;
+        $pages = 0;
+
+        do {
+            $response = $this->client->post($endpoint, [], array_filter([
+                'limit' => 30,
+                'page_token' => $pageToken,
+            ]));
+            array_push($warehouses, ...($response['result']['warehouses'] ?? []));
+            $pageToken = $response['result']['paging']['nextPageToken'] ?? null;
+        } while ($pageToken && ++$pages < 50);
+
+        return $warehouses;
     }
 
     /**
@@ -221,44 +231,4 @@ class InventoryApi implements InventoryApiInterface
         });
     }
 
-    /**
-     * Обновить остатки
-     *
-     * PUT /campaigns/{campaignId}/offers/stocks
-     */
-    public function updateStocks(int $warehouseId, array $stocks): bool
-    {
-        $response = $this->client->put('/campaigns/{campaignId}/offers/stocks', [
-            'skus' => array_map(function ($stock) use ($warehouseId) {
-                return [
-                    'sku' => $stock['sku'],
-                    'warehouseId' => $warehouseId,
-                    'items' => [
-                        [
-                            'type' => 'FIT',
-                            'count' => $stock['quantity'],
-                        ],
-                    ],
-                ];
-            }, $stocks),
-        ]);
-
-        return $response !== null;
-    }
-
-    /**
-     * Генерация отчёта по остаткам на складах
-     *
-     * POST /reports/generateStocksOnWarehousesReport
-     *
-     * @param  array  $params  [campaignId, businessId, warehouseIds, reportDate, categoryIds, hasStocks]
-     *
-     * @see https://yandex.ru/dev/market/partner-api/doc/en/reference/reports
-     */
-    public function generateStocksReport(array $params): ?string
-    {
-        $response = $this->client->post('/reports/generateStocksOnWarehousesReport', $params);
-
-        return $response['report_id'] ?? null;
-    }
 }

@@ -3,7 +3,7 @@
 namespace App\Jobs;
 
 use App\Domains\Ozon\OzonMarketplace;
-use App\Domains\Wildberries\WildberriesMarketplace;
+use App\Domains\Wildberries\Api\SuppliesApi as WbSuppliesApi;
 use App\Models\Integration;
 use App\Models\WarehouseSlot;
 use Illuminate\Bus\Queueable;
@@ -17,8 +17,8 @@ use Illuminate\Support\Facades\Log;
  * Job для синхронизации слотов приёмки с маркетплейсов
  * 
  * Синхронизирует:
- * - Ozon: слоты из /v1/supply/timeslot/list
- * - Wildberries: коэффициенты из /api/tariffs/v1/acceptance/coefficients
+ * - Ozon: нечего — /v1/supply/timeslot/list отключён, слоты только у черновика — пропуск
+ * - Wildberries: коэффициенты приёмки временно отключены WB (с 15.08.2026) — пропуск
  */
 class SyncWarehouseSlotsJob implements ShouldQueue
 {
@@ -76,6 +76,15 @@ class SyncWarehouseSlotsJob implements ShouldQueue
     {
         $marketplace = OzonMarketplace::fromIntegration($integration);
         $suppliesApi = $marketplace->supplies();
+
+        // /v1/supply/timeslot/list Ozon отключил: слоты теперь есть только у черновика
+        // (/v2/draft/timeslot/info, SupplyService::getAvailableTimeslots) — синкать нечего.
+        if (! $suppliesApi->supportsFeature('get_acceptance_slots')) {
+            Log::warning('Ozon slots sync skipped: слоты склада без черновика API больше не отдаёт', [
+                'integration_id' => $integration->id,
+            ]);
+            return;
+        }
 
         // Получаем склады
         $warehouses = $suppliesApi->getAvailableWarehouses();
@@ -146,63 +155,16 @@ class SyncWarehouseSlotsJob implements ShouldQueue
 
     /**
      * Синхронизация слотов Wildberries
-     * 
-     * WB использует коэффициенты приёмки вместо слотов
-     * coefficient = 0 или 1 И allowUnload = true → слот доступен
+     *
+     * Слоты WB — это коэффициенты приёмки (GET /api/tariffs/v1/acceptance/coefficients),
+     * а метод WB временно отключил с 15.08.2026 (RN-570), замены пока нет. Не зовём
+     * его и не трогаем сохранённые слоты — только фиксируем причину в логе.
      */
     private function syncWildberriesSlots(Integration $integration): void
     {
-        $marketplace = WildberriesMarketplace::fromIntegration($integration);
-        $suppliesApi = $marketplace->supplies();
-
-        // Получаем коэффициенты приёмки на 14 дней
-        $slots = $suppliesApi->getAvailableAcceptanceSlots($this->warehouseId);
-
-        if (empty($slots)) {
-            Log::warning('No WB acceptance slots found', ['integration_id' => $integration->id]);
-            return;
-        }
-
-        $synced = 0;
-        $created = 0;
-
-        foreach ($slots as $slotData) {
-            $warehouseId = $slotData['warehouse_id'] ?? null;
-            $date = $slotData['date'] ?? null;
-            
-            if (!$warehouseId || !$date) continue;
-
-            $slot = WarehouseSlot::updateOrCreate(
-                [
-                    'marketplace' => 'wildberries',
-                    'warehouse_id' => $warehouseId,
-                    'date' => $date,
-                    'time_from' => '00:00',
-                    'time_to' => '23:59',
-                ],
-                [
-                    'warehouse_name' => $slotData['warehouse_name'] ?? null,
-                    'coefficient' => $slotData['coefficient'] ?? null,
-                    'is_available' => $slotData['is_available'] ?? false,
-                    'allow_unload' => $slotData['allow_unload'] ?? false,
-                    'box_type_id' => $slotData['box_type_id'] ?? null,
-                    'is_sorting_center' => $slotData['is_sorting_center'] ?? false,
-                    'storage_coefficient' => $slotData['storage_coefficient'] ?? null,
-                    'delivery_coefficient' => $slotData['delivery_coefficient'] ?? null,
-                    'synced_at' => now(),
-                ]
-            );
-
-            $synced++;
-            if ($slot->wasRecentlyCreated) {
-                $created++;
-            }
-        }
-
-        Log::info('WB slots synced', [
+        Log::info('WB slots sync skipped: '.WbSuppliesApi::DISABLED_REASON, [
             'integration_id' => $integration->id,
-            'synced' => $synced,
-            'created' => $created,
+            'warehouse_id' => $this->warehouseId,
         ]);
     }
 }

@@ -85,7 +85,6 @@ class OzonSupplySyncService
 
         $v1Details = $ozon->supplies()->getSupplyOrderDetailsV1((string) $orderId);
         $bundle = $ozon->fboSupplyOrders()->getBundle($orderId);
-        $directItems = $ozon->fboSupplyOrders()->getItems($orderId);
         $bundleItemsByBundleId = $this->extractBundleItems($bundle, $supplies);
 
         $created = 0;
@@ -142,7 +141,6 @@ class OzonSupplySyncService
                     'order' => $order,
                     'details_v1' => $v1Details,
                     'bundle' => $bundle,
-                    'direct_items' => $directItems,
                 ],
                 'external_last_synced_at' => now(),
             ];
@@ -159,9 +157,6 @@ class OzonSupplySyncService
                 }
 
                 $items = $bundleId !== '' ? ($bundleItemsByBundleId[$bundleId] ?? []) : $this->flattenBundleItems($bundleItemsByBundleId);
-                if ($items === []) {
-                    $items = $this->extractDirectItems($directItems);
-                }
                 $itemsSynced += $this->syncSupplyItems($integration->id, $supply, $items, $remoteSupplyId);
                 $supply->recalculateTotals();
                 $acceptedQty = (int) $supply->items()->sum('accepted_qty');
@@ -340,18 +335,6 @@ class OzonSupplySyncService
         return $items;
     }
 
-    private function extractDirectItems(array $response): array
-    {
-        $items = [];
-        foreach (($response['items'] ?? []) as $item) {
-            if (is_array($item)) {
-                $items[] = $item;
-            }
-        }
-
-        return $items;
-    }
-
     private function extractClusterName(array $supplyData, array $order, array $v1Details): ?string
     {
         $storageWarehouseName = $supplyData['storage_warehouse']['name'] ?? null;
@@ -402,7 +385,7 @@ class OzonSupplySyncService
             $supplyData['storage_warehouse']['name'] ?? null,
             $supplyData['warehouse_name'] ?? null,
             $supplyData['warehouse']['name'] ?? null,
-            $order['drop_off_warehouse']['name'] ?? null,
+            $order['dropoff_warehouse']['name'] ?? null,
             $v1Details['warehouse_name'] ?? null,
             $v1Details['warehouse']['name'] ?? null,
             $order['warehouse_name'] ?? null,
@@ -424,7 +407,7 @@ class OzonSupplySyncService
             $supplyData['storage_warehouse']['warehouse_id'] ?? null,
             $supplyData['warehouse_id'] ?? null,
             $supplyData['warehouse']['id'] ?? null,
-            $order['drop_off_warehouse']['warehouse_id'] ?? null,
+            $order['dropoff_warehouse']['warehouse_id'] ?? null,
             $v1Details['warehouse_id'] ?? null,
             $v1Details['warehouse']['id'] ?? null,
             $order['warehouse_id'] ?? null,

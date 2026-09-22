@@ -390,7 +390,10 @@ class SyncUnitEconomicsCommand extends Command
                         $this->warn('  Не удалось синхронизировать Ozon postings: '.$postingSyncException->getMessage());
                     }
 
-                    $actualCosts = $ozonService->getActualCostsBySku();
+                    // $actualCosts для Ozon не заполняем: /v1/finance/realization удалён
+                    // 28.04.2025, а его ответ и раньше не доходил до расчёта (ключи не
+                    // совпадали с avg_*_per_unit). Факт эквайринга и последней мили —
+                    // OzonActualRatesService (начисления /v1/finance/accrual/by-day).
 
                     // === НАЛОГОВАЯ БАЗА: фактические цены продажи (отчёт о реализации) ===
                     // Ozon ставит доп. скидки за счёт продавца («Баллы за скидки») — товар
@@ -515,7 +518,7 @@ class SyncUnitEconomicsCommand extends Command
                         $this->info("  Индекс локализации: {$localizationIndex['average_delivery_time']}ч, коэф: {$localizationIndex['tariff_coefficient']}, доп.%: {$localizationIndex['additional_fee_percent']} (кэш)");
                     } else {
                         $localizationIndex = $ozonService->getLocalizationIndex();
-                        $this->info("  Индекс локализации: {$localizationIndex['average_delivery_time']}ч, коэф: {$localizationIndex['tariff_coefficient']}, доп.%: {$localizationIndex['additional_fee_percent']} (API)");
+                        $this->info("  Индекс локализации: {$localizationIndex['average_delivery_time']}ч, коэф: {$localizationIndex['tariff_coefficient']}, доп.%: {$localizationIndex['additional_fee_percent']}, локальность: ".($localizationIndex['local_sales_index'] ?? '—').'% (API)');
 
                         // Сохраняем в settings интеграции
                         if ($integration) {
@@ -524,6 +527,9 @@ class SyncUnitEconomicsCommand extends Command
                                 'localization_coefficient' => $localizationIndex['tariff_coefficient'],
                                 'localization_additional_percent' => $localizationIndex['additional_fee_percent'],
                                 'localization_tariff_status' => $localizationIndex['tariff_status'] ?? 'UNKNOWN',
+                                // Индекс локальности (/v1/analytics/local-sale/total); при сбое — прежний.
+                                'localization_local_index' => $localizationIndex['local_sales_index']
+                                    ?? ($integrationSettings['localization_local_index'] ?? null),
                             ]);
                             $integration->update([
                                 'settings' => $newSettings,
@@ -785,9 +791,8 @@ class SyncUnitEconomicsCommand extends Command
                         $this->warn('  Не удалось получить возвраты Ozon: '.$returnsException->getMessage());
                     }
 
-                    // TODO: Эквайринг из финансовых транзакций отключён (слишком много данных, OOM)
-                    // $acquiringData = $ozonService->getAcquiringBySku();
-                    // Используем фиксированный 1.5% (стандартная ставка Ozon)
+                    // Эквайринг по факту — OzonActualRatesService (локальные начисления),
+                    // дефолт 1.5% только если начислений нет.
                 } else {
                     $this->warn('  Нет credentials для Ozon API');
                 }
@@ -2929,31 +2934,16 @@ class SyncUnitEconomicsCommand extends Command
 
     private function buildYandexTariffOffer(Product $product, ?array $priceData): ?array
     {
-        $price = (float) ($priceData['price'] ?? $product->price ?? 0);
-        if ($price <= 0) {
-            return null;
-        }
-
-        $yandexData = $product->yandex_data ?? [];
-        $categoryId = (int) ($yandexData['categoryId'] ?? 0);
-        $lengthCm = ((float) ($yandexData['length_mm'] ?? $product->depth ?? 0)) / 10;
-        $widthCm = ((float) ($yandexData['width_mm'] ?? $product->width ?? 0)) / 10;
-        $heightCm = ((float) ($yandexData['height_mm'] ?? $product->height ?? 0)) / 10;
-        $weightKg = ((float) ($yandexData['weight_g'] ?? $product->weight ?? 0)) / 1000;
-
-        if ($categoryId <= 0 || $lengthCm <= 0 || $widthCm <= 0 || $heightCm <= 0 || $weightKg <= 0) {
-            return null;
-        }
-
-        return [
-            'category_id' => $categoryId,
-            'price' => $price,
-            'length' => round($lengthCm, 2),
-            'width' => round($widthCm, 2),
-            'height' => round($heightCm, 2),
-            'weight' => round($weightKg, 3),
-            'quantity' => 1,
-        ];
+        return YandexMarketMarketplace::tariffOffer(
+            $product->yandex_data ?? [],
+            (float) ($priceData['price'] ?? $product->price ?? 0),
+            [
+                'depth' => $product->depth,
+                'width' => $product->width,
+                'height' => $product->height,
+                'weight' => $product->weight,
+            ]
+        );
     }
 
     private function extractYandexTariffBreakdown(array $responseItem): array

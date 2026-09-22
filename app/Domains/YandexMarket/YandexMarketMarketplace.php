@@ -50,7 +50,7 @@ class YandexMarketMarketplace implements MarketplaceInterface
     }
 
     /**
-     * Автоопределение схемы из API кампании (placementType: FBS/FBY/DBS/CROSSBORDER)
+     * Автоопределение схемы из API кампании (PlacementType: FBS (вкл. Экспресс)/FBY/DBS/LAAS)
      */
     private function detectSchemeFromApi(): string
     {
@@ -69,8 +69,6 @@ class YandexMarketMarketplace implements MarketplaceInterface
             return match ($placementType) {
                 'FBS' => 'FBS',
                 'DBS' => 'DBS',
-                'EXPRESS' => 'EXPRESS',
-                'FBY', 'FBY_PLUS' => 'FBY',
                 default => 'FBY',
             };
         } catch (\Exception $e) {
@@ -151,17 +149,8 @@ class YandexMarketMarketplace implements MarketplaceInterface
 
         \Illuminate\Support\Facades\Log::info('YM products loaded', ['count' => count($products)]);
 
-        $prices = $this->getProductPricesWithPagination();
-        if (! empty($prices)) {
-            foreach ($products as &$product) {
-                $sku = $product['sku'] ?? null;
-                if ($sku && isset($prices[$sku])) {
-                    $product['price'] = $prices[$sku]['price'];
-                    $product['old_price'] = $prices[$sku]['old_price'] ?? $product['old_price'] ?? null;
-                }
-            }
-            unset($product);
-        }
+        // Цена уже пришла в offer-mappings (offer.basicPrice → transformProduct):
+        // отдельный GET offer-prices не нужен (устарел, отключение 05.04.2027).
 
         // Получаем остатки и обогащаем
         $inventory = $this->getInventory();
@@ -202,42 +191,18 @@ class YandexMarketMarketplace implements MarketplaceInterface
             return;
         }
 
-        // Собираем данные для запроса тарифов
+        // Только товары со всеми обязательными полями: один неполный товар
+        // валит всю пачку /v2/tariffs/calculate.
         $offersForTariffs = [];
         $skuIndex = [];
         foreach ($products as $i => $product) {
             $sku = $product['sku'] ?? null;
-            $price = $product['price'] ?? 0;
-            if (! $sku || $price <= 0) {
+            $offer = $sku ? self::tariffOffer($product['yandex_data'] ?? [], (float) ($product['price'] ?? 0)) : null;
+            if ($offer === null) {
                 continue;
             }
 
-            $yd = $product['yandex_data'] ?? [];
-            $categoryId = $yd['categoryId'] ?? null;
-            // Габариты в см и кг (из weightDimensions)
-            $lengthCm = ($yd['length_mm'] ?? 0) / 10;
-            $widthCm = ($yd['width_mm'] ?? 0) / 10;
-            $heightCm = ($yd['height_mm'] ?? 0) / 10;
-            $weightKg = ($yd['weight_g'] ?? 0) / 1000;
-
-            $offer = ['offerId' => $sku, 'price' => (float) $price];
-            if ($categoryId) {
-                $offer['categoryId'] = (int) $categoryId;
-            }
-            if ($lengthCm > 0) {
-                $offer['length'] = $lengthCm;
-            }
-            if ($widthCm > 0) {
-                $offer['width'] = $widthCm;
-            }
-            if ($heightCm > 0) {
-                $offer['height'] = $heightCm;
-            }
-            if ($weightKg > 0) {
-                $offer['weight'] = $weightKg;
-            }
-
-            $offersForTariffs[] = $offer;
+            $offersForTariffs[$sku] = $offer;
             $skuIndex[$sku] = $i;
         }
 
@@ -261,66 +226,6 @@ class YandexMarketMarketplace implements MarketplaceInterface
             $idx = $skuIndex[$sku];
             $products[$idx]['yandex_data']['tariffs'] = $tariffs;
         }
-    }
-
-    /**
-     * Получить цены с пагинацией
-     */
-    private function getProductPricesWithPagination(): array
-    {
-        $allPrices = [];
-        $pageToken = null;
-        $iterations = 0;
-        $maxIterations = 100; // Защита от бесконечного цикла без обрезания больших каталогов
-
-        do {
-            $result = $this->products->getPricesWithPagination($pageToken);
-            $items = $result['items'] ?? [];
-            
-            if (empty($items)) {
-                break;
-            }
-            
-            foreach ($items as $item) {
-                $offerId = $item['offerId'] ?? $item['shopSku'] ?? null;
-                if (! $offerId) {
-                    continue;
-                }
-
-                // basicPrice — актуальное поле, price — fallback
-                $price = null;
-                $oldPrice = null;
-                if (isset($item['basicPrice']['value'])) {
-                    $price = (float) $item['basicPrice']['value'];
-                    $oldPrice = isset($item['basicPrice']['discountBase']) 
-                        ? (float) $item['basicPrice']['discountBase'] 
-                        : null;
-                } elseif (isset($item['price']['value'])) {
-                    $price = (float) $item['price']['value'];
-                }
-
-                if ($price !== null) {
-                    $allPrices[$offerId] = [
-                        'price' => $price,
-                        'old_price' => $oldPrice,
-                    ];
-                }
-            }
-            
-            $pageToken = $result['paging']['nextPageToken'] ?? null;
-            $iterations++;
-            
-            // Защита от бесконечного цикла
-            if ($iterations >= $maxIterations) {
-                \Illuminate\Support\Facades\Log::warning('YM prices pagination limit reached', [
-                    'iterations' => $iterations,
-                    'prices_loaded' => count($allPrices),
-                ]);
-                break;
-            }
-        } while ($pageToken);
-
-        return $allPrices;
     }
 
     private function transformProduct(array $entry, ?int $integrationId = null): array
@@ -408,11 +313,42 @@ class YandexMarketMarketplace implements MarketplaceInterface
     // === Tariffs ===
 
     /**
+     * Товар для POST /v2/tariffs/calculate (CalculateTariffsOfferDTO): categoryId,
+     * price, length/width/height (см) и weight (кг) обязательны и > 0, offerId в
+     * контракте нет. Не хватает любого поля — null (товар в расчёт не идёт).
+     *
+     * @param  array  $yandexData  yandex_data товара (categoryId, *_mm, weight_g)
+     * @param  array  $fallback  габариты товара вне yandex_data: depth/width/height (мм), weight (г)
+     */
+    public static function tariffOffer(array $yandexData, float $price, array $fallback = []): ?array
+    {
+        $categoryId = (int) ($yandexData['categoryId'] ?? 0);
+        $lengthCm = ((float) ($yandexData['length_mm'] ?? $fallback['depth'] ?? 0)) / 10;
+        $widthCm = ((float) ($yandexData['width_mm'] ?? $fallback['width'] ?? 0)) / 10;
+        $heightCm = ((float) ($yandexData['height_mm'] ?? $fallback['height'] ?? 0)) / 10;
+        $weightKg = ((float) ($yandexData['weight_g'] ?? $fallback['weight'] ?? 0)) / 1000;
+
+        if ($price <= 0 || $categoryId <= 0 || $lengthCm <= 0 || $widthCm <= 0 || $heightCm <= 0 || $weightKg <= 0) {
+            return null;
+        }
+
+        return [
+            'categoryId' => $categoryId,
+            'price' => $price,
+            'length' => round($lengthCm, 2),
+            'width' => round($widthCm, 2),
+            'height' => round($heightCm, 2),
+            'weight' => round($weightKg, 3),
+            'quantity' => 1,
+        ];
+    }
+
+    /**
      * Рассчитать реальные тарифы для товаров через Yandex Market API
      *
-     * POST /v2/tariffs/calculate?campaignId={campaignId}
+     * POST /v2/tariffs/calculate (до 200 товаров за запрос)
      *
-     * @param  array  $offers  [{offerId, categoryId, price, length, width, height, weight}, ...]
+     * @param  array<string, array>  $offers  offerId => tariffOffer()
      * @param  string  $sellingProgram  FBY|FBS|DBS|EXPRESS
      * @return array<string, array>  offerId => [tariffs => [...]]
      */
@@ -424,23 +360,21 @@ class YandexMarketMarketplace implements MarketplaceInterface
         }
 
         $result = [];
-        // API принимает до 200 товаров за раз
         foreach (array_chunk($offers, 200, true) as $chunk) {
-            $chunkOfferIds = array_values(array_column($chunk, 'offerId'));
-            $chunkValues = array_values($chunk);
+            $chunkOfferIds = array_keys($chunk);
 
             try {
                 $response = $this->client->post('/v2/tariffs/calculate', [
                     'parameters' => [
                         'sellingProgram' => $sellingProgram,
                     ],
-                    'offers' => $chunkValues,
+                    'offers' => array_values($chunk),
                 ]);
 
                 foreach ($response['result']['offers'] ?? [] as $idx => $item) {
-                    // API возвращает offers в том же порядке — маппим по индексу
-                    $offerId = $item['offer']['offerId'] ?? ($chunkOfferIds[$idx] ?? null);
-                    if ($offerId) {
+                    // offer в ответе — эхо запроса без offerId: маппим по порядку
+                    $offerId = $chunkOfferIds[$idx] ?? null;
+                    if ($offerId !== null) {
                         $result[$offerId] = $item['tariffs'] ?? [];
                     }
                 }

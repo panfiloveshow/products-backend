@@ -13,7 +13,7 @@ use Illuminate\Support\Facades\Log;
  * - POST /v1/cargoes/get — получение грузомест
  * - POST /v1/cargoes-label/create — создание этикеток
  * - POST /v1/cargoes-label/get — статус этикеток
- * - GET /v1/cargoes-label/file/{file_guid} — скачать PDF
+ *   (GET /v1/cargoes-label/file/{file_guid} отключён 10.04.2026 — PDF по ссылке result.file_url)
  */
 class FboCargoesApi
 {
@@ -100,15 +100,5 @@ class FboCargoesApi
             'file_guid' => $response['file_guid'] ?? null,
             'error' => $response['error'] ?? null,
         ];
-    }
-
-    /**
-     * Скачать PDF с этикетками
-     */
-    public function downloadLabels(string $fileGuid): ?string
-    {
-        $response = $this->client->get("/v1/cargoes-label/file/{$fileGuid}");
-        
-        return $response['content'] ?? null;
     }
 }

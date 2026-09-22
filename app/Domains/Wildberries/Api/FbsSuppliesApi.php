@@ -7,23 +7,18 @@ namespace App\Domains\Wildberries\Api;
  * 
  * FBS (Fulfillment by Seller) — продавец сам хранит товары и отправляет их на склад WB
  * 
- * Поддерживаемые операции:
+ * Поддерживаемые операции (marketplace-api; клиент сам подставляет хост,
+ * в endpoint передаём только путь):
  * - POST /api/v3/supplies — создать новую поставку
  * - GET /api/v3/supplies — список поставок
  * - GET /api/v3/supplies/{supplyId} — детали поставки
  * - DELETE /api/v3/supplies/{supplyId} — удалить пустую поставку
- * - POST /api/v3/supplies/{supplyId}/orders — добавить заказы в поставку
- * - PATCH /api/v3/supplies/{supplyId}/deliver — передать в доставку
- * - GET /api/v3/supplies/{supplyId}/orders — заказы в поставке
- * - GET /api/v3/supplies/{supplyId}/trbx — коробки поставки
- * - GET /api/v3/supplies/{supplyId}/barcodes — штрихкоды/этикетки
- * 
+ * - GET /api/v3/offices, GET /api/v3/warehouses — офисы и склады продавца
+ *
  * @see https://dev.wildberries.ru/openapi/orders-fbs
  */
 class FbsSuppliesApi
 {
-    private const BASE_URL = 'https://marketplace-api.wildberries.ru';
-
     public function __construct(
         private WildberriesClient $client
     ) {}
@@ -43,7 +38,7 @@ class FbsSuppliesApi
             $body['name'] = $name;
         }
 
-        $response = $this->client->post(self::BASE_URL . '/api/v3/supplies', $body);
+        $response = $this->client->post('/api/v3/supplies', $body);
 
         if (!$response || empty($response['id'])) {
             throw new \RuntimeException(
@@ -71,15 +66,13 @@ class FbsSuppliesApi
      */
     public function getSupplies(array $filters = []): array
     {
+        // limit и next обязательны: next = 0 для первой страницы
         $params = [
             'limit' => $filters['limit'] ?? 1000,
+            'next' => $filters['next'] ?? 0,
         ];
 
-        if (!empty($filters['next'])) {
-            $params['next'] = $filters['next'];
-        }
-
-        $response = $this->client->get(self::BASE_URL . '/api/v3/supplies', $params);
+        $response = $this->client->get('/api/v3/supplies', $params);
 
         if (!$response) {
             return [];
@@ -97,7 +90,7 @@ class FbsSuppliesApi
      */
     public function getSupplyDetails(string $supplyId): ?array
     {
-        $response = $this->client->get(self::BASE_URL . "/api/v3/supplies/{$supplyId}");
+        $response = $this->client->get("/api/v3/supplies/{$supplyId}");
 
         if (!$response) {
             return null;
@@ -115,124 +108,9 @@ class FbsSuppliesApi
      */
     public function deleteSupply(string $supplyId): bool
     {
-        $response = $this->client->delete(self::BASE_URL . "/api/v3/supplies/{$supplyId}");
+        $response = $this->client->delete("/api/v3/supplies/{$supplyId}");
 
         return $response !== null;
-    }
-
-    /**
-     * Добавить заказы (сборочные задания) в поставку
-     * 
-     * POST /api/v3/supplies/{supplyId}/orders
-     * До 100 заказов за запрос
-     * 
-     * @param string $supplyId ID поставки
-     * @param array $orderIds Массив ID заказов (до 100)
-     */
-    public function addOrdersToSupply(string $supplyId, array $orderIds): array
-    {
-        if (count($orderIds) > 100) {
-            throw new \InvalidArgumentException('Максимум 100 заказов за запрос');
-        }
-
-        $response = $this->client->post(
-            self::BASE_URL . "/api/v3/supplies/{$supplyId}/orders",
-            ['orders' => array_map(fn($id) => (int) $id, $orderIds)]
-        );
-
-        if (!$response) {
-            throw new \RuntimeException('Не удалось добавить заказы в поставку');
-        }
-
-        return [
-            'supply_id' => $supplyId,
-            'added_count' => count($orderIds),
-            'orders' => $orderIds,
-        ];
-    }
-
-    /**
-     * Передать поставку в доставку
-     * 
-     * PATCH /api/v3/supplies/{supplyId}/deliver
-     * 
-     * После этого поставка закрывается и можно получить QR-код
-     */
-    public function deliverSupply(string $supplyId): bool
-    {
-        $response = $this->client->patch(self::BASE_URL . "/api/v3/supplies/{supplyId}/deliver");
-
-        return $response !== null;
-    }
-
-    /**
-     * Получить заказы в поставке
-     * 
-     * GET /api/v3/supplies/{supplyId}/orders
-     */
-    public function getSupplyOrders(string $supplyId): array
-    {
-        $response = $this->client->get(self::BASE_URL . "/api/v3/supplies/{$supplyId}/orders");
-
-        if (!$response) {
-            return [];
-        }
-
-        return $response['orders'] ?? [];
-    }
-
-    /**
-     * Получить коробки поставки
-     * 
-     * GET /api/v3/supplies/{supplyId}/trbx
-     */
-    public function getSupplyBoxes(string $supplyId): array
-    {
-        $response = $this->client->get(self::BASE_URL . "/api/v3/supplies/{$supplyId}/trbx");
-
-        if (!$response) {
-            return [];
-        }
-
-        return $response['trbxes'] ?? [];
-    }
-
-    /**
-     * Получить штрихкоды/этикетки поставки
-     * 
-     * GET /api/v3/supplies/{supplyId}/barcode
-     * 
-     * @param string $supplyId ID поставки
-     * @param string $type Тип: svg, zplv, zplh, png
-     */
-    public function getSupplyBarcode(string $supplyId, string $type = 'png'): ?array
-    {
-        $response = $this->client->get(
-            self::BASE_URL . "/api/v3/supplies/{$supplyId}/barcode",
-            ['type' => $type]
-        );
-
-        if (!$response) {
-            return null;
-        }
-
-        return [
-            'type' => $type,
-            'file' => $response['file'] ?? null,
-            'barcode' => $response['barcode'] ?? null,
-        ];
-    }
-
-    /**
-     * Получить QR-код поставки (после передачи в доставку)
-     * 
-     * GET /api/v3/supplies/{supplyId}/trbx/qr
-     */
-    public function getSupplyQRCode(string $supplyId): ?string
-    {
-        $response = $this->client->get(self::BASE_URL . "/api/v3/supplies/{$supplyId}/trbx/qr");
-
-        return $response['file'] ?? null;
     }
 
     /**
@@ -293,13 +171,8 @@ class FbsSuppliesApi
         $supported = [
             'create_supply' => true,
             'delete_supply' => true,
-            'add_orders' => true,
-            'deliver_supply' => true,
             'get_supplies' => true,
             'get_supply_details' => true,
-            'get_supply_orders' => true,
-            'get_barcode' => true,
-            'get_qr_code' => true,
             'get_offices' => true,
             'get_warehouses' => true,
         ];

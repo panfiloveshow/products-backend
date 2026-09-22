@@ -22,7 +22,8 @@ use Illuminate\Support\Facades\Log;
  * - Возможности запуска отдельно от основной синхронизации
  * - Chunk-обработки для экономии памяти
  *
- * Источник данных: WB API /api/v5/supplier/reportDetailByPeriod
+ * Источник данных: WB Finance API POST /api/finance/v1/sales-reports/detailed
+ * (v5 reportDetailByPeriod отключён WB 15.07.2026)
  * Поля: storage_fee_total, storage_fee_last_week, storage_fee_report_from, storage_fee_report_to
  */
 class SyncStorageFeesJob implements ShouldQueue

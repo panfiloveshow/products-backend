@@ -2,16 +2,17 @@
 
 namespace App\Domains\Locality\Recommendation;
 
-use App\Domains\Ozon\Api\FboSupplyOrdersApi;
 use App\Domains\Ozon\Api\OzonClient;
+use App\Domains\Ozon\Api\SuppliesApi;
 use App\Models\Integration;
 use App\Models\LocalityRecommendation;
 use App\Models\Product;
 use Illuminate\Support\Facades\Log;
 
 /**
- * Собирает payload и вызывает /v1/draft/create для LocalityRecommendation.
- * Polling getDraftCreateStatus с backoff (до 5 попыток × 2 сек).
+ * Собирает payload и создаёт черновик прямой поставки для LocalityRecommendation
+ * через SuppliesApi::createDirectDraft (/v1/draft/direct/create).
+ * Ждёт расчёт черновика: poll /v2/draft/create/info (до 5 попыток × 2 сек).
  */
 class LocalityDraftApplier
 {
@@ -38,29 +39,25 @@ class LocalityDraftApplier
     public function apply(LocalityRecommendation $rec): array
     {
         $integration = Integration::findOrFail($rec->integration_id);
-        $api = new FboSupplyOrdersApi(OzonClient::fromIntegration($integration));
+        $api = new SuppliesApi(OzonClient::fromIntegration($integration));
 
         $payload = $this->buildPayload($rec);
 
-        $result = $api->createDirectDraft(
-            $payload['items'],
-            $payload['cluster_ids'],
-            $payload['type'],
-        );
-
-        if (! ($result['success'] ?? false)) {
-            Log::channel('locality')->warning('LocalityDraftApplier createDirectDraft failed', [
-                'recommendation_id' => $rec->id,
-                'error' => $result['error'] ?? null,
-            ]);
-            return ['success' => false, 'draft_id' => null, 'error' => $result['error'] ?? 'draft_create_failed'];
+        try {
+            [$draftId, $error] = $this->waitForDraft($api, $api->createDirectDraft([
+                'cluster_id' => $payload['cluster_ids'][0] ?? 0,
+                'items' => $payload['items'],
+            ]));
+        } catch (\RuntimeException $e) {
+            [$draftId, $error] = [null, $e->getMessage()];
         }
 
-        $operationId = (string) $result['operation_id'];
-        $draftId = $this->pollDraftId($api, $operationId);
-
         if ($draftId === null) {
-            return ['success' => false, 'draft_id' => null, 'error' => 'draft_status_timeout'];
+            Log::channel('locality')->warning('LocalityDraftApplier createDirectDraft failed', [
+                'recommendation_id' => $rec->id,
+                'error' => $error,
+            ]);
+            return ['success' => false, 'draft_id' => null, 'error' => $error];
         }
 
         $rec->fill([
@@ -73,65 +70,25 @@ class LocalityDraftApplier
     }
 
     /**
-     * Batch-версия: создаёт один Ozon FBO-draft для произвольного набора позиций в целевой кластер.
-     * Используется AutoSupplyPlanController::createClusterDrafts, когда план уже split по кластерам.
+     * Черновик создаётся сразу, склады Ozon считает асинхронно — ждём status=SUCCESS.
      *
-     * @param list<array{sku:int, quantity:int}> $items уже с числовым ozon SKU (не offer_id)
-     * @param array<string, mixed> $options
-     * @return array{success:bool, draft_id:?string, error:?string, supply_method?:string}
+     * @return array{0:?string, 1:?string} [draft_id, ошибка]
      */
-    public function applyBatch(Integration $integration, array $items, int $clusterId, array $options = []): array
+    private function waitForDraft(SuppliesApi $api, array $result): array
     {
-        if (empty($items)) {
-            return ['success' => false, 'draft_id' => null, 'error' => 'empty_items'];
-        }
-
-        $api = new FboSupplyOrdersApi(OzonClient::fromIntegration($integration));
-        $supplyMethod = (($options['supply_method'] ?? null) === 'crossdock') ? 'crossdock' : 'direct';
-        $draftType = $supplyMethod === 'crossdock' ? 'CREATE_TYPE_CROSSDOCK' : 'CREATE_TYPE_DIRECT';
-        $dropOffPointWarehouseId = isset($options['drop_off_point_warehouse_id'])
-            ? (int) $options['drop_off_point_warehouse_id']
-            : null;
-
-        $result = $api->createDirectDraft(
-            $items,
-            [$clusterId],
-            $draftType,
-            $dropOffPointWarehouseId,
-        );
-
-        if (! ($result['success'] ?? false)) {
-            Log::channel('locality')->warning('LocalityDraftApplier applyBatch createDirectDraft failed', [
-                'integration_id' => $integration->id,
-                'cluster_id' => $clusterId,
-                'supply_method' => $supplyMethod,
-                'drop_off_point_warehouse_id' => $dropOffPointWarehouseId,
-                'items_count' => count($items),
-                'error' => $result['error'] ?? null,
-            ]);
-            return ['success' => false, 'draft_id' => null, 'error' => $result['error'] ?? 'draft_create_failed'];
-        }
-
-        $operationId = (string) $result['operation_id'];
-        $draftId = $this->pollDraftId($api, $operationId);
-        if ($draftId === null) {
-            return ['success' => false, 'draft_id' => null, 'error' => 'draft_status_timeout'];
-        }
-
-        return ['success' => true, 'draft_id' => $draftId, 'error' => null, 'supply_method' => $supplyMethod];
-    }
-
-    private function pollDraftId(FboSupplyOrdersApi $api, string $operationId): ?string
-    {
-        for ($attempt = 1; $attempt <= 5; $attempt++) {
-            $status = $api->getDraftCreateStatus($operationId);
-            $draftId = $status['draft_id'] ?? ($status['result']['draft_id'] ?? null);
-            if ($draftId !== null) {
-                return (string) $draftId;
+        for ($attempt = 1; ; $attempt++) {
+            if (! empty($result['draft_id'])) {
+                return [(string) $result['draft_id'], null];
+            }
+            if (($result['status'] ?? null) === 'failed' || empty($result['pending_draft_id'])) {
+                return [null, implode('; ', (array) ($result['errors'] ?? [])) ?: 'draft_create_failed'];
+            }
+            if ($attempt > 5) {
+                return [null, 'draft_status_timeout'];
             }
             sleep(2);
+            $result = $api->pollDraftCreation((string) $result['pending_draft_id'], (array) ($result['errors'] ?? []));
         }
-        return null;
     }
 
     private function resolveOzonSku(?Product $product): int

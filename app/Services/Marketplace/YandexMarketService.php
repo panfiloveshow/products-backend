@@ -208,7 +208,7 @@ class YandexMarketService implements MarketplaceInterface
 
             do {
                 $query = array_filter([
-                    'limit' => 200,
+                    'limit' => 100, // максимум по спеке; больше ЯМ молча режет до 100
                     'page_token' => $pageToken,
                 ]);
                 $url = "{$this->baseUrl}/v2/campaigns/{$this->campaignId}/offers/stocks";
@@ -302,23 +302,44 @@ class YandexMarketService implements MarketplaceInterface
     }
 
     /**
-     * Статистика продаж (POST /v2/campaigns/{campaignId}/stats/skus).
+     * Заказы за период (POST /v2/campaigns/{campaignId}/stats/orders).
+     *
+     * stats/skus сюда не подходит: периода у него нет, а shopSkus обязателен (1–500).
+     * Пагинация — limit (≤ 200) и page_token в query, как в Domains\YandexMarket\Api\SalesApi.
      */
     public function getSalesStats(string $dateFrom, string $dateTo): array
     {
         try {
-            $response = Http::withHeaders($this->headers())
-                ->post("{$this->baseUrl}/v2/campaigns/{$this->campaignId}/stats/skus", [
-                    'shopSkus' => [],
-                    'dateFrom' => $dateFrom,
-                    'dateTo' => $dateTo,
-                ]);
+            $orders = [];
+            $pageToken = null;
+            $pages = 0;
 
-            if (! $response->successful()) {
-                return [];
-            }
+            do {
+                $query = http_build_query(array_filter([
+                    'limit' => 200,
+                    'page_token' => $pageToken,
+                ]));
+                $response = Http::withHeaders($this->headers())
+                    ->post("{$this->baseUrl}/v2/campaigns/{$this->campaignId}/stats/orders?{$query}", [
+                        'dateFrom' => $dateFrom,
+                        'dateTo' => $dateTo,
+                    ]);
 
-            return $response->json()['result']['shopSkus'] ?? [];
+                if (! $response->successful()) {
+                    Log::error('YM getSalesStats error', [
+                        'status' => $response->status(),
+                        'body' => mb_substr($response->body(), 0, 300),
+                    ]);
+
+                    return [];
+                }
+
+                $data = $response->json();
+                array_push($orders, ...($data['result']['orders'] ?? []));
+                $pageToken = $data['result']['paging']['nextPageToken'] ?? null;
+            } while ($pageToken && ++$pages < 100);
+
+            return $orders;
 
         } catch (\Exception $e) {
             Log::error('YM getSalesStats error', ['error' => $e->getMessage()]);

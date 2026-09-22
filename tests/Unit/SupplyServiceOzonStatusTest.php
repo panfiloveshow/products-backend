@@ -52,6 +52,100 @@ class SupplyServiceOzonStatusTest extends TestCase
             && $request['order_ids'] === [5678]);
     }
 
+    public function test_pending_draft_is_polled_via_v2_info_not_recreated(): void
+    {
+        $integration = Integration::factory()->ozon()->create([
+            'id' => 919193,
+            'work_space_id' => 91,
+        ]);
+        $supply = Supply::create([
+            'integration_id' => $integration->id,
+            'supply_type' => Supply::TYPE_FBO,
+            'supply_method' => Supply::METHOD_DIRECT,
+            'status' => Supply::STATUS_DRAFT,
+            'cluster_id' => '101',
+            'ozon_response' => ['pending_draft_id' => '42', 'status' => 'pending', 'errors' => []],
+        ]);
+
+        Http::preventStrayRequests();
+        Http::fake([
+            'api-seller.ozon.ru/v2/draft/create/info' => Http::response([
+                'status' => 'SUCCESS',
+                'clusters' => [],
+                'errors' => [],
+            ]),
+        ]);
+
+        $result = app(SupplyService::class)->createOzonDraft($supply);
+
+        $supply->refresh();
+        $this->assertSame('42', $result['draft_id']);
+        $this->assertSame('42', (string) $supply->ozon_draft_id);
+        $this->assertSame(Supply::STATUS_DRAFT_OZON, $supply->status);
+        Http::assertSentCount(1);
+        Http::assertSent(fn ($request): bool => $request->url() === 'https://api-seller.ozon.ru/v2/draft/create/info'
+            && $request['draft_id'] === 42);
+    }
+
+    public function test_timeslots_take_storage_warehouse_from_v2_draft_info(): void
+    {
+        $integration = Integration::factory()->ozon()->create([
+            'id' => 919194,
+            'work_space_id' => 91,
+        ]);
+        $supply = Supply::create([
+            'integration_id' => $integration->id,
+            'supply_type' => Supply::TYPE_FBO,
+            'supply_method' => Supply::METHOD_DIRECT,
+            'status' => Supply::STATUS_DRAFT_OZON,
+            'ozon_draft_id' => '42',
+            'cluster_id' => '101',
+        ]);
+
+        Http::preventStrayRequests();
+        Http::fake([
+            'api-seller.ozon.ru/v2/draft/create/info' => Http::response([
+                'status' => 'SUCCESS',
+                'clusters' => [[
+                    'macrolocal_cluster_id' => 4039,
+                    'supply_type' => 'DIRECT',
+                    'warehouses' => [
+                        [
+                            'storage_warehouse' => ['warehouse_id' => 700, 'name' => 'ЗАКРЫТ'],
+                            'availability_status' => ['state' => 'NOT_AVAILABLE'],
+                        ],
+                        [
+                            'storage_warehouse' => ['warehouse_id' => 701, 'name' => 'ХОРУГВИНО'],
+                            'availability_status' => ['state' => 'FULL_AVAILABLE'],
+                        ],
+                    ],
+                ]],
+            ]),
+            'api-seller.ozon.ru/v1/cluster/list' => Http::response([
+                'clusters' => [['id' => 101, 'macrolocal_cluster_id' => 4039, 'name' => 'Москва', 'logistic_clusters' => []]],
+            ]),
+            'api-seller.ozon.ru/v2/draft/timeslot/info' => Http::response([
+                'result' => ['drop_off_warehouse_timeslots' => ['days' => [[
+                    'date_in_timezone' => now()->addDays(2)->toDateString() . 'T00:00:00',
+                    'timeslots' => [[
+                        'from_in_timezone' => now()->addDays(2)->toDateString() . 'T09:00:00',
+                        'to_in_timezone' => now()->addDays(2)->toDateString() . 'T10:00:00',
+                    ]],
+                ]]]],
+            ]),
+        ]);
+
+        $slots = app(SupplyService::class)->getAvailableTimeslots($supply, false);
+
+        $supply->refresh();
+        $this->assertSame('701', (string) $supply->warehouse_id);
+        $this->assertSame('ХОРУГВИНО', $supply->warehouse_name);
+        $this->assertCount(1, $slots);
+        Http::assertSent(fn ($request): bool => $request->url() === 'https://api-seller.ozon.ru/v2/draft/timeslot/info'
+            && $request['supply_type'] === 'DIRECT'
+            && $request['selected_cluster_warehouses'] === [['macrolocal_cluster_id' => 4039, 'storage_warehouse_id' => 701]]);
+    }
+
     public function test_expired_or_foreign_timeslot_is_rejected_before_money_path(): void
     {
         $integration = Integration::factory()->ozon()->create([

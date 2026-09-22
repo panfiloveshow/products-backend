@@ -79,7 +79,10 @@ class SyncUnitEconomicsJob implements ShouldQueue, ShouldBeUnique
                             $settings['localization_coefficient'] = $localizationIndex['tariff_coefficient'];
                             $settings['localization_additional_percent'] = $localizationIndex['additional_fee_percent'];
                             $settings['localization_tariff_status'] = $localizationIndex['tariff_status'] ?? 'UNKNOWN';
-                            
+                            // Индекс локальности (/v1/analytics/local-sale/total); при сбое — прежний.
+                            $settings['localization_local_index'] = $localizationIndex['local_sales_index']
+                                ?? ($settings['localization_local_index'] ?? null);
+
                             $integration->update([
                                 'settings' => $settings,
                                 'localization_checked_at' => now(),

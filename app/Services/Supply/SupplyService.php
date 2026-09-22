@@ -178,17 +178,19 @@ class SupplyService
         }
 
         $previousResponse = is_array($supply->ozon_response) ? $supply->ozon_response : [];
-        $existingOperationId = $previousResponse['operation_id'] ?? null;
-        if ($existingOperationId) {
+        $pendingDraftId = $previousResponse['pending_draft_id'] ?? null;
+        if ($pendingDraftId) {
+            // Черновик уже создан, Ozon ещё считает склады — только poll
+            // /v2/draft/create/info, без повторного create.
             $ozon = OzonMarketplace::fromIntegration($supply->integration);
-            $draftInfo = $ozon->supplies()->getDraftCreateInfo((string) $existingOperationId);
-            $draftId = $this->extractDraftId($draftInfo);
-            $calculationFailed = ($draftInfo['status'] ?? null) === 'CALCULATION_STATUS_FAILED';
-            $result = array_merge($previousResponse, [
-                'draft_id' => $draftId,
-                'operation_id' => (string) $existingOperationId,
-                'draft_info' => $draftInfo,
-                'status' => $draftId ? 'draft' : ($calculationFailed ? 'failed' : 'pending'),
+            $poll = $ozon->supplies()->pollDraftCreation(
+                (string) $pendingDraftId,
+                (array) ($previousResponse['errors'] ?? [])
+            );
+            $draftId = $poll['draft_id'];
+            $result = array_merge($previousResponse, $poll, [
+                // Расчёт упал — следующий запуск создаст новый черновик.
+                'pending_draft_id' => $poll['status'] === 'failed' ? null : $poll['pending_draft_id'],
                 'idempotent' => true,
             ]);
             $supply->update([
@@ -272,6 +274,9 @@ class SupplyService
             $draftId = isset($result['draft_id']) && $result['draft_id'] !== ''
                 ? (string) $result['draft_id']
                 : null;
+            if (($result['status'] ?? null) === 'failed') {
+                $result['pending_draft_id'] = null;
+            }
             $supply->update([
                 'ozon_draft_id' => $draftId,
                 'ozon_response' => $result,
@@ -284,9 +289,9 @@ class SupplyService
             // Логируем успех
             $supply->logEvent(SupplyEvent::TYPE_DRAFT_CREATED, [
                 'title' => 'Черновик создан в Ozon',
-                'new_value' => $draftId ?: ($result['operation_id'] ?? null),
+                'new_value' => $draftId ?: ($result['pending_draft_id'] ?? null),
                 'api_method' => 'POST',
-                'api_endpoint' => "/v1/draft/{$supply->supply_method}/create",
+                'api_endpoint' => '/v1/draft/' . str_replace('_', '-', (string) $supply->supply_method) . '/create',
                 'api_response_body' => $result,
                 'api_response_code' => 200,
                 'api_duration_ms' => $duration,
@@ -367,7 +372,8 @@ class SupplyService
             $supply->ozon_draft_id,
             $supply->warehouse_id,
             $supply->cluster_id,
-            $supply->warehouse_name
+            $supply->warehouse_name,
+            (string) ($supply->supply_method ?? Supply::METHOD_DIRECT)
         );
 
         // Обновляем кэш
@@ -658,61 +664,32 @@ class SupplyService
         }
     }
 
-    private function extractDraftId(array $response): ?string
-    {
-        $value = $response['draft_id'] ?? $response['result']['draft_id'] ?? null;
-        if ($value) {
-            return (string) $value;
-        }
-
-        foreach (($response['clusters'] ?? $response['result']['clusters'] ?? []) as $cluster) {
-            if (! empty($cluster['draft_id'])) {
-                return (string) $cluster['draft_id'];
-            }
-        }
-
-        return null;
-    }
-
+    /**
+     * Склад хранения из расчёта черновика /v2/draft/create/info:
+     * clusters[].warehouses[].storage_warehouse, сначала FULL_AVAILABLE, потом PARTIAL_AVAILABLE.
+     */
     private function resolveWarehouseForDraft(Supply $supply): void
     {
         $ozon = OzonMarketplace::fromIntegration($supply->integration);
         $info = $ozon->supplies()->getDraftInfo((string) $supply->ozon_draft_id);
-        $clusters = $info['clusters'] ?? $info['result']['clusters'] ?? [];
-        $wantedCluster = (string) ($supply->cluster_id ?? '');
-        $fallback = null;
+        $byState = [];
 
-        foreach ($clusters as $cluster) {
-            $clusterId = (string) (
-                $cluster['id']
-                ?? $cluster['cluster_id']
-                ?? $cluster['macrolocal_cluster_id']
-                ?? ''
-            );
-            foreach (($cluster['warehouses'] ?? $cluster['storage_warehouses'] ?? []) as $warehouse) {
-                $available = $warehouse['is_available']
-                    ?? (($warehouse['availability_status']['state'] ?? 'AVAILABLE') === 'AVAILABLE');
-                if (! $available) {
-                    continue;
-                }
-
+        foreach (($info['clusters'] ?? []) as $cluster) {
+            foreach (($cluster['warehouses'] ?? []) as $warehouse) {
                 $candidate = [
-                    'warehouse_id' => (string) ($warehouse['id'] ?? $warehouse['warehouse_id'] ?? ''),
-                    'warehouse_name' => $warehouse['name'] ?? $warehouse['warehouse_name'] ?? null,
+                    'warehouse_id' => (string) ($warehouse['storage_warehouse']['warehouse_id'] ?? ''),
+                    'warehouse_name' => $warehouse['storage_warehouse']['name'] ?? null,
                 ];
-                if ($candidate['warehouse_id'] === '') {
-                    continue;
-                }
-                $fallback ??= $candidate;
-                if ($wantedCluster !== '' && $clusterId === $wantedCluster) {
-                    $supply->update($candidate);
-                    return;
+                $state = (string) ($warehouse['availability_status']['state'] ?? '');
+                if ($candidate['warehouse_id'] !== '' && in_array($state, ['FULL_AVAILABLE', 'PARTIAL_AVAILABLE'], true)) {
+                    $byState[$state] ??= $candidate;
                 }
             }
         }
 
-        if ($fallback !== null) {
-            $supply->update($fallback);
+        $chosen = $byState['FULL_AVAILABLE'] ?? $byState['PARTIAL_AVAILABLE'] ?? null;
+        if ($chosen !== null) {
+            $supply->update($chosen);
         }
     }
 
