@@ -606,7 +606,7 @@ class SyncUnitEconomicsCommand extends Command
                     // Ozon «Выкупы по товару за 28 дней». Analytics API используется только
                     // для тех SKU, по которым в 28д нет ни одного постинга.
                     //
-                    // Перед расчётом освежаем статусы «в пути» постингов — /v2/posting/fbo/list
+                    // Перед расчётом освежаем статусы «в пути» постингов — список постингов Ozon
                     // иногда отдаёт устаревший delivering по заказам, которые на Ozon
                     // уже доставлены и учтены в виджете «Выкупы» как выкупленные.
                     try {
@@ -2342,7 +2342,7 @@ class SyncUnitEconomicsCommand extends Command
                     $data['acquiring_percent'] = $acquiringData['avg_acquiring_percent'];
                     $data['acquiring_value'] = $acquiringData['total_acquiring'] / max($acquiringData['orders_count'], 1);
                 } elseif ($actualCosts && isset($actualCosts['avg_acquiring_per_unit']) && $actualCosts['avg_acquiring_per_unit'] > 0) {
-                    // Из заказов /v2/posting/fbo/list
+                    // Из заказов (список постингов Ozon)
                     $data['acquiring_value'] = $actualCosts['avg_acquiring_per_unit'];
                     if ($price > 0) {
                         $data['acquiring_percent'] = round(($actualCosts['avg_acquiring_per_unit'] / $price) * 100, 2);

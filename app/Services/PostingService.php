@@ -126,47 +126,67 @@ class PostingService
     private function syncOzonFbsPostings(Integration $integration, OzonMarketplace $marketplace, ?string $status, string $since, string $to): array
     {
         $ozonStatus = match ($status) {
-            'awaiting_packaging' => 'awaiting_packaging',
-            'awaiting_deliver' => 'awaiting_deliver',
-            'delivering' => 'delivering',
-            'delivered' => 'delivered',
-            'cancelled' => 'cancelled',
+            'awaiting_packaging', 'awaiting_deliver', 'delivering', 'delivered', 'cancelled' => $status,
             default => null,
         };
 
+        // /v3/posting/fbs/list отключён 31.08.2026 → /v4: cursor, filter.statuses[], sort_dir.
+        return $this->syncOzonPostingPages($integration, $marketplace, '/v4/posting/fbs/list', 'fbs', array_filter([
+            'since' => $since,
+            'to' => $to,
+            'statuses' => $ozonStatus ? [$ozonStatus] : null,
+        ]), [
+            'analytics_data' => true,
+            'barcodes' => true,
+            'financial_data' => true,
+        ]);
+    }
+
+    private function syncOzonFboPostings(Integration $integration, OzonMarketplace $marketplace, string $since, string $to): array
+    {
+        // FBO v2 отключён 31.08.2026 → /v3. «Пустой result» у v3 в июле
+        // был не поломкой: у v3 нет обёртки result, postings лежат в корне ответа.
+        return $this->syncOzonPostingPages($integration, $marketplace, '/v3/posting/fbo/list', 'fbo', [
+            'since' => $since,
+            'to' => $to,
+        ], [
+            'analytics_data' => true,
+            'financial_data' => true,
+        ]);
+    }
+
+    /**
+     * Курсорная пагинация /v4/posting/fbs/list и /v3/posting/fbo/list (limit ≤ 100,
+     * ответ {postings, cursor, has_next} без обёртки result).
+     */
+    private function syncOzonPostingPages(Integration $integration, OzonMarketplace $marketplace, string $endpoint, string $deliveryType, array $filter, array $with): array
+    {
         $created = 0;
         $updated = 0;
-        $offset = 0;
-        $limit = 1000;
+        $cursor = '';
 
         do {
-            $response = $marketplace->getClient()->post('/v3/posting/fbs/list', [
-                'dir' => 'DESC',
-                'filter' => array_filter([
-                    'status' => $ozonStatus,
-                    'since' => $since,
-                    'to' => $to,
-                ]),
-                'limit' => $limit,
-                'offset' => $offset,
-                'with' => [
-                    'analytics_data' => true,
-                    'barcodes' => true,
-                    'financial_data' => true,
-                ],
-            ]);
-
-            // null = HTTP-ошибка клиента: бросаем, чтобы не продвинуть водяной знак.
-            if ($response === null) {
-                throw new \RuntimeException('Ozon FBS postings: пустой ответ API (HTTP-ошибка)');
+            $body = ['filter' => $filter, 'limit' => 100, 'sort_dir' => 'ASC', 'with' => $with];
+            if ($cursor !== '') {
+                $body['cursor'] = $cursor;
             }
 
-            $postings = $response['result']['postings'] ?? [];
+            $response = $marketplace->getClient()->post($endpoint, $body);
+
+            // null (исключение/429) и _error (4xx/5xx, в т.ч. «метод отключён») — бросаем,
+            // чтобы НЕ продвинуть водяной знак: пустая страница вместо ошибки и была
+            // причиной «тихой смерти» постингов.
+            if ($response === null || ! empty($response['_error'])) {
+                throw new \RuntimeException("Ozon {$endpoint}: ошибка API (HTTP " . ($response['_http_status'] ?? '—') . ')');
+            }
+
+            $postings = $response['postings'] ?? $response['result']['postings'] ?? [];
+            $postings = is_array($postings) ? $postings : [];
 
             DB::beginTransaction();
             try {
                 foreach ($postings as $ozonPosting) {
-                    $result = $this->upsertOzonPosting($integration, $ozonPosting, 'fbs');
+                    $result = $this->upsertOzonPosting($integration, $ozonPosting, $deliveryType);
                     if ($result === 'created') {
                         $created++;
                     } else {
@@ -179,8 +199,11 @@ class PostingService
                 throw $e;
             }
 
-            $offset += $limit;
-        } while (count($postings) === $limit);
+            $nextCursor = (string) ($response['cursor'] ?? '');
+            // Защита от зацикливания: курсор не сдвинулся — дальше идти некуда.
+            $hasNext = ! empty($response['has_next']) && $nextCursor !== '' && $nextCursor !== $cursor;
+            $cursor = $nextCursor;
+        } while ($hasNext);
 
         return [
             'total' => $created + $updated,
@@ -189,67 +212,16 @@ class PostingService
         ];
     }
 
-    private function syncOzonFboPostings(Integration $integration, OzonMarketplace $marketplace, string $since, string $to): array
+    /**
+     * Сумма Ozon: число, строка или объект {amount, currency} (v3/v4 posting list).
+     */
+    private function ozonAmount(mixed $value): float
     {
-        $created = 0;
-        $updated = 0;
-        $offset = 0;
-        $limit = 1000;
+        if (is_array($value)) {
+            $value = $value['amount'] ?? 0;
+        }
 
-        do {
-            // ВАЖНО: /v2/posting/fbo/list — /v3 у Ozon с ~29.07.2026 отдаёт HTTP 200
-            // с пустым result: постинги тихо замирали, а водяной знак уезжал вперёд
-            // (выкуп по постингам врал — «100%» без свежих отмен).
-            $response = $marketplace->getClient()->post('/v2/posting/fbo/list', [
-                'dir' => 'DESC',
-                'filter' => [
-                    'since' => $since,
-                    'to' => $to,
-                ],
-                'limit' => $limit,
-                'offset' => $offset,
-                'with' => [
-                    'analytics_data' => true,
-                    'financial_data' => true,
-                ],
-            ]);
-
-            // null = HTTP-ошибка клиента (401/429/5xx): бросаем, чтобы НЕ продвинуть
-            // водяной знак и не потерять окно заказов навсегда.
-            if ($response === null) {
-                throw new \RuntimeException('Ozon FBO postings: пустой ответ API (HTTP-ошибка)');
-            }
-
-            $postings = $response['result']['postings']
-                ?? $response['postings']
-                ?? $response['result']
-                ?? [];
-            $postings = is_array($postings) ? $postings : [];
-
-            DB::beginTransaction();
-            try {
-                foreach ($postings as $ozonPosting) {
-                    $result = $this->upsertOzonPosting($integration, $ozonPosting, 'fbo');
-                    if ($result === 'created') {
-                        $created++;
-                    } else {
-                        $updated++;
-                    }
-                }
-                DB::commit();
-            } catch (\Exception $e) {
-                DB::rollBack();
-                throw $e;
-            }
-
-            $offset += $limit;
-        } while (count($postings) === $limit);
-
-        return [
-            'total' => $created + $updated,
-            'created' => $created,
-            'updated' => $updated,
-        ];
+        return is_numeric($value) ? (float) $value : 0.0;
     }
 
     /**
@@ -325,7 +297,7 @@ class PostingService
         // Пересчитываем итоги
         $posting->recalculateTotals();
         $posting->update([
-            'total_price' => collect($data['products'] ?? [])->sum(fn($p) => ($p['price'] ?? 0) * ($p['quantity'] ?? 1)),
+            'total_price' => collect($data['products'] ?? [])->sum(fn($p) => $this->ozonAmount($p['price'] ?? 0) * ($p['quantity'] ?? 1)),
         ]);
 
         return $result;
@@ -349,7 +321,7 @@ class PostingService
                 'name' => $product['name'] ?? '',
                 'image_url' => $product['digital_codes'][0] ?? null,
                 'quantity' => $product['quantity'] ?? 1,
-                'price' => $product['price'] ?? 0,
+                'price' => $this->ozonAmount($product['price'] ?? 0),
                 'commission_amount' => $product['commission_amount'] ?? null,
                 'commission_percent' => $product['commission_percent'] ?? null,
                 'payout' => $product['payout'] ?? null,
@@ -357,7 +329,7 @@ class PostingService
                 'volume' => $product['volume'] ?? null,
                 'meta' => [
                     'delivery_type' => $deliveryType,
-                    'currency_code' => $product['currency_code'] ?? 'RUB',
+                    'currency_code' => $product['price']['currency'] ?? $product['currency_code'] ?? 'RUB',
                     'mandatory_mark' => $product['mandatory_mark'] ?? null,
                 ],
             ]);

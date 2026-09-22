@@ -186,7 +186,7 @@ class YandexMarketServiceTest extends TestCase
     public function test_sales_api_counts_item_quantity_not_order_lines_only(): void
     {
         Http::fake([
-            'https://api.partner.market.yandex.ru/v2/campaigns/12345/stats/orders' => Http::response([
+            'https://api.partner.market.yandex.ru/v2/campaigns/12345/stats/orders*' => Http::response([
                 'result' => [
                     'orders' => [
                         [

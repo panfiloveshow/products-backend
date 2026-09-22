@@ -105,14 +105,15 @@ class SalesApi
         try {
             $result = [];
             $page = 0;
+            $pageToken = null;
 
             do {
-                $response = $this->client->post('/v2/campaigns/{campaignId}/stats/orders', array_filter([
+                // Пагинация — query limit (≤200) + pageToken. pagerFrom/pagerSize в теле ЯМ
+                // игнорировал → отдавал 100 заказов по умолчанию, и окно обрезалось до 100.
+                $response = $this->client->post('/v2/campaigns/{campaignId}/stats/orders', [
                     'dateFrom'  => $dateFrom,
                     'dateTo'    => $dateTo,
-                    'pagerFrom' => $page * 200,
-                    'pagerSize' => 200,
-                ]));
+                ], array_filter(['limit' => 200, 'pageToken' => $pageToken]));
 
                 $orders = $response['result']['orders'] ?? [];
 
@@ -146,7 +147,9 @@ class SalesApi
                     }
                 }
 
-                $hasMore = count($orders) === 200;
+                $nextToken = $response['result']['paging']['nextPageToken'] ?? null;
+                $hasMore = $nextToken !== null && $nextToken !== '' && $nextToken !== $pageToken;
+                $pageToken = $nextToken;
                 $page++;
             } while ($hasMore && $page < 100); // max 20 000 заказов за окно
 

@@ -8,7 +8,7 @@ use Illuminate\Support\Facades\Log;
  * API для работы с отправлениями FBS
  * 
  * Endpoints:
- * - POST /v3/posting/fbs/list — список отправлений
+ * - POST /v4/posting/fbs/list — список отправлений
  * - POST /v3/posting/fbs/get — детали отправления
  * - POST /v3/posting/fbs/ship — отгрузка
  * - POST /v2/posting/fbs/package-label — этикетки
@@ -25,12 +25,12 @@ class FbsPostingsApi
     /**
      * Получение списка отправлений FBS
      */
-    public function list(array $filter = [], int $limit = 100, int $offset = 0): array
+    public function list(array $filter = [], int $limit = 100, string $cursor = ''): array
     {
         $body = [
-            'dir' => 'DESC',
-            'limit' => $limit,
-            'offset' => $offset,
+            // Контракт v3 FBO / v4 FBS: cursor вместо offset, limit ≤ 100, sort_dir.
+            'sort_dir' => 'DESC',
+            'limit' => min($limit, 100),
             'with' => [
                 'analytics_data' => false,
                 'financial_data' => true,
@@ -41,17 +41,21 @@ class FbsPostingsApi
         if (!empty($filter)) {
             $body['filter'] = $filter;
         }
+        if ($cursor !== '') {
+            $body['cursor'] = $cursor;
+        }
 
-        $response = $this->client->post('/v3/posting/fbs/list', $body);
+        $response = $this->client->post('/v4/posting/fbs/list', $body);
 
         Log::info('Ozon FBS postings/list', [
             'filter' => $filter,
-            'count' => count($response['result']['postings'] ?? []),
+            'count' => count($response['postings'] ?? []),
         ]);
 
         return [
-            'postings' => $response['result']['postings'] ?? [],
-            'has_next' => $response['result']['has_next'] ?? false,
+            'postings' => $response['postings'] ?? [],
+            'cursor' => $response['cursor'] ?? null,
+            'has_next' => (bool) ($response['has_next'] ?? false),
         ];
     }
 

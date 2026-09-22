@@ -475,6 +475,46 @@ class OzonService implements MarketplaceInterface
     }
 
     /**
+     * Страницы /v3/posting/fbo/list или /v4/posting/fbs/list (cursor, limit ≤ 100,
+     * ответ {postings, cursor, has_next} без обёртки result). Ошибка API — стоп.
+     *
+     * @return \Generator<int, array<int, array>>
+     */
+    private function postingPages(string $path, string $since, string $to, string $status): \Generator
+    {
+        $cursor = '';
+        do {
+            $body = [
+                'filter'   => ['since' => $since, 'to' => $to, 'statuses' => [$status]],
+                'limit'    => 100,
+                'sort_dir' => 'ASC',
+                'with'     => ['analytics_data' => true, 'financial_data' => false],
+            ];
+            if ($cursor !== '') {
+                $body['cursor'] = $cursor;
+            }
+
+            $response = Http::withHeaders([
+                'Client-Id' => $this->clientId,
+                'Api-Key'   => $this->apiKey,
+            ])->post("{$this->baseUrl}{$path}", $body);
+
+            if (!$response->successful()) {
+                Log::error('Ozon postings list error', ['path' => $path, 'status' => $response->status()]);
+                return;
+            }
+
+            $payload = $response->json();
+            $postings = $payload['postings'] ?? $payload['result']['postings'] ?? [];
+            yield is_array($postings) ? $postings : [];
+
+            $next = (string) ($payload['cursor'] ?? '');
+            $hasNext = !empty($payload['has_next']) && $next !== '' && $next !== $cursor;
+            $cursor = $next;
+        } while ($hasNext);
+    }
+
+    /**
      * Продажи по SKU и складу через /v3/posting/fbo/list за последние N дней.
      * Возвращает [offer_id => [warehouse_id_hash => [warehouse_name, sales_30_days, avg_daily_sales, ...]]]
      */
@@ -483,45 +523,10 @@ class OzonService implements MarketplaceInterface
         try {
             $since  = now()->subDays($days)->setTime(0, 0, 0)->toIso8601String();
             $to     = now()->toIso8601String();
-            $offset = 0;
-            $limit  = 1000;
-
             // rawUnits[offer_id][warehouse_id] = ['units' => int, 'warehouse_name' => string]
             $rawUnits = [];
 
-            do {
-                $response = Http::withHeaders([
-                    'Client-Id' => $this->clientId,
-                    'Api-Key'   => $this->apiKey,
-                ])->post("{$this->baseUrl}/v3/posting/fbo/list", [
-                    'dir'    => 'ASC',
-                    'filter' => [
-                        'since'  => $since,
-                        'to'     => $to,
-                        'status' => 'delivered',
-                    ],
-                    'limit'  => $limit,
-                    'offset' => $offset,
-                    'with'   => [
-                        'analytics_data' => true,
-                        'financial_data' => false,
-                    ],
-                ]);
-
-                if (!$response->successful()) {
-                    Log::error('Ozon getSalesBySkuAndWarehouse postings error', [
-                        'status' => $response->status(),
-                    ]);
-                    break;
-                }
-
-                $payload = $response->json();
-                $postings = $payload['result']['postings']
-                    ?? $payload['postings']
-                    ?? $payload['result']
-                    ?? [];
-                $postings = is_array($postings) ? $postings : [];
-
+            foreach ($this->postingPages('/v3/posting/fbo/list', $since, $to, 'delivered') as $postings) {
                 foreach ($postings as $posting) {
                     $whName = $posting['analytics_data']['warehouse_name'] ?? '';
                     if (!$whName) {
@@ -542,9 +547,7 @@ class OzonService implements MarketplaceInterface
                         $rawUnits[$offerId][$warehouseId]['units'] += $qty;
                     }
                 }
-
-                $offset += $limit;
-            } while (count($postings) === $limit);
+            }
 
             // Преобразуем в финальный формат
             $result = [];
@@ -679,7 +682,7 @@ class OzonService implements MarketplaceInterface
     }
 
     /**
-     * Продажи FBS по SKU и складу через /v2/posting/fbs/list за последние N дней.
+     * Продажи FBS по SKU и складу через /v4/posting/fbs/list за последние N дней.
      * Возвращает [offer_id => [warehouse_id_hash => [warehouse_name, sales_30_days, avg_daily_sales, ...]]]
      */
     public function getSalesBySkuAndWarehouseFbs(int $days = 28): array
@@ -687,38 +690,12 @@ class OzonService implements MarketplaceInterface
         try {
             $since    = now()->subDays($days)->setTime(0, 0, 0)->toIso8601String();
             $to       = now()->toIso8601String();
-            $offset   = 0;
-            $limit    = 1000;
             $rawUnits = [];
 
-            do {
-                $response = Http::withHeaders([
-                    'Client-Id' => $this->clientId,
-                    'Api-Key'   => $this->apiKey,
-                ])->post("{$this->baseUrl}/v2/posting/fbs/list", [
-                    'dir'    => 'ASC',
-                    'filter' => [
-                        'since'  => $since,
-                        'to'     => $to,
-                        'status' => 'delivered',
-                    ],
-                    'limit'  => $limit,
-                    'offset' => $offset,
-                    'with'   => [
-                        'analytics_data' => true,
-                        'financial_data' => false,
-                    ],
-                ]);
-
-                if (!$response->successful()) {
-                    Log::error('Ozon getSalesBySkuAndWarehouseFbs error', ['status' => $response->status()]);
-                    break;
-                }
-
-                $postings = $response->json()['result'] ?? [];
-
+            foreach ($this->postingPages('/v4/posting/fbs/list', $since, $to, 'delivered') as $postings) {
                 foreach ($postings as $posting) {
-                    $whName = $posting['analytics_data']['warehouse_name'] ?? '';
+                    // v4: имя склада в analytics_data.warehouse (warehouse_name было в v2/v3).
+                    $whName = $posting['analytics_data']['warehouse_name'] ?? $posting['analytics_data']['warehouse'] ?? '';
                     $whId   = (string)($posting['analytics_data']['warehouse_id'] ?? '');
 
                     if (!$whName && !$whId) {
@@ -739,9 +716,7 @@ class OzonService implements MarketplaceInterface
                         $rawUnits[$offerId][$warehouseId]['units'] += $qty;
                     }
                 }
-
-                $offset += $limit;
-            } while (count($postings) === $limit);
+            }
 
             $result = [];
             foreach ($rawUnits as $offerId => $warehouses) {

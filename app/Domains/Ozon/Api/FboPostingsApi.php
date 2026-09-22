@@ -20,12 +20,12 @@ class FboPostingsApi
     /**
      * Получение списка отправлений FBO
      */
-    public function list(array $filter = [], int $limit = 100, int $offset = 0): array
+    public function list(array $filter = [], int $limit = 100, string $cursor = ''): array
     {
         $body = [
-            'dir' => 'DESC',
-            'limit' => $limit,
-            'offset' => $offset,
+            // Контракт v3 FBO / v4 FBS: cursor вместо offset, limit ≤ 100, sort_dir.
+            'sort_dir' => 'DESC',
+            'limit' => min($limit, 100),
             'with' => [
                 'analytics_data' => true,
                 'financial_data' => true,
@@ -34,6 +34,9 @@ class FboPostingsApi
 
         if (!empty($filter)) {
             $body['filter'] = $filter;
+        }
+        if ($cursor !== '') {
+            $body['cursor'] = $cursor;
         }
 
         $response = $this->client->post('/v3/posting/fbo/list', $body);

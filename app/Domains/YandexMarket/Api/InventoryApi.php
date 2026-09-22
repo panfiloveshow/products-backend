@@ -172,7 +172,7 @@ class InventoryApi implements InventoryApiInterface
         // 2. Fallback: бизнес-склады через resolveBusinessId
         try {
             $businessId = $this->client->resolveBusinessId();
-            $response = $this->client->post("/businesses/{$businessId}/warehouses", []);
+            $response = $this->client->post("/v2/businesses/{$businessId}/warehouses", []);
             $warehouses = $response['result']['warehouses'] ?? $response['warehouses'] ?? [];
 
             return $warehouses;

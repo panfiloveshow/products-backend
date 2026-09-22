@@ -34,35 +34,41 @@ class WarehousesApi
     public function getInTransitBySku(): array
     {
         try {
-            $response = $this->client->post('/v3/posting/fbo/list', [
-                'dir' => 'ASC',
-                'filter' => [
-                    'status' => 'delivering',
-                ],
-                'limit' => 1000,
-                'offset' => 0,
-                'with' => [
-                    'analytics_data' => false,
-                    'financial_data' => false,
-                ],
-            ]);
-
+            // v3: limit ≤ 100, cursor, filter.statuses[], postings в корне ответа.
             $result = [];
-            $postings = $response['result']['postings']
-                ?? $response['postings']
-                ?? $response['result']
-                ?? [];
-            foreach (is_array($postings) ? $postings : [] as $posting) {
-                foreach ($posting['products'] ?? [] as $product) {
-                    $sku = $product['offer_id'] ?? null;
-                    if (!$sku) continue;
-
-                    if (!isset($result[$sku])) {
-                        $result[$sku] = 0;
-                    }
-                    $result[$sku] += (int)($product['quantity'] ?? 0);
+            $cursor = '';
+            do {
+                $body = [
+                    'filter' => [
+                        'since' => now()->subMonths(3)->toIso8601String(),
+                        'to' => now()->toIso8601String(),
+                        'statuses' => ['delivering'],
+                    ],
+                    'limit' => 100,
+                    'sort_dir' => 'ASC',
+                    'with' => ['analytics_data' => false, 'financial_data' => false],
+                ];
+                if ($cursor !== '') {
+                    $body['cursor'] = $cursor;
                 }
-            }
+                $response = $this->client->post('/v3/posting/fbo/list', $body);
+                if (empty($response) || ! empty($response['_error'])) {
+                    break;
+                }
+
+                foreach ($response['postings'] ?? [] as $posting) {
+                    foreach ($posting['products'] ?? [] as $product) {
+                        $sku = $product['offer_id'] ?? null;
+                        if (!$sku) continue;
+
+                        $result[$sku] = ($result[$sku] ?? 0) + (int)($product['quantity'] ?? 0);
+                    }
+                }
+
+                $next = (string) ($response['cursor'] ?? '');
+                $hasNext = ! empty($response['has_next']) && $next !== '' && $next !== $cursor;
+                $cursor = $next;
+            } while ($hasNext);
 
             return $result;
         } catch (\Exception $e) {

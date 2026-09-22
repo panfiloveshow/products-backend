@@ -59,7 +59,7 @@ class YandexMarketMarketplace implements MarketplaceInterface
             if ($cid === '') {
                 return 'FBY';
             }
-            $response = $this->client->get('/campaigns/{campaignId}');
+            $response = $this->client->get('/v2/campaigns/{campaignId}');
             $placementType = strtoupper((string) (
                 data_get($response, 'campaign.placementType')
                 ?? data_get($response, 'result.campaign.placementType')

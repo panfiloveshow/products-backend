@@ -351,7 +351,7 @@ class SalesApi
     }
 
     /**
-     * Получить продажи FBS по SKU и складу через /v3/posting/fbs/list за последние N дней.
+     * Получить продажи FBS по SKU и складу через /v4/posting/fbs/list за последние N дней.
      *
      * @return array [offer_id => [warehouse_id => ['warehouse_name', 'sales_7_days', 'sales_14_days', 'sales_30_days', 'avg_daily_sales', 'ordered_units_total', 'fulfillment_type']]]
      */
@@ -367,7 +367,7 @@ class SalesApi
             $rawUnits = [];
 
             do {
-                // Новый формат v3: statuses[]/sort_dir/cursor, postings на верхнем уровне.
+                // v4 (v3 отключён 31.08.2026): statuses[]/sort_dir/cursor, postings на верхнем уровне.
                 $body = [
                     'filter'   => [
                         'since'    => $since,
@@ -391,7 +391,7 @@ class SalesApi
                 // Устойчивость к rate-limit — повтор страницы с backoff (см. FBO-вариант выше).
                 $attempt = 0;
                 while (true) {
-                    $response = $this->client->post('/v3/posting/fbs/list', $body);
+                    $response = $this->client->post('/v4/posting/fbs/list', $body);
                     if ((empty($response) || ! empty($response['_error'])) && $attempt < 5) {
                         usleep((int) (500000 * (2 ** $attempt)));
                         $attempt++;
@@ -410,7 +410,8 @@ class SalesApi
                     }
 
                     $analytics = $posting['analytics_data'] ?? [];
-                    $warehouseName = (string) ($analytics['warehouse_name'] ?? '');
+                    // v4: имя склада в analytics_data.warehouse (warehouse_name было в v3).
+                    $warehouseName = (string) ($analytics['warehouse_name'] ?? $analytics['warehouse'] ?? $posting['delivery_method']['warehouse'] ?? '');
                     $warehouseIdRaw = (string) ($analytics['warehouse_id'] ?? '');
 
                     if ($warehouseName === '' && $warehouseIdRaw === '') {
