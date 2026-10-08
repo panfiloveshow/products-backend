@@ -226,6 +226,7 @@ class FinanceTransactionSyncer
 
             $monthKey = $period->format('Y-m');
             $operationDate = $period->copy()->endOfMonth()->startOfDay()->toDateTimeString();
+            $sales = [];
             foreach ($rows as $row) {
                 if (! is_array($row)) {
                     continue;
@@ -238,11 +239,18 @@ class FinanceTransactionSyncer
                     continue;
                 }
 
-                $attrs = [
-                    'integration_id' => $integrationId,
-                    'operation_id' => "real:{$monthKey}:" . ($sku !== '' ? $sku : $offerId),
-                ];
-                $values = [
+                $operationId = "real:{$monthKey}:" . ($sku !== '' ? $sku : $offerId);
+                // Отчёт содержит несколько строк SKU с разными ценами: сохраняем
+                // их сумму, иначе последняя строка занижает знаменатель ставок.
+                if (isset($sales[$operationId])) {
+                    $sales[$operationId]['amount'] = round($sales[$operationId]['amount'] + $amount, 2);
+                    $sales[$operationId]['accruals_for_sale'] = $sales[$operationId]['amount'];
+                    $sales[$operationId]['raw']['quantity'] += $quantity;
+
+                    continue;
+                }
+
+                $sales[$operationId] = [
                     'operation_type' => 'OperationAgentDeliveredToCustomer',
                     'operation_type_name' => 'Продажа (realization v2, месяц)',
                     'operation_date' => $operationDate,
@@ -257,7 +265,10 @@ class FinanceTransactionSyncer
                     ],
                     'fetched_at' => now(),
                 ];
+            }
 
+            foreach ($sales as $operationId => $values) {
+                $attrs = ['integration_id' => $integrationId, 'operation_id' => $operationId];
                 $existing = OzonFinanceTransaction::query()->where($attrs)->first();
                 if ($existing === null) {
                     OzonFinanceTransaction::query()->create(array_merge($attrs, $values));
