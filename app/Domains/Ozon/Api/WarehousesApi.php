@@ -99,10 +99,12 @@ class WarehousesApi
     /**
      * Получить возвраты по SKU
      * Использует актуальный endpoint /v1/returns/list (заменяет устаревший /v3/returns/company/fbo)
+     * @param array<string, list<string>>|null $postingNumbersBySku Ограничение заказами, по которым рассчитан выкуп SKU.
      */
-    public function getReturnsBySku(int $days = 30): array
+    public function getReturnsBySku(int $days = 30, ?array $postingNumbersBySku = null): array
     {
         try {
+            $postingLookup = array_map(static fn (array $numbers): array => array_fill_keys($numbers, true), $postingNumbersBySku ?? []);
             // Используем актуальный endpoint для возвратов FBO и FBS.
             // Пагинация по last_id (курсор из ответа), чтобы не терять возвраты
             // у крупных каталогов, где за окно их больше 500.
@@ -148,6 +150,10 @@ class WarehousesApi
                     foreach ($products ?? [] as $product) {
                         $sku = $product['offer_id'] ?? null;
                         if (!$sku) continue;
+
+                        if (isset($postingLookup[$sku]) && !isset($postingLookup[$sku][$return['posting_number'] ?? ''])) {
+                            continue;
+                        }
 
                         if (!isset($result[$sku])) {
                             $result[$sku] = 0;

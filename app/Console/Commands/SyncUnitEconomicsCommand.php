@@ -33,6 +33,7 @@ use App\Services\Wildberries\WildberriesAcquiringSnapshotStore;
 use Illuminate\Console\Command;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 
 class SyncUnitEconomicsCommand extends Command
@@ -766,7 +767,22 @@ class SyncUnitEconomicsCommand extends Command
                     // redemptionData (по offer_id и по ozon_sku), откуда они доходят
                     // до CalculationInput->returnsCount и учитываются в расчёте.
                     try {
-                        $returnsBySku = $ozonService->getReturnsBySku(30); // [offer_id => qty]
+                        // Возвраты должны относиться к тем же заказам D-28…D-1, что и
+                        // postings-выкуп. Изменение статуса старого возврата за 30д
+                        // не делает его возвратом одного из текущих заказов SKU.
+                        $dateTo = now()->subDay()->endOfDay();
+                        $dateFrom = (clone $dateTo)->subDays(27)->startOfDay();
+                        $postingNumbersBySku = array_fill_keys(array_keys($postingsBuyoutMap), []);
+                        $cohortOrders = DB::table('ozon_order_unit_economics')
+                            ->where('integration_id', $integrationId)
+                            ->whereBetween('order_date', [$dateFrom, $dateTo])
+                            ->select('sku', 'posting_number')->distinct()->get();
+                        foreach ($cohortOrders as $order) {
+                            if (isset($postingNumbersBySku[$order->sku])) {
+                                $postingNumbersBySku[$order->sku][] = $order->posting_number;
+                            }
+                        }
+                        $returnsBySku = $ozonService->getReturnsBySku(30, $postingNumbersBySku); // [offer_id => qty]
                         $returnsApplied = 0;
                         foreach ($returnsBySku as $returnOfferId => $returnsCount) {
                             $returnsCount = (int) $returnsCount;
