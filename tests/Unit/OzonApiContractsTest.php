@@ -7,6 +7,7 @@ use App\Domains\Ozon\Api\OzonClient;
 use App\Domains\Ozon\Api\SalesApi;
 use App\Domains\Ozon\Api\StockAnalyticsApi;
 use App\Domains\Ozon\Api\SuppliesApi;
+use App\Domains\Ozon\OzonMarketplace;
 use App\Exceptions\OzonAmbiguousRemoteStateException;
 use App\Exceptions\OzonPreconditionException;
 use Carbon\Carbon;
@@ -15,6 +16,32 @@ use Tests\TestCase;
 
 class OzonApiContractsTest extends TestCase
 {
+    public function test_returns_are_matched_to_the_buyout_order_cohort(): void
+    {
+        Http::fake([
+            'api-seller.ozon.ru/v1/returns/list' => Http::response([
+                'returns' => [
+                    ['id' => 1, 'type' => 'ClientReturn', 'posting_number' => 'september-3', 'product' => ['offer_id' => 'P020', 'quantity' => 2]],
+                    ['id' => 2, 'type' => 'ClientReturn', 'posting_number' => 'september-30', 'product' => ['offer_id' => 'P020', 'quantity' => 1]],
+                    ['id' => 3, 'type' => 'Cancellation', 'posting_number' => 'september-30', 'product' => ['offer_id' => 'P020', 'quantity' => 1]],
+                    ['id' => 4, 'type' => 'ClientReturn', 'posting_number' => 'old-order', 'product' => ['offer_id' => 'no-current-orders', 'quantity' => 1]],
+                    ['id' => 5, 'type' => 'ClientReturn', 'posting_number' => 'api-order', 'product' => ['offer_id' => 'analytics-fallback', 'quantity' => 1]],
+                ],
+                'has_next' => false,
+            ]),
+        ]);
+
+        $marketplace = new OzonMarketplace(['client_id' => 'client', 'api_key' => 'key']);
+        $returns = $marketplace->getReturnsBySku(30, [
+            'P020' => ['september-30'],
+            'no-current-orders' => [],
+        ]);
+
+        $this->assertSame(['P020' => 1, 'analytics-fallback' => 1], $returns);
+        $this->assertSame(['P020' => 3, 'no-current-orders' => 1, 'analytics-fallback' => 1], $marketplace->getReturnsBySku(30));
+        $this->assertSame(['analytics-fallback' => 1], $marketplace->getReturnsBySku(30, ['P020' => [], 'no-current-orders' => []]));
+    }
+
     public function test_stock_analytics_uses_post_body_contract(): void
     {
         Http::fake([

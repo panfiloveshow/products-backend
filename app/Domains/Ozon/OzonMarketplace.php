@@ -957,9 +957,9 @@ class OzonMarketplace implements MarketplaceInterface
         return $this->warehouses->getInTransitBySku();
     }
 
-    public function getReturnsBySku(int $days = 30): array
+    public function getReturnsBySku(int $days = 30, ?array $postingNumbersBySku = null): array
     {
-        return $this->warehouses->getReturnsBySku($days);
+        return $this->warehouses->getReturnsBySku($days, $postingNumbersBySku);
     }
 
     // === Categories ===
