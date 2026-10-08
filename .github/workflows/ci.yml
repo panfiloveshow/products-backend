@@ -61,6 +61,7 @@ jobs:
           tests/Unit/MarketplacePriceResolverTest.php
           tests/Unit/UnitEconomicsCacheServiceTest.php
           tests/Unit/OzonCurrentPricePersistenceTest.php
+          tests/Unit/Locality/FinanceTransactionSyncerMonthlyRealizationTest.php
           tests/Unit/SyncUnitEconomicsCommandExitCodeTest.php
           tests/Feature/UnitEconomicsPriceIntegrityTest.php
           tests/Feature/UnitEconomicsCacheConsistencyTest.php
