@@ -136,18 +136,36 @@ class FboSupplyOrdersApi
             'bundle_ids' => $bundleIds,
         ]);
         
-        $response = $this->client->post('/v1/supply-order/bundle', [
-            'bundle_ids' => $bundleIds,
-            'limit' => 100,
-        ]);
+        $items = [];
+        $bundles = [];
+        // Ozon разрешает получать состав одной поставки за вызов.
+        foreach (array_unique($bundleIds) as $bundleId) {
+            $bundleItems = [];
+            $lastId = '';
+            $seen = [];
+            do {
+                $response = $this->client->post('/v1/supply-order/bundle', [
+                    'bundle_ids' => [$bundleId], 'limit' => 100, 'last_id' => $lastId,
+                ]);
+                if (!$response || !empty($response['_error'])) {
+                    throw new \RuntimeException('Не удалось получить полный состав поставки Ozon.');
+                }
+                $bundleItems = array_merge($bundleItems, $response['items'] ?? []);
+                if (empty($response['has_next'])) {
+                    break;
+                }
+                $next = (string) ($response['last_id'] ?? '');
+                if ($next === '' || isset($seen[$next])) {
+                    throw new \RuntimeException('Ozon не вернул новый last_id состава поставки.');
+                }
+                $seen[$next] = true;
+                $lastId = $next;
+            } while (true);
+            $items = array_merge($items, $bundleItems);
+            $bundles[] = ['bundle_id' => $bundleId, 'items' => $bundleItems];
+        }
 
-        Log::info('Ozon FBO supply-order/bundle response', [
-            'supply_order_id' => $supplyOrderId,
-            'response_keys' => $response ? array_keys($response) : [],
-            'bundles_count' => count($response['bundles'] ?? []),
-        ]);
-
-        return $response ?? [];
+        return ['items' => $items, 'bundles' => $bundles, 'total_count' => count($items), 'has_next' => false, 'last_id' => ''];
     }
 
     /**
@@ -190,11 +208,11 @@ class FboSupplyOrdersApi
      */
     public function getStatusCounters(): array
     {
-        $response = $this->client->post('/v1/supply-order/status/counter', []);
+        $response = $this->client->post('/v1/supply-order/status/counter', [], true);
 
         Log::info('Ozon FBO status/counter response', ['response' => $response]);
 
-        return $response['counters'] ?? $response ?? [];
+        return $response['items'] ?? $response['counters'] ?? [];
     }
 
     // Черновики и заявки из черновика (/v1/draft/*/create, /v2/draft/*) — в SuppliesApi.
@@ -243,32 +261,26 @@ class FboSupplyOrdersApi
      * @param string $timeslotTo Конец таймслота (ISO 8601 с Z)
      * @return array
      */
-    public function editTimeslot(int $supplyOrderId, string $timeslotFrom, string $timeslotTo): array
+    public function editTimeslot(int $supplyOrderId, string $timeslotFrom, string $timeslotTo, ?int $rowVersion = null): array
     {
-        // Убедимся, что timestamp в правильном формате с Z
-        if (!str_ends_with($timeslotFrom, 'Z')) {
-            $timeslotFrom = rtrim($timeslotFrom, 'Z') . 'Z';
+        if ($rowVersion === null) {
+            $current = $this->client->post('/v1/fbp/order/get', ['supply_id' => (string) $supplyOrderId]);
+            if (!empty($current['_error']) || !isset($current['row_version'])) {
+                throw new \App\Exceptions\OzonPreconditionException('Ozon не вернул актуальную row_version поставки.');
+            }
+            $rowVersion = (int) $current['row_version'];
         }
-        if (!str_ends_with($timeslotTo, 'Z')) {
-            $timeslotTo = rtrim($timeslotTo, 'Z') . 'Z';
-        }
-
         $body = [
             'supply_id' => (string) $supplyOrderId,
-            'timeslot_start' => $timeslotFrom,
-            'timeslot_end' => $timeslotTo,
+            'row_version' => $rowVersion,
+            'timeslot_start' => \Carbon\Carbon::parse($timeslotFrom)->utc()->format('Y-m-d\TH:i:s\Z'),
         ];
-
-        Log::info('Ozon FBO fbp/order/direct/timeslot/edit request', ['body' => $body]);
-
         $response = $this->client->post('/v1/fbp/order/direct/timeslot/edit', $body);
 
-        Log::info('Ozon FBO fbp/order/direct/timeslot/edit response', ['response' => $response]);
-
         return [
-            'success' => empty($response['error']) && empty($response['code']),
+            'success' => is_array($response) && isset($response['row_version']) && empty($response['_error']) && empty($response['error']) && empty($response['error_reasons']) && empty($response['code']),
             'response' => $response,
-            'error' => $response['error'] ?? $response['message'] ?? null,
+            'error' => $response['error'] ?? $response['message'] ?? ($response['error_reasons'] ?? null),
             '_http_status' => $response['_http_status'] ?? null,
         ];
     }

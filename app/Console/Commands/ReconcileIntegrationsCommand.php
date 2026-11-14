@@ -3,11 +3,13 @@
 namespace App\Console\Commands;
 
 use App\Models\Integration;
+use App\Services\IntegrationCredentialMirrorService;
 use App\Services\SellicoApiService;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Schema;
 
 /**
  * Сверяет локальное зеркало интеграций с живым списком Sellico (источник истины)
@@ -21,13 +23,16 @@ use Illuminate\Support\Facades\Log;
  * остаются локально навсегда. Эта команда закрывает разрыв.
  *
  * БЕЗОПАСНОСТЬ (fail-closed): удаление выполняется ТОЛЬКО если из Sellico получен
- * достоверный НЕПУСТОЙ список. Любая ошибка авторизации / сети / пустой ответ →
- * workspace пропускается без единого удаления. По умолчанию — dry-run.
+ * достоверный полный реестр сервисного аккаунта. Ошибки авторизации, сети и формата
+ * запрещают очистку. Пустой полный реестр означает удаление последней интеграции.
+ * Legacy-режим с пользовательским токеном по-прежнему запрещает пустые списки.
+ * По умолчанию — dry-run.
  */
 class ReconcileIntegrationsCommand extends Command
 {
     protected $signature = 'integrations:reconcile
         {--workspace= : Конкретный work_space_id (по умолчанию — все из локальной таблицы)}
+        {--integration=* : Ограничить очистку перечисленными ID интеграций}
         {--token= : Пользовательский Sellico-токен (Bearer) для эндпоинта /workspaces/{ws}/integrations}
         {--apply : Реально удалить сирот (по умолчанию только показывает, ничего не трогает)}
         {--force : Снять предохранитель при количестве сирот больше порога}';
@@ -42,16 +47,43 @@ class ReconcileIntegrationsCommand extends Command
         $apply = (bool) $this->option('apply');
         $force = (bool) $this->option('force');
         $token = $this->option('token') ?: null;
-
         $workspaceOpt = $this->option('workspace');
+        if ($workspaceOpt !== null && (filter_var($workspaceOpt, FILTER_VALIDATE_INT) === false || (int) $workspaceOpt <= 0)) {
+            $this->error('workspace должен быть положительным целым ID.');
+
+            return self::FAILURE;
+        }
+        $onlyIds = [];
+        foreach ((array) $this->option('integration') as $value) {
+            $id = filter_var($value, FILTER_VALIDATE_INT);
+            if ($id === false || $id <= 0) {
+                $this->error('integration должен быть положительным целым ID.');
+
+                return self::FAILURE;
+            }
+            $onlyIds[] = $id;
+        }
+
+        $snapshot = null;
+        $canonical = [];
+        if (! $token) {
+            $result = $sellico->getIntegrationSnapshot();
+            if (! ($result['success'] ?? false) || ! is_array($result['integrations'] ?? null)) {
+                $this->error('Полный список Sellico недоступен: ничего не удалено.');
+
+                return self::FAILURE;
+            }
+            $snapshot = $this->pluckIds($result['integrations']);
+            $canonical = array_column($result['integrations'], null, 'id');
+        }
+
         $workspaceIds = $workspaceOpt !== null
             ? [(int) $workspaceOpt]
-            : Integration::query()
-                ->whereNotNull('work_space_id')
+            : Integration::withoutGlobalScopes()
                 ->distinct()
                 ->pluck('work_space_id')
                 ->map(fn ($v) => (int) $v)
-                ->filter()
+                ->filter(fn ($id) => $snapshot !== null || $id > 0)
                 ->sort()
                 ->values()
                 ->all();
@@ -65,26 +97,51 @@ class ReconcileIntegrationsCommand extends Command
         $tables = $this->integrationIdTables();
         $totalOrphans = 0;
         $totalDeletedRows = 0;
+        $failures = 0;
+        $credentialsUpdated = 0;
 
         foreach ($workspaceIds as $ws) {
             $this->line("=== workspace {$ws} ===");
 
-            $liveIds = $this->fetchLiveIntegrationIds($sellico, $ws, $token);
+            $liveIds = $snapshot ?? $this->fetchLiveIntegrationIds($sellico, $ws, $token);
 
             if ($liveIds === null) {
                 $this->warn('  ⚠ Не удалось получить достоверный список из Sellico — workspace пропущен (удалений нет).');
+
                 continue;
             }
-            if (empty($liveIds)) {
+            if (empty($liveIds) && $snapshot === null) {
                 $this->warn("  ⚠ Sellico вернул ПУСТОЙ список для workspace {$ws} — пропуск из осторожности (вероятна ошибка авторизации).");
+
                 continue;
             }
 
-            $local = Integration::where('work_space_id', $ws)->get(['id', 'name', 'marketplace']);
+            $local = Integration::withoutGlobalScopes()
+                ->when($onlyIds !== [], fn ($query) => $query->whereIn('id', $onlyIds))
+                ->where(fn ($query) => $ws === 0
+                    ? $query->whereNull('work_space_id')->orWhere('work_space_id', 0)
+                    : $query->where('work_space_id', $ws))
+                ->get();
+            if ($apply && $canonical !== []) {
+                foreach ($local as $integration) {
+                    $version = $canonical[$integration->id]['credentials_version'] ?? null;
+                    if (! $version) {
+                        continue;
+                    }
+                    try {
+                        $credentialsUpdated += (int) app(IntegrationCredentialMirrorService::class)->sync($integration, $version);
+                    } catch (\Throwable $e) {
+                        $failures++;
+                        $this->warn('Не удалось обновить зеркало ключа интеграции '.$integration->id);
+                        Log::warning('Credential mirror failed', ['integration_id' => $integration->id, 'exception' => $e::class]);
+                    }
+                }
+            }
             $orphans = $local->reject(fn ($i) => in_array((int) $i->id, $liveIds, true))->values();
 
             if ($orphans->isEmpty()) {
                 $this->info("  ✓ Сирот нет (локально {$local->count()}, живых ".count($liveIds).').');
+
                 continue;
             }
 
@@ -103,11 +160,13 @@ class ReconcileIntegrationsCommand extends Command
 
             if (! $apply) {
                 $this->line('  (dry-run — ничего не удалено; добавьте --apply)');
+
                 continue;
             }
 
-            if ($orphans->count() > self::MAX_DELETE_WITHOUT_FORCE && ! $force) {
+            if ($snapshot === null && $orphans->count() > self::MAX_DELETE_WITHOUT_FORCE && ! $force) {
                 $this->error('  ⛔ Сирот '.$orphans->count().' > порога '.self::MAX_DELETE_WITHOUT_FORCE.' — подозрительно. Проверьте и запустите с --force.');
+
                 continue;
             }
 
@@ -124,6 +183,7 @@ class ReconcileIntegrationsCommand extends Command
                         'deleted' => $deleted,
                     ]);
                 } catch (\Throwable $e) {
+                    $failures++;
                     $this->error("    ✗ не удалось удалить id={$o->id}: ".$e->getMessage());
                     Log::error('Integration reconcile: delete failed', [
                         'id' => $o->id,
@@ -136,8 +196,11 @@ class ReconcileIntegrationsCommand extends Command
 
         $this->line('');
         $this->info("Итог: сирот найдено {$totalOrphans}".($apply ? ", удалено строк {$totalDeletedRows}" : ' (dry-run, без изменений)'));
+        if ($apply) {
+            $this->info('Обновлено ключей из Sellico: '.$credentialsUpdated);
+        }
 
-        return self::SUCCESS;
+        return $failures > 0 ? self::FAILURE : self::SUCCESS;
     }
 
     /**
@@ -203,6 +266,15 @@ class ReconcileIntegrationsCommand extends Command
      */
     private function integrationIdTables(): array
     {
+        if (DB::connection()->getDriverName() !== 'pgsql') {
+            $tables = array_values(array_filter(Schema::getTableListing(), fn ($table) => Schema::hasColumn($table, 'integration_id')));
+            $tables = array_values(array_filter($tables, fn ($table) => $table !== 'products' && $table !== 'integrations'));
+            if (Schema::hasTable('products')) {
+                $tables[] = 'products';
+            }
+
+            return $tables;
+        }
         $rows = DB::select(
             "SELECT table_name FROM information_schema.columns
              WHERE column_name = 'integration_id' AND table_schema = 'public'
@@ -228,7 +300,7 @@ class ReconcileIntegrationsCommand extends Command
         $out = [];
         foreach ($tables as $t) {
             try {
-                $out[$t] = DB::table($t)->where('integration_id', $id)->count();
+                $out[$t] = DB::table($t)->where('integration_id', (string) $id)->count();
             } catch (\Throwable $e) {
                 // тип колонки несовместим / таблицы нет — пропускаем
             }
@@ -249,7 +321,7 @@ class ReconcileIntegrationsCommand extends Command
         $deleted = [];
         DB::transaction(function () use ($tables, $id, &$deleted) {
             foreach ($tables as $t) {
-                $deleted[$t] = DB::table($t)->where('integration_id', $id)->delete();
+                $deleted[$t] = DB::table($t)->where('integration_id', (string) $id)->delete();
             }
             $deleted['integrations'] = DB::table('integrations')->where('id', $id)->delete();
         });

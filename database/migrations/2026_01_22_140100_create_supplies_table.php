@@ -94,7 +94,7 @@ return new class extends Migration
             $table->foreignId('responsible_id')->nullable()->constrained('users')->nullOnDelete();
             
             // Связь с планом
-            $table->foreignId('supply_plan_id')->nullable()->constrained('supply_plans')->nullOnDelete();
+            $table->foreignUuid('supply_plan_id')->nullable()->constrained('supply_plans')->nullOnDelete();
             
             // Мета
             $table->text('comment')->nullable();

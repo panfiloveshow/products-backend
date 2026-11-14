@@ -46,7 +46,7 @@ class PlanningFactSnapshotService
     {
         $integration = Integration::withoutGlobalScopes()->find($plan->integration_id);
         $registry = $integration
-            ? app(DataFreshnessRegistry::class)->inspect($integration)
+            ? app(DataFreshnessRegistry::class)->inspect($integration, (string) $plan->id)
             : null;
         $requestedParams = $plan->requested_params_json ?: $this->planParams($plan);
         $effectiveParams = $plan->effective_params_json ?: $this->planParams($plan);
@@ -67,6 +67,7 @@ class PlanningFactSnapshotService
             'summary_json' => [
                 'stage' => 'started',
                 'facts_hash' => $registry['hash'] ?? null,
+                'input_version_started' => $registry['hash'] ?? null,
                 'params_hash' => $this->hash([
                     'requested' => $requestedParams,
                     'effective' => $effectiveParams,
@@ -129,25 +130,30 @@ class PlanningFactSnapshotService
             ? PlanningFactSnapshot::query()->find($plan->snapshot_id)
             : null;
 
+        $startedBeforeCompletion = $snapshot !== null && $snapshot->status === 'building' && PlanningSnapshotEvidence::digest($snapshot->summary_json['input_version_started'] ?? null);
+
         if (! $snapshot) {
             $snapshot = $this->start($plan);
         }
 
         $integration = Integration::withoutGlobalScopes()->find($plan->integration_id);
         $registry = $integration
-            ? app(DataFreshnessRegistry::class)->inspect($integration)
+            ? app(DataFreshnessRegistry::class)->inspect($integration, (string) $plan->id)
             : [];
         $freshness = array_merge(
             $payload['facts_freshness'] ?? [],
             ['registry' => $registry]
         );
         $previousSummary = is_array($snapshot->summary_json) ? $snapshot->summary_json : [];
+        $startedHash = $previousSummary['input_version_started'] ?? null;
         $summary = array_merge($payload['summary'] ?? [], [
             'stage' => 'completed',
             // params_hash пишут start() и recordEffectiveParams(); без переноса
             // он терялся здесь, и снимок нельзя было сверить по параметрам.
             'params_hash' => $previousSummary['params_hash'] ?? null,
             'facts_hash' => $registry['hash'] ?? null,
+            'input_version_started' => $startedHash,
+            'inputs_stable_during_calculation' => $startedBeforeCompletion && PlanningSnapshotEvidence::digest($startedHash) && PlanningSnapshotEvidence::digest($registry['hash'] ?? null) && hash_equals($startedHash, $registry['hash']),
             'demand_hash' => $this->hash($payload['demand_facts'] ?? []),
             'stock_hash' => $this->hash($payload['stock_facts'] ?? []),
             'supply_hash' => $this->hash($payload['supply_facts'] ?? []),
@@ -169,6 +175,9 @@ class PlanningFactSnapshotService
             ),
             'summary_json' => $summary,
         ]);
+
+        $snapshot->refresh();
+        $snapshot->update(['summary_json' => PlanningSnapshotEvidence::seal($snapshot)]);
 
         return $snapshot;
     }

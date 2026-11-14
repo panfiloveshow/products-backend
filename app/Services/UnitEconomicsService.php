@@ -253,6 +253,7 @@ class UnitEconomicsService
             'commission_rate_is_effective' => $data['commission_rate_is_effective'] ?? null,
             'redemption_rate' => isset($data['redemption_rate']) ? (float) $data['redemption_rate'] : null,
             'acquiring_percent' => isset($data['acquiring_percent']) ? (float) $data['acquiring_percent'] : 1.5,
+            'last_mile_cost' => isset($data['last_mile_cost']) ? (float) $data['last_mile_cost'] : null,
             'storage_cost' => isset($data['storage_cost']) ? (float) $data['storage_cost'] : 0,
             'packaging_cost' => isset($data['packaging_cost']) ? (float) $data['packaging_cost'] : 0,
             'own_delivery_cost' => isset($data['own_delivery_cost']) ? (float) $data['own_delivery_cost'] : 0,
@@ -746,6 +747,13 @@ class UnitEconomicsService
         $data['marketplace'] = $marketplace;
         $calculated = $this->calculate($marketplace, $data);
         $fulfillmentType = strtoupper((string) ($data['fulfillment_type'] ?? $calculated['fulfillment_type'] ?? 'FBO'));
+        $lastMileDetails = [];
+        if ($marketplace === 'ozon') {
+            $lastMileDetails = [
+                'last_mile_cost' => $calculated['last_mile_cost'] ?? 0,
+                'last_mile_per_unit' => round(($calculated['last_mile_cost'] ?? 0) / max(1, (int) ($data['sales_count'] ?? 0)), 2),
+            ];
+        }
 
         return UnitEconomics::updateOrCreate(
             [
@@ -753,10 +761,10 @@ class UnitEconomicsService
                 'marketplace' => $marketplace,
                 'integration_id' => $data['integration_id'] ?? null,
                 'fulfillment_type' => $fulfillmentType,
+            ],
+            array_merge([
                 'period_start' => $data['period_start'] ?? now()->startOfMonth()->toDateString(),
                 'period_end' => $data['period_end'] ?? now()->endOfMonth()->toDateString(),
-            ],
-            [
                 'product_name' => $data['product_name'] ?? null,
                 'price' => $data['price'],
                 'cost_price' => $data['cost_price'],
@@ -768,7 +776,7 @@ class UnitEconomicsService
                 'margin_percent' => $calculated['margin_percent'],
                 'roi_percent' => $calculated['roi_percent'],
                 'marketplace_data' => $calculated,
-            ]
+            ], $lastMileDetails)
         );
     }
 
@@ -933,14 +941,6 @@ class UnitEconomicsService
         ?string $periodEnd = null,
         ?array $localizationIndex = null
     ): array {
-        $exitCode = \Illuminate\Support\Facades\Artisan::call('unit-economics:sync', [
-            '--integration' => $integration->id,
-            '--skip-cache-dispatch' => true,
-        ]);
-
-        return [
-            'synced' => $exitCode === 0 ? 1 : 0,
-            'errors' => $exitCode !== 0 ? 1 : 0,
-        ];
+        return app(UnitEconomicsSynchronizer::class)->syncIntegration($integration, $periodStart, $periodEnd);
     }
 }

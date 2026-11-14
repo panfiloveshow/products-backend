@@ -30,68 +30,10 @@ class WildberriesPriceRefreshService
             throw new RuntimeException('WB Prices API returned no prices');
         }
 
-        $stats = [
-            'total' => 0,
-            'matched' => 0,
-            'updated' => 0,
-            'unchanged' => 0,
-            'missing' => 0,
-        ];
+        $integration = new \App\Models\Integration;
+        $integration->forceFill(['id' => $integrationId, 'marketplace' => 'wildberries']);
 
-        Product::query()
-            ->where('integration_id', $integrationId)
-            ->where('marketplace', 'wildberries')
-            ->orderBy('id')
-            ->chunk(500, function ($products) use ($prices, &$stats): void {
-                foreach ($products as $product) {
-                    $stats['total']++;
-                    $wbData = is_array($product->wb_data) ? $product->wb_data : [];
-                    [$priceData, $source] = $this->resolvePriceData($prices, $product, $wbData);
-
-                    if ($priceData === null) {
-                        $stats['missing']++;
-
-                        continue;
-                    }
-
-                    $actualPrice = (float) ($priceData['final_price']
-                        ?? $priceData['discounted_price']
-                        ?? $priceData['price']
-                        ?? 0);
-                    if ($actualPrice <= 0) {
-                        $stats['missing']++;
-
-                        continue;
-                    }
-
-                    $stats['matched']++;
-                    $basePrice = (float) ($priceData['price'] ?? 0);
-                    $oldPrice = $basePrice > $actualPrice ? $basePrice : null;
-                    $priceChanged = abs((float) $product->price - $actualPrice) > 0.009;
-                    $oldPriceChanged = $this->nullablePriceChanged($product->old_price, $oldPrice);
-
-                    if (! $priceChanged && ! $oldPriceChanged) {
-                        $stats['unchanged']++;
-
-                        continue;
-                    }
-
-                    $product->forceFill([
-                        'price' => $actualPrice,
-                        'old_price' => $oldPrice,
-                        'wb_data' => array_merge($wbData, [
-                            'actual_price' => $actualPrice,
-                            'old_price' => $oldPrice,
-                            'price_source' => $source,
-                            'prices_by_size' => $priceData['sizes'] ?? ($wbData['prices_by_size'] ?? []),
-                            'price_synced_at' => now()->utc()->toIso8601String(),
-                        ]),
-                    ])->save();
-                    $stats['updated']++;
-                }
-            });
-
-        return $stats;
+        return app(\App\Services\UnitEconomics\MarketplacePriceObservation::class)->apply($integration, $prices, 0);
     }
 
     /**
@@ -99,7 +41,7 @@ class WildberriesPriceRefreshService
      * @param  array<string,mixed>  $wbData
      * @return array{0:?array,1:string}
      */
-    private function resolvePriceData(array $prices, Product $product, array $wbData): array
+    public function resolvePriceData(array $prices, Product $product, array $wbData): array
     {
         $nmId = trim((string) ($wbData['nmID'] ?? ''));
         $sizeId = trim((string) ($wbData['sizeID'] ?? $wbData['chrtID'] ?? ''));
@@ -121,16 +63,4 @@ class WildberriesPriceRefreshService
         return [null, 'prices_api_missing'];
     }
 
-    private function nullablePriceChanged(mixed $current, ?float $next): bool
-    {
-        if ($current === null || $current === '') {
-            return $next !== null;
-        }
-
-        if ($next === null) {
-            return true;
-        }
-
-        return abs((float) $current - $next) > 0.009;
-    }
 }

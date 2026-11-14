@@ -201,6 +201,38 @@ class OzonAutoSupplyPlanMaterializationTest extends TestCase
             ->assertJsonPath('data.approval_check.errors.0.code', 'ozon_sku_unresolved');
     }
 
+    public function test_validation_without_a_facts_hash_cannot_authorize_native_execution(): void
+    {
+        [$plan] = $this->makeReadyPlan([
+            ['sku' => 'SKU-FACTS', 'cluster_id' => '101', 'cluster_name' => 'Москва', 'qty' => 5, 'ozon_sku' => 700001],
+        ]);
+        $this->validateForApproval($plan);
+        $validation = $plan->fresh()->validation_json;
+        $this->assertArrayHasKey('facts_hash', $validation);
+        unset($validation['facts_hash']);
+        $plan->update(['validation_json' => $validation]);
+        $response = $this->postJson("/api/auto-supply-plans/{$plan->id}/approve", [], $this->workspaceHeaders())->assertUnprocessable();
+        $this->assertContains('facts_evidence_missing', array_column($response->json('data.approval_check.errors'), 'code'));
+        $this->assertDatabaseCount('supplies', 0);
+    }
+
+    public function test_product_ids_and_non_integer_metadata_are_never_treated_as_native_ozon_skus(): void
+    {
+        \Illuminate\Support\Facades\Http::preventStrayRequests();
+        Queue::fake();
+        foreach ([[], ['product_id' => 900001], ['sku' => 700001.5], ['sku' => '700001.5'], ['sku' => '7e5'], ['sku' => '+700001']] as $index => $metadata) {
+            [$plan] = $this->makeReadyPlan([
+                ['sku' => 'SELLER-ARTICLE-'.$index, 'cluster_id' => '101', 'cluster_name' => 'Москва', 'qty' => 5, 'ozon_sku' => 700001],
+            ]);
+            Product::where('integration_id', $plan->integration_id)->firstOrFail()->update(['marketplace_id' => (string) (900001 + $index), 'ozon_data' => $metadata]);
+            $response = $this->postJson("/api/auto-supply-plans/{$plan->id}/approve", [], $this->workspaceHeaders())->assertUnprocessable();
+            $this->assertContains('ozon_sku_unresolved', array_column($response->json('data.approval_check.errors'), 'code'));
+        }
+        $this->assertDatabaseCount('supplies', 0);
+        Queue::assertNothingPushed();
+        \Illuminate\Support\Facades\Http::assertNothingSent();
+    }
+
     public function test_crossdock_requires_drop_off_point_before_approval(): void
     {
         [$plan] = $this->makeReadyPlan(
@@ -543,17 +575,11 @@ class OzonAutoSupplyPlanMaterializationTest extends TestCase
             ]);
         }
 
-        $snapshot = PlanningFactSnapshot::create([
-            'auto_supply_plan_id' => $plan->id,
-            'integration_id' => $integration->id,
-            'marketplace' => 'ozon',
-            'status' => 'ready',
-            'captured_at' => now(),
-            'params_json' => ['effective' => $plan->params],
-            'facts_freshness_json' => ['status' => 'ready'],
-            'summary_json' => ['stage' => 'completed'],
-        ]);
-        $plan->update(['snapshot_id' => $snapshot->id]);
+        $capture = app(\App\Services\AutoSupplyPlanning\PlanningFactSnapshotService::class);
+        $capture->start($plan);
+        $facts = app(\App\Services\AutoSupplyPlanning\OzonPlanningFactsBuilder::class)->buildLineFacts($plan->lines()->get()->toArray());
+        $capture->complete($plan, ['demand_facts' => ['lines' => $facts['demand']], 'stock_facts' => ['lines' => $facts['stock']],
+            'supply_facts' => ['lines' => $facts['supply']], 'economics_facts' => ['lines' => $facts['economics']]]);
 
         return [$plan, $lines];
     }

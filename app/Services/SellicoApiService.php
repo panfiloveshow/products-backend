@@ -146,6 +146,46 @@ class SellicoApiService
         }
     }
 
+    /** Authoritative, unpaginated inventory, including inactive integrations and empty workspaces. */
+    public function getIntegrationSnapshot(): array
+    {
+        try {
+            $response = $this->withServiceTokenRetry(fn (string $token) => Http::timeout(15)
+                ->withToken($token)->acceptJson()->get($this->baseUrl.'/get-integrations', ['inventory_only' => 1]));
+            if (! $response?->successful()) {
+                return ['success' => false, 'error' => 'Не удалось получить полный список интеграций Sellico'];
+            }
+            $manifest = $response->json();
+            $rows = $manifest['integrations'] ?? null;
+            if (($manifest['scope'] ?? null) !== 'all' || ($manifest['complete'] ?? null) !== true
+                || ! is_array($rows) || ! array_is_list($rows)) {
+                return ['success' => false, 'error' => 'Неполный или некорректный список интеграций Sellico'];
+            }
+            $snapshot = [];
+            foreach ($rows as $row) {
+                if (! is_array($row) || ! isset($row['id'], $row['work_space_id'])
+                    || filter_var($row['id'], FILTER_VALIDATE_INT) === false || (int) $row['id'] <= 0
+                    || filter_var($row['work_space_id'], FILTER_VALIDATE_INT) === false || (int) $row['work_space_id'] <= 0
+                    || isset($snapshot[(int) $row['id']])) {
+                    return ['success' => false, 'error' => 'Некорректные записи в списке интеграций Sellico'];
+                }
+                $snapshot[(int) $row['id']] = ['id' => (int) $row['id'], 'work_space_id' => (int) $row['work_space_id']];
+                if (array_key_exists('credentials_version', $row)) {
+                    if (! is_string($row['credentials_version']) || ! preg_match('/^[a-f0-9]{64}$/D', $row['credentials_version'])) {
+                        return ['success' => false, 'error' => 'Некорректная версия ключа Sellico'];
+                    }
+                    $snapshot[(int) $row['id']]['credentials_version'] = $row['credentials_version'];
+                }
+            }
+
+            return ['success' => true, 'integrations' => array_values($snapshot)];
+        } catch (\Throwable $e) {
+            Log::warning('Sellico integration snapshot unavailable', ['exception' => $e::class]);
+
+            return ['success' => false, 'error' => 'Не удалось проверить список интеграций Sellico'];
+        }
+    }
+
     /**
      * Получить API ключи маркетплейсов для workspace
      */

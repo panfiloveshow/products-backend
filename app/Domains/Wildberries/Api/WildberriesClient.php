@@ -6,6 +6,9 @@ use App\Models\Integration;
 use Illuminate\Http\Client\Response;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Http;
+use App\Services\Marketplace\PriceDispatchAuthorization;
+use App\Services\Marketplace\PriceDispatchDenied;
+use App\Services\Manager\ManagerFbsExecutionPolicy;
 use Illuminate\Support\Facades\Log;
 
 /**
@@ -98,6 +101,8 @@ class WildberriesClient
      */
     public function statistics(string $endpoint, array $params = []): ?array
     {
+        $this->lastResponseStatus = null;
+        $this->lastRateLimitRetryAfter = null;
         $requestId = uniqid('wb_stat_', true);
 
         Log::info('WB Statistics API Request', [
@@ -119,7 +124,24 @@ class WildberriesClient
         $isStrict = in_array($endpoint, $strictOnePerMinuteEndpoints, true);
         $maxAttempts = $isStrict ? 1 : 3;
 
+        // dateFrom with flag=0 filters lastChangeDate (WB's Moscow time), not
+        // the sale date. A complete 91-day response can therefore serve the
+        // following 30-day request without consuming another seller API slot.
+        $dateFrom = $params['dateFrom'] ?? null;
+        $canReuse = $isStrict && in_array($params['flag'] ?? 0, [0, '0'], true)
+            && array_diff(array_keys($params), ['dateFrom', 'flag']) === []
+            && is_string($dateFrom) && preg_match('/^\d{4}-\d{2}-\d{2}$/D', $dateFrom);
+        $snapshotKey = 'wb:statistics:snapshot:'.hash('sha256', $this->apiKey.'|'.$endpoint);
+        if ($canReuse && is_array($snapshot = Cache::get($snapshotKey))
+            && ($snapshot['date_from'] ?? '9999') <= $dateFrom) {
+            $this->lastResponseStatus = 200;
+            return array_values(array_filter($snapshot['rows'], static fn (array $row): bool =>
+                substr($row['lastChangeDate'], 0, 10) >= $dateFrom));
+        }
+
         if ($isStrict && ! $this->reserveStrictStatisticsSlot($endpoint)) {
+            $this->lastResponseStatus = 429;
+            $this->lastRateLimitRetryAfter = self::STRICT_STATISTICS_COOLDOWN_SECONDS;
             return null;
         }
 
@@ -133,6 +155,8 @@ class WildberriesClient
 
                 $status = $response->status();
                 $body = $response->body();
+                $this->lastResponseStatus = $status;
+                $this->lastRateLimitRetryAfter = $status === 429 ? ($this->rateLimitRetryAfter($response) ?? 60) : null;
 
                 Log::info('WB Statistics API Response', [
                     'request_id' => $requestId,
@@ -144,7 +168,18 @@ class WildberriesClient
                 ]);
 
                 if ($response->successful()) {
-                    return $response->json();
+                    $rows = $response->json();
+                    // WB caps a page at approximately 80k records. Never treat
+                    // a full page, malformed rows, or a large body as reusable.
+                    if ($canReuse && is_array($rows) && array_is_list($rows) && count($rows) < 80000
+                        && strlen($body) <= 16 * 1024 * 1024
+                        && count(array_filter($rows, static fn ($row): bool => is_array($row)
+                            && is_string($row['lastChangeDate'] ?? null)
+                            && preg_match('/^\d{4}-\d{2}-\d{2}T/', $row['lastChangeDate']))) === count($rows)) {
+                        Cache::put($snapshotKey, ['date_from' => $dateFrom, 'rows' => $rows], now()->addSeconds(self::STRICT_STATISTICS_COOLDOWN_SECONDS));
+                    }
+
+                    return $rows;
                 }
 
                 if ($status === 429 && $attempt < $maxAttempts) {
@@ -392,15 +427,32 @@ class WildberriesClient
             'api_key_prefix' => substr($this->apiKey, 0, 6).'***',
         ]);
 
-        $maxAttempts = 3;
+        $priceMutation = PriceDispatchAuthorization::isWbMutation($baseUrl, $endpoint);
+        $fbsMutation = ManagerFbsExecutionPolicy::isMutation('wildberries', 'POST', $baseUrl, $endpoint);
+        $maxAttempts = ($priceMutation || $fbsMutation) ? 1 : 3;
+        $dispatchId = null;
+        $nativeRequestStarted = false;
 
         for ($attempt = 1; $attempt <= $maxAttempts; $attempt++) {
             try {
                 $this->rateLimitDelay();
 
-                $response = Http::withHeaders($this->getHeaders())
-                    ->timeout($this->timeout)
-                    ->post($baseUrl.$endpoint, $data);
+                $pending = Http::withHeaders($this->getHeaders())->timeout($this->timeout);
+                if ($priceMutation) {
+                    if ($baseUrl !== self::PRICES_URL) throw new \DomainException('Недопустимый адрес отправки цены WB.');
+                    $wire = PriceDispatchAuthorization::encode($data);
+                    $grant = app(PriceDispatchAuthorization::class)->authorize('wb', PriceDispatchAuthorization::wbAccount($this->apiKey), $endpoint, $wire);
+                    $dispatchId = $grant['command_id'];
+                    $pending->beforeSending(function () use ($grant, &$nativeRequestStarted): void {
+                        PriceDispatchAuthorization::assertFresh($grant);
+                        $nativeRequestStarted = true;
+                    });
+                    $response = $pending->withOptions(['allow_redirects' => false])->withBody($wire, 'application/json')->post($baseUrl.$endpoint);
+                } else {
+                    $response = $fbsMutation
+                        ? app(ManagerFbsExecutionPolicy::class)->legacy('wildberries', $this->apiKey, null, fn () => $pending->withOptions(['allow_redirects' => false])->post($baseUrl.$endpoint, $data))
+                        : $pending->post($baseUrl.$endpoint, $data);
+                }
 
                 $status = $response->status();
                 $body = $response->body();
@@ -419,7 +471,12 @@ class WildberriesClient
                 if ($response->successful()) {
                     $this->lastRateLimitRetryAfter = null;
 
-                    return $response->json();
+                    $decoded = $response->json();
+                    if ($priceMutation) {
+                        if (! is_array($decoded)) return ['_error' => true, '_sellico_price_dispatch' => ['command_id' => $dispatchId, 'status' => 'submit_unknown']];
+                        $decoded['_sellico_price_dispatch'] = ['command_id' => $dispatchId, 'status' => 'receipt_received'];
+                    }
+                    return $decoded;
                 }
 
                 if ($status === 429) {
@@ -429,7 +486,7 @@ class WildberriesClient
                     // Короткий лимит можно переждать в текущем воркере. Длинный
                     // Finance cooldown (до нескольких часов) отдаём очереди,
                     // чтобы не блокировать worker и не делать бесполезные 2/4с retry.
-                    if ($attempt < $maxAttempts && ($headerDelay === null || $headerDelay <= 15)) {
+                    if (! $priceMutation && $attempt < $maxAttempts && ($headerDelay === null || $headerDelay <= 15)) {
                         $delay = max(1, $headerDelay ?? min(2 * pow(2, $attempt - 1), 15));
                         Log::info('WB API 429 rate limit, retrying', [
                             'request_id' => $requestId,
@@ -457,7 +514,7 @@ class WildberriesClient
                     'body' => substr($body, 0, 500),
                 ]);
 
-                return null;
+                return $priceMutation ? ['_error' => true, '_http_status' => $status, '_sellico_price_dispatch' => ['command_id' => $dispatchId, 'status' => $status < 400 || $status >= 500 || $status === 408 || $status === 499 ? 'submit_unknown' : 'rejected']] : null;
             } catch (\Exception $e) {
                 Log::error('WB API exception', [
                     'request_id' => $requestId,
@@ -466,7 +523,9 @@ class WildberriesClient
                     'error' => $e->getMessage(),
                 ]);
 
-                return null;
+                $dispatch = ['command_id' => $dispatchId, 'status' => $nativeRequestStarted ? 'submit_unknown' : 'not_dispatched'];
+                if (! $nativeRequestStarted && $e instanceof PriceDispatchDenied) $dispatch['denial'] = $e->publicData();
+                return $priceMutation ? ['_error' => true, '_http_status' => 0, '_sellico_price_dispatch' => $dispatch] : null;
             }
         }
 
@@ -479,9 +538,11 @@ class WildberriesClient
     public function put(string $endpoint, array $data = [], string $baseUrl = self::BASE_URL): ?array
     {
         try {
-            $response = Http::withHeaders($this->getHeaders())
-                ->timeout($this->timeout)
-                ->put($baseUrl.$endpoint, $data);
+            if (PriceDispatchAuthorization::isWbPriceHost($baseUrl)) throw new \DomainException('Этот метод отправки цены WB не поддерживается общим исполнителем.');
+            $fbsMutation = ManagerFbsExecutionPolicy::isMutation('wildberries', 'PUT', $baseUrl, $endpoint);
+            $send = fn () => Http::withHeaders($this->getHeaders())->timeout($this->timeout)->withOptions($fbsMutation ? ['allow_redirects' => false] : [])->put($baseUrl.$endpoint, $data);
+            $response = $fbsMutation
+                ? app(ManagerFbsExecutionPolicy::class)->legacy('wildberries', $this->apiKey, null, $send) : $send();
 
             // 204 No Content - успешное обновление без тела ответа
             if ($response->status() === 204) {
@@ -515,9 +576,11 @@ class WildberriesClient
     public function delete(string $endpoint, string $baseUrl = self::BASE_URL): ?array
     {
         try {
-            $response = Http::withHeaders($this->getHeaders())
-                ->timeout($this->timeout)
-                ->delete($baseUrl.$endpoint);
+            if (PriceDispatchAuthorization::isWbPriceHost($baseUrl)) throw new \DomainException('Этот метод отправки цены WB не поддерживается общим исполнителем.');
+            $fbsMutation = ManagerFbsExecutionPolicy::isMutation('wildberries', 'DELETE', $baseUrl, $endpoint);
+            $send = fn () => Http::withHeaders($this->getHeaders())->timeout($this->timeout)->withOptions($fbsMutation ? ['allow_redirects' => false] : [])->delete($baseUrl.$endpoint);
+            $response = $fbsMutation
+                ? app(ManagerFbsExecutionPolicy::class)->legacy('wildberries', $this->apiKey, null, $send) : $send();
 
             if ($response->status() === 204) {
                 return ['success' => true];
@@ -550,9 +613,11 @@ class WildberriesClient
     public function patch(string $endpoint, array $data = [], string $baseUrl = self::BASE_URL): ?array
     {
         try {
-            $response = Http::withHeaders($this->getHeaders())
-                ->timeout($this->timeout)
-                ->patch($baseUrl.$endpoint, $data);
+            if (PriceDispatchAuthorization::isWbPriceHost($baseUrl)) throw new \DomainException('Этот метод отправки цены WB не поддерживается общим исполнителем.');
+            $fbsMutation = ManagerFbsExecutionPolicy::isMutation('wildberries', 'PATCH', $baseUrl, $endpoint);
+            $send = fn () => Http::withHeaders($this->getHeaders())->timeout($this->timeout)->withOptions($fbsMutation ? ['allow_redirects' => false] : [])->patch($baseUrl.$endpoint, $data);
+            $response = $fbsMutation
+                ? app(ManagerFbsExecutionPolicy::class)->legacy('wildberries', $this->apiKey, null, $send) : $send();
 
             if ($response->status() === 204) {
                 return ['success' => true];
@@ -648,10 +713,17 @@ class WildberriesClient
      */
     public function analyticsGet(string $endpoint, array $params = []): ?array
     {
+        $this->lastResponseStatus = null;
+        $this->lastRateLimitRetryAfter = null;
         try {
             $response = Http::withHeaders($this->getHeaders())
                 ->timeout(60)
                 ->get(self::ANALYTICS_URL.$endpoint, $params);
+
+            $this->lastResponseStatus = $response->status();
+            if ($response->status() === 429) {
+                $this->lastRateLimitRetryAfter = $this->rateLimitRetryAfter($response) ?? 60;
+            }
 
             if ($response->successful()) {
                 return $response->json();
@@ -681,12 +753,15 @@ class WildberriesClient
      */
     public function analyticsPost(string $endpoint, array $data = []): ?array
     {
+        $this->lastResponseStatus = null;
+        $this->lastRateLimitRetryAfter = null;
         $tokenHash = substr(sha1($this->apiKey), 0, 16);
         // Disabled flag is endpoint-specific so a 403 on one endpoint (e.g. stocks-report)
         // doesn't silently block other endpoints (e.g. sales-funnel) that use a different scope.
         $endpointHash = substr(sha1($endpoint), 0, 12);
         $disabledKey = "wb:analytics:disabled:{$tokenHash}:{$endpointHash}";
         if (Cache::get($disabledKey)) {
+            $this->lastResponseStatus = 403;
             return null;
         }
 
@@ -697,6 +772,8 @@ class WildberriesClient
 
         $lock = Cache::lock($lockKey, $lockSeconds);
         if (! $lock->get()) {
+            $this->lastResponseStatus = 429;
+            $this->lastRateLimitRetryAfter = $lockSeconds;
             // Не блокируем воркер: пусть InventoryApi уйдёт на legacy Statistics API.
             return null;
         }
@@ -715,6 +792,11 @@ class WildberriesClient
                 $response = Http::withHeaders($this->getHeaders())
                     ->timeout(60)
                     ->post(self::ANALYTICS_URL.$endpoint, $data);
+
+                $this->lastResponseStatus = $response->status();
+                $this->lastRateLimitRetryAfter = $response->status() === 429
+                    ? ($this->rateLimitRetryAfter($response) ?? (int) $response->header('Retry-After') ?: 60)
+                    : null;
 
                 if ($response->successful()) {
                     return $response->json();

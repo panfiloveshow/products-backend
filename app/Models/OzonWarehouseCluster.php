@@ -52,6 +52,14 @@ class OzonWarehouseCluster extends Model
     public static function findByWarehouseName(string $warehouseName): ?self
     {
         $normalized = self::normalizeWarehouseName($warehouseName);
+
+        // The database cache shares the business connection. Remembering a
+        // missing warehouse locks a common cache row until the whole chunk
+        // commits, and different sellers acquire those rows in different orders.
+        if (Cache::getStore() instanceof \Illuminate\Cache\DatabaseStore
+            && (new static)->getConnection()->transactionLevel() > 0) {
+            return self::where('warehouse_name_normalized', $normalized)->first();
+        }
         
         return Cache::remember(
             "ozon_warehouse_cluster:{$normalized}",

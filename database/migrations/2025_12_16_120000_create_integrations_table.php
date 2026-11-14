@@ -12,7 +12,7 @@ return new class extends Migration
             $table->id();
             $table->string('name'); // Название магазина/интеграции
             $table->string('marketplace'); // wildberries, ozon, yandex
-            $table->json('credentials'); // API ключи (зашифрованы)
+            $table->text('credentials'); // encrypted:array хранит непрозрачную строку, а не JSON
             $table->boolean('is_active')->default(true);
             $table->boolean('auto_sync_enabled')->default(true);
             $table->integer('sync_interval_hours')->default(6); // Интервал автосинхронизации

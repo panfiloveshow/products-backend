@@ -55,7 +55,7 @@ class MarketplacePriceResolver
         );
 
         if ($product->marketplace === 'ozon') {
-            $productPriceIsNewer = $productObservedAt !== null
+            $productPriceIsNewer = (int) ($marketplaceData['price_version'] ?? 0) > 0 || $productObservedAt !== null
                 && ($unitEconomicsObservedAt === null || $productObservedAt > $unitEconomicsObservedAt);
 
             $candidates = [
@@ -147,7 +147,7 @@ class MarketplacePriceResolver
         array $marketplaceData,
         ?string $fallbackObservedAt = null
     ): array {
-        $observedAt = $marketplaceData['price_observed_at'] ?? $fallbackObservedAt;
+        $observedAt = $marketplaceData['price_observed_at'] ?? null;
         $observedAt = is_string($observedAt) && trim($observedAt) !== '' ? $observedAt : null;
 
         return [

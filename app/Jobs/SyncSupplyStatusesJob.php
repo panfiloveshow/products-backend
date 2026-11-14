@@ -2,91 +2,58 @@
 
 namespace App\Jobs;
 
-use App\Models\Integration;
 use App\Models\Supply;
-use App\Services\Supply\SupplyService;
 use Illuminate\Bus\Queueable;
+use Illuminate\Contracts\Queue\ShouldBeUnique;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
 use Illuminate\Support\Facades\Log;
 
-/**
- * Job для синхронизации статусов поставок из Ozon
- * 
- * Запускается по расписанию (каждые 15-30 минут)
- */
-class SyncSupplyStatusesJob implements ShouldQueue
+/** Dispatches bounded, independently retryable work; never calls the seller API. */
+class SyncSupplyStatusesJob implements ShouldBeUnique, ShouldQueue
 {
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
 
     public int $tries = 3;
-    public int $timeout = 300;
 
-    public function __construct(
-        public ?int $integrationId = null
-    ) {}
+    public int $timeout = 60;
 
-    public function handle(SupplyService $service): void
+    public int $uniqueFor = 300;
+
+    // Keep the original constructor/property compatible with already queued jobs.
+    public function __construct(public ?int $integrationId = null)
     {
-        $startTime = microtime(true);
+        $this->onQueue(config('autoplanning.execution.status_queue', 'supply-statuses'));
+    }
 
-        try {
-            // Получаем активные поставки
-            $query = Supply::active()
-                ->where(function ($query) {
-                    $query->whereNotNull('ozon_order_id')
-                        ->orWhereNotNull('ozon_supply_id')
-                        ->orWhereNotNull('ozon_draft_id');
-                });
+    public function uniqueId(): string
+    {
+        return 'supply-status-dispatch:'.($this->integrationId ?? 'all');
+    }
 
-            if ($this->integrationId) {
-                $query->where('integration_id', $this->integrationId);
-            }
-
-            $supplies = $query->get();
-
-            Log::info('Starting supply status sync', [
-                'integration_id' => $this->integrationId,
-                'supplies_count' => $supplies->count(),
-            ]);
-
-            $synced = 0;
-            $errors = 0;
-
-            foreach ($supplies as $supply) {
-                try {
-                    $service->syncStatus($supply);
-                    $synced++;
-                } catch (\Exception $e) {
-                    $errors++;
-                    Log::warning('Failed to sync supply status', [
-                        'supply_id' => $supply->id,
-                        'error' => $e->getMessage(),
-                    ]);
+    public function handle(): void
+    {
+        $scheduled = 0;
+        Supply::trackableOzon()
+            ->when($this->integrationId, fn ($query) => $query->where('integration_id', $this->integrationId))
+            ->where(fn ($query) => $query->whereNull('external_last_synced_at')->orWhere('external_last_synced_at', '<', now()->subMinutes(5)))
+            ->select(['id', 'integration_id'])
+            ->chunkById(100, function ($supplies) use (&$scheduled): void {
+                $supplies = $supplies->filter(fn ($s) => (int) \Illuminate\Support\Facades\Cache::get('supply-status-cooldown:'.$s->id, 0) <= time());
+                foreach ($supplies->groupBy('integration_id') as $integrationId => $group) {
+                    foreach ($group->chunk(50) as $batch) {
+                        SyncSupplyStatusBatchJob::dispatch((int) $integrationId, $batch->pluck('id')->map(fn ($id) => (int) $id)->all(), time());
+                        $scheduled += $batch->count();
+                    }
                 }
+            });
 
-                // Небольшая задержка между запросами
-                usleep(100000); // 100ms
-            }
-
-            $duration = round(microtime(true) - $startTime, 2);
-
-            Log::info('Supply status sync completed', [
-                'integration_id' => $this->integrationId,
-                'synced' => $synced,
-                'errors' => $errors,
-                'duration_sec' => $duration,
-            ]);
-
-        } catch (\Exception $e) {
-            Log::error('Failed to sync supply statuses', [
-                'integration_id' => $this->integrationId,
-                'error' => $e->getMessage(),
-            ]);
-
-            throw $e;
-        }
+        Log::info('Supply status work dispatched', [
+            'integration_id' => $this->integrationId,
+            'supplies' => $scheduled,
+            'queue' => $this->queue,
+        ]);
     }
 }

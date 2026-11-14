@@ -2,7 +2,7 @@
 
 namespace Tests\Unit;
 
-use App\Console\Commands\SyncUnitEconomicsCommand;
+use App\Services\UnitEconomicsSynchronizer;
 use App\Models\Product;
 use ReflectionClass;
 use Tests\TestCase;
@@ -26,7 +26,7 @@ class WildberriesUnitEconomicsSourceObservationTest extends TestCase
                 'dimensions_observed_at' => $observedAt,
             ],
         ]);
-        $command = new SyncUnitEconomicsCommand;
+        $command = new UnitEconomicsSynchronizer;
         $reflection = new ReflectionClass($command);
         $build = $reflection->getMethod('buildCalculationData');
 

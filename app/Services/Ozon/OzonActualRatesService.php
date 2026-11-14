@@ -2,7 +2,10 @@
 
 namespace App\Services\Ozon;
 
+use App\Models\Integration;
 use App\Models\OzonFinanceTransaction;
+use Carbon\Carbon;
+use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Support\Facades\DB;
 
 /**
@@ -29,6 +32,19 @@ class OzonActualRatesService
      * @var array<string, array<string, mixed>>
      */
     private static array $cache = [];
+
+    private static array $periodCache = [];
+
+    public static function forgetIntegration(int $integrationId): void
+    {
+        foreach (['cache', 'skuLastMileCache', 'periodCache'] as $property) {
+            foreach (array_keys(self::${$property}) as $key) {
+                if (str_starts_with($key, $integrationId.':')) {
+                    unset(self::${$property}[$key]);
+                }
+            }
+        }
+    }
 
     private const SALE_OPERATION = 'OperationAgentDeliveredToCustomer';
 
@@ -79,16 +95,14 @@ class OzonActualRatesService
 
     private function compute(int $integrationId, int $days): array
     {
-        $from = now()->subDays($days + 1)->startOfDay();
-        $to = now()->subDays(1)->endOfDay();
+        $period = $this->ratePeriod($integrationId, $days);
+        $from = $period['from'];
+        $to = $period['to'];
 
         // units: legacy-строка = 1 постинг (quantity в raw нет → 1),
         // строка realization/by-day = SKU-день с raw.quantity штук.
-        $sales = DB::table('ozon_finance_transactions')
-            ->where('integration_id', $integrationId)
-            ->where('operation_type', self::SALE_OPERATION)
-            ->whereBetween('operation_date', [$from, $to])
-            ->selectRaw("coalesce(sum(coalesce(nullif(raw->>'quantity', '')::int, 1)), 0) units, coalesce(sum(accruals_for_sale), 0) revenue")
+        $sales = $this->salesQuery($integrationId, $period)
+            ->selectRaw("coalesce(sum(cast(coalesce(nullif(raw->>'quantity', ''), '1') as integer)), 0) units, coalesce(sum(accruals_for_sale), 0) revenue")
             ->first();
 
         $units = (int) ($sales->units ?? 0);
@@ -99,7 +113,10 @@ class OzonActualRatesService
             'last_mile_avg' => null,
             'revenue' => $revenue,
             'units' => $units,
-            'days' => $days,
+            'days' => (int) $from->diffInDays($to->copy()->startOfDay()) + 1,
+            'period_from' => $from->toDateString(),
+            'period_to' => $to->toDateString(),
+            'source' => $period['source'],
         ];
 
         // Меньше 20 продаж — выборка не репрезентативна, остаёмся на тарифных дефолтах.
@@ -114,7 +131,7 @@ class OzonActualRatesService
             ->sum('amount'));
 
         $acquiring = $sum(self::ACQUIRING_OPERATIONS);
-        $lastMile = $this->lastMileTotal($integrationId, $from, $to) + $sum(self::LAST_MILE_OPERATIONS);
+        $lastMile = $this->lastMileTotal($this->salesQuery($integrationId, $period)) + $sum(self::LAST_MILE_OPERATIONS);
 
         return [
             // Ставки-выбросы не пропускаем: Ozon не берёт больше 3% эквайринга,
@@ -123,7 +140,10 @@ class OzonActualRatesService
             'last_mile_avg' => $lastMile > 0 ? round($lastMile / $units, 2) : null,
             'revenue' => $revenue,
             'units' => $units,
-            'days' => $days,
+            'days' => $empty['days'],
+            'period_from' => $empty['period_from'],
+            'period_to' => $empty['period_to'],
+            'source' => $period['source'],
         ];
     }
 
@@ -131,14 +151,11 @@ class OzonActualRatesService
      * Последняя миля лежит не отдельной операцией, а услугой внутри операции продажи:
      * RedistributionLastMileCourier / RedistributionLastMilePVZ / DeliveryToHandoverPlaceOzon.
      */
-    private function lastMileTotal(int $integrationId, \DateTimeInterface $from, \DateTimeInterface $to): float
+    private function lastMileTotal(Builder $sales): float
     {
         $total = 0.0;
 
-        OzonFinanceTransaction::query()
-            ->where('integration_id', $integrationId)
-            ->where('operation_type', self::SALE_OPERATION)
-            ->whereBetween('operation_date', [$from, $to])
+        $sales
             ->select(['id', 'raw'])
             ->chunkById(2000, function ($rows) use (&$total): void {
                 foreach ($rows as $row) {
@@ -166,16 +183,14 @@ class OzonActualRatesService
 
     private function computeLastMilePerSku(int $integrationId, int $days): array
     {
-        $from = now()->subDays($days + 1)->startOfDay();
-        $to = now()->subDays(1)->endOfDay();
+        $period = $this->ratePeriod($integrationId, $days);
+        $from = $period['from'];
+        $to = $period['to'];
 
         $sums = [];
         $counts = [];
 
-        OzonFinanceTransaction::query()
-            ->where('integration_id', $integrationId)
-            ->where('operation_type', self::SALE_OPERATION)
-            ->whereBetween('operation_date', [$from, $to])
+        $this->salesQuery($integrationId, $period)
             ->whereNotNull('sku')
             ->where('sku', '!=', '')
             ->select(['id', 'sku', 'raw'])
@@ -213,6 +228,60 @@ class OzonActualRatesService
         }
 
         return $map;
+    }
+
+    /** Sales and fees must use the same granularity and calendar period. */
+    private function ratePeriod(int $integrationId, int $days): array
+    {
+        $key = $this->cacheKey($integrationId, $days);
+        if (isset(self::$periodCache[$key])) {
+            return self::$periodCache[$key];
+        }
+
+        $period = [
+            'from' => now()->subDays(max(1, $days))->startOfDay(),
+            'to' => now()->subDay()->endOfDay(),
+            'source' => 'daily',
+        ];
+        $monthly = OzonFinanceTransaction::query()
+            ->where('integration_id', $integrationId)
+            ->where('operation_type', self::SALE_OPERATION)
+            ->where('raw->source', 'realization_v2_month')
+            ->where('operation_date', '<', now()->startOfMonth())
+            ->orderByDesc('operation_date')
+            ->first(['operation_date']);
+
+        $integration = Integration::find($integrationId);
+        $blocked = (bool) data_get($integration?->settings, 'ozon_premium_plus_required', false)
+            || in_array((string) $integration?->credential_health, ['invalid', 'expired', 'revoked'], true);
+        if ($blocked && $monthly === null) {
+            $period['source'] = 'unavailable';
+        } elseif ($monthly !== null) {
+            if ($blocked || ! $this->salesQuery($integrationId, $period)->exists()) {
+                $month = Carbon::parse($monthly->operation_date);
+                $period = ['from' => $month->copy()->startOfMonth(), 'to' => $month->copy()->endOfMonth(), 'source' => 'monthly'];
+            }
+        }
+
+        return self::$periodCache[$key] = $period;
+    }
+
+    private function salesQuery(int $integrationId, array $period): Builder
+    {
+        $query = OzonFinanceTransaction::query()
+            ->where('integration_id', $integrationId)
+            ->where('operation_type', self::SALE_OPERATION)
+            ->whereBetween('operation_date', [$period['from'], $period['to']]);
+
+        if ($period['source'] === 'unavailable') {
+            return $query->whereRaw('1 = 0');
+        }
+
+        if ($period['source'] === 'monthly') {
+            return $query->where('raw->source', 'realization_v2_month');
+        }
+
+        return $query->where(fn (Builder $q) => $q->whereNull('raw->source')->orWhere('raw->source', '!=', 'realization_v2_month'));
     }
 
     private function lastMileOfRow(OzonFinanceTransaction $row): float

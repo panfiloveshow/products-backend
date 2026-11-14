@@ -129,6 +129,17 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
         $settings = SupplySettings::where('integration_id', $integrationId)->first();
         $leadTimeDays = $settings->default_lead_time_days ?? AutoSupplyPlanService::LEAD_TIME_DEFAULT;
         $minSafetyDays = $settings->safety_stock_days ?? ($plan->safety_stock_days ?: 3);
+        // Only the manager's versioned recipe is an explicit per-plan choice.
+        // Legacy plans contain generated defaults too; keep their old policy.
+        $managerParameters = ($params['manager_parameter_version'] ?? null) === 'manager_parameters_v1';
+        if ($managerParameters) {
+            if (! is_int($params['lead_time_days'] ?? null) || $params['lead_time_days'] < 0 || $params['lead_time_days'] > 30
+                || ! is_int($params['safety_days'] ?? null) || $params['safety_days'] < 0 || $params['safety_days'] > 30) {
+                throw new \RuntimeException('Invalid explicit manager planning parameters.');
+            }
+            $leadTimeDays = $params['lead_time_days'];
+            $minSafetyDays = $params['safety_days'];
+        }
         $planDefaultTargetDays = min($plan->target_cover_days ?: 21, $horizonDays);
 
         // Получаем только актуальные записи остатков для интеграции:
@@ -170,6 +181,19 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
         $warehouses = $warehouseQuery->get();
 
         if ($warehouses->isEmpty() && $constraintNeedSkus === []) {
+            // Empty local input completes the capture, but does not prove
+            // zero marketplace demand/stock. Keep its missing-data quality.
+            $snapshots = app(PlanningFactSnapshotService::class);
+            $snapshots->recordEffectiveParams($plan, [
+                'horizon_days' => $horizonDays, 'analysis_period_days' => $analysisPeriodDays,
+                'min_cover_days' => $minCoverDays, 'max_cover_days' => $maxCoverDays,
+                'target_cover_days' => $planDefaultTargetDays, 'safety_stock_days' => $minSafetyDays,
+                'lead_time_days' => $leadTimeDays, 'include_in_transit' => $includeInTransit,
+                'settings_source' => $settings ? 'supply_settings' : 'defaults',
+                'lead_time_source' => $managerParameters ? 'manager_explicit_parameters' : ($settings ? 'supply_settings' : 'defaults'),
+                'safety_stock_source' => $managerParameters ? 'manager_explicit_parameters' : ($settings ? 'supply_settings' : 'defaults'),
+            ]);
+            $snapshots->complete($plan, ['planning_sources' => [], 'summary' => ['input_status' => 'no_local_inventory_rows', 'total_lines' => 0]]);
             $plan->markReady(0, 0, 0, $service->emptyQualityJson());
             return;
         }
@@ -249,14 +273,7 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
 
         // BUG FIX: для Yandex UE хранится как 'yandex_market' (нормализовано)
         $unitEconomicsRaw = UnitEconomics::query()
-            ->when(
-                $marketplace === 'ozon',
-                fn ($q) => $q->where('integration_id', $integrationId),
-                fn ($q) => $q->where(function ($inner) use ($integrationId) {
-                    $inner->where('integration_id', $integrationId)
-                        ->orWhereNull('integration_id');
-                })
-            )
+            ->where('integration_id', $integrationId)
             ->when(
                 in_array($marketplace, ['yandex', 'yandex_market'], true),
                 fn ($q) => $q->whereIn('marketplace', ['yandex', 'yandex_market']),
@@ -371,12 +388,12 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
         $supplyInTransit = $service->getInTransitFromSupplies($integrationId);
         $ozonClusterSupplies = ($marketplace === 'ozon' && ! empty($clusterMapping));
         $supplyInTransitByClusterPending = $ozonClusterSupplies
-            ? $this->getOzonInTransitFromSuppliesByCluster($integrationId, $clusterMapping, ['draft_ozon', 'slot_pending', 'slot_booked', 'preparing', 'ready_to_ship'])
+            ? $this->getOzonInTransitFromSuppliesByCluster($integrationId, $clusterMapping, ['draft_ozon', 'slot_pending', 'slot_booked', 'preparing', 'ready_to_ship'], (string) $plan->id)
             : [];
         $supplyInTransitByClusterShipped = $ozonClusterSupplies
             // at_warehouse: привезён, но не принят — нет ни в остатках, ни в transit_stock_count;
             // относим к «отгруженным», чтобы не заказать повторно
-            ? $this->getOzonInTransitFromSuppliesByCluster($integrationId, $clusterMapping, ['shipped', 'in_transit', 'at_warehouse'])
+            ? $this->getOzonInTransitFromSuppliesByCluster($integrationId, $clusterMapping, ['shipped', 'in_transit', 'at_warehouse'], (string) $plan->id)
             : [];
 
         // v3: Проверяем, загружен ли CSV-отчёт заказов для этой интеграции
@@ -1845,6 +1862,8 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
             'demand_seasonality_multiplier' => $seasonalityMultiplier,
             'trend_multiplier' => $trendMultiplier,
             'settings_source' => $settings ? 'supply_settings' : 'defaults',
+            'lead_time_source' => $managerParameters ? 'manager_explicit_parameters' : ($settings ? 'supply_settings' : 'defaults'),
+            'safety_stock_source' => $managerParameters ? 'manager_explicit_parameters' : ($settings ? 'supply_settings' : 'defaults'),
             'safety_stock_sigma_lead_time' => $ssSigmaLtEnabled,
             'safety_stock_service_level_z' => $ssServiceLevelZ,
             'selected_cluster_ids' => $selectedOzonClusterIds,
@@ -2225,13 +2244,14 @@ class CalculateAutoSupplyPlanJob implements ShouldQueue
     /**
      * @return array<string, int> keyed by "sku|cluster_id"
      */
-    private function getOzonInTransitFromSuppliesByCluster(int $integrationId, array $clusterMapping, array $statuses = ['draft_ozon', 'slot_pending', 'slot_booked', 'preparing', 'ready_to_ship', 'shipped', 'in_transit', 'at_warehouse']): array
+    private function getOzonInTransitFromSuppliesByCluster(int $integrationId, array $clusterMapping, array $statuses = ['draft_ozon', 'slot_pending', 'slot_booked', 'preparing', 'ready_to_ship', 'shipped', 'in_transit', 'at_warehouse'], ?string $planId = null): array
     {
         try {
             $rows = \Illuminate\Support\Facades\DB::table('supply_items')
                 ->join('supplies', 'supply_items.supply_id', '=', 'supplies.id')
                 ->where('supplies.integration_id', $integrationId)
                 ->whereIn('supplies.status', $statuses)
+                ->when($planId !== null, fn ($q) => $q->where(fn ($inner) => $inner->whereNull('supplies.auto_supply_plan_id')->orWhere('supplies.auto_supply_plan_id', '!=', $planId)))
                 ->selectRaw('supply_items.sku, supplies.cluster_id, supplies.warehouse_name, SUM(supply_items.planned_qty) as qty')
                 ->groupBy('supply_items.sku', 'supplies.cluster_id', 'supplies.warehouse_name')
                 ->get();

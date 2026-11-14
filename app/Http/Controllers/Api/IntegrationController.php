@@ -160,45 +160,10 @@ class IntegrationController extends Controller
      */
     public function store(StoreIntegrationRequest $request): JsonResponse
     {
-        $validated = $request->validated();
-
-        $integration = Integration::create([
-            'name' => $validated['name'],
-            'marketplace' => $validated['marketplace'],
-            'credentials' => $validated['credentials'],
-            'credential_type' => ! empty($validated['credentials']['oauth_access_token'])
-                ? 'oauth'
-                : 'api_key',
-            'credentials_expires_at' => $validated['credentials']['expires_at'] ?? null,
-            'credential_scopes' => $validated['credentials']['scopes'] ?? null,
-            'credential_health' => 'unknown',
-            'is_active' => true,
-            'auto_sync_enabled' => $validated['auto_sync_enabled'] ?? true,
-            'sync_interval_hours' => $validated['sync_interval_hours'] ?? 6,
-        ]);
-
-        Log::info('Integration created', [
-            'id' => $integration->id,
-            'marketplace' => $integration->marketplace,
-        ]);
-
-        ActivityLogger::forRequest(
-            $request,
-            action: 'integration_created',
-            title: 'Интеграция создана',
-            description: "Создана интеграция «{$integration->name}» ({$integration->marketplace})",
-            meta: [
-                'entity_type' => 'integration',
-                'entity_id' => $integration->id,
-                'marketplace' => $integration->marketplace,
-            ],
-        );
-
         return response()->json([
-            'success' => true,
-            'message' => 'Интеграция создана',
-            'data' => $this->formatIntegration($integration),
-        ], 201);
+            'success' => false,
+            'message' => 'Подключите магазин в настройках интеграций основного кабинета Sellico.',
+        ], 409);
     }
 
     /**

@@ -296,6 +296,7 @@ class InventoryController extends Controller
     {
         $alerts = InventoryAlert::active()
             ->orderBy('priority', 'desc')
+            ->orderByRaw('CASE WHEN sku = ? THEN 0 ELSE 1 END', ['__OZON_CREDENTIAL__'])
             ->orderBy('created_at', 'desc')
             ->limit(100)
             ->get();

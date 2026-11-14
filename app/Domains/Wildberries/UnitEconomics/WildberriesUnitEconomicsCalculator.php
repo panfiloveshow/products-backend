@@ -179,33 +179,6 @@ class WildberriesUnitEconomicsCalculator implements UnitEconomicsCalculatorInter
         $acquiringRate = $options['acquiring_percent'] ?? $input->acquiringPercent ?? 1.5;
         $acquiring = $price * ($acquiringRate / 100);
 
-        // === ИТОГОВЫЕ РАСЧЁТЫ ===
-
-        // Всего затрат (без себестоимости)
-        $marketplaceCosts = $commission + $logistics + $expectedReturnCost + $storageCost + $acceptanceCost + $penaltyCost + $acquiring;
-
-        // Всего затрат, % = затраты / цена × 100
-        $totalExpensesPercent = $price > 0 ? ($marketplaceCosts / $price) * 100 : 0;
-
-        // ДРР, ₽ = цена × ДРР%
-        $drrAmount = $price * ($drrPercent / 100);
-
-        // На р/с = деньги, которые перечисляет маркетплейс: действующая цена −
-        // удержания WB (комиссия, логистика, возвраты, хранение, эквайринг) − реклама/ДРР.
-        // ДРР WB удерживает из выплаты, поэтому он ВХОДИТ в «На РС» (как у Ozon, см.
-        // фронтовый пересчёт WBProductsTable). СПП финансирует WB → база = действующая цена.
-        $toSettlementAccount = $price - $marketplaceCosts - $drrAmount;
-
-        // Налог, ₽ = действующая цена × налог%.
-        // База налога едина для WB/Ozon/Yandex и не зависит от суммы к перечислению на р/с.
-        $taxAmount = $price * ($taxPercent / 100);
-
-        // Чистая прибыль = на р/с − себестоимость − налог (ДРР уже в «На РС»)
-        $netProfit = $toSettlementAccount - $costPrice - $taxAmount;
-
-        // Маржа, % = чистая прибыль / цена × 100
-        $marginPercent = $price > 0 ? ($netProfit / $price) * 100 : 0;
-
         // Разбивка расходов
         $costs = new CostBreakdown(
             commission: $commission,
@@ -224,6 +197,33 @@ class WildberriesUnitEconomicsCalculator implements UnitEconomicsCalculatorInter
             acceptanceCost: $acceptanceCost,
             penaltyCost: $penaltyCost,
         );
+
+        // === ИТОГОВЫЕ РАСЧЁТЫ ===
+
+        // Всего затрат (без себестоимости)
+        $marketplaceCosts = $costs->getMarketplaceCosts();
+
+        // Всего затрат, % = затраты / цена × 100
+        $totalExpensesPercent = $price > 0 ? ($marketplaceCosts / $price) * 100 : 0;
+
+        // ДРР, ₽ = цена × ДРР%
+        $drrAmount = $price * ($drrPercent / 100);
+
+        // На р/с = деньги, которые перечисляет маркетплейс: действующая цена −
+        // удержания WB (комиссия, логистика, возвраты, хранение, эквайринг) − реклама/ДРР.
+        // ДРР WB удерживает из выплаты, поэтому он ВХОДИТ в «На РС» (как у Ozon, см.
+        // фронтовый пересчёт WBProductsTable). СПП финансирует WB → база = действующая цена.
+        $toSettlementAccount = $price - $marketplaceCosts - $drrAmount;
+
+        // Налог, ₽ = действующая цена × налог%.
+        // База налога едина для WB/Ozon/Yandex и не зависит от суммы к перечислению на р/с.
+        $taxAmount = $price * ($taxPercent / 100);
+
+        // Product costs include purchase, packaging and additional costs. DRR is already in settlement.
+        $netProfit = $toSettlementAccount - $costs->getProductCosts() - $taxAmount;
+
+        // Маржа, % = чистая прибыль / цена × 100
+        $marginPercent = $price > 0 ? ($netProfit / $price) * 100 : 0;
 
         $totalCosts = $costs->getTotalCosts() + $drrAmount + $taxAmount;
 
@@ -250,6 +250,16 @@ class WildberriesUnitEconomicsCalculator implements UnitEconomicsCalculatorInter
 
         // Добавляем WB-специфичные поля через metadata
         $result->metadata = [
+            'financial_input_usage' => ['version' => 'domain_financial_input_usage_v1', 'items' => [
+                'cost_price' => true, 'commission_rate' => true, 'acquiring_percent' => true, 'redemption_rate' => true,
+                'packaging_cost' => true, 'additional_costs' => true, 'penalty_cost' => true,
+                'storage_cost' => in_array($scheme, ['FBO', 'FBW'], true),
+                'acceptance_cost' => in_array($scheme, ['FBO', 'FBW', 'FBS'], true),
+                'own_delivery_cost' => $usesOwnDelivery, 'own_return_cost' => $usesOwnDelivery,
+                'marketplace_compensation' => false,
+                'length' => ! $usesOwnDelivery, 'width' => ! $usesOwnDelivery, 'height' => ! $usesOwnDelivery,
+                'weight' => false, // Current WB tariffs use volume; physical weight is informational.
+            ]],
             'spp_percent' => $sppPercent,
             'spp_amount' => round($sppAmount, 2),
             'warehouse_coef_percent' => $usesOwnDelivery ? 100.0 : $warehouseCoefPercent,
@@ -272,6 +282,7 @@ class WildberriesUnitEconomicsCalculator implements UnitEconomicsCalculatorInter
             'effective_logistics' => round($effectiveLogistics, 2),
             'total_expenses_percent' => round($totalExpensesPercent, 2),
             'to_settlement_account' => round($toSettlementAccount, 2),
+            'settlement_includes_drr' => true,
             'drr_percent' => $drrPercent,
             'drr_amount' => round($drrAmount, 2),
             'tax_percent' => $taxPercent,

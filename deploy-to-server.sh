@@ -29,26 +29,22 @@ ssh -o StrictHostKeyChecking=accept-new "$HOST" "cd ${REMOTE_PATH} && git config
   
   # --omit-dir-times: каталоги принадлежат www-data, время на них выставить нельзя,
   # и без этого флага rsync заваливает вывод «failed to set times».
+  export COPYFILE_DISABLE=1
   rsync -avz --delete --omit-dir-times \
     --exclude '.git/' \
     --exclude '.DS_Store' \
+    --exclude '._*' \
     --exclude 'node_modules/' \
     --exclude 'vendor/' \
-    --exclude '.env' \
-    --exclude '.env.backup*' \
+    --exclude '.env*' \
     `# bootstrap/cache локально содержит dev-пакеты (laravel/pail), которых нет в` \
     `# серверном vendor --no-dev: залитый туда packages.php ломает artisan целиком.` \
     --exclude 'bootstrap/cache/' \
-    --exclude '.phpunit.result.cache' \
-    --exclude 'storage/framework/*.sqlite' \
+    --exclude '.phpunit*' \
+    --exclude '/storage/' \
     --exclude '_backups/' \
     --exclude '*.bak' \
     --exclude 'public/build/' \
-    --exclude 'storage/logs/' \
-    --exclude 'storage/framework/cache/data/' \
-    --exclude 'storage/framework/sessions/' \
-    --exclude 'storage/framework/views/' \
-    --exclude 'storage/framework/testing/' \
     -e "ssh -o StrictHostKeyChecking=accept-new" \
     "$SCRIPT_DIR/" "${HOST}:${REMOTE_PATH}/"
   

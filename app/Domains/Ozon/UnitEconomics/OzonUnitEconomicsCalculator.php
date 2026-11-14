@@ -85,7 +85,8 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
             localityCommissionDiscountPp: $context['locality_commission_discount_pp'],
             logisticsBasis: $context['logistics_basis'],
             logisticsEstimateMarkupPercent: $context['logistics_estimate_markup_percent'],
-            upcomingCommissionRate: $context['upcoming_commission_rate']
+            upcomingCommissionRate: $context['upcoming_commission_rate'],
+            commissionSource: $context['commission_source']
         );
     }
 
@@ -137,7 +138,8 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
             localityCommissionDiscountPp: $context['locality_commission_discount_pp'],
             logisticsBasis: $context['logistics_basis'],
             logisticsEstimateMarkupPercent: $context['logistics_estimate_markup_percent'],
-            upcomingCommissionRate: $context['upcoming_commission_rate']
+            upcomingCommissionRate: $context['upcoming_commission_rate'],
+            commissionSource: $context['commission_source']
         );
     }
 
@@ -201,7 +203,8 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
             localityCommissionDiscountPp: $context['locality_commission_discount_pp'],
             logisticsBasis: $context['logistics_basis'],
             logisticsEstimateMarkupPercent: $context['logistics_estimate_markup_percent'],
-            upcomingCommissionRate: $context['upcoming_commission_rate']
+            upcomingCommissionRate: $context['upcoming_commission_rate'],
+            commissionSource: $context['commission_source']
         );
     }
 
@@ -266,7 +269,8 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
             localityCommissionDiscountPp: $context['locality_commission_discount_pp'],
             logisticsBasis: $context['logistics_basis'],
             logisticsEstimateMarkupPercent: $context['logistics_estimate_markup_percent'],
-            upcomingCommissionRate: $context['upcoming_commission_rate']
+            upcomingCommissionRate: $context['upcoming_commission_rate'],
+            commissionSource: $context['commission_source']
         );
     }
 
@@ -309,7 +313,8 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
         float $localityCommissionDiscountPp = 0,
         ?string $logisticsBasis = null,
         float $logisticsEstimateMarkupPercent = 0,
-        ?float $upcomingCommissionRate = null
+        ?float $upcomingCommissionRate = null,
+        ?string $commissionSource = null
     ): UnitEconomicsResult {
         $price = $input->price;
         
@@ -392,6 +397,17 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
         );
 
         $result->metadata = [
+            'financial_input_usage' => ['version' => 'domain_financial_input_usage_v1', 'items' => [
+                'cost_price' => true, 'commission_rate' => true, 'acquiring_percent' => true, 'redemption_rate' => true,
+                'packaging_cost' => true, 'additional_costs' => true, 'penalty_cost' => true, 'acceptance_cost' => true,
+                'storage_cost' => strtoupper($input->fulfillmentType) === 'FBO',
+                'own_delivery_cost' => in_array(strtoupper($input->fulfillmentType), ['RFBS', 'EXPRESS'], true),
+                'own_return_cost' => in_array(strtoupper($input->fulfillmentType), ['RFBS', 'EXPRESS'], true),
+                'marketplace_compensation' => strtoupper($input->fulfillmentType) === 'EXPRESS',
+            ]],
+            'commission_source' => $commissionSource,
+            'commission_input_source' => $input->commissionRateSource ?? null,
+            'commission_observed_at' => $commissionSource === 'ozon_prices_v5' ? $input->commissionObservedAt : null,
             'base_logistics' => round($baseLogistics ?? $logistics, 2),
             'last_mile' => round($lastMile, 2),
             'processing_fee' => round($processingFee, 2),
@@ -646,11 +662,16 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
         // («Электрические чайники» 31% → 54%): ставка, снятая до этой даты, после
         // неё занижает комиссию, поэтому берём официальную таблицу.
         // Ставка, посчитанная из факта реализации, всегда свежая — её не трогаем.
+        $unverified = in_array($input->commissionRateSource ?? null, ['unverified_marketplace', 'model_default', 'cached_base_unverified'], true);
         $commissionIsStale = $input->commissionRateIsEffective !== true
-            && $this->pricing->isCommissionObservationStale($input->commissionObservedAt, $pricingDate);
+            && ($this->pricing->isCommissionObservationStale($input->commissionObservedAt, $pricingDate)
+                || ($unverified && ($commissionData['tariff_source'] ?? null) === 'ozon_category_table'));
         $commissionRate = $commissionIsStale
             ? (float) $commissionData['sales_fee_percent']
             : ($input->commissionRate ?? (float) $commissionData['sales_fee_percent']);
+        $commissionSource = $commissionIsStale || $input->commissionRate === null
+            ? ($commissionData['tariff_source'] ?? null)
+            : ($input->commissionRateSource ?? 'manual_or_legacy_input');
         $acquiringRate = $input->acquiringPercent ?? 1.5;
         $dominantClusterId = $input->dominantClusterId;
         $dominantClusterShare = $input->dominantClusterShare;
@@ -760,6 +781,7 @@ class OzonUnitEconomicsCalculator implements UnitEconomicsCalculatorInterface
             'commission_rate' => $commissionRate,
             'commission' => $input->price * ($commissionRate / 100),
             'commission_rate_base' => $baseCommissionRate,
+            'commission_source' => $commissionSource,
             'locality_commission_discount_pp' => $localityCommissionDiscountPp,
             // Ставка по официальной таблице Ozon, вступающей в силу 28.08.2026 —
             // чтобы можно было посчитать цены заранее, до её вступления.

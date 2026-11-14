@@ -204,6 +204,25 @@ class SupplyService
             return $result;
         }
 
+        if ($supply->auto_supply_plan_id && \Illuminate\Support\Facades\Schema::hasTable('manager_fbo_resource_holds')
+            && \App\Models\ManagerOzonFboOperation::where('plan->plan_id', (string) $supply->auto_supply_plan_id)
+                ->whereIn('id', DB::table('manager_fbo_resource_holds')->select('operation_id'))->exists()) {
+            throw new OzonPreconditionException('План уже имеет исполнение FBO в чате. Проверьте журнал перед новым созданием.');
+        }
+
+        if ($supply->auto_supply_plan_id) {
+            $plan = \App\Models\AutoSupplyPlan::whereKey($supply->auto_supply_plan_id)
+                ->where('integration_id', $supply->integration_id)->where('marketplace', 'ozon')->first();
+            $check = $plan ? app(\App\Services\AutoSupplyPlanning\OzonPlanMaterializationService::class)->approvalCheck($plan) : null;
+            $approved = $plan?->approval_fingerprint;
+            if (! $plan || $plan->business_status !== \App\Models\AutoSupplyPlan::BUSINESS_STATUS_APPROVED
+                || ($check['allowed'] ?? false) !== true || ! is_string($approved) || $approved === ''
+                || ! hash_equals($approved, (string) $check['fingerprint'])
+                || ! hash_equals($approved, (string) ($supply->meta['approval_fingerprint'] ?? ''))) {
+                throw new OzonPreconditionException('Исходные данные или утверждение автоплана больше не подтверждены. Выполните новый расчёт перед созданием черновика.');
+            }
+        }
+
         $integration = $supply->integration;
         $ozon = OzonMarketplace::fromIntegration($integration);
 
@@ -544,7 +563,7 @@ class SupplyService
     /**
      * Синхронизировать статус поставки из Ozon
      */
-    public function syncStatus(Supply $supply): void
+    public function syncStatus(Supply $supply, ?array $orderDetails = null): void
     {
         if (! $supply->ozon_order_id && ! $supply->ozon_supply_id && ! $supply->ozon_draft_id) {
             return;
@@ -555,21 +574,16 @@ class SupplyService
         try {
             $orderId = $supply->ozon_order_id ?: $supply->ozon_supply_id;
             if ($orderId) {
-                $details = $ozon->supplies()->getSupplyOrdersDetails([
+                $details = $orderDetails ?? $ozon->supplies()->getSupplyOrdersDetails([
                     (int) $orderId,
                 ]);
                 $order = collect($details['orders'] ?? [])->first(
                     fn (array $item): bool => (string) ($item['id'] ?? $item['order_id'] ?? '')
                         === (string) $orderId
-                ) ?? collect($details['orders'] ?? [])->first();
+                );
 
                 if (! is_array($order)) {
-                    Log::warning('Ozon supply-order/get returned no matching order', [
-                        'supply_id' => $supply->id,
-                        'ozon_order_id' => $orderId,
-                    ]);
-
-                    return;
+                    throw new \RuntimeException('Ozon did not return the requested supply order');
                 }
 
                 $remoteSupply = collect($order['supplies'] ?? [])->first(
@@ -604,6 +618,10 @@ class SupplyService
 
             $oldStatus = $supply->ozon_status;
 
+            if (! $newStatus) {
+                throw new \RuntimeException('Ozon did not return a supply status');
+            }
+
             if ($newStatus && $newStatus !== $oldStatus) {
                 $supply->update([
                     'ozon_order_id' => $supply->ozon_order_id,
@@ -632,7 +650,36 @@ class SupplyService
                 'supply_id' => $supply->id,
                 'error' => $e->getMessage(),
             ]);
+
+            throw $e;
         }
+    }
+
+    /** One API request for a bounded set of orders from the same seller. */
+    public function syncStatusesBatch(\Illuminate\Support\Collection $supplies): array
+    {
+        $stats = ['total' => $supplies->count(), 'succeeded' => 0, 'failed' => 0];
+        if ($supplies->isEmpty()) {
+            return $stats;
+        }
+        if ($supplies->count() > 50 || $supplies->pluck('integration_id')->unique()->count() !== 1) {
+            throw new \InvalidArgumentException('Supply batch must contain at most 50 supplies from one integration');
+        }
+        $ids = $supplies->map(fn ($s) => (int) ($s->ozon_order_id ?: $s->ozon_supply_id))->filter()->unique()->values()->all();
+        $details = $ids ? OzonMarketplace::fromIntegration($supplies->first()->integration)->supplies()->getSupplyOrdersDetails($ids) : [];
+        foreach ($supplies as $supply) {
+            try {
+                $this->syncStatus($supply, $details);
+                $stats['succeeded']++;
+            } catch (\Throwable $e) {
+                $stats['failed']++;
+                // An unavailable order is not fresh, and should not be requested
+                // again on every global tick while its remote identifier is bad.
+                \Illuminate\Support\Facades\Cache::put('supply-status-cooldown:'.$supply->id, time() + 3600, now()->addHour());
+            }
+        }
+
+        return $stats;
     }
 
     /**

@@ -24,21 +24,21 @@ class FboCargoesApi
     /**
      * Создание грузомест для заявки
      */
-    public function create(int $supplyOrderId, array $cargoes): array
+    public function create(int $supplyId, array $cargoes): array
     {
         $response = $this->client->post('/v1/cargoes/create', [
-            'supply_order_id' => $supplyOrderId,
+            'supply_id' => $supplyId,
             'cargoes' => $cargoes,
         ]);
 
         Log::info('Ozon FBO cargoes/create', [
-            'supply_order_id' => $supplyOrderId,
+            'supply_id' => $supplyId,
             'cargoes_count' => count($cargoes),
         ]);
 
         return [
             'operation_id' => $response['operation_id'] ?? null,
-            'success' => !empty($response['operation_id']),
+            'success' => !empty($response['operation_id']) && empty($response['_error']) && empty($response['errors']),
         ];
     }
 
@@ -57,32 +57,33 @@ class FboCargoesApi
     /**
      * Получение грузомест заявки
      */
-    public function get(int $supplyOrderId): array
+    public function get(int $supplyId): array
     {
-        $response = $this->client->post('/v1/cargoes/get', [
-            'supply_order_id' => $supplyOrderId,
-        ]);
+        $response = $this->client->post('/v1/cargoes/get', ['supply_ids' => [(string) $supplyId]]);
+        $supply = collect($response['supply'] ?? [])->first(fn ($s) => (string) ($s['supply_id'] ?? '') === (string) $supplyId);
 
-        return $response['cargoes'] ?? [];
+        return $supply['cargoes'] ?? [];
     }
 
     /**
      * Создание задачи на генерацию этикеток
      */
-    public function createLabels(int $supplyOrderId): array
+    public function createLabels(int $supplyId, array $cargoIds = []): array
     {
         $response = $this->client->post('/v1/cargoes-label/create', [
-            'supply_order_id' => $supplyOrderId,
+            'supply_id' => $supplyId,
+            'cargoes' => array_map(fn ($id) => ['cargo_id' => (int) $id], $cargoIds),
         ]);
 
         Log::info('Ozon FBO cargoes-label/create', [
-            'supply_order_id' => $supplyOrderId,
-            'task_id' => $response['task_id'] ?? null,
+            'supply_id' => $supplyId,
+            'task_id' => $response['operation_id'] ?? null,
         ]);
 
         return [
-            'task_id' => $response['task_id'] ?? null,
-            'success' => !empty($response['task_id']),
+            'operation_id' => $response['operation_id'] ?? null,
+            'task_id' => $response['operation_id'] ?? null,
+            'success' => !empty($response['operation_id']) && empty($response['_error']) && empty($response['errors']),
         ];
     }
 
@@ -92,13 +93,14 @@ class FboCargoesApi
     public function getLabelsStatus(string $taskId): array
     {
         $response = $this->client->post('/v1/cargoes-label/get', [
-            'task_id' => $taskId,
+            'operation_id' => $taskId,
         ]);
 
         return [
             'status' => $response['status'] ?? null,
             'file_guid' => $response['file_guid'] ?? null,
-            'error' => $response['error'] ?? null,
+            'file_url' => $response['result']['file_url'] ?? null,
+            'error' => $response['errors'] ?? $response['error'] ?? null,
         ];
     }
 }

@@ -19,6 +19,33 @@ return [
     |
     */
 
+    'price_dispatch' => [
+        'url' => env('PRICE_DISPATCH_GATE_URL', ''),
+        'secret' => env('PRICE_DISPATCH_GATE_SECRET', ''),
+        // Owner decision 2026-11-05/11: prices change only through personally
+        // approved commands of the shared executor. Direct Products price
+        // senders (repricer, Ozon imports with prices, Ozon promotion changes)
+        // are retired and refuse before any network request unless enabled.
+        'legacy_enabled' => env('PRICE_LEGACY_DISPATCH_ENABLED', false),
+    ],
+
+    'manager' => [
+        'ozon_fbo_enabled' => env('MANAGER_OZON_FBO_ENABLED', false),
+        'fbs_execution_controls_enabled' => env('MANAGER_FBS_EXECUTION_CONTROLS_ENABLED', false),
+        'fbs_writes_enabled' => env('MANAGER_FBS_WRITES_ENABLED', true),
+        'fbs_cancellations_enabled' => env('MANAGER_FBS_CANCELLATIONS_ENABLED', false),
+        'ozon_carriages_enabled' => env('MANAGER_OZON_CARRIAGES_ENABLED', false),
+        'wb_supplies_enabled' => env('MANAGER_WB_SUPPLIES_ENABLED', false),
+        'ozon_packing_enabled' => env('MANAGER_OZON_PACKING_ENABLED', false),
+        'ozon_packing_outbox_enabled' => env('MANAGER_OZON_PACKING_OUTBOX_ENABLED', false),
+        'supply_calculations_enabled' => env('MANAGER_SUPPLY_CALCULATIONS_ENABLED', false),
+        'financial_settings_enabled' => env('MANAGER_FINANCIAL_SETTINGS_ENABLED', false),
+        'promotions_enabled' => env('MANAGER_PROMOTIONS_ENABLED', false),
+        'price_proposals_enabled' => env('MANAGER_PRICE_PROPOSALS_ENABLED', false),
+        'price_execution_enabled' => env('MANAGER_PRICE_EXECUTION_ENABLED', false),
+        'price_executor_url' => env('MANAGER_PRICE_EXECUTOR_URL', ''),
+    ],
+
     'postmark' => [
         'key' => env('POSTMARK_API_KEY'),
     ],

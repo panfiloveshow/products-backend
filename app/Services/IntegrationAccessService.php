@@ -250,7 +250,7 @@ class IntegrationAccessService
         };
     }
 
-    private function sanitizeStoredCredentials(array $credentials): array
+    public function sanitizeStoredCredentials(array $credentials): array
     {
         $runtimeOnlyKeys = [
             'performance_api_key',

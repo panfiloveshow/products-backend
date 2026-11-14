@@ -86,7 +86,7 @@ return new class extends Migration
                 $table->timestamp('processed_at')->nullable()->after('processed_by');
             }
             if (!Schema::hasColumn('supply_recommendations', 'supply_plan_id')) {
-                $table->unsignedBigInteger('supply_plan_id')->nullable()->after('processed_at');
+                $table->uuid('supply_plan_id')->nullable()->after('processed_at');
             }
         });
     }

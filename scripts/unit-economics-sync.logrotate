@@ -1,0 +1,13 @@
+/var/www/products-backend/storage/logs/ue-price-rotation.log
+/var/www/products-backend/storage/logs/ue-price-recovery.log
+/var/www/products-backend/storage/logs/ue-sync-health.log
+/var/www/products-backend/storage/logs/worker-price-refresh.log
+/var/www/products-backend/storage/logs/worker-ue-enrichment.log {
+    su www-data www-data
+    size 20M
+    rotate 7
+    compress
+    missingok
+    notifempty
+    copytruncate
+}

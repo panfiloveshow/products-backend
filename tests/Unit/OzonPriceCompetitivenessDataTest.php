@@ -2,7 +2,7 @@
 
 namespace Tests\Unit;
 
-use App\Console\Commands\SyncUnitEconomicsCommand;
+use App\Services\UnitEconomicsSynchronizer;
 use ReflectionClass;
 use Tests\TestCase;
 
@@ -59,7 +59,7 @@ class OzonPriceCompetitivenessDataTest extends TestCase
 
     private function buildOzonPriceCompetitivenessData(float $currentPrice, array $pricingStrategyData): array
     {
-        $command = new SyncUnitEconomicsCommand;
+        $command = new UnitEconomicsSynchronizer;
         $method = (new ReflectionClass($command))->getMethod('buildOzonPriceCompetitivenessData');
         $method->setAccessible(true);
 

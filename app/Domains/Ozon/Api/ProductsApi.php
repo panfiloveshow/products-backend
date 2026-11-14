@@ -51,8 +51,10 @@ class ProductsApi implements ProductsApiInterface
 
         return [
             'items' => $response['result']['items'] ?? [],
-            'total' => $response['result']['total'] ?? 0,
+            'total' => $response['result']['total_items'] ?? $response['result']['total'] ?? 0,
             'last_id' => $response['result']['last_id'] ?? '',
+            'complete' => ! ($response['_error'] ?? false) && is_array($response['result']['items'] ?? null)
+                && array_key_exists('last_id', $response['result'] ?? []),
         ];
     }
 
@@ -281,13 +283,16 @@ class ProductsApi implements ProductsApiInterface
                 break;
             }
 
+            $observedAt = now()->utc()->toIso8601String();
+            $commissionsObservedAt = now()->utc()->format('Y-m-d\TH:i:s.uP');
+
             // v5 API возвращает items напрямую, cursor вместо last_id
             $items = $response['items'] ?? [];
             $cursor = $response['cursor'] ?? '';
 
             foreach ($items as $item) {
                 $sku = $item['offer_id'] ?? null;
-                if (!$sku) continue;
+                if (!is_string($sku) || $sku === '') continue;
 
                 if (!empty($skus) && !in_array($sku, $skus)) continue;
 
@@ -328,6 +333,7 @@ class ProductsApi implements ProductsApiInterface
                 
                 $allPrices[$sku] = [
                     'product_id' => $item['product_id'] ?? null,
+                    'offer_id' => (string) $sku,
                     'price' => $price,                           // Базовая цена без скидок
                     'old_price' => $oldPrice,                    // Зачёркнутая цена (маркетинговая)
                     'min_price' => (float) ($priceData['min_price'] ?? 0),
@@ -344,6 +350,8 @@ class ProductsApi implements ProductsApiInterface
                     'competitor_price_source' => $priceIndexes['selected_index_source'] ?? null,
                     // Дополнительные данные из v5 API
                     'commissions' => $item['commissions'] ?? [],
+                    'price_observed_at' => $observedAt,
+                    'commissions_observed_at' => $commissionsObservedAt,
                     'volume_weight' => (float) ($item['volume_weight'] ?? 0),
                 ];
             }
@@ -351,6 +359,204 @@ class ProductsApi implements ProductsApiInterface
         } while (!empty($items) && !empty($cursor));
 
         return $allPrices;
+    }
+
+    /** Authoritative prices with explicit completeness; never wait in a worker on 429. */
+    public function getPriceSnapshot(?Integration $integration = null, array $skus = []): array
+    {
+        $snapshot = ['prices' => [], 'complete' => false, 'http_status' => null,
+            'retry_after' => null, 'request_started_at' => now()->utc()->toIso8601String()];
+        $cursor = '';
+        $seen = [];
+        $pending = [];
+        $pagesComplete = false;
+        $deadline = microtime(true) + 90;
+        for ($page = 0; $page < 200; $page++) {
+            if (microtime(true) >= $deadline) {
+                break;
+            }
+            $response = $this->client->post('/v5/product/info/prices', [
+                'filter' => ['visibility' => 'ALL'], 'limit' => 1000, 'cursor' => $cursor,
+            ], retryRateLimit: false);
+            $snapshot['http_status'] = $this->client->getLastResponseStatus();
+            $snapshot['retry_after'] = $this->client->getLastRateLimitRetryAfter();
+            if (! is_array($response) || ($response['_error'] ?? false)
+                || ! is_array($response['items'] ?? null) || ! array_key_exists('cursor', $response)) {
+                break;
+            }
+            $this->recordSnapshotPrices($response['items'], $snapshot, $pending, $skus);
+            $next = (string) $response['cursor'];
+            if ($next === '') {
+                $pagesComplete = true;
+                break;
+            }
+            if ($response['items'] === [] || isset($seen[$next])) {
+                break;
+            }
+            $seen[$next] = true;
+            $cursor = $next;
+        }
+        // Ozon can omit archived offers from an unfiltered ALL listing while
+        // still returning their authoritative prices for an explicit offer_id.
+        // Recover only known missing offers, never replace them with catalog prices.
+        if ($pagesComplete && $skus !== []) {
+            $missing = array_values(array_diff($skus, array_keys($snapshot['prices']), array_keys($pending)));
+            foreach (array_chunk($missing, 1000) as $batch) {
+                $cursor = '';
+                $seen = [];
+                $batchComplete = false;
+                for ($page = 0; $page < 200 && microtime(true) < $deadline; $page++) {
+                    $response = $this->client->post('/v5/product/info/prices', [
+                        'filter' => ['offer_id' => $batch, 'visibility' => 'ALL'], 'limit' => 1000, 'cursor' => $cursor,
+                    ], retryRateLimit: false);
+                    $snapshot['http_status'] = $this->client->getLastResponseStatus();
+                    $snapshot['retry_after'] = $this->client->getLastRateLimitRetryAfter();
+                    if (! is_array($response) || ($response['_error'] ?? false)
+                        || ! is_array($response['items'] ?? null) || ! array_key_exists('cursor', $response)) {
+                        break;
+                    }
+                    $this->recordSnapshotPrices($response['items'], $snapshot, $pending, $batch);
+                    $next = (string) $response['cursor'];
+                    if ($next === '') {
+                        $batchComplete = true;
+                        break;
+                    }
+                    if ($response['items'] === [] || isset($seen[$next])) {
+                        break;
+                    }
+                    $seen[$next] = true;
+                    $cursor = $next;
+                }
+                if (! $batchComplete) {
+                    $pagesComplete = false;
+                    break;
+                }
+            }
+        }
+        // An incomplete primary snapshot must keep its failure/status. Fetching
+        // optional data now would hide the rate limit that stopped pagination.
+        if ($pending !== [] && $pagesComplete) {
+            $actions = $this->getActionPriceSnapshot($deadline);
+            if (! $actions['complete']) {
+                $snapshot['http_status'] = $actions['http_status'];
+                $snapshot['retry_after'] = $actions['retry_after'];
+
+                return $snapshot;
+            }
+            foreach ($pending as $sku => $item) {
+                $snapshot['prices'][$sku] = $this->snapshotPrice($item, $actions['prices']);
+            }
+        }
+        $snapshot['complete'] = $pagesComplete;
+
+        return $snapshot;
+    }
+
+    private function recordSnapshotPrices(array $items, array &$snapshot, array &$pending, array $skus): void
+    {
+        $observedAt = now()->utc()->toIso8601String();
+        $commissionsObservedAt = now()->utc()->format('Y-m-d\TH:i:s.uP');
+        foreach ($items as $item) {
+            if (! is_array($item) || ! is_string($item['offer_id'] ?? null) || $item['offer_id'] === '' || ! is_array($item['price'] ?? null)) {
+                continue;
+            }
+            $sku = (string) $item['offer_id'];
+            if ($skus !== [] && ! in_array($sku, $skus, true)) {
+                continue;
+            }
+            $item['price_observed_at'] = $observedAt;
+            $item['commissions_observed_at'] = $commissionsObservedAt;
+            if ((float) ($item['price']['marketing_seller_price'] ?? 0) > 0) {
+                $snapshot['prices'][$sku] = $this->snapshotPrice($item, []);
+                unset($pending[$sku]);
+            } else {
+                $pending[$sku] = $item;
+            }
+        }
+    }
+
+    private function snapshotPrice(array $item, array $actions): array
+    {
+        $data = $item['price'];
+        $base = (float) ($data['price'] ?? 0);
+        $marketing = (float) ($data['marketing_seller_price'] ?? 0);
+        $action = (float) ($actions[(int) ($item['product_id'] ?? 0)] ?? 0);
+        $actual = $marketing > 0 ? $marketing : ($action > 0 && $action < $base ? $action : $base);
+        $indexes = $this->normalizePriceIndexes($item['price_indexes'] ?? []);
+
+        return ['product_id' => $item['product_id'] ?? null, 'offer_id' => (string) $item['offer_id'], 'price' => $base,
+            'old_price' => (float) ($data['old_price'] ?? 0), 'min_price' => (float) ($data['min_price'] ?? 0),
+            'marketing_seller_price' => $marketing, 'actual_price' => $actual,
+            'price_source' => $marketing > 0 ? 'marketing_seller_price' : ($actual < $base ? 'action_price' : 'seller_price'),
+            'is_in_promotion' => $actual < $base,
+            'promotion_discount' => $actual < $base && $base > 0 ? round((1 - $actual / $base) * 100, 1) : 0,
+            'price_indexes' => $indexes, 'price_index_color' => $indexes['color_index'] ?? null,
+            'commissions' => $item['commissions'] ?? [], 'volume_weight' => (float) ($item['volume_weight'] ?? 0),
+            'price_observed_at' => $item['price_observed_at'], 'commissions_observed_at' => $item['commissions_observed_at']];
+    }
+
+    private function getActionPriceSnapshot(float $deadline): array
+    {
+        $result = ['prices' => [], 'complete' => false, 'http_status' => null, 'retry_after' => null];
+        $response = $this->client->get('/v1/actions');
+        $result['http_status'] = $this->client->getLastResponseStatus();
+        $result['retry_after'] = $this->client->getLastRateLimitRetryAfter();
+        if (! is_array($response['result'] ?? null)) {
+            return $result;
+        }
+        foreach ($response['result'] as $action) {
+            if (microtime(true) >= $deadline) {
+                return $result;
+            }
+            if (empty($action['id']) || ((int) ($action['participating_products_count'] ?? 0) === 0 && empty($action['is_participating']))) {
+                continue;
+            }
+            $cursor = '';
+            $seen = [];
+            $complete = false;
+            $received = 0;
+            for ($page = 0; $page < 200; $page++) {
+                if (microtime(true) >= $deadline) {
+                    return $result;
+                }
+                $response = $this->client->post('/v2/actions/products', [
+                    'action_id' => (int) $action['id'], 'limit' => 100, 'last_id' => $cursor,
+                ], retryRateLimit: false);
+                $result['http_status'] = $this->client->getLastResponseStatus();
+                $result['retry_after'] = $this->client->getLastRateLimitRetryAfter();
+                if (! is_array($response['products'] ?? null) || ($response['_error'] ?? false)) {
+                    return $result;
+                }
+                foreach ($response['products'] as $product) {
+                    $id = (int) ($product['id'] ?? 0);
+                    $price = (float) ($product['action_price']['amount'] ?? 0);
+                    if ($id && $price > 0) {
+                        $result['prices'][$id] = min($result['prices'][$id] ?? $price, $price);
+                    }
+                }
+                $received += count($response['products']);
+                $total = isset($response['total']) && is_numeric($response['total']) ? max(0, (int) $response['total']) : null;
+                $next = (string) ($response['last_id'] ?? '');
+                // v2 retains the last product cursor on the final page. A
+                // fulfilled total (or an empty page without a total) is terminal.
+                if ($next === '' || ($total !== null && $received >= $total)
+                    || ($response['products'] === [] && $total === null)) {
+                    $complete = true;
+                    break;
+                }
+                if ($response['products'] === [] || isset($seen[$next])) {
+                    break;
+                }
+                $seen[$next] = true;
+                $cursor = $next;
+            }
+            if (! $complete) {
+                return $result;
+            }
+        }
+        $result['complete'] = true;
+
+        return $result;
     }
 
     /**
@@ -644,7 +850,11 @@ class ProductsApi implements ProductsApiInterface
             'limit' => 1000,
         ]);
 
-        return $response['result']['items'] ?? $response['items'] ?? [];
+        if (!is_array($response) || !empty($response['_error'])) {
+            return [];
+        }
+
+        return $response['result']['items'] ?? $response['items'] ?? $response['result'] ?? [];
     }
 
     // ========================================
@@ -687,22 +897,15 @@ class ProductsApi implements ProductsApiInterface
      */
     public function importProducts(array $products): array
     {
-        $response = $this->client->post('/v3/product/import', [
-            'items' => $products,
-        ]);
-
-        if (!$response) {
-            return [
-                'success' => false,
-                'error' => 'Failed to import products to Ozon',
-            ];
+        $response = $this->client->post('/v3/product/import', ['items' => $products]);
+        $failure = $this->nativeWriteFailure($response, 'Failed to import products to Ozon');
+        if ($failure !== null) return $failure;
+        $task = $response['result']['task_id'] ?? null;
+        if ((! is_int($task) && ! is_string($task)) || ! preg_match('/^[1-9][0-9]*$/D', (string) $task)) {
+            return ['success' => false, 'status' => 'unknown', 'error' => 'Ozon import task receipt is not confirmed', 'completion_verified' => false];
         }
-
-        return [
-            'success' => true,
-            'task_id' => $response['result']['task_id'] ?? null,
-            'result' => $response['result'] ?? [],
-        ];
+        return ['success' => true, 'status' => 'accepted', 'completion_verified' => false,
+            'task_id' => $task, 'result' => $response['result'], 'dispatch' => $response['_sellico_price_dispatch'] ?? null];
     }
 
     /**
@@ -741,21 +944,9 @@ class ProductsApi implements ProductsApiInterface
      */
     public function updatePrices(array $prices): array
     {
-        $response = $this->client->post('/v1/product/import/prices', [
-            'prices' => $prices,
-        ]);
-
-        if (!$response) {
-            return [
-                'success' => false,
-                'error' => 'Failed to update prices on Ozon',
-            ];
-        }
-
-        return [
-            'success' => true,
-            'result' => $response['result'] ?? [],
-        ];
+        if ($prices === [] || ! array_is_list($prices)) return ['success' => false, 'status' => 'not_dispatched', 'error' => 'Explicit price rows are required'];
+        $response = $this->client->post('/v1/product/import/prices', ['prices' => $prices]);
+        return $this->nativeItemWriteResult($response, $prices, 'prices');
     }
 
     /**
@@ -775,21 +966,9 @@ class ProductsApi implements ProductsApiInterface
      */
     public function updateStocks(array $stocks): array
     {
-        $response = $this->client->post('/v2/products/stocks', [
-            'stocks' => $stocks,
-        ]);
-
-        if (!$response) {
-            return [
-                'success' => false,
-                'error' => 'Failed to update stocks on Ozon',
-            ];
-        }
-
-        return [
-            'success' => true,
-            'result' => $response['result'] ?? [],
-        ];
+        if ($stocks === [] || ! array_is_list($stocks)) return ['success' => false, 'status' => 'not_dispatched', 'error' => 'Explicit stock rows are required'];
+        $response = $this->client->post('/v2/products/stocks', ['stocks' => $stocks]);
+        return $this->nativeItemWriteResult($response, $stocks, 'stocks');
     }
 
     /**
@@ -814,7 +993,7 @@ class ProductsApi implements ProductsApiInterface
             'items' => $items,
         ]);
 
-        if (!$response) {
+        if (!$response || !empty($response['_error']) || !isset($response['task_id'])) {
             return [
                 'success' => false,
                 'error' => 'Failed to update attributes on Ozon',
@@ -823,7 +1002,8 @@ class ProductsApi implements ProductsApiInterface
 
         return [
             'success' => true,
-            'result' => $response['result'] ?? [],
+            'task_id' => $response['task_id'],
+            'result' => $response['result'] ?? ['task_id' => $response['task_id']],
         ];
     }
 
@@ -899,49 +1079,11 @@ class ProductsApi implements ProductsApiInterface
      */
     public function exportProduct(array $product, ?int $warehouseId = null): array
     {
-        $results = [
-            'success' => true,
-            'steps' => [],
-        ];
-
-        // 1. Импорт основных данных товара
-        $importResult = $this->importProducts([$product]);
-        $results['steps']['import'] = $importResult;
-        
-        if (!$importResult['success']) {
-            $results['success'] = false;
-            return $results;
+        $result = $this->exportProducts([$product], $warehouseId);
+        foreach (['import', 'prices', 'stocks'] as $step) {
+            if (isset($result['steps'][$step][0])) $result['steps'][$step] = $result['steps'][$step][0];
         }
-
-        // 2. Обновление цен (если указаны)
-        if (isset($product['price'])) {
-            $priceData = [
-                'offer_id' => $product['offer_id'],
-                'price' => (string) $product['price'],
-                'currency_code' => $product['currency_code'] ?? 'RUB',
-            ];
-            
-            if (isset($product['old_price'])) {
-                $priceData['old_price'] = (string) $product['old_price'];
-            }
-            
-            $priceResult = $this->updatePrices([$priceData]);
-            $results['steps']['prices'] = $priceResult;
-        }
-
-        // 3. Обновление остатков (если указан склад)
-        if ($warehouseId && isset($product['stock'])) {
-            $stockResult = $this->updateStocks([
-                [
-                    'offer_id' => $product['offer_id'],
-                    'stock' => (int) $product['stock'],
-                    'warehouse_id' => $warehouseId,
-                ]
-            ]);
-            $results['steps']['stocks'] = $stockResult;
-        }
-
-        return $results;
+        return $result;
     }
 
     /**
@@ -953,60 +1095,125 @@ class ProductsApi implements ProductsApiInterface
      */
     public function exportProducts(array $products, ?int $warehouseId = null): array
     {
-        $results = [
-            'success' => true,
-            'total' => count($products),
-            'imported' => 0,
-            'failed' => 0,
-            'errors' => [],
-        ];
-
-        // Импортируем товары батчами по 100 штук (лимит Ozon API)
-        $batches = array_chunk($products, 100);
-        
-        foreach ($batches as $batch) {
-            $importResult = $this->importProducts($batch);
-            
-            if ($importResult['success']) {
-                $results['imported'] += count($batch);
-            } else {
-                $results['failed'] += count($batch);
-                $results['errors'][] = $importResult['error'] ?? 'Unknown error';
+        $result = ['success' => false, 'status' => 'not_dispatched', 'completion_verified' => false,
+            'total' => count($products), 'accepted_for_import' => 0, 'imported' => null, 'failed' => null,
+            'steps' => [], 'task_ids' => [], 'errors' => []];
+        try {
+            $products = $this->explicitExportInputs($products, $warehouseId);
+        } catch (\InvalidArgumentException $error) {
+            $result['errors'][] = $error->getMessage();
+            return $result;
+        }
+        foreach (array_chunk($products, 100) as $batch) {
+            $import = $this->importProducts($batch);
+            $result['steps']['import'][] = $import;
+            if (! $import['success']) return $this->unfinishedExport($result, $import);
+            $result['accepted_for_import'] += count($batch);
+            $result['task_ids'][] = $import['task_id'];
+            // The import is asynchronous. These results are request receipts,
+            // not a claim that imported cards or their prices were observed.
+            $prices = array_map(function (array $product): array {
+                $row = ['offer_id' => $product['offer_id'], 'price' => $product['price'], 'currency_code' => $product['currency_code']];
+                if (array_key_exists('old_price', $product)) $row['old_price'] = $product['old_price'];
+                return $row;
+            }, $batch);
+            $price = $this->updatePrices($prices);
+            $result['steps']['prices'][] = $price;
+            if (! $price['success']) return $this->unfinishedExport($result, $price);
+            $stocks = [];
+            if ($warehouseId !== null) foreach ($batch as $product) {
+                if (array_key_exists('stock', $product)) $stocks[] = ['offer_id' => $product['offer_id'], 'stock' => $product['stock'], 'warehouse_id' => $warehouseId];
+            }
+            if ($stocks !== []) {
+                $stock = $this->updateStocks($stocks);
+                $result['steps']['stocks'][] = $stock;
+                if (! $stock['success']) return $this->unfinishedExport($result, $stock);
             }
         }
+        $result['success'] = true;
+        $result['status'] = 'accepted';
+        return $result;
+    }
 
-        // Обновляем цены
-        $prices = array_map(function ($product) {
-            return [
-                'offer_id' => $product['offer_id'],
-                'price' => (string) ($product['price'] ?? 0),
-                'old_price' => (string) ($product['old_price'] ?? 0),
-                'currency_code' => $product['currency_code'] ?? 'RUB',
-            ];
-        }, $products);
-
-        $priceBatches = array_chunk($prices, 1000);
-        foreach ($priceBatches as $batch) {
-            $this->updatePrices($batch);
+    private function nativeWriteFailure(?array $response, string $message): ?array
+    {
+        if ($response !== null && empty($response['_error'])) return null;
+        $dispatch = $response['_sellico_price_dispatch'] ?? null;
+        $status = match ($dispatch['status'] ?? null) {
+            'not_dispatched' => 'not_dispatched',
+            'rejected' => 'failed',
+            default => 'unknown',
+        };
+        if ($status === 'not_dispatched') {
+            $denial = \App\Services\Marketplace\PriceDispatchDenied::fromServiceError($dispatch['denial']['code'] ?? null);
+            if ($denial !== null) $message = $denial->getMessage();
         }
+        return ['success' => false, 'status' => $status, 'completion_verified' => false, 'error' => $message, 'dispatch' => $dispatch];
+    }
 
-        // Обновляем остатки если указан склад
-        if ($warehouseId) {
-            $stocks = array_map(function ($product) use ($warehouseId) {
-                return [
-                    'offer_id' => $product['offer_id'],
-                    'stock' => (int) ($product['stock'] ?? 0),
-                    'warehouse_id' => $warehouseId,
-                ];
-            }, $products);
+    private function nativeItemWriteResult(?array $response, array $requested, string $kind): array
+    {
+        $failure = $this->nativeWriteFailure($response, 'Ozon '.$kind.' request was not confirmed');
+        if ($failure !== null) return $failure;
+        $rows = $response['result'] ?? null;
+        $base = ['success' => false, 'status' => 'unknown', 'completion_verified' => false,
+            'result' => is_array($rows) ? $rows : null, 'dispatch' => $response['_sellico_price_dispatch'] ?? null];
+        if (! is_array($rows) || ! array_is_list($rows) || count($rows) !== count($requested)) {
+            return $base + ['error' => 'Ozon result does not cover the exact requested rows'];
+        }
+        $used = []; $accepted = 0; $rejected = 0; $unknown = false;
+        foreach ($requested as $input) {
+            $matches = [];
+            if (! is_array($input) || (! isset($input['offer_id']) && ! isset($input['product_id']))) $unknown = true;
+            else foreach ($rows as $index => $row) {
+                if (! is_array($row) || isset($used[$index])) continue;
+                $same = true;
+                foreach (['offer_id', 'product_id', ...($kind === 'stocks' ? ['warehouse_id'] : [])] as $key) {
+                    if (array_key_exists($key, $input) && (! array_key_exists($key, $row) || ! (is_string($row[$key]) || $key !== 'offer_id' && is_int($row[$key])) || ! (is_string($input[$key]) || $key !== 'offer_id' && is_int($input[$key])) || (string) $row[$key] !== (string) $input[$key])) $same = false;
+                }
+                if ($same) $matches[] = $index;
+            }
+            if (count($matches) !== 1) { $unknown = true; continue; }
+            $index = $matches[0]; $used[$index] = true; $row = $rows[$index];
+            if (($row['updated'] ?? null) === true && ($row['errors'] ?? null) === []) $accepted++;
+            elseif (($row['updated'] ?? null) === false && is_array($row['errors'] ?? null) && $row['errors'] !== []) $rejected++;
+            else $unknown = true;
+        }
+        if ($unknown || count($used) !== count($rows)) return $base + ['error' => 'Exact Ozon item receipts are incomplete or inconsistent'];
+        if ($rejected > 0) return array_replace($base, ['status' => $accepted > 0 ? 'partial' : 'failed', 'error' => 'Ozon rejected one or more requested rows']);
+        return array_replace($base, ['success' => true, 'status' => 'accepted']);
+    }
 
-            $stockBatches = array_chunk($stocks, 100);
-            foreach ($stockBatches as $batch) {
-                $this->updateStocks($batch);
+    private function explicitExportInputs(array $products, ?int $warehouseId): array
+    {
+        if ($products === [] || ! array_is_list($products) || $warehouseId !== null && $warehouseId <= 0) throw new \InvalidArgumentException('Нужны товары и корректный явно выбранный склад.');
+        $seen = [];
+        foreach ($products as &$product) {
+            if (! is_array($product) || ! is_string($product['offer_id'] ?? null) || trim($product['offer_id']) === '' || isset($seen[$product['offer_id']])) throw new \InvalidArgumentException('Нужны непустые уникальные артикулы товаров.');
+            $seen[$product['offer_id']] = true;
+            foreach (['price', 'old_price'] as $key) {
+                if ($key === 'old_price' && ! array_key_exists($key, $product)) continue;
+                $value = $product[$key] ?? null;
+                $text = is_string($value) || is_int($value) ? (string) $value : (is_float($value) && is_finite($value) ? json_encode($value, JSON_THROW_ON_ERROR) : null);
+                if (! is_string($text) || strlen($text) > 64 || ! preg_match('/^[0-9]+(?:\.[0-9]{1,2})?$/D', $text) || $key === 'price' && ! preg_match('/[1-9]/', $text)) throw new \InvalidArgumentException('Нужна явная положительная цена товара; старая цена при наличии должна быть точной неотрицательной суммой.');
+                $product[$key] = $text;
+            }
+            if (! is_string($product['currency_code'] ?? null) || ! preg_match('/^[A-Z]{3}$/D', $product['currency_code'])) throw new \InvalidArgumentException('Нужна явная валюта цены товара.');
+            if (array_key_exists('stock', $product)) {
+                if ($warehouseId === null) throw new \InvalidArgumentException('Для явно заданного остатка нужно явно выбрать склад.');
+                $value = $product['stock'];
+                if (! is_int($value) || $value < 0) throw new \InvalidArgumentException('Остаток при наличии должен быть явным неотрицательным целым числом.');
             }
         }
+        unset($product);
+        return $products;
+    }
 
-        $results['success'] = $results['failed'] === 0;
-        return $results;
+    private function unfinishedExport(array $result, array $step): array
+    {
+        $result['status'] = ($step['status'] ?? 'unknown') === 'unknown' ? 'unknown'
+            : ($result['accepted_for_import'] > 0 ? 'partial' : ($step['status'] ?? 'failed'));
+        $result['errors'][] = $step['error'] ?? 'Ozon did not confirm a requested export step';
+        return $result;
     }
 }

@@ -9,6 +9,13 @@ use Illuminate\Support\Facades\Log;
  */
 class AnalyticsApi
 {
+    private string $lastRedemptionStatus = 'unknown';
+
+    public function getRedemptionAnalyticsStatus(): string
+    {
+        return $this->lastRedemptionStatus;
+    }
+
     public function __construct(
         private OzonClient $client
     ) {}
@@ -95,6 +102,7 @@ class AnalyticsApi
         $dateTo = $dateTo ?? $defaultDateTo;
 
         $result = [];
+        $this->lastRedemptionStatus = 'unknown';
         $pageSize = 1000;
         $maxPages = 50; // hard-cap: 50 000 SKU — страхует от зависания при кривом ответе API
 
@@ -103,6 +111,7 @@ class AnalyticsApi
         // сохранённом Premium; отдельную пробу не делаем (лимит 1 запрос/мин, 50/сутки).
         $analytics = new AnalyticsDataClient($this->client);
         if ($analytics->premiumKnown() === false) {
+            $this->lastRedemptionStatus = 'premium_required';
             Log::info('Ozon getRedemptionRateFromAnalytics: не-Premium — analytics-выкуп пропущен (fallback на другой источник)');
 
             return [];
@@ -120,6 +129,7 @@ class AnalyticsApi
                 'offset' => 0,
             ], $maxPages, true, false);
 
+            $this->lastRedemptionStatus = $report['status'];
             if ($report['status'] === 'premium_required') {
                 return [];
             }
@@ -189,6 +199,7 @@ class AnalyticsApi
 
             return $result;
         } catch (\Exception $e) {
+            $this->lastRedemptionStatus = 'error';
             Log::error('Ozon getRedemptionRateFromAnalytics error', [
                 'error' => $e->getMessage(),
                 'partial_count' => count($result),

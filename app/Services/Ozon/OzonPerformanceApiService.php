@@ -189,7 +189,7 @@ class OzonPerformanceApiService
             'to' => $this->toRfc3339End($dateTo),
             'dateFrom' => $dateFrom,
             'dateTo' => $dateTo,
-            'groupBy' => 'NO',
+            'groupBy' => 'NO_GROUP_BY',
         ];
 
         $generate = $this->authorized($accessToken)
@@ -1343,7 +1343,7 @@ class OzonPerformanceApiService
     /**
      * Асинхронный товарный отчёт Ozon Performance API.
      *
-     * POST /api/client/statistics (groupBy=NO) → poll GET /api/client/statistics/{uuid} →
+     * POST /api/client/statistics (groupBy=NO_GROUP_BY) → poll GET /api/client/statistics/{uuid} →
      * скачать отчёт по link (ZIP с одним CSV на кампанию, либо одиночный CSV) → разобрать
      * товарные строки. Это единственный путь, который отдаёт per-SKU клики/показы/CTR/расход/ДРР.
      *
@@ -1446,7 +1446,7 @@ class OzonPerformanceApiService
             'campaigns' => array_values($campaignIds),
             'from' => $this->toRfc3339Start($dateFrom),
             'to' => $this->toRfc3339End($dateTo),
-            'groupBy' => 'NO',
+            'groupBy' => 'NO_GROUP_BY',
         ];
 
         // Лёгкий бэкофф на 429 (rate limit Ozon Performance): одна короткая повторная попытка.

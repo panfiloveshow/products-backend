@@ -670,7 +670,8 @@ class OzonPerformanceApiServiceTest extends TestCase
             }
 
             return in_array('101', $request['campaigns'], true)
-                && ! in_array('900', $request['campaigns'], true);
+                && ! in_array('900', $request['campaigns'], true)
+                && $request['groupBy'] === 'NO_GROUP_BY';
         });
     }
 
@@ -776,7 +777,7 @@ class OzonPerformanceApiServiceTest extends TestCase
                 return false;
             }
 
-            return $request['campaigns'] === ['101'];
+            return $request['campaigns'] === ['101'] && $request['groupBy'] === 'NO_GROUP_BY';
         });
 
         // Отчёт «все товары» заказан с корректными timeBounds.

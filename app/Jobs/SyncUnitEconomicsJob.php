@@ -7,18 +7,21 @@ use App\Services\Wildberries\WildberriesTariffRefresher;
 use App\Services\UnitEconomicsService;
 use App\Domains\Marketplace\MarketplaceFactory;
 use Illuminate\Bus\Queueable;
-use Illuminate\Contracts\Queue\ShouldBeUnique;
+use Illuminate\Contracts\Queue\ShouldBeUniqueUntilProcessing;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
 use Illuminate\Support\Facades\Log;
 
-class SyncUnitEconomicsJob implements ShouldQueue, ShouldBeUnique
+class SyncUnitEconomicsJob implements ShouldQueue, ShouldBeUniqueUntilProcessing
 {
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
 
-    public int $tries = 3;
+    public int $tries = 0;
+    public int $maxExceptions = 3;
+    public bool $failOnTimeout = true;
+    public ?int $requestedAt = null;
     // Крупные магазины (сотни товаров) не укладывались в 600с → таймаут до диспатча кэша,
     // из-за чего товары не появлялись в юнит-экономике. Поднимаем лимит.
     public int $timeout = 1800;
@@ -26,27 +29,48 @@ class SyncUnitEconomicsJob implements ShouldQueue, ShouldBeUnique
     // Джоб диспатчится из трёх мест (кнопка синка, после синка остатков, после хранения) —
     // без uniqueness дубли стакались и по 20+ минут блокировали очередь unit-economics.
     public int $uniqueFor = 3600;
+    public ?string $unitEconomicsRunId = null;
 
     public function uniqueId(): string
     {
-        return (string) $this->integrationId;
+        return $this->integrationId.':'.($this->unitEconomicsRunId ?? 'default');
+    }
+
+    public function middleware(): array
+    {
+        return [(new \Illuminate\Queue\Middleware\WithoutOverlapping('ue-full:'.$this->integrationId))->shared()->expireAfter(1860)->releaseAfter(60)];
+    }
+
+    public function retryUntil(): \DateTimeInterface
+    {
+        return ($this->unitEconomicsRunId ? \App\Models\UnitEconomicsSyncRun::find($this->unitEconomicsRunId)?->deadline_at : null)
+            ?? \Carbon\CarbonImmutable::createFromTimestampUTC($this->requestedAt ?? time())->addHours(6);
     }
 
     public function __construct(
         public int $integrationId,
         public ?string $periodStart = null,
-        public ?string $periodEnd = null
-    ) {}
+        public ?string $periodEnd = null,
+        ?string $unitEconomicsRunId = null
+    ) {
+        $this->unitEconomicsRunId = $unitEconomicsRunId;
+        $this->requestedAt = time();
+        $this->onQueue($unitEconomicsRunId ? config('unit_economics_sync.enrichment_queue') : 'unit-economics');
+    }
 
-    public function handle(UnitEconomicsService $unitEconomicsService): void
+    public function handle(UnitEconomicsService $unitEconomicsService): array
     {
+        if ($this->unitEconomicsRunId) {
+            app(\App\Services\UnitEconomics\UnitEconomicsSyncCoordinator::class)->updateStage($this->unitEconomicsRunId, 'enrichment', 'running');
+        }
+        \App\Services\Ozon\OzonActualRatesService::forgetIntegration($this->integrationId);
         $integration = Integration::find($this->integrationId);
         
         if (!$integration) {
             Log::error('SyncUnitEconomicsJob: Integration not found', [
                 'integration_id' => $this->integrationId
             ]);
-            return;
+            return ['synced' => 0, 'errors' => 0, 'status' => 'skipped', 'reason' => 'integration_missing'];
         }
         
         Log::info('SyncUnitEconomicsJob started', [
@@ -123,7 +147,11 @@ class SyncUnitEconomicsJob implements ShouldQueue, ShouldBeUnique
                 $localizationIndex
             );
 
-            Log::info('SyncUnitEconomicsJob completed', [
+            $status = $result['status'] ?? ($result['errors'] > 0 ? ($result['synced'] > 0 ? 'partial' : 'failed') : 'completed');
+            if ($status === 'failed') {
+                throw new \RuntimeException('Unit economics synchronization failed for '.$result['errors'].' SKU(s)');
+            }
+            Log::log($status === 'partial' ? 'warning' : 'info', 'SyncUnitEconomicsJob '.$status, [
                 'integration_id' => $this->integrationId,
                 'synced' => $result['synced'],
                 'errors' => $result['errors'],
@@ -131,8 +159,17 @@ class SyncUnitEconomicsJob implements ShouldQueue, ShouldBeUnique
             ]);
             
             // Запускаем пересчёт кэша ПОСЛЕ завершения синхронизации UnitEconomics
-            RecalculateUnitEconomicsCacheJob::dispatch($this->integrationId)
+            if ($this->unitEconomicsRunId) {
+                app(\App\Services\UnitEconomics\UnitEconomicsSyncCoordinator::class)->updateStage($this->unitEconomicsRunId, 'enrichment', 'running', [
+                    'source_status' => $status, 'source_errors' => $result['source_errors'] ?? 0,
+                    'error_code' => ($result['source_errors'] ?? 0) > 0 ? 'source_data_incomplete' : (($result['errors'] ?? 0) > 0 ? 'sku_sync_failed' : null),
+                    'total' => $result['total'] ?? 0,
+                    'succeeded' => $result['succeeded'] ?? 0, 'failed' => $result['errors'] ?? 0]);
+            }
+            RecalculateUnitEconomicsCacheJob::dispatch($this->integrationId, $this->unitEconomicsRunId)
                 ->onQueue('unit-economics');
+
+            return $result;
             
         } catch (\Exception $e) {
             Log::error('SyncUnitEconomicsJob failed', [
@@ -152,6 +189,9 @@ class SyncUnitEconomicsJob implements ShouldQueue, ShouldBeUnique
      */
     public function failed(\Throwable $exception): void
     {
+        if ($this->unitEconomicsRunId) {
+            app(\App\Services\UnitEconomics\UnitEconomicsSyncCoordinator::class)->updateStage($this->unitEconomicsRunId, 'enrichment', 'failed', ['error_code' => 'enrichment_failed']);
+        }
         Log::warning('SyncUnitEconomicsJob failed; dispatching cache rebuild anyway', [
             'integration_id' => $this->integrationId,
             'error' => $exception->getMessage(),

@@ -4,6 +4,7 @@ namespace Tests\Unit;
 
 use App\Models\Integration;
 use App\Services\Ozon\OzonCredentialHealthService;
+use App\Services\SellicoApiService;
 use Illuminate\Foundation\Testing\LazilyRefreshDatabase;
 use Illuminate\Support\Facades\Http;
 use Tests\TestCase;
@@ -135,6 +136,10 @@ class OzonCredentialHealthServiceTest extends TestCase
     {
         Http::preventStrayRequests();
         Http::fake(['*' => Http::response([], 200)]);
+        // The central resolver also has no credentials for this integration.
+        // Keep this Ozon-probe test independent of local Sellico configuration.
+        $this->mock(SellicoApiService::class)
+            ->shouldReceive('getIntegrationById')->andReturn(['success' => false]);
 
         $integration = Integration::factory()->ozon()->create([
             'id' => random_int(100000, 999999),

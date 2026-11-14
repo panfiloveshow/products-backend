@@ -147,6 +147,26 @@ class OzonAutoSupplyPlanCalculationPipelineTest extends TestCase
         $this->assertSame(64, strlen((string) $snapshot->summary_json['params_hash']));
     }
 
+    public function test_manager_explicit_lead_and_zero_safety_days_are_applied_without_changing_legacy_settings(): void
+    {
+        $integration = $this->seedOzonFacts(volatileDemand: true);
+        SupplySettings::updateOrCreate(['integration_id' => $integration->id], ['default_lead_time_days' => 9, 'safety_stock_days' => 5]);
+        $plan = $this->runCalculation($integration, ['manager_parameter_version' => 'manager_parameters_v1', 'lead_time_days' => 4, 'safety_days' => 0],
+            ['horizon_days' => 90, 'max_cover_days' => 90]);
+        $this->assertSame('ready', $plan->status, (string) $plan->error_message);
+        $this->assertSame(4, (int) $plan->effective_params_json['lead_time_days']);
+        $this->assertSame(0, (int) $plan->effective_params_json['safety_stock_days']);
+        $this->assertSame('manager_explicit_parameters', $plan->effective_params_json['lead_time_source']);
+        $this->assertSame('manager_explicit_parameters', $plan->effective_params_json['safety_stock_source']);
+        $this->assertSame(4, (int) $this->explainOf($plan, 'SKU-A')['inputs']['lead_time_days']);
+        $this->assertSame(9, (int) SupplySettings::where('integration_id', $integration->id)->value('default_lead_time_days'));
+        $this->assertSame(5, (int) SupplySettings::where('integration_id', $integration->id)->value('safety_stock_days'));
+
+        $legacy = $this->runCalculation($integration, ['lead_time_days' => 4, 'safety_days' => 0]);
+        $this->assertSame(9, (int) $legacy->effective_params_json['lead_time_days']);
+        $this->assertSame(5, (int) $legacy->effective_params_json['safety_stock_days']);
+    }
+
     public function test_budget_limit_is_never_exceeded(): void
     {
         $integration = $this->seedOzonFacts();
@@ -212,6 +232,10 @@ class OzonAutoSupplyPlanCalculationPipelineTest extends TestCase
         $this->assertSame(AutoSupplyPlan::STATUS_READY, $plan->status);
         $this->assertSame(0, (int) $plan->total_lines);
         $this->assertNull($plan->error_message);
+        $snapshot = PlanningFactSnapshot::where('auto_supply_plan_id', $plan->id)->firstOrFail();
+        $this->assertSame('ready', $snapshot->status);
+        $this->assertSame('no_local_inventory_rows', $snapshot->summary_json['input_status']);
+        $this->assertSame([], $snapshot->planning_sources_json);
     }
 
     private function seedOzonFacts(bool $volatileDemand = false): Integration

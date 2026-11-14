@@ -21,6 +21,8 @@ class UnitEconomicsSettings extends Model
 
     protected $table = 'unit_economics_settings';
 
+    protected $hidden = ['explicit_cost_price'];
+
     protected $fillable = [
         'integration_id',
         'sku',
@@ -43,6 +45,7 @@ class UnitEconomicsSettings extends Model
 
     protected $casts = [
         'cost_price' => 'decimal:2',
+        'explicit_cost_price' => 'decimal:2',
         'return_fee' => 'decimal:2',
         'drr_percent' => 'decimal:2',
         'our_share_percent' => 'decimal:2',
@@ -59,6 +62,23 @@ class UnitEconomicsSettings extends Model
         'is_select_only' => 'boolean',
         'is_size_restricted' => 'boolean',
     ];
+
+    public function setCostPriceAttribute($value): void
+    {
+        $this->attributes['cost_price'] = $value;
+        // Old forms/imports retain their zero-as-missing contract, including
+        // an explicit reset to the same numeric zero. Do not introduce the
+        // new column into writes before its migration has run.
+        if (array_key_exists('explicit_cost_price', $this->attributes)) {
+            $this->attributes['explicit_cost_price'] = null;
+        }
+    }
+
+    public function hasExplicitCostPrice(): bool
+    {
+        return $this->cost_price !== null && $this->explicit_cost_price !== null
+            && (float) $this->cost_price >= 0 && $this->cost_price === $this->explicit_cost_price;
+    }
 
     /**
      * Интеграция

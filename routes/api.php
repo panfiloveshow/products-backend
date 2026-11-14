@@ -44,6 +44,167 @@ Route::get('/health', fn () => response()->json([
     'time' => now()->toIso8601String(),
 ]))->name('health');
 
+// Fresh CRM authorization on every call, including in development. These routes
+// only read prices and calculate a scenario; they cannot enqueue a price upload.
+Route::get('manager/supply-plans', [\App\Http\Controllers\Api\ManagerSupplyPlanController::class, 'index'])
+    ->middleware(\App\Http\Middleware\CheckManagerAccess::class.':auto_supply.view,integrations.view');
+Route::get('manager/supply-destination-catalog', [\App\Http\Controllers\Api\ManagerSupplyDestinationCatalogController::class, 'show'])
+    ->middleware(\App\Http\Middleware\CheckManagerAccess::class.':auto_supply.view,integrations.view');
+Route::get('manager/supply-planning-context', [\App\Http\Controllers\Api\ManagerSupplyPlanningContextController::class, 'show'])
+    ->middleware(\App\Http\Middleware\CheckManagerAccess::class.':auto_supply.view,integrations.view');
+Route::post('manager/supply-calculations/prepare', [\App\Http\Controllers\Api\ManagerSupplyCalculationController::class, 'prepare'])
+    ->middleware(\App\Http\Middleware\CheckManagerAccess::class.':auto_supply.view,integrations.view,auto_supply.create');
+Route::prefix('manager/supply-calculations')->middleware(\App\Http\Middleware\CheckManagerAccess::class.':auto_supply.view,integrations.view')->group(function () {
+    Route::get('/{id}', [\App\Http\Controllers\Api\ManagerSupplyCalculationController::class, 'show']);
+    Route::post('/{id}/approve', [\App\Http\Controllers\Api\ManagerSupplyCalculationController::class, 'approve']);
+    Route::post('/{id}/cancel', [\App\Http\Controllers\Api\ManagerSupplyCalculationController::class, 'cancel']);
+});
+Route::get('manager/supply-plans/detail', [\App\Http\Controllers\Api\ManagerSupplyPlanController::class, 'show'])
+    ->middleware(\App\Http\Middleware\CheckManagerAccess::class.':auto_supply.view,integrations.view');
+Route::get('manager/prices/context', [\App\Http\Controllers\Api\ManagerPriceController::class, 'context'])
+    ->middleware(\App\Http\Middleware\CheckManagerAccess::class.':products.view,marketing.view,unit_economics.view');
+Route::post('manager/financial-settings/prepare', [\App\Http\Controllers\Api\ManagerFinancialSettingsController::class, 'prepare'])
+    ->middleware(\App\Http\Middleware\CheckManagerAccess::class.':products.view,unit_economics.view,unit_economics.settings.edit');
+Route::prefix('manager/financial-settings')->middleware(\App\Http\Middleware\CheckManagerAccess::class.':products.view,unit_economics.view')->group(function () {
+    Route::get('/{id}', [\App\Http\Controllers\Api\ManagerFinancialSettingsController::class, 'show']);
+    Route::post('/{id}/approve', [\App\Http\Controllers\Api\ManagerFinancialSettingsController::class, 'approve']);
+    Route::post('/{id}/cancel', [\App\Http\Controllers\Api\ManagerFinancialSettingsController::class, 'cancel']);
+});
+Route::post('manager/prices/simulate', [\App\Http\Controllers\Api\ManagerPriceController::class, 'simulate'])
+    ->middleware(\App\Http\Middleware\CheckManagerAccess::class.':products.view,marketing.view,unit_economics.view,unit_economics.calculate');
+Route::post('manager/price-proposals/prepare', [\App\Http\Controllers\Api\ManagerPriceProposalController::class, 'prepare'])
+    ->middleware(\App\Http\Middleware\CheckManagerAccess::class.':products.view,marketing.view,unit_economics.view,unit_economics.calculate');
+Route::prefix('manager/price-proposals')->middleware(\App\Http\Middleware\CheckManagerAccess::class.':products.view,marketing.view,unit_economics.view')->group(function () {
+    Route::post('{id}/approve', [\App\Http\Controllers\Api\ManagerPriceProposalController::class, 'approve']);
+    Route::post('{id}/reconcile', [\App\Http\Controllers\Api\ManagerPriceProposalController::class, 'reconcile']);
+    Route::post('{id}/validate-execution', [\App\Http\Controllers\Api\ManagerPriceProposalController::class, 'validateExecution']);
+    Route::get('/{id}', [\App\Http\Controllers\Api\ManagerPriceProposalController::class, 'show']);
+    Route::post('/{id}/cancel', [\App\Http\Controllers\Api\ManagerPriceProposalController::class, 'cancel']);
+    Route::post('/{id}/recheck', [\App\Http\Controllers\Api\ManagerPriceProposalController::class, 'recheck']);
+});
+Route::prefix('manager/fbs-execution-controls')->middleware(\App\Http\Middleware\CheckManagerAccess::class.':auto_supply.view,integrations.view')->group(function () {
+    Route::get('context', [\App\Http\Controllers\Api\ManagerFbsExecutionControlController::class, 'context']);
+    Route::post('prepare', [\App\Http\Controllers\Api\ManagerFbsExecutionControlController::class, 'prepare']);
+    Route::get('{operation}', [\App\Http\Controllers\Api\ManagerFbsExecutionControlController::class, 'show'])->whereUuid('operation');
+    Route::post('{operation}/approve', [\App\Http\Controllers\Api\ManagerFbsExecutionControlController::class, 'approve'])->whereUuid('operation');
+    Route::post('{operation}/cancel', [\App\Http\Controllers\Api\ManagerFbsExecutionControlController::class, 'cancel'])->whereUuid('operation');
+});
+Route::get('manager/fbs/queue', [\App\Http\Controllers\Api\ManagerFbsController::class, 'index'])
+    ->middleware(\App\Http\Middleware\CheckManagerAccess::class.':auto_supply.view,integrations.view');
+Route::prefix('manager/wb-supplies')->middleware(\App\Http\Middleware\CheckManagerAccess::class.':auto_supply.view,integrations.view')->group(function () {
+    Route::post('document/context', [\App\Http\Controllers\Api\ManagerWbSupplyController::class, 'documentContext']);
+    Route::post('document/download', [\App\Http\Controllers\Api\ManagerWbSupplyController::class, 'downloadDocument']);
+    Route::get('list', [\App\Http\Controllers\Api\ManagerWbSupplyController::class, 'listing']);
+    Route::post('points', [\App\Http\Controllers\Api\ManagerWbSupplyController::class, 'points']);
+    Route::post('context', [\App\Http\Controllers\Api\ManagerWbSupplyController::class, 'context']);
+    Route::post('prepare', [\App\Http\Controllers\Api\ManagerWbSupplyController::class, 'prepare']);
+    Route::get('{operation}', [\App\Http\Controllers\Api\ManagerWbSupplyController::class, 'show'])->whereUuid('operation');
+    Route::post('{operation}/approve', [\App\Http\Controllers\Api\ManagerWbSupplyController::class, 'approve'])->whereUuid('operation');
+    Route::post('{operation}/cancel', [\App\Http\Controllers\Api\ManagerWbSupplyController::class, 'cancel'])->whereUuid('operation');
+    Route::post('{operation}/reconcile', [\App\Http\Controllers\Api\ManagerWbSupplyController::class, 'reconcile'])->whereUuid('operation');
+});
+
+Route::prefix('manager/ozon-packing')->middleware(\App\Http\Middleware\CheckManagerAccess::class.':auto_supply.view,integrations.view')->group(function () {
+    Route::post('context', [\App\Http\Controllers\Api\ManagerOzonPackingController::class, 'context']);
+    Route::post('prepare', [\App\Http\Controllers\Api\ManagerOzonPackingController::class, 'prepare']);
+    Route::post('one-package/context', [\App\Http\Controllers\Api\ManagerOzonPackingController::class, 'onePackageContext']);
+    Route::post('one-package/prepare', [\App\Http\Controllers\Api\ManagerOzonPackingController::class, 'prepareOnePackage']);
+    Route::get('{operation}', [\App\Http\Controllers\Api\ManagerOzonPackingController::class, 'show'])->whereUuid('operation');
+    Route::post('{operation}/approve', [\App\Http\Controllers\Api\ManagerOzonPackingController::class, 'approve'])->whereUuid('operation');
+    Route::post('{operation}/cancel', [\App\Http\Controllers\Api\ManagerOzonPackingController::class, 'cancel'])->whereUuid('operation');
+    Route::post('{operation}/reconcile', [\App\Http\Controllers\Api\ManagerOzonPackingController::class, 'reconcile'])->whereUuid('operation');
+});
+
+Route::get('manager/supply-input-health', [\App\Http\Controllers\Api\ManagerSupplyInputHealthController::class, 'read'])
+    ->middleware(\App\Http\Middleware\CheckManagerAccess::class.':auto_supply.view,integrations.view');
+
+Route::get('manager/supply-handoff-context', [\App\Http\Controllers\Api\ManagerSupplyHandoffContextController::class, 'read'])
+    ->middleware(\App\Http\Middleware\CheckManagerAccess::class.':auto_supply.view,integrations.view');
+
+Route::prefix('manager/ozon-fbo')->middleware(\App\Http\Middleware\CheckManagerAccess::class.':auto_supply.view,integrations.view')->group(function () {
+    Route::post('context', [\App\Http\Controllers\Api\ManagerOzonFboController::class, 'context']);
+    Route::post('prepare', [\App\Http\Controllers\Api\ManagerOzonFboController::class, 'prepare']);
+    Route::get('{operation}', [\App\Http\Controllers\Api\ManagerOzonFboController::class, 'show'])->whereUuid('operation');
+    Route::get('{operation}/availability', [\App\Http\Controllers\Api\ManagerOzonFboController::class, 'availability'])->whereUuid('operation');
+    Route::post('{operation}/slots', [\App\Http\Controllers\Api\ManagerOzonFboController::class, 'slots'])->whereUuid('operation');
+    Route::post('{operation}/approve', [\App\Http\Controllers\Api\ManagerOzonFboController::class, 'approve'])->whereUuid('operation');
+    Route::post('{operation}/cancel', [\App\Http\Controllers\Api\ManagerOzonFboController::class, 'cancel'])->whereUuid('operation');
+    Route::post('{operation}/reconcile', [\App\Http\Controllers\Api\ManagerOzonFboController::class, 'reconcile'])->whereUuid('operation');
+});
+
+Route::prefix('manager/ozon-carriages')->middleware(\App\Http\Middleware\CheckManagerAccess::class.':auto_supply.view,integrations.view')->group(function () {
+    Route::get('methods', [\App\Http\Controllers\Api\ManagerOzonCarriageController::class, 'methods']);
+    Route::get('context', [\App\Http\Controllers\Api\ManagerOzonCarriageController::class, 'context']);
+    Route::post('prepare', [\App\Http\Controllers\Api\ManagerOzonCarriageController::class, 'prepare']);
+    Route::get('{operation}', [\App\Http\Controllers\Api\ManagerOzonCarriageController::class, 'show'])->whereUuid('operation');
+    Route::post('{operation}/approve', [\App\Http\Controllers\Api\ManagerOzonCarriageController::class, 'approve'])->whereUuid('operation');
+    Route::post('{operation}/cancel', [\App\Http\Controllers\Api\ManagerOzonCarriageController::class, 'cancel'])->whereUuid('operation');
+    Route::post('{operation}/reconcile', [\App\Http\Controllers\Api\ManagerOzonCarriageController::class, 'reconcile'])->whereUuid('operation');
+});
+Route::get('manager/fbs/ozon/shipments', [\App\Http\Controllers\Api\ManagerOzonShipmentDocumentController::class, 'index'])
+    ->middleware(\App\Http\Middleware\CheckManagerAccess::class.':auto_supply.view,integrations.view');
+Route::get('manager/fbs/ozon/shipment-document/context', [\App\Http\Controllers\Api\ManagerOzonShipmentDocumentController::class, 'prepare'])
+    ->middleware(\App\Http\Middleware\CheckManagerAccess::class.':auto_supply.view,auto_supply.export,integrations.view');
+Route::post('manager/fbs/ozon/shipment-document/download', [\App\Http\Controllers\Api\ManagerOzonShipmentDocumentController::class, 'download'])
+    ->middleware(\App\Http\Middleware\CheckManagerAccess::class.':auto_supply.view,auto_supply.export,integrations.view');
+Route::get('manager/fbs/label/context', [\App\Http\Controllers\Api\ManagerFbsDocumentController::class, 'prepare'])
+    ->middleware(\App\Http\Middleware\CheckManagerAccess::class.':auto_supply.view,auto_supply.export,integrations.view');
+Route::post('manager/fbs/label/download', [\App\Http\Controllers\Api\ManagerFbsDocumentController::class, 'download'])
+    ->middleware(\App\Http\Middleware\CheckManagerAccess::class.':auto_supply.view,auto_supply.export,integrations.view');
+Route::get('manager/fbs/cancellation-context', [\App\Http\Controllers\Api\ManagerFbsOperationController::class, 'cancellationContext'])
+    ->middleware(\App\Http\Middleware\CheckManagerAccess::class.':auto_supply.view,integrations.view');
+Route::post('manager/fbs/prepare-cancellation', [\App\Http\Controllers\Api\ManagerFbsOperationController::class, 'prepareCancellation'])
+    ->middleware(\App\Http\Middleware\CheckManagerAccess::class.':auto_supply.view,auto_supply.create,integrations.view');
+Route::post('manager/fbs/prepare', [\App\Http\Controllers\Api\ManagerFbsOperationController::class, 'prepare'])
+    ->middleware(\App\Http\Middleware\CheckManagerAccess::class.':auto_supply.view,integrations.view,auto_supply.create');
+Route::prefix('manager/fbs-operations')->middleware(\App\Http\Middleware\CheckManagerAccess::class.':auto_supply.view,integrations.view')->group(function () {
+    Route::get('unknown', [\App\Http\Controllers\Api\ManagerFbsRecoveryController::class, 'unknown']);
+    Route::post('{operation}/resolution/prepare', [\App\Http\Controllers\Api\ManagerFbsRecoveryController::class, 'prepareResolution'])
+        ->whereUuid('operation')
+        ->middleware(\App\Http\Middleware\CheckManagerAccess::class.':auto_supply.view,integrations.view,auto_supply.create');
+    Route::get('{operation}/resolution/{resolution}', [\App\Http\Controllers\Api\ManagerFbsRecoveryController::class, 'showResolution'])
+        ->whereUuid(['operation', 'resolution']);
+    Route::post('{operation}/resolution/{resolution}/approve', [\App\Http\Controllers\Api\ManagerFbsRecoveryController::class, 'approveResolution'])
+        ->whereUuid(['operation', 'resolution'])
+        ->middleware(\App\Http\Middleware\CheckManagerAccess::class.':auto_supply.view,integrations.view,auto_supply.create');
+    Route::post('{operation}/resolution/{resolution}/cancel', [\App\Http\Controllers\Api\ManagerFbsRecoveryController::class, 'cancelResolution'])
+        ->whereUuid(['operation', 'resolution']);
+    Route::get('{operation}', [\App\Http\Controllers\Api\ManagerFbsOperationController::class, 'show'])->whereUuid('operation');
+    Route::post('{operation}/approve', [\App\Http\Controllers\Api\ManagerFbsOperationController::class, 'approve'])->whereUuid('operation');
+    Route::post('{operation}/cancel', [\App\Http\Controllers\Api\ManagerFbsOperationController::class, 'cancel'])->whereUuid('operation');
+    Route::post('{operation}/reconcile', [\App\Http\Controllers\Api\ManagerFbsOperationController::class, 'reconcile'])->whereUuid('operation');
+});
+
+Route::get('manager/fbs-complex-context', [\App\Http\Controllers\Api\ManagerFbsRecoveryController::class, 'complexContext'])
+    ->middleware(\App\Http\Middleware\CheckManagerAccess::class.':auto_supply.view,integrations.view');
+
+Route::prefix('manager/ozon-fbo-operations')->middleware(\App\Http\Middleware\CheckManagerAccess::class.':auto_supply.view,integrations.view')->group(function () {
+    Route::get('unknown', [\App\Http\Controllers\Api\ManagerOzonFboRecoveryController::class, 'unknown']);
+    Route::post('{operation}/resolution/prepare', [\App\Http\Controllers\Api\ManagerOzonFboRecoveryController::class, 'prepareResolution'])
+        ->whereUuid('operation')
+        ->middleware(\App\Http\Middleware\CheckManagerAccess::class.':auto_supply.view,integrations.view,auto_supply.create');
+    Route::get('{operation}/resolution/{resolution}', [\App\Http\Controllers\Api\ManagerOzonFboRecoveryController::class, 'showResolution'])
+        ->whereUuid(['operation', 'resolution']);
+    Route::post('{operation}/resolution/{resolution}/approve', [\App\Http\Controllers\Api\ManagerOzonFboRecoveryController::class, 'approveResolution'])
+        ->whereUuid(['operation', 'resolution'])
+        ->middleware(\App\Http\Middleware\CheckManagerAccess::class.':auto_supply.view,integrations.view,auto_supply.create');
+    Route::post('{operation}/resolution/{resolution}/cancel', [\App\Http\Controllers\Api\ManagerOzonFboRecoveryController::class, 'cancelResolution'])
+        ->whereUuid(['operation', 'resolution']);
+});
+
+Route::get('manager/fbo-scheme-handoff/context', [\App\Http\Controllers\Api\ManagerOzonFboRecoveryController::class, 'schemeHandoffContext'])
+    ->middleware(\App\Http\Middleware\CheckManagerAccess::class.':auto_supply.view,integrations.view');
+
+Route::prefix('manager/promotions')->middleware(\App\Http\Middleware\CheckManagerAccess::class.':products.view,marketing.view,unit_economics.view')->group(function () {
+    Route::get('/', [\App\Http\Controllers\Api\ManagerPromotionController::class, 'index']);
+    Route::get('candidate-context', [\App\Http\Controllers\Api\ManagerPromotionController::class, 'candidateContext']);
+    Route::post('proposals/prepare', [\App\Http\Controllers\Api\ManagerPromotionController::class, 'prepare'])
+        ->middleware(\App\Http\Middleware\CheckManagerAccess::class.':products.view,marketing.view,unit_economics.view,unit_economics.calculate');
+    Route::get('proposals/{id}', [\App\Http\Controllers\Api\ManagerPromotionController::class, 'show']);
+    Route::post('proposals/{id}/approve', [\App\Http\Controllers\Api\ManagerPromotionController::class, 'approve']);
+    Route::post('proposals/{id}/cancel', [\App\Http\Controllers\Api\ManagerPromotionController::class, 'cancel']);
+});
+
 Route::prefix('integrations')->middleware('sellico.permission')->group(function () {
     Route::get('/', [IntegrationController::class, 'index'])->name('integrations.index');
     Route::get('/{id}/premium-status', [IntegrationController::class, 'getPremiumStatus'])->name('integrations.premiumStatus');

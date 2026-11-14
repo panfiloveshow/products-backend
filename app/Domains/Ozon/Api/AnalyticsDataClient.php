@@ -53,7 +53,7 @@ class AnalyticsDataClient
      *   Премиум-метрики уходят в запрос только при true.
      * @param  bool  $basicFallback  при отказе 400/403 на премиум-метриках повторить с базовыми.
      * @return array{rows: list<array{dimensions: array, metrics: array<string, float>}>, metrics: list<string>, status: string}
-     *   status: ok | premium_required | rate_limited | error
+     *   status: ok | partial | premium_required | rate_limited | error
      */
     public function fetch(array $body, int $maxPages = 1, ?bool $premium = null, bool $basicFallback = true): array
     {
@@ -116,7 +116,10 @@ class AnalyticsDataClient
                 return ['rows' => $rows, 'metrics' => $metrics, 'status' => 'error'];
             }
 
-            $data = $response['result']['data'] ?? [];
+            $data = $response['result']['data'] ?? null;
+            if (!is_array($data)) {
+                return ['rows' => $rows, 'metrics' => $metrics, 'status' => 'error'];
+            }
             foreach ($data as $row) {
                 $values = array_values((array) ($row['metrics'] ?? []));
                 $named = [];
@@ -127,12 +130,12 @@ class AnalyticsDataClient
             }
 
             if (count($data) < $limit) {
-                break;
+                return ['rows' => $rows, 'metrics' => $metrics, 'status' => 'ok'];
             }
             $body['offset'] += $limit;
         }
 
-        return ['rows' => $rows, 'metrics' => $metrics, 'status' => 'ok'];
+        return ['rows' => $rows, 'metrics' => $metrics, 'status' => 'partial'];
     }
 
     private function withMetrics(array $body, array $metrics): array

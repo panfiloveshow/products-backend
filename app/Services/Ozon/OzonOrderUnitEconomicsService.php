@@ -33,6 +33,7 @@ class OzonOrderUnitEconomicsService
     public function syncForIntegration(int $integrationId, ?Carbon $since = null): Collection
     {
         $rows = collect();
+        $sellerFboSales7Days = $this->localityService->countSellerFboOrders7Days($integrationId);
 
         // Каждый чанк оборачиваем в DB::transaction — гарантия атомарности
         // per-chunk: если chunkN упадёт на item'е #57, первые 56 откатятся,
@@ -41,21 +42,24 @@ class OzonOrderUnitEconomicsService
         // tariff_version_used, половина оставалась со старыми, и
         // LocalityAggregator потом брал микс.
         Posting::query()
-            ->with(['items', 'items.product'])
+            ->with(['items', 'items.product' => fn ($query) => $query->where('integration_id', $integrationId)])
             ->where('integration_id', $integrationId)
             ->where('marketplace', 'ozon')
             ->when($since !== null, fn ($q) => $q->where('synced_at', '>=', $since))
-            ->chunk(100, function ($postings) use (&$rows): void {
-                \DB::transaction(function () use ($postings, &$rows): void {
+            ->chunk(100, function ($postings) use (&$rows, $sellerFboSales7Days): void {
+                $committed = \DB::transaction(function () use ($postings, $sellerFboSales7Days): Collection {
+                    $chunkRows = collect();
                     foreach ($postings as $posting) {
                         foreach ($posting->items as $item) {
-                            $row = $this->upsertForPostingItem($posting, $item);
+                            $row = $this->upsertForPostingItem($posting, $item, $sellerFboSales7Days);
                             if ($row !== null) {
-                                $rows->push($row);
+                                $chunkRows->push($row);
                             }
                         }
                     }
-                });
+                    return $chunkRows;
+                }, 5);
+                $rows = $rows->merge($committed);
             });
 
         return $rows;
@@ -91,17 +95,20 @@ class OzonOrderUnitEconomicsService
         return $summary;
     }
 
-    public function upsertForPostingItem(Posting $posting, PostingItem $item): ?OzonOrderUnitEconomics
+    public function upsertForPostingItem(Posting $posting, PostingItem $item, ?int $sellerFboSales7Days = null): ?OzonOrderUnitEconomics
     {
         $sku = (string) ($item->sku ?: $item->offer_id ?: '');
         if ($sku === '') {
             return null;
         }
 
-        $product = $item->product ?: Product::query()
-            ->where('integration_id', $posting->integration_id)
-            ->where('sku', $sku)
-            ->first();
+        $product = $item->product;
+        if ($product === null || (int) $product->integration_id !== (int) $posting->integration_id) {
+            $product = Product::query()
+                ->where('integration_id', $posting->integration_id)
+                ->where('sku', $sku)
+                ->first();
+        }
 
         $volumeLiters = $this->resolveVolumeLiters($item, $product);
         $orderDate = $this->resolveOrderDate($posting);
@@ -139,7 +146,8 @@ class OzonOrderUnitEconomicsService
             $effectiveShippingClusterName,
             $destinationClusterName,
             (float) ($item->price ?? 0),
-            $pricingDate
+            $pricingDate,
+            $sellerFboSales7Days
         );
 
         $markupPercent = $markupApplied ? (float) $clusterLogistics['non_local_markup_percent'] : 0.0;
@@ -335,7 +343,8 @@ class OzonOrderUnitEconomicsService
         ?string $shippingClusterName,
         ?string $destinationClusterName,
         float $price,
-        ?string $pricingDate = null
+        ?string $pricingDate = null,
+        ?int $sellerFboSales7Days = null
     ): array {
         if ($posting->status === Posting::STATUS_CANCELLED || $posting->cancelled_at !== null) {
             return [false, 'cancelled_order', 'Надбавка не применяется: заказ отменён', 'confirmed'];
@@ -350,7 +359,7 @@ class OzonOrderUnitEconomicsService
         }
 
         // Seller-level total FBO sales in 7 days (Ozon rule applies per-seller, not per-SKU)
-        $sellerFboSales7Days = $this->localityService->countSellerFboOrders7Days((int) $posting->integration_id);
+        $sellerFboSales7Days ??= $this->localityService->countSellerFboOrders7Days((int) $posting->integration_id);
 
         if ($sellerFboSales7Days < 50) {
             return [false, 'fbo_lt_50_orders_7d', 'Надбавка не применяется: за 7 дней по FBO меньше 50 заказов', 'confirmed'];

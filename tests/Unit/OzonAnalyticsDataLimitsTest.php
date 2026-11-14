@@ -44,6 +44,22 @@ class OzonAnalyticsDataLimitsTest extends TestCase
         return ['dimensions' => [['id' => $sku, 'name' => '']], 'metrics' => $metrics];
     }
 
+    public function test_successful_empty_redemption_analytics_is_distinct_from_an_api_failure(): void
+    {
+        Http::fake(['*/v1/analytics/data' => Http::response(['result' => ['data' => []]])]);
+        $api = new AnalyticsApi($this->client());
+        $this->assertSame([], $api->getRedemptionRateFromAnalytics());
+        $this->assertSame('ok', $api->getRedemptionAnalyticsStatus());
+    }
+
+    public function test_rate_limited_redemption_analytics_is_not_reported_as_successful_no_sales(): void
+    {
+        Http::fake(['*/v1/analytics/data' => Http::response(['message' => 'limited'], 429)]);
+        $api = new AnalyticsApi($this->client());
+        $this->assertSame([], $api->getRedemptionRateFromAnalytics());
+        $this->assertSame('rate_limited', $api->getRedemptionAnalyticsStatus());
+    }
+
     public function test_pages_are_spaced_by_a_minute_and_metrics_parsed_by_name(): void
     {
         Http::fakeSequence('*/v1/analytics/data')
@@ -111,6 +127,24 @@ class OzonAnalyticsDataLimitsTest extends TestCase
 
         $this->assertSame('rate_limited', $report['status']);
         Http::assertSentCount(1);
+    }
+
+    public function test_exhausting_page_budget_does_not_claim_a_complete_report(): void
+    {
+        Http::fake(['*/v1/analytics/data' => Http::response(['result' => ['data' => [$this->row('1', [2])]]])]);
+        $report = (new AnalyticsDataClient($this->client()))->fetch([
+            'date_from' => '2026-09-01', 'date_to' => '2026-09-21',
+            'metrics' => ['ordered_units'], 'dimension' => ['sku'], 'limit' => 1,
+        ], 1);
+        $this->assertSame('partial', $report['status']);
+        $this->assertCount(1, $report['rows']);
+    }
+
+    public function test_malformed_response_is_not_a_successful_empty_report(): void
+    {
+        Http::fake(['*/v1/analytics/data' => Http::response(['unexpected' => []])]);
+        $report = (new AnalyticsDataClient($this->client()))->fetch(['metrics' => ['ordered_units']]);
+        $this->assertSame('error', $report['status']);
     }
 
     public function test_premium_check_caches_rejection_for_a_day(): void

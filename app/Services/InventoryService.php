@@ -352,16 +352,26 @@ class InventoryService
         string $marketplace,
         array $credentials = [],
         ?int $integrationId = null,
-        ?int $dispatchDelaySeconds = null
+        ?int $dispatchDelaySeconds = null,
+        ?string $unitEconomicsRunId = null
     ): SyncLog {
         $lock = Cache::lock(
             SyncStartGuard::cacheLockKey('inventory', $marketplace, $integrationId),
             120
         );
 
-        return $lock->block(15, function () use ($marketplace, $credentials, $integrationId, $dispatchDelaySeconds) {
+        return $lock->block(15, function () use ($marketplace, $credentials, $integrationId, $dispatchDelaySeconds, $unitEconomicsRunId) {
+            $coordinator = app(\App\Services\UnitEconomics\UnitEconomicsSyncCoordinator::class);
+            $integration = $integrationId ? \App\Models\Integration::find($integrationId) : null;
+            if (! $unitEconomicsRunId && $integration && in_array($marketplace, ['wildberries', 'ozon'], true) && $coordinator->enabled($integrationId)) {
+                $stages = ['inventory', 'prices', 'projection', 'enrichment', ...($marketplace === 'wildberries' ? ['finance'] : [])];
+                $unitEconomicsRunId = $coordinator->start($integration, 'full', $stages)->id;
+            }
             $existingSync = SyncStartGuard::findActiveDuplicate('inventory', $marketplace, $integrationId);
             if ($existingSync) {
+                if ($unitEconomicsRunId) {
+                    $coordinator->attachLog($existingSync, $unitEconomicsRunId);
+                }
                 return $existingSync;
             }
 
@@ -371,7 +381,12 @@ class InventoryService
                 'sync_type' => 'inventory',
                 'status' => SyncLog::STATUS_PENDING,
                 'credentials' => $credentials,
+                'metadata' => $unitEconomicsRunId ? ['unit_economics_run_id' => $unitEconomicsRunId,
+                    'queue_available_at' => now()->addSeconds(max(0, (int) $dispatchDelaySeconds))->utc()->toIso8601String()] : null,
             ]);
+            if ($unitEconomicsRunId) {
+                $coordinator->logStage($syncLog);
+            }
 
             $pending = SyncInventoryJob::dispatch($syncLog);
             if ($dispatchDelaySeconds !== null && $dispatchDelaySeconds > 0) {

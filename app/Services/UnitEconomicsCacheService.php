@@ -22,6 +22,7 @@ use App\Models\UnitEconomicsSettings;
 use App\Models\WildberriesTariffSnapshot;
 use App\Services\Ozon\OzonLocalityService;
 use App\Services\UnitEconomics\MarketplacePriceResolver;
+use App\Services\UnitEconomics\CalculationFingerprint;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
@@ -99,6 +100,60 @@ class UnitEconomicsCacheService
      */
     public function recalculateProduct(Product $product): array
     {
+        return DB::transaction(function () use ($product): array {
+            \App\Models\UnitEconomicsSyncState::whereKey($product->integration_id)->lockForUpdate()->first();
+
+            return $this->recalculateProductSchemes($product);
+        });
+    }
+
+    /**
+     * What-if only: the same input assembler and calculators, no updateOrCreate,
+     * publication, queue dispatch or transaction/rollback pretending to be a preview.
+     * Callers must independently check source completeness and the live seller price.
+     */
+    public function previewPrice(Product $product, string $scheme, float $sellerPrice): array
+    {
+        if (!in_array($product->marketplace, ['wildberries', 'ozon'], true)
+            || !in_array($scheme, $this->orchestrator->getSupportedSchemes($product->marketplace), true)
+            || !is_finite($sellerPrice) || $sellerPrice <= 0 || $sellerPrice > 1_000_000_000) {
+            throw new \InvalidArgumentException('Unsupported price scenario');
+        }
+        $this->refreshSingleProductInputs($product);
+        if ($product->marketplace === 'ozon') $this->primeOzonSkuLocality($product);
+        $settings = $this->getSettingsCached($product->integration_id, $product->sku);
+        $data = $this->prepareCalculationInput($product, $settings, $scheme);
+        // Price-dependent inputs (for example the seller's RFBS delivery matrix)
+        // must be selected for the candidate price before the domain calculation.
+        $candidate = $this->prepareCalculationInput($product, $settings, $scheme, $sellerPrice);
+        $before = $this->previewResult($product, $settings, $this->orchestrator->calculate(CalculationInput::fromArray($data)), $data);
+        $after = $this->previewResult($product, $settings, $this->orchestrator->calculate(CalculationInput::fromArray($candidate)), $candidate);
+        // Inputs carry observed facts and explicit manual settings; never credentials.
+        return ['before' => $before, 'after' => $after, 'inputs' => $candidate, 'financial_model' => 'products_main_financials_v1'];
+    }
+
+    private function previewResult(Product $product, ?UnitEconomicsSettings $settings, UnitEconomicsResult $result, array $inputData): array
+    {
+        // This pure converter also owns seller tax, VAT, DRR and share in the
+        // main calculation. Reuse it without persisting the preview to cache.
+        $financials = $this->convertResultToCacheData($product, $settings, $result, $inputData);
+        $view = $result->toArray();
+        foreach (['total_costs', 'revenue', 'net_profit', 'margin_percent', 'to_settlement_account',
+            'drr_percent', 'drr_amount', 'our_share_percent', 'our_share_amount', 'tax_percent', 'tax_amount', 'vat_percent', 'vat_amount'] as $field) {
+            $view[$field] = round((float) $financials[$field], 2);
+        }
+        $view['margin_absolute'] = $view['net_profit'];
+        $view['roi'] = $result->costs->getProductCosts() > 0 ? round((float) $financials['roi_percent'], 2) : null;
+        $view['is_profitable'] = (float) $financials['net_profit'] > 0;
+        foreach (['profit_min', 'profit_base', 'profit_max'] as $field) $view[$field] = $financials['marketplace_data'][$field];
+        $view['_calculation_identity'] = $financials['marketplace_data']['calculation_identity'];
+        $view['financial_input_usage'] = \App\Services\UnitEconomics\FinancialInputUsage::fromResult($result);
+
+        return $view;
+    }
+
+    private function recalculateProductSchemes(Product $product): array
+    {
         $this->forgetUnitEconomicsCache($product->integration_id, $product->sku);
         $schemes = $this->getSchemesForProduct($product);
         $results = [];
@@ -147,6 +202,18 @@ class UnitEconomicsCacheService
      * Использует новую доменную архитектуру
      */
     public function calculateAndCache(Product $product, string $fulfillmentType): UnitEconomicsCache
+    {
+        return DB::transaction(function () use ($product, $fulfillmentType): UnitEconomicsCache {
+            $state = \App\Models\UnitEconomicsSyncState::whereKey($product->integration_id)->lockForUpdate()->first();
+            $current = Product::whereKey($product->id)->lockForUpdate()->firstOrFail();
+            $cache = $this->calculateCurrentProduct($current, $fulfillmentType);
+            $state?->increment('publication_revision');
+
+            return $cache;
+        });
+    }
+
+    private function calculateCurrentProduct(Product $product, string $fulfillmentType): UnitEconomicsCache
     {
         $integrationId = $product->integration_id;
         $marketplace = $product->marketplace;
@@ -210,10 +277,8 @@ class UnitEconomicsCacheService
             return ['error' => 'Integration not found'];
         }
 
-        // Shadow-update вместо delete→insert: фиксируем timestamp старта,
-        // пересчитываем через updateOrCreate (обновляет existing, создаёт новые),
-        // в конце удаляем только те записи, что не были тронуты (updated_at < startedAt).
-        // Так фронт не получит пустой кэш в окне между delete и первым insert.
+        // Each SKU is published atomically across its schemes. A failed SKU keeps
+        // its previous projection; a timestamp alone never proves catalog deletion.
         $startedAt = now();
 
         $stats = [
@@ -221,6 +286,7 @@ class UnitEconomicsCacheService
             'success' => 0,
             'errors' => 0,
             'schemes' => [],
+            'failed_skus' => [],
         ];
 
         $schemes = $this->getSchemesForMarketplace($integration->marketplace);
@@ -243,13 +309,19 @@ class UnitEconomicsCacheService
                     $stats['total']++;
 
                     try {
+                        DB::transaction(function () use ($product, $schemes): void {
+                            \App\Models\UnitEconomicsSyncState::whereKey($product->integration_id)->lockForUpdate()->first();
+                            foreach ($schemes as $scheme) {
+                                $this->calculateAndCache($product, $scheme);
+                            }
+                        });
                         foreach ($schemes as $scheme) {
-                            $this->calculateAndCache($product, $scheme);
                             $stats['schemes'][$scheme] = ($stats['schemes'][$scheme] ?? 0) + 1;
                         }
                         $stats['success']++;
-                    } catch (\Exception $e) {
+                    } catch (\Throwable $e) {
                         $stats['errors']++;
+                        $stats['failed_skus'][] = (string) $product->sku;
                         Log::error('UnitEconomicsCache recalculate error', [
                             'product_id' => $product->id,
                             'sku' => $product->sku,
@@ -259,11 +331,18 @@ class UnitEconomicsCacheService
                 }
             });
 
-        // Зачищаем "устаревшие" записи — те, что не были тронуты этим пересчётом
-        // (SKU пропали из products, или не вернули результат из калькулятора).
-        $stalePruned = UnitEconomicsCache::where('integration_id', $integrationId)
-            ->where('updated_at', '<', $startedAt)
-            ->delete();
+        // Product removal is handled by the authoritative catalog sync. Only
+        // orphaned projections may be removed, and never during a partial run.
+        $stalePruned = 0;
+        if ($stats['errors'] === 0) {
+            $stalePruned = UnitEconomicsCache::where('integration_id', $integrationId)
+                ->whereNotExists(function ($query): void {
+                    $query->selectRaw('1')->from('products')
+                        ->whereColumn('products.integration_id', 'unit_economics_cache.integration_id')
+                        ->whereColumn('products.sku', 'unit_economics_cache.sku');
+                })->delete();
+        }
+        $stats['status'] = $stats['errors'] === 0 ? 'completed' : ($stats['success'] > 0 ? 'partial' : 'failed');
 
         Log::info('UnitEconomicsCache recalculated for integration', [
             'integration_id' => $integrationId,
@@ -376,6 +455,15 @@ class UnitEconomicsCacheService
      */
     private function recalculateProductAllSchemes(Product $product): array
     {
+        return DB::transaction(function () use ($product): array {
+            \App\Models\UnitEconomicsSyncState::whereKey($product->integration_id)->lockForUpdate()->first();
+
+            return $this->calculateAllSchemes($product);
+        });
+    }
+
+    private function calculateAllSchemes(Product $product): array
+    {
         $this->forgetUnitEconomicsCache($product->integration_id, $product->sku);
         $schemes = $this->getSchemesForMarketplace($product->marketplace);
         $results = [];
@@ -387,7 +475,63 @@ class UnitEconomicsCacheService
         return $results;
     }
 
-    private function prepareCalculationInput(Product $product, ?UnitEconomicsSettings $settings, string $fulfillmentType): array
+    /** The caller holds the run/version guard; a SKU's schemes publish together. */
+    public function publishObservedProduct(Product $product, int $version): void
+    {
+        DB::transaction(function () use ($product, $version): void {
+            $state = \App\Models\UnitEconomicsSyncState::whereKey($product->integration_id)->lockForUpdate()->first();
+            $current = Product::whereKey($product->id)->lockForUpdate()->firstOrFail();
+            $field = $current->marketplace === 'wildberries' ? 'wb_data' : 'ozon_data';
+            $source = $current->{$field} ?? [];
+            if ((int) ($source['price_version'] ?? 0) !== $version) {
+                throw new \RuntimeException('Price observation was superseded');
+            }
+            $schemes = $this->getSchemesForMarketplace($current->marketplace);
+            $rows = UnitEconomicsCache::where('integration_id', $current->integration_id)->where('sku', $current->sku)
+                ->where('product_id', $current->id)->where('marketplace', $current->marketplace)
+                ->whereIn('fulfillment_type', $schemes)->lockForUpdate()->get();
+            $this->refreshSingleProductInputs($current);
+            if ($current->marketplace === 'ozon') $this->primeOzonSkuLocality($current);
+            $settings = $this->getSettingsCached($current->integration_id, $current->sku);
+            $coherent = $rows->count() === count($schemes) && $rows->every(fn ($row) =>
+                abs((float) $row->price - (float) $current->price) < 0.009
+                && abs((float) $row->old_price - (float) $current->old_price) < 0.009
+                && ($row->marketplace_data['calculation_error_code'] ?? null) === null
+                && (int) $row->data_version === UnitEconomicsCache::CURRENT_DATA_VERSION
+                && $row->calculated_at && $row->calculated_at->betweenIncluded(now()->subHours(72), now()->addMinutes(5))
+                && CalculationFingerprint::matches($row->marketplace_data['calculation_identity'] ?? null,
+                    CalculationFingerprint::forInputs($current, $this->prepareCalculationInput($current, $settings, $row->fulfillment_type)), $current));
+            if ($coherent) {
+                foreach ($rows as $row) {
+                    $row->forceFill(['source_version' => $version, 'price_observed_at' => $source['price_observed_at'],
+                        'price_source' => $source['price_source'] ?? null, 'is_in_promotion' => $source['is_in_promotion'] ?? false,
+                        'promotion_discount' => $source['promotion_discount'] ?? 0,
+                        'marketplace_data' => array_merge($row->marketplace_data ?? [],
+                            array_intersect_key($source, array_flip(\App\Services\UnitEconomics\MarketplacePriceObservation::PRICE_FIELDS)))])->save();
+                }
+                $state?->increment('publication_revision');
+            } else {
+                $this->recalculateProductAllSchemes($current);
+            }
+            $this->forgetStatsCache($current->integration_id, $current->marketplace, $schemes);
+        });
+    }
+
+    public function markProjectionFailure(Product $product, int $version): void
+    {
+        DB::transaction(function () use ($product, $version): void {
+            $state = \App\Models\UnitEconomicsSyncState::whereKey($product->integration_id)->lockForUpdate()->first();
+            Product::whereKey($product->id)->lockForUpdate()->firstOrFail();
+            foreach (UnitEconomicsCache::where('integration_id', $product->integration_id)->where('sku', $product->sku)->lockForUpdate()->get() as $row) {
+                $row->forceFill(['marketplace_data' => array_merge($row->marketplace_data ?? [], [
+                    'calculation_error_code' => 'calculation_failed', 'calculation_error_at' => now()->utc()->toIso8601String(),
+                    'calculation_requested_version' => $version])])->save();
+            }
+            $state?->increment('publication_revision');
+        });
+    }
+
+    private function prepareCalculationInput(Product $product, ?UnitEconomicsSettings $settings, string $fulfillmentType, ?float $sellerPriceOverride = null): array
     {
         $marketplace = $product->marketplace === 'yandex' ? 'yandex_market' : $product->marketplace;
 
@@ -428,9 +572,12 @@ class UnitEconomicsCacheService
         $cachedMarketplaceData = is_array($existingUE?->marketplace_data ?? null)
             ? $existingUE->marketplace_data
             : [];
+        $commissionObservation = $marketplace === 'ozon'
+            ? app(\App\Services\UnitEconomics\OzonCommissionObservation::class)->forScheme($product, $fulfillmentType, $marketplaceData)
+            : null;
         // Выбор ставки по схеме — в OzonRatePolicy, её же зовёт синк.
         $commissionFromApi = $marketplace === 'ozon'
-            ? app(OzonRatePolicy::class)->commissionPercentForScheme($fulfillmentType, $commissions)
+            ? ($commissionObservation !== null ? (float) $commissionObservation['percent'] : app(OzonRatePolicy::class)->commissionPercentForScheme($fulfillmentType, $commissions))
             : ($commissions[$schemeKey]['percent']
                 ?? $commissions['fbs']['percent']
                 ?? $commissions['fbo']['percent']
@@ -445,6 +592,13 @@ class UnitEconomicsCacheService
         $commissionRateIsEffective = $commissionFromApi === null
             && $cachedBaseCommission === null
             && $existingUE?->commission_percent !== null;
+        $commissionRateSource = $marketplace === 'ozon' ? match (true) {
+            $commissionObservation !== null => 'ozon_prices_v5',
+            $commissionFromApi !== null => 'unverified_marketplace',
+            $cachedBaseCommission !== null => 'cached_base_unverified',
+            $existingUE?->commission_percent !== null => 'stored_effective',
+            default => 'model_default',
+        } : null;
 
         // WB: комиссия из живого снапшота приоритетнее замороженной в wb_data
         // (см. loadWildberriesCommissionBySubject). Так повышение комиссий WB
@@ -664,7 +818,7 @@ class UnitEconomicsCacheService
             $tariffSource = $existingUE?->tariff_source;
             $tariffEffectiveFrom = $existingUE?->tariff_effective_from?->format('Y-m-d')
                 ?? ($existingUE?->tariff_effective_from ? (string) $existingUE->tariff_effective_from : null);
-            $priceSegment = $existingUE?->price_segment;
+            $priceSegment = $sellerPriceOverride === null ? $existingUE?->price_segment : null;
             $routeResolutionStatus = $marketplaceData['route_resolution_status']
                 ?? $deliveryProfile?->route_resolution_status
                 ?? $existingMarketplaceData['route_resolution_status']
@@ -779,11 +933,11 @@ class UnitEconomicsCacheService
         $heightCm = $heightMm !== null ? ((float) $heightMm / 10) : 0.0;
         $weightKg = $weightG !== null ? ((float) $weightG / 1000) : 0.0;
 
-        $costPrice = ($settings?->cost_price && $settings->cost_price > 0)
+        $costPrice = ($settings && ($settings->cost_price > 0 || $settings->hasExplicitCostPrice()))
             ? $settings->cost_price
             : ($existingUE?->cost_price ?? 0);
 
-        $actualPrice = $this->resolvePriceForCalculation(
+        $actualPrice = $sellerPriceOverride ?? $this->resolvePriceForCalculation(
             $product,
             $marketplaceData,
             $commissions,
@@ -1043,11 +1197,10 @@ class UnitEconomicsCacheService
             'category_id' => $product->category ?? 'default',
             'commission_rate' => (float) $commissionPercent,
             'commission_rate_is_effective' => $commissionRateIsEffective,
+            'commission_rate_source' => $commissionRateSource,
             // Когда снята ставка из API: с 28.08.2026 у Ozon новая таблица
             // вознаграждений, и значение старше неё калькулятор игнорирует.
-            'commission_observed_at' => $marketplace === 'ozon' && $commissionFromApi !== null
-                ? optional($product->updated_at)->toDateString()
-                : null,
+            'commission_observed_at' => $commissionObservation['observed_at'] ?? null,
             'redemption_rate' => (float) $redemptionRate,
             'redemption_source' => $redemptionSource,
             'redemption_period_days' => $redemptionPeriodDays,
@@ -1185,7 +1338,10 @@ class UnitEconomicsCacheService
                 'in_flight_count' => $redemption['in_flight_count'] ?? $existingMarketplaceData['in_flight_count'] ?? null,
                 'spp_percent' => $sppPercent,
                 'price_source' => $marketplaceData['price_source'] ?? null,
-                'commission_source' => isset($marketplaceData['commissions_by_scheme']) ? 'wb_commission_api_scheme' : null,
+                'commission_source' => $marketplace === 'ozon' ? ($commissionObservation['source'] ?? null)
+                    : (isset($marketplaceData['commissions_by_scheme']) ? 'wb_commission_api_scheme' : null),
+                'commission_observed_at' => $commissionObservation['observed_at'] ?? null,
+                'commission_rate_source' => $commissionRateSource,
                 'storage_source' => $marketplace === 'wildberries'
                     ? (array_key_exists('storage_cost_per_unit', $marketplaceData) || array_key_exists('storage_cost_normalized', $marketplaceData)
                         ? 'wb_normalized_per_unit'
@@ -1298,10 +1454,19 @@ class UnitEconomicsCacheService
             'product_id' => $product->id,
             'product_name' => $result->productName ?? $product->name,
             'marketplace' => $result->marketplace,
+            'source_version' => (int) (($product->marketplace === 'wildberries' ? $product->wb_data : $product->ozon_data)['price_version'] ?? 0),
+            'price_observed_at' => ($product->marketplace === 'wildberries' ? $product->wb_data : $product->ozon_data)['price_observed_at'] ?? null,
+            'price_source' => ($product->marketplace === 'wildberries' ? $product->wb_data : $product->ozon_data)['price_source'] ?? null,
             'marketplace_data' => array_merge(
                 is_array($extra) ? $extra : [],
                 is_array($result->metadata ?? null) ? $result->metadata : [],
                 [
+                    'calculation_identity' => CalculationFingerprint::forInputs($product, $inputData),
+                    'return_audit' => ['model' => 'per_sold_unit_v1',
+                        'orders_count' => $inputData['orders_count'] ?? null,
+                        'returns_count' => $inputData['returns_count'] ?? null,
+                        'cancelled_count' => $inputData['cancelled_count'] ?? null],
+                    'calculation_error_code' => null,
                     'route_key' => $result->metadata['route_key'] ?? $extra['route_key'] ?? null,
                     'route_label' => $result->metadata['route_label'] ?? $extra['route_label'] ?? null,
                     'is_local_sale' => $result->metadata['is_local_sale'] ?? $extra['is_local_sale'] ?? null,
@@ -1417,7 +1582,7 @@ class UnitEconomicsCacheService
             // поэтому в «На РС» не входят (они вычитаются ниже, в net_profit).
             'to_settlement_account' => round(
                 ($result->metadata['to_settlement_account'] ?? ($result->price - $costs->getMarketplaceCosts()))
-                - $effectiveDrrAmount,
+                - (($result->metadata['settlement_includes_drr'] ?? false) === true ? 0 : $effectiveDrrAmount),
                 2
             ),
             'margin_percent' => $marginPercent,
@@ -1426,7 +1591,7 @@ class UnitEconomicsCacheService
             'roi_percent' => $roiPercent,
             // Метаданные
             'calculated_at' => now(),
-            'data_version' => 2, // Новая версия с доменной архитектурой
+            'data_version' => UnitEconomicsCache::CURRENT_DATA_VERSION,
         ];
     }
 
@@ -1510,8 +1675,8 @@ class UnitEconomicsCacheService
                 ? ($product->depth * $product->width * $product->height) / 1000000
                 : 1);
 
-        // Себестоимость: настройки пользователя (если > 0) > UnitEconomics > 0
-        $costPrice = ($settings?->cost_price && $settings->cost_price > 0)
+        // Explicit input includes zero; legacy automatic zero still falls back.
+        $costPrice = ($settings && ($settings->cost_price > 0 || $settings->hasExplicitCostPrice()))
             ? $settings->cost_price
             : ($existingUE?->cost_price ?? 0);
 
@@ -2738,6 +2903,23 @@ class UnitEconomicsCacheService
     {
         $key = $integrationId.'|'.$sku;
         unset($this->settingsCache[$key]);
+    }
+
+    /** Preview/publication must see changes made after this service was resolved. */
+    private function refreshSingleProductInputs(Product $product): void
+    {
+        $id = (int) $product->integration_id;
+        $sku = (string) $product->sku;
+        $this->forgetUnitEconomicsCache($id, $sku);
+        $this->forgetSettingsCache($id, $sku);
+        unset($this->integrationCache[$id], $this->wildberriesTariffSnapshotCache[$id],
+            $this->integrationStockWeightedCoefCache[$id], $this->integrationFallbackProfileCache[$id],
+            $this->supplyFixationCache[$id.'|'.$sku], $this->localityCache[$sku]);
+        foreach (array_keys($this->deliveryProfileCache) as $key) {
+            if (str_starts_with($key, $id.'|'.$sku.'|')) unset($this->deliveryProfileCache[$key]);
+        }
+        $this->warehouseCoefficientCache = [];
+        $this->sellerFboOrders7DaysCache = null;
     }
 
     private function forgetStatsCache(int $integrationId, string $marketplace, array $schemes): void
