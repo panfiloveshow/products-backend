@@ -19,6 +19,78 @@ class CostPriceControllerTest extends TestCase
 {
     use LazilyRefreshDatabase;
 
+    public function test_export_does_not_rebuild_money_from_a_rounded_margin_percent(): void
+    {
+        foreach (['wildberries', 'ozon'] as $index => $marketplace) {
+            $integration = Integration::factory()->{$marketplace}()->create(['id' => 61050 + $index]);
+            $product = Product::factory()->{$marketplace}()->create(['integration_id' => $integration->id, 'sku' => 'ROUNDING-TEST',
+                'marketplace_id' => '184010799', 'wb_data' => ['nmID' => 184010799], 'ozon_data' => ['offer_id' => 'ROUNDING-TEST', 'sku' => 1712345699]]);
+            UnitEconomicsSettings::create(['integration_id' => $integration->id, 'sku' => $product->sku, 'cost_price' => 600, 'tax_percent' => 6]);
+            UnitEconomics::create(['integration_id' => $integration->id, 'sku' => $product->sku, 'marketplace' => $marketplace, 'fulfillment_type' => 'FBO',
+                'is_actual_scheme' => true, 'price' => 1400, 'commission_percent' => 20, 'effective_logistics' => 100,
+                'net_profit' => 100, 'net_profit_per_unit' => 100, 'margin_percent' => 7.14, 'drr_percent' => 3.01]);
+            $payload = (new CostPriceController(new CostPriceParserService()))->unitEconomicsExport(Request::create('/api/products/unit-economics/export?integration_id='.$integration->id))->getData(true);
+            $item = $payload['items'][0];
+            // 100 RUB unit profit + 42.14 RUB advertising. 7.14% is only a rounded display value.
+            $this->assertEquals(142.14, $item['margin_before_ads'], $marketplace);
+            $this->assertEquals(193.86, $item['other_costs'], $marketplace);
+            $profit = round($item['price'] - $item['cost_price'] - $item['logistics_cost'] - $item['other_costs']
+                - $item['price'] * ($item['commission_percent'] + $item['tax_percent'] + $item['drr_percent']) / 100, 2);
+            $this->assertEquals($item['net_profit'], $profit, $marketplace);
+        }
+    }
+
+    public function test_loss_making_export_preserves_expenses_for_both_marketplaces(): void
+    {
+        foreach (['wildberries', 'ozon'] as $index => $marketplace) {
+            $integration = Integration::factory()->{$marketplace}()->create(['id' => 61040 + $index]);
+            $product = Product::factory()->{$marketplace}()->create([
+                'integration_id' => $integration->id,
+                'sku' => 'LOSS-TEST',
+                'marketplace_id' => '184010799',
+                'wb_data' => ['nmID' => 184010799],
+                'ozon_data' => ['offer_id' => 'LOSS-TEST', 'sku' => 1712345699],
+            ]);
+            UnitEconomicsSettings::create([
+                'integration_id' => $integration->id,
+                'sku' => $product->sku,
+                'cost_price' => 600,
+                'tax_percent' => 6,
+            ]);
+            UnitEconomics::create([
+                'integration_id' => $integration->id,
+                'sku' => $product->sku,
+                'marketplace' => $marketplace,
+                'fulfillment_type' => 'FBO',
+                'is_actual_scheme' => true,
+                'price' => 1000,
+                'commission_percent' => 20,
+                'effective_logistics' => 100,
+                'net_profit' => -200,
+                'net_profit_per_unit' => -200,
+                'margin_percent' => -20,
+                'drr_percent' => 5,
+            ]);
+
+            $controller = new CostPriceController(new CostPriceParserService());
+            $payload = $controller->unitEconomicsExport(Request::create(
+                '/api/products/unit-economics/export?integration_id=' . $integration->id
+            ))->getData(true);
+
+            $this->assertCount(1, $payload['items']);
+            $item = $payload['items'][0];
+            $this->assertEquals(-150, $item['margin_before_ads'], $marketplace);
+            $this->assertEquals(190, $item['other_costs'], $marketplace);
+            $this->assertEquals(0, $item['max_allowed_drr']);
+            $this->assertFalse($item['ready']);
+            $this->assertContains('unprofitable', $item['readiness_reasons']);
+            // Revenue minus every exported expense must reconstruct the loss.
+            $profit = $item['price'] - $item['cost_price'] - $item['logistics_cost']
+                - $item['other_costs'] - $item['price'] * ($item['commission_percent'] + $item['tax_percent'] + $item['drr_percent']) / 100;
+            $this->assertEquals($item['net_profit'], $profit, $marketplace);
+        }
+    }
+
     public function test_commission_source_distinguishes_live_snapshot_from_default(): void
     {
         $this->assertSame(
@@ -189,7 +261,9 @@ class CostPriceControllerTest extends TestCase
         $this->assertCount(1, $payload['items']);
         $this->assertSame(2, $payload['items'][0]['variant_count']);
         $this->assertEquals(600.0, $payload['items'][0]['customer_price']);
-        $this->assertEquals(100.0, $payload['items'][0]['margin_before_ads']);
+        // The per-unit result is 100 RUB for both variants; the cheaper variant
+        // carries 50 RUB advertising. Its pre-ad money is 150, not 5% + 5% of 1000.
+        $this->assertEquals(150.0, $payload['items'][0]['margin_before_ads']);
         $this->assertEquals(10.0, $payload['items'][0]['max_allowed_drr']);
         $this->assertEquals(800.0, $payload['items'][0]['cost_price']);
         $this->assertTrue($payload['items'][0]['ready']);

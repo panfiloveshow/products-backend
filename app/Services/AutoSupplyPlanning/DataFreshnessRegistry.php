@@ -18,7 +18,7 @@ class DataFreshnessRegistry
     /**
      * @return array<string, mixed>
      */
-    public function inspect(Integration $integration): array
+    public function inspect(Integration $integration, ?string $planId = null): array
     {
         $integrationId = (int) $integration->id;
         $marketplace = (string) $integration->marketplace;
@@ -34,6 +34,11 @@ class DataFreshnessRegistry
             ->where('marketplace', $marketplace);
         $inventorySkuCount = (int) (clone $inventoryQuery)->distinct()->count('sku');
         $inventoryUpdatedAt = (clone $inventoryQuery)->max('last_updated');
+        $inventoryDemandQuery = (clone $inventoryQuery)
+            ->where(function ($query) {
+                $query->where('average_daily_sales', '>', 0)->orWhere('effective_daily_sales', '>', 0)->orWhere('sales_30_days', '>', 0);
+            });
+        $inventoryDemandUpdatedAt = (clone $inventoryDemandQuery)->min('last_updated');
         $inventoryDemandSkuCount = (int) (clone $inventoryQuery)
             ->where(function ($query) {
                 $query->where('average_daily_sales', '>', 0)
@@ -48,7 +53,7 @@ class DataFreshnessRegistry
             ->where('marketplace', $marketplace);
         $postingCount = (int) (clone $postingsQuery)->count();
         $postingUpdatedAt = (clone $postingsQuery)->max(
-            DB::raw('COALESCE(synced_at, updated_at)')
+            'synced_at'
         );
 
         $economicsQuery = DB::table('unit_economics')
@@ -63,13 +68,10 @@ class DataFreshnessRegistry
             ->orderByDesc('synced_at')
             ->first();
 
-        $supplyUpdatedAt = DB::table('supplies')
-            ->where('integration_id', $integrationId)
-            ->max('updated_at');
-        $activeSupplies = (int) DB::table('supplies')
-            ->where('integration_id', $integrationId)
-            ->whereNotIn('status', ['closed', 'cancelled'])
-            ->count();
+        $supplyQuery = DB::table('supplies')->where('integration_id', $integrationId)->whereIn('status', PlanningSourceFingerprint::IN_TRANSIT_STATUSES);
+        if ($planId !== null) $supplyQuery->where(fn ($q) => $q->whereNull('auto_supply_plan_id')->orWhere('auto_supply_plan_id', '!=', $planId));
+        $supplyUpdatedAt = (clone $supplyQuery)->max('updated_at');
+        $activeSupplies = (int) (clone $supplyQuery)->count();
 
         $credentialHealth = $marketplace === 'ozon'
             ? app(OzonCredentialHealthService::class)->assess($integration)
@@ -80,6 +82,12 @@ class DataFreshnessRegistry
                 'severity' => 'none',
                 'message' => 'Credentials готовы.',
             ];
+
+        $inputEvidence = app(PlanningSourceFingerprint::class)->capture($integration, $planId);
+        $inventoryEvidence = $inputEvidence['sources']['inventory'];
+        $inventoryUpdatedAt = $inventoryEvidence['oldest_row_at'];
+        $productUpdatedAt = $inputEvidence['sources']['products']['oldest_row_at'];
+        $economicsUpdatedAt = $inputEvidence['sources']['economics']['oldest_row_at'];
 
         $cards = [
             'credentials' => $this->credentialCard($integration, $credentialHealth),
@@ -103,7 +111,7 @@ class DataFreshnessRegistry
             ),
             'demand' => $this->card(
                 'demand',
-                $this->latest($postingUpdatedAt, $inventoryUpdatedAt),
+                $this->latest($postingUpdatedAt, $inventoryDemandUpdatedAt),
                 $postingCount + $inventoryDemandSkuCount,
                 $this->coverage($inventoryDemandSkuCount, $productCount),
                 true,
@@ -149,6 +157,23 @@ class DataFreshnessRegistry
             ),
         ];
 
+        foreach (['products', 'inventory', 'economics'] as $source) {
+            $evidence = $inputEvidence['sources'][$source];
+            $cards[$source]['meta'] = [...$cards[$source]['meta'], ...$evidence];
+            if ($evidence['missing_row_dates'] + $evidence['invalid_row_dates'] + $evidence['future_row_dates'] > 0) {
+                $cards[$source]['status'] = 'missing';
+                $cards[$source]['message'] = 'Не у всех строк источника есть допустимое время наблюдения или изменения.';
+            } elseif ($evidence['stale_rows'] > 0) {
+                $cards[$source]['status'] = 'stale';
+                $cards[$source]['message'] = 'Часть строк источника старше SLA. Обновление другой строки не подтверждает их свежесть.';
+            }
+        }
+        foreach ($cards as $source => &$card) {
+            $card['native_origin_verified'] = false;
+            $card['timestamp_basis'] = in_array($source, ['inventory', 'demand', 'constraints'], true) ? 'reported_observation_time' : 'local_record_update';
+        }
+        unset($card);
+
         $blocking = collect($cards)->filter(
             static fn (array $card): bool => $card['blocking']
         );
@@ -183,6 +208,8 @@ class DataFreshnessRegistry
         $hashPayload = [
             'integration_id' => $integrationId,
             'marketplace' => $marketplace,
+            'scope_plan_id' => $planId,
+            'input_content_version' => $inputEvidence['hash'],
             'sources' => collect($cards)->map(static fn (array $card): array => [
                 'fetched_at' => $card['fetched_at'],
                 'items' => $card['items'],
@@ -215,6 +242,7 @@ class DataFreshnessRegistry
                 'warehouses_blocked' => (int) ($constraintSummary['warehouses_blocked'] ?? 0),
                 'summary' => $constraintSummary,
             ],
+            'input_evidence' => $inputEvidence,
             'hash' => hash('sha256', json_encode(
                 $hashPayload,
                 JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR
@@ -255,7 +283,8 @@ class DataFreshnessRegistry
             $latest = null;
             foreach ($sources as $source) {
                 $fetchedAt = $cards[$source]['fetched_at'] ?? null;
-                $timestamp = $fetchedAt ? CarbonImmutable::parse($fetchedAt) : null;
+                $timestamp = PlanningSourceFingerprint::timestamp($fetchedAt);
+                if ($timestamp?->gt(now()->addMinutes(5))) $timestamp = null;
                 $completed = $completed && $timestamp !== null && $timestamp->greaterThanOrEqualTo($requestedAt);
                 if ($timestamp !== null && ($latest === null || $timestamp->greaterThan($latest))) {
                     $latest = $timestamp;
@@ -342,7 +371,8 @@ class DataFreshnessRegistry
         int $integrationId,
         array $meta
     ): array {
-        $timestamp = $fetchedAt ? CarbonImmutable::parse($fetchedAt) : null;
+        $timestamp = PlanningSourceFingerprint::timestamp($fetchedAt);
+        if ($timestamp?->gt(now()->addMinutes(5))) $timestamp = null;
         $ageMinutes = $timestamp?->diffInMinutes(now());
         $slaHours = max(1, (int) config("autoplanning.freshness_sla_hours.{$source}", 24));
         $lastError = $this->lastSyncError($integrationId, $source);
@@ -404,6 +434,8 @@ class DataFreshnessRegistry
 
     private function latest(mixed ...$timestamps): mixed
     {
-        return collect($timestamps)->filter()->sortDesc()->first();
+        $dates = array_filter(array_map(fn ($value) => PlanningSourceFingerprint::timestamp($value), $timestamps));
+        usort($dates, fn ($a, $b) => $b->getTimestamp() <=> $a->getTimestamp());
+        return isset($dates[0]) ? $dates[0]->utc()->toIso8601String() : null;
     }
 }

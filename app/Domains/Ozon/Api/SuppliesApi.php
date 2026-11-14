@@ -230,7 +230,7 @@ class SuppliesApi implements SuppliesApiInterface
 
         \Log::info('Ozon createCargo response', ['response' => $response]);
 
-        if (!$response || !empty($response['errors'])) {
+        if (!$response || !empty($response['_error']) || !empty($response['errors']) || empty($response['operation_id'])) {
             $errorMessage = $response['errors']['error_reasons'][0] 
                 ?? $response['error']['message'] 
                 ?? $response['message'] 
@@ -251,16 +251,16 @@ class SuppliesApi implements SuppliesApiInterface
      * 
      * POST /v2/cargoes/create/info
      */
-    public function getCargoCreateInfo(string $supplyId): array
+    public function getCargoCreateInfo(string $operationId): array
     {
         $body = [
-            'supply_id' => (int) $supplyId,
+            'operation_id' => $operationId,
         ];
 
         $response = $this->client->post('/v2/cargoes/create/info', $body);
 
         return [
-            'success' => empty($response['error']),
+            'success' => !empty($response) && empty($response['_error']) && empty($response['error']) && empty($response['errors']),
             'data' => $response,
         ];
     }
@@ -274,13 +274,13 @@ class SuppliesApi implements SuppliesApiInterface
     {
         $body = [
             'supply_id' => (int) $supplyId,
-            'cargo_id' => $cargoId,
+            'cargo_ids' => [$cargoId],
         ];
 
         $response = $this->client->post('/v1/cargoes/delete', $body);
 
         return [
-            'success' => empty($response['error']),
+            'success' => !empty($response['operation_id']) && empty($response['_error']) && empty($response['error']) && empty($response['errors']),
             'operation_id' => $response['operation_id'] ?? null,
         ];
     }
@@ -341,8 +341,9 @@ class SuppliesApi implements SuppliesApiInterface
             ?? null;
 
         return [
-            'success' => empty($response['_error']) && empty($response['error']) && empty($response['code']),
+            'success' => !empty($response) && empty($response['_error']) && empty($response['error']) && empty($response['errors']) && empty($response['code']),
             'file_guid' => $fileGuid,
+            'file_url' => $response['result']['file_url'] ?? null,
             'status' => $status,
             'data' => $response,
         ];
@@ -508,7 +509,7 @@ class SuppliesApi implements SuppliesApiInterface
 
     /**
      * Загруженность/доступность складов FBO (этап 1, Ozon-синк ограничений).
-     * POST /v1/supplier/available_warehouses — возвращает доступные для поставки склады
+     * GET /v1/supplier/available_warehouses — возвращает доступные для поставки склады
      * с расписанием: ёмкость приёмки (товаров/день) и ближайшую дату.
      *
      * Wire-формат (проверено по docs.ozon.ru / Go-клиенту):
@@ -519,7 +520,7 @@ class SuppliesApi implements SuppliesApiInterface
      */
     public function getWarehouseWorkload(): array
     {
-        $response = $this->client->post('/v1/supplier/available_warehouses', [], true);
+        $response = $this->client->get('/v1/supplier/available_warehouses');
 
         if (! $response || ($response['_error'] ?? false)) {
             return [];
@@ -988,11 +989,7 @@ class SuppliesApi implements SuppliesApiInterface
      */
     public function getSupplyOrderBundle(int $supplyOrderId): array
     {
-        $response = $this->client->post('/v1/supply-order/bundle', [
-            'supply_order_id' => $supplyOrderId,
-        ]);
-
-        return $response ?? [];
+        return (new FboSupplyOrdersApi($this->client))->getBundle($supplyOrderId);
     }
 
     /**
@@ -1273,7 +1270,7 @@ class SuppliesApi implements SuppliesApiInterface
 
         $response = $this->client->post('/v1/supply-order/pass/create', $body);
 
-        if (!$response || !empty($response['error'])) {
+        if (!$response || !empty($response['_error']) || !empty($response['error']) || !empty($response['errors']) || !empty($response['error_reasons'])) {
             throw new \RuntimeException(
                 'Не удалось создать пропуск: ' .
                 ($response['error']['message'] ?? 'Unknown error')
@@ -1288,17 +1285,13 @@ class SuppliesApi implements SuppliesApiInterface
      *
      * POST /v1/fbp/order/direct/timeslot/list
      */
-    public function getFbpOrderDirectTimeslotList(string $supplyOrderId, array $payload = []): array
+    public function getFbpOrderDirectTimeslotList(string $supplyId, array $payload = []): array
     {
-        $body = [
-            'supply_order_id' => (int) $supplyOrderId,
-        ];
-
-        if (!empty($payload['date_from'])) {
-            $body['date_from'] = $payload['date_from'];
-        }
-        if (!empty($payload['date_to'])) {
-            $body['date_to'] = $payload['date_to'];
+        $body = ['supply_id' => $supplyId];
+        foreach (['interval_start' => 'date_from', 'interval_end' => 'date_to'] as $field => $legacy) {
+            if (!empty($payload[$field] ?? $payload[$legacy] ?? null)) {
+                $body[$field] = $payload[$field] ?? $payload[$legacy];
+            }
         }
 
         \Illuminate\Support\Facades\Log::info('Ozon fbp/order/direct/timeslot/list request', ['body' => $body]);
@@ -1324,7 +1317,7 @@ class SuppliesApi implements SuppliesApiInterface
         }
 
         \Illuminate\Support\Facades\Log::info('Ozon fbp/order/direct/timeslot/list response', [
-            'order_id' => $supplyOrderId,
+            'supply_id' => $supplyId,
             'response_keys' => $response ? array_keys($response) : [],
         ]);
 
@@ -1369,7 +1362,7 @@ class SuppliesApi implements SuppliesApiInterface
             'operation_id' => $operationId,
         ]);
 
-        if (!$response || !empty($response['error'])) {
+        if (!$response || !empty($response['_error']) || !empty($response['error']) || !empty($response['errors']) || !empty($response['error_reasons'])) {
             throw new \RuntimeException(
                 'Не удалось получить статус таймслота: ' .
                 ($response['error']['message'] ?? 'Unknown error')
@@ -1386,35 +1379,26 @@ class SuppliesApi implements SuppliesApiInterface
      * 
      * Использует timeslot_start напрямую без поиска timeslot_id
      */
-    public function setSupplyOrderTimeslot(string $supplyOrderId, string $timeslotFrom, string $timeslotTo): array
+    public function setSupplyOrderTimeslot(string $supplyId, string $timeslotFrom, string $timeslotTo, ?int $rowVersion = null): array
     {
-        // Убедимся, что timestamp в правильном формате с Z
-        if (!str_ends_with($timeslotFrom, 'Z')) {
-            $timeslotFrom = rtrim($timeslotFrom, 'Z') . 'Z';
+        if ($rowVersion === null) {
+            $current = $this->client->post('/v1/fbp/draft/get', ['supply_id' => $supplyId]);
+            if (!empty($current['_error']) || !isset($current['row_version'])) {
+                throw new OzonPreconditionException('Ozon не вернул актуальную row_version черновика.');
+            }
+            $rowVersion = (int) $current['row_version'];
         }
-        if (!str_ends_with($timeslotTo, 'Z')) {
-            $timeslotTo = rtrim($timeslotTo, 'Z') . 'Z';
-        }
-
         $body = [
-            'supply_id' => $supplyOrderId,
-            'timeslot_start' => $timeslotFrom,
+            'supply_id' => $supplyId,
+            'row_version' => $rowVersion,
+            'timeslot_start' => \Carbon\Carbon::parse($timeslotFrom)->utc()->format('Y-m-d\TH:i:s\Z'),
         ];
-
-        \Illuminate\Support\Facades\Log::info('Ozon fbp/draft/direct/timeslot/edit request', ['body' => $body]);
-
         $response = $this->client->post('/v1/fbp/draft/direct/timeslot/edit', $body);
 
-        \Illuminate\Support\Facades\Log::info('Ozon fbp/draft/direct/timeslot/edit response', [
-            'response_keys' => $response ? array_keys($response) : [],
-            'has_error' => !empty($response['error']) || !empty($response['code']),
-            'response' => $response,
-        ]);
-
         return [
-            'success' => empty($response['error']) && empty($response['code']),
+            'success' => is_array($response) && isset($response['row_version']) && empty($response['_error']) && empty($response['error']) && empty($response['error_reasons']) && empty($response['code']),
             'response' => $response,
-            'error' => $response['error'] ?? $response['message'] ?? null,
+            'error' => $response['error'] ?? $response['message'] ?? ($response['error_reasons'] ?? null),
             '_http_status' => $response['_http_status'] ?? null,
         ];
     }
@@ -1427,12 +1411,12 @@ class SuppliesApi implements SuppliesApiInterface
     public function updateSupplyOrderContent(string $supplyOrderId, array $payload = []): array
     {
         $body = array_merge([
-            'supply_order_id' => (int) $supplyOrderId,
+            'order_id' => (int) $supplyOrderId,
         ], $payload);
 
         $response = $this->client->post('/v1/supply-order/content/update', $body);
 
-        if (!$response || !empty($response['error'])) {
+        if (!$response || !empty($response['_error']) || !empty($response['error']) || !empty($response['errors']) || !empty($response['error_reasons'])) {
             throw new \RuntimeException(
                 'Не удалось обновить состав заявки: ' .
                 ($response['error']['message'] ?? 'Unknown error')
@@ -1447,15 +1431,15 @@ class SuppliesApi implements SuppliesApiInterface
      * 
      * POST /v1/supply-order/content/update/validation
      */
-    public function validateSupplyOrderContent(string $supplyOrderId, array $payload = []): array
+    public function validateSupplyOrderContent(string $supplyId, array $payload = []): array
     {
         $body = array_merge([
-            'supply_order_id' => (int) $supplyOrderId,
+            'supply_id' => (int) $supplyId,
         ], $payload);
 
         $response = $this->client->post('/v1/supply-order/content/update/validation', $body);
 
-        if (!$response || !empty($response['error'])) {
+        if (!$response || !empty($response['_error']) || !empty($response['error']) || !empty($response['errors']) || !empty($response['error_reasons'])) {
             throw new \RuntimeException(
                 'Не удалось проверить состав заявки: ' .
                 ($response['error']['message'] ?? 'Unknown error')
@@ -1476,7 +1460,7 @@ class SuppliesApi implements SuppliesApiInterface
             'operation_id' => $operationId,
         ]);
 
-        if (!$response || !empty($response['error'])) {
+        if (!$response || !empty($response['_error']) || !empty($response['error']) || !empty($response['errors']) || !empty($response['error_reasons'])) {
             throw new \RuntimeException(
                 'Не удалось получить статус редактирования состава: ' .
                 ($response['error']['message'] ?? 'Unknown error')
@@ -1491,15 +1475,15 @@ class SuppliesApi implements SuppliesApiInterface
      * 
      * POST /v1/fbp/act-from/create
      */
-    public function createFbpAcceptanceAct(string $supplyOrderId, array $payload = []): array
+    public function createFbpAcceptanceAct(string $supplyId, array $payload = []): array
     {
         $body = array_merge([
-            'supply_order_id' => (int) $supplyOrderId,
+            'supply_id' => $supplyId,
         ], $payload);
 
         $response = $this->client->post('/v1/fbp/act-from/create', $body);
 
-        if (!$response || !empty($response['error'])) {
+        if (!$response || !empty($response['_error']) || !empty($response['error']) || !empty($response['errors']) || !empty($response['error_reasons'])) {
             throw new \RuntimeException(
                 'Не удалось создать акт приёмки: ' .
                 ($response['error']['message'] ?? 'Unknown error')
@@ -1514,13 +1498,13 @@ class SuppliesApi implements SuppliesApiInterface
      * 
      * POST /v1/fbp/act-from/get
      */
-    public function getFbpAcceptanceActStatus(string $operationId): array
+    public function getFbpAcceptanceActStatus(string $fileUuid): array
     {
         $response = $this->client->post('/v1/fbp/act-from/get', [
-            'operation_id' => $operationId,
+            'file_uuid' => $fileUuid,
         ]);
 
-        if (!$response || !empty($response['error'])) {
+        if (!$response || !empty($response['_error']) || !empty($response['error']) || !empty($response['errors']) || !empty($response['error_reasons'])) {
             throw new \RuntimeException(
                 'Не удалось получить статус акта: ' .
                 ($response['error']['message'] ?? 'Unknown error')
@@ -1535,23 +1519,21 @@ class SuppliesApi implements SuppliesApiInterface
      * 
      * POST /v1/fbp/draft/direct/timeslot/edit
      */
-    public function editFbpDirectDraftTimeslot(string $draftId, string|int $timeslotId, array $payload = []): array
+    public function editFbpDirectDraftTimeslot(string $supplyId, string|int $timeslotStart, array $payload = []): array
     {
-        $body = array_merge([
-            'draft_id' => (string) $draftId,
-            'timeslot_id' => (int) $timeslotId,
-        ], $payload);
-
-        $response = $this->client->post('/v1/fbp/draft/direct/timeslot/edit', $body);
-
-        if (!$response || !empty($response['error'])) {
-            throw new \RuntimeException(
-                'Не удалось изменить таймслот черновика: ' .
-                ($response['error']['message'] ?? 'Unknown error')
-            );
+        $start = $payload['timeslot_start'] ?? $timeslotStart;
+        if (!is_string($start) || !str_contains($start, 'T')) {
+            throw new OzonPreconditionException('Ozon требует timeslot_start, числовой timeslot_id больше не поддерживается.');
+        }
+        $result = $this->setSupplyOrderTimeslot(
+            (string) ($payload['supply_id'] ?? $supplyId), $start, '',
+            isset($payload['row_version']) ? (int) $payload['row_version'] : null
+        );
+        if (!$result['success']) {
+            throw new \RuntimeException('Не удалось изменить таймслот черновика: '.json_encode($result['error'], JSON_UNESCAPED_UNICODE));
         }
 
-        return $response['result'] ?? $response;
+        return $result['response'];
     }
 
     /**
@@ -1565,7 +1547,7 @@ class SuppliesApi implements SuppliesApiInterface
             'operation_id' => $operationId,
         ]);
 
-        if (!$response || !empty($response['error'])) {
+        if (!$response || !empty($response['_error']) || !empty($response['error']) || !empty($response['errors']) || !empty($response['error_reasons'])) {
             throw new \RuntimeException(
                 'Не удалось получить статус пропуска: ' .
                 ($response['error']['message'] ?? 'Unknown error')
@@ -1583,19 +1565,20 @@ class SuppliesApi implements SuppliesApiInterface
     public function getCargoes(string $supplyOrderId): array
     {
         $response = $this->client->post('/v1/cargoes/get', [
-            'supply_order_id' => (int) $supplyOrderId,
+            'supply_ids' => [(string) $supplyOrderId],
         ]);
 
-        if (!$response) {
+        if (!$response || !empty($response['_error'])) {
             return [];
         }
 
-        $cargoes = $response['result']['cargoes'] ?? $response['cargoes'] ?? [];
+        $nativeSupply = collect($response['supply'] ?? [])->first(fn ($s) => (string) ($s['supply_id'] ?? '') === $supplyOrderId);
+        $cargoes = $nativeSupply['cargoes'] ?? [];
         
         return array_map(fn($cargo) => [
             'id' => $cargo['cargo_id'] ?? null,
             'barcode' => $cargo['barcode'] ?? null,
-            'type' => $cargo['container_type'] ?? null,
+            'type' => $cargo['type'] ?? $cargo['container_type'] ?? null,
             'weight' => $cargo['weight'] ?? 0,
             'dimensions' => [
                 'length' => $cargo['length'] ?? 0,
@@ -1749,14 +1732,14 @@ class SuppliesApi implements SuppliesApiInterface
     public function getCargoesInfo(string $supplyId): array
     {
         $response = $this->client->post('/v1/cargoes/get', [
-            'supply_id' => $supplyId,
+            'supply_ids' => [$supplyId],
         ]);
 
         if (!$response) {
             return [];
         }
 
-        $result = $response['result'] ?? $response;
+        $result = collect($response['supply'] ?? [])->first(fn ($s) => (string) ($s['supply_id'] ?? '') === $supplyId) ?? [];
         $cargoes = $result['cargoes'] ?? [];
         
         return [

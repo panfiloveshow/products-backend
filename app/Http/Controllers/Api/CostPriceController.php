@@ -214,11 +214,24 @@ class CostPriceController extends Controller
         ]);
     }
 
-    private function unitEconomicsRows(int $integrationId)
+    public function managerPriceEvidence(Product $product, string $scheme): ?array
+    {
+        $checkedAt = now()->utc();
+        $rows = $product->marketplace === 'ozon'
+            ? $this->ozonUnitEconomicsRows((int) $product->integration_id, $product->sku, $scheme)
+            : $this->unitEconomicsRows((int) $product->integration_id, $product->sku, $scheme);
+        if ($rows->count() !== 1) return null;
+        return $product->marketplace === 'ozon'
+            ? $this->ozonUnitEconomicsItem($rows->first(), $checkedAt)
+            : $this->unitEconomicsItem($rows->first(), $checkedAt, $this->sourceFreshness->freshEvidence((int) $product->integration_id, $checkedAt));
+    }
+
+    private function unitEconomicsRows(int $integrationId, ?string $sku = null, ?string $scheme = null)
     {
         return Product::query()
             ->where('products.integration_id', $integrationId)
             ->where('products.marketplace', 'wildberries')
+            ->when($sku !== null, fn ($query) => $query->where('products.sku', $sku))
             ->leftJoin('unit_economics_settings as settings', function ($join) {
                 $join->on('settings.integration_id', '=', 'products.integration_id')
                     ->on('settings.sku', '=', 'products.sku');
@@ -227,15 +240,16 @@ class CostPriceController extends Controller
                 $join->on('vendor_settings.integration_id', '=', 'products.integration_id')
                     ->on('vendor_settings.sku', '=', 'products.vendor_code');
             })
-            ->leftJoin('unit_economics as calculated', function ($join) {
+            ->leftJoin('unit_economics as calculated', function ($join) use ($scheme) {
                 $join->on('calculated.integration_id', '=', 'products.integration_id')
                     ->on('calculated.sku', '=', 'products.sku')
                     ->where('calculated.is_actual_scheme', '=', true);
+                if ($scheme !== null) $join->where('calculated.fulfillment_type', '=', $scheme);
             })
             ->get([
                 'products.marketplace_id',
                 'products.wb_data',
-                DB::raw('COALESCE(NULLIF(settings.cost_price, 0), NULLIF(vendor_settings.cost_price, 0)) AS cost_price'),
+                ...$this->costPriceColumns('COALESCE(NULLIF(settings.cost_price, 0), NULLIF(vendor_settings.cost_price, 0))'),
                 DB::raw('COALESCE(settings.tax_percent, vendor_settings.tax_percent) AS tax_percent'),
                 'calculated.price',
                 'calculated.customer_price',
@@ -291,7 +305,7 @@ class CostPriceController extends Controller
      * (sku = offer_id, fallback на артикул продавца и сохранённую себестоимость),
      * рассчитанная экономика фактической схемы — из unit_economics (marketplace=ozon).
      */
-    private function ozonUnitEconomicsRows(int $integrationId)
+    private function ozonUnitEconomicsRows(int $integrationId, ?string $sku = null, ?string $scheme = null)
     {
         // Сервисный экспорт (shared-token, integration_id задан явно) не должен
         // зависеть от workspace текущего запроса: tenant-scope молча отдаёт
@@ -300,6 +314,7 @@ class CostPriceController extends Controller
             ->withoutGlobalScope('current_workspace')
             ->where('products.integration_id', $integrationId)
             ->where('products.marketplace', 'ozon')
+            ->when($sku !== null, fn ($query) => $query->where('products.sku', $sku))
             ->leftJoin('unit_economics_settings as settings', function ($join) {
                 $join->on('settings.integration_id', '=', 'products.integration_id')
                     ->on('settings.sku', '=', 'products.sku');
@@ -308,16 +323,17 @@ class CostPriceController extends Controller
                 $join->on('vendor_settings.integration_id', '=', 'products.integration_id')
                     ->on('vendor_settings.sku', '=', 'products.vendor_code');
             })
-            ->leftJoin('unit_economics as calculated', function ($join) {
+            ->leftJoin('unit_economics as calculated', function ($join) use ($scheme) {
                 $join->on('calculated.integration_id', '=', 'products.integration_id')
                     ->on('calculated.sku', '=', 'products.sku')
                     ->where('calculated.marketplace', '=', 'ozon')
                     ->where('calculated.is_actual_scheme', '=', true);
+                if ($scheme !== null) $join->where('calculated.fulfillment_type', '=', $scheme);
             })
             ->get([
                 'products.sku as offer_id',
                 'products.ozon_data',
-                DB::raw('COALESCE(NULLIF(settings.cost_price, 0), NULLIF(vendor_settings.cost_price, 0), NULLIF(calculated.cost_price, 0), NULLIF(products.cost_price, 0)) AS cost_price'),
+                ...$this->costPriceColumns('COALESCE(NULLIF(settings.cost_price, 0), NULLIF(vendor_settings.cost_price, 0), NULLIF(calculated.cost_price, 0), NULLIF(products.cost_price, 0))'),
                 DB::raw('COALESCE(settings.tax_percent, vendor_settings.tax_percent, calculated.tax_percent) AS tax_percent'),
                 'calculated.price',
                 'calculated.commission_percent',
@@ -352,12 +368,13 @@ class CostPriceController extends Controller
         $drrPercent = $number($row->drr_percent);
         // Как и для WB: отсутствующий текущий ДРР — не синтетический ноль;
         // маржа без рекламы сама является реальным потолком безубыточности.
-        $maxAllowedDrr = $marginPercent !== null
-            ? round(max(0, min(100, $marginPercent + ($drrPercent ?? 0))), 2)
+        $preAdsMarginPercent = $marginPercent !== null ? $marginPercent + ($drrPercent ?? 0) : null;
+        $maxAllowedDrr = $preAdsMarginPercent !== null
+            ? round(max(0, min(100, $preAdsMarginPercent)), 2)
             : null;
-        $marginBeforeAds = ($price !== null && $maxAllowedDrr !== null)
-            ? round($price * $maxAllowedDrr / 100, 2)
-            : null;
+        // Advertising capacity is bounded at zero; the underlying loss is not.
+        // Clamping it here used to erase expenses on loss-making products.
+        $marginBeforeAds = $this->preAdProfit($price, $number($row->net_profit_per_unit ?? null), $drrPercent, $preAdsMarginPercent);
 
         $otherCosts = null;
         if ($price !== null && $costPrice !== null && $logisticsCost !== null && $commissionPercent !== null && $taxPercent !== null && $marginBeforeAds !== null) {
@@ -368,16 +385,15 @@ class CostPriceController extends Controller
 
         $calculatedAt = $row->calculated_at ? \Illuminate\Support\Carbon::parse($row->calculated_at)->utc() : null;
 
-        $reasons = [];
+        $reasons = $this->costPriceReadinessReasons($row, $costPrice);
         foreach ([
             'price' => $price,
-            'cost_price' => $costPrice,
             'commission' => $commissionPercent,
             'tax' => $taxPercent,
             'logistics' => $logisticsCost,
             'profit' => $netProfit,
         ] as $field => $value) {
-            if ($value === null || (in_array($field, ['price', 'cost_price'], true) && $value <= 0)) {
+            if ($value === null || ($field === 'price' && $value <= 0)) {
                 $reasons[] = 'missing_' . $field;
             }
         }
@@ -399,6 +415,7 @@ class CostPriceController extends Controller
             'sku' => $ozonSku > 0 ? $ozonSku : null,
             'price' => $price,
             'cost_price' => $costPrice,
+            'explicit_zero_cost_price' => $costPrice === 0.0 && (bool) ($row->explicit_zero_cost_price ?? false),
             'logistics_cost' => $logisticsCost,
             'other_costs' => $otherCosts,
             'commission_percent' => $commissionPercent,
@@ -477,12 +494,12 @@ class CostPriceController extends Controller
         // A missing current advertising DRR is not synthetic zero: keep it null
         // in the response. Margin is already calculated without advertising in
         // that case, so it is itself the real pre-ads break-even ceiling.
-        $maxAllowedDrr = $marginPercent !== null
-            ? round(max(0, min(100, $marginPercent + ($drrPercent ?? 0))), 2)
+        $preAdsMarginPercent = $marginPercent !== null ? $marginPercent + ($drrPercent ?? 0) : null;
+        $maxAllowedDrr = $preAdsMarginPercent !== null
+            ? round(max(0, min(100, $preAdsMarginPercent)), 2)
             : null;
-        $marginBeforeAds = ($price !== null && $maxAllowedDrr !== null)
-            ? round($price * $maxAllowedDrr / 100, 2)
-            : null;
+        // Keep real negative pre-ad profit when reconciling expense components.
+        $marginBeforeAds = $this->preAdProfit($price, $number($row->net_profit_per_unit ?? null), $drrPercent, $preAdsMarginPercent);
 
         $otherCosts = null;
         if ($price !== null && $costPrice !== null && $logisticsCost !== null && $commissionPercent !== null && $taxPercent !== null && $marginBeforeAds !== null) {
@@ -503,16 +520,15 @@ class CostPriceController extends Controller
             'acquiring' => $this->sourceFreshness->observedAt($row->acquiring_observed_at),
         ];
 
-        $reasons = [];
+        $reasons = $this->costPriceReadinessReasons($row, $costPrice);
         foreach ([
             'price' => $price,
-            'cost_price' => $costPrice,
             'commission' => $commissionPercent,
             'tax' => $taxPercent,
             'logistics' => $logisticsCost,
             'profit' => $netProfit,
         ] as $field => $value) {
-            if ($value === null || (in_array($field, ['price', 'cost_price'], true) && $value <= 0)) {
+            if ($value === null || ($field === 'price' && $value <= 0)) {
                 $reasons[] = 'missing_' . $field;
             }
         }
@@ -574,6 +590,7 @@ class CostPriceController extends Controller
             'price' => $price,
             'customer_price' => $number($row->customer_price),
             'cost_price' => $costPrice,
+            'explicit_zero_cost_price' => $costPrice === 0.0 && (bool) ($row->explicit_zero_cost_price ?? false),
             'logistics_cost' => $logisticsCost,
             'other_costs' => $otherCosts,
             'commission_percent' => $commissionPercent,
@@ -605,6 +622,41 @@ class CostPriceController extends Controller
                 'acquiring' => $sourceObservedAt['acquiring']?->toRfc3339String(),
             ],
         ];
+    }
+
+    /** Preserve kopecks from the per-unit result; the displayed margin is rounded. */
+    private function preAdProfit(?float $price, ?float $unitNetProfit, ?float $drrPercent, ?float $preAdsMarginPercent): ?float
+    {
+        if ($price === null || $preAdsMarginPercent === null) {
+            return null;
+        }
+        return round($unitNetProfit !== null ? $unitNetProfit + $price * ($drrPercent ?? 0) / 100 : $price * $preAdsMarginPercent / 100, 2);
+    }
+
+    private function costPriceColumns(string $fallback): array
+    {
+        // Only the exact SKU's personal choice can override a legacy alias.
+        // Keep old readers working while the additive migration is pending.
+        $explicitZero = Schema::hasColumn('unit_economics_settings', 'explicit_cost_price')
+            ? 'settings.cost_price = 0 AND settings.explicit_cost_price = 0'
+            : '1 = 0';
+
+        return [
+            DB::raw("CASE WHEN {$explicitZero} THEN 0 ELSE {$fallback} END AS cost_price"),
+            DB::raw("CASE WHEN {$explicitZero} THEN 1 ELSE 0 END AS explicit_zero_cost_price"),
+            'calculated.cost_price as calculated_cost_price',
+        ];
+    }
+
+    private function costPriceReadinessReasons($row, ?float $costPrice): array
+    {
+        $explicitZero = (bool) ($row->explicit_zero_cost_price ?? false);
+        if ($costPrice === null || $costPrice < 0 || ($costPrice == 0 && ! $explicitZero)) return ['missing_cost_price'];
+        if ($explicitZero && ($row->calculated_cost_price === null || (float) $row->calculated_cost_price != 0)) {
+            return ['cost_price_not_recalculated'];
+        }
+
+        return [];
     }
 
     /**

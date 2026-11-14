@@ -23,7 +23,7 @@ return new class extends Migration
             $table->foreignId('integration_id')->constrained()->onDelete('cascade');
             
             // Товар
-            $table->foreignId('product_id')->nullable()->constrained()->onDelete('cascade');
+            $table->foreignUuid('product_id')->nullable()->constrained()->onDelete('cascade');
             $table->string('sku', 100)->index();
             $table->string('ozon_product_id', 50)->nullable();
             $table->string('product_name', 500)->nullable();
@@ -89,7 +89,7 @@ return new class extends Migration
             $table->timestamp('processed_at')->nullable();
             
             // Связь с планом/поставкой
-            $table->foreignId('supply_plan_id')->nullable()->constrained('supply_plans')->nullOnDelete();
+            $table->foreignUuid('supply_plan_id')->nullable()->constrained('supply_plans')->nullOnDelete();
             $table->unsignedBigInteger('supply_id')->nullable()->index();
             
             $table->timestamps();

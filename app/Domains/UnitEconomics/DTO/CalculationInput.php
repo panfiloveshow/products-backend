@@ -110,6 +110,9 @@ class CalculationInput
 
         // Название товара (для отображения)
         public readonly ?string $productName = null,
+        // Provenance is distinct from a timestamp: null may be an explicit
+        // manual input, while unverified marketplace defaults are not API facts.
+        public readonly ?string $commissionRateSource = null,
     ) {}
 
     /**
@@ -247,6 +250,7 @@ class CalculationInput
             inFlightCount: isset($data['in_flight_count']) ? (int) $data['in_flight_count'] : null,
             returnsCount: isset($data['returns_count']) ? (int) $data['returns_count'] : null,
             productName: $data['product_name'] ?? null,
+            commissionRateSource: is_string($data['commission_rate_source'] ?? null) ? $data['commission_rate_source'] : null,
         );
     }
 }

@@ -14,6 +14,8 @@ use Illuminate\Support\Facades\Log;
  */
 class RealizationReportApi
 {
+    private bool $lastDetailedReportSucceeded = false;
+
     public function __construct(
         private WildberriesClient $client
     ) {}
@@ -34,6 +36,7 @@ class RealizationReportApi
         string $dateTo,
         array $fields = []
     ): array {
+        $this->lastDetailedReportSucceeded = false;
         try {
             $allRows = [];
             $rrdId = 0;
@@ -52,14 +55,28 @@ class RealizationReportApi
                 }
 
                 $rows = $this->client->financePost('/api/finance/v1/sales-reports/detailed', $payload);
-                if (! is_array($rows) || $rows === []) {
+                if ($this->client->getLastResponseStatus() === 204) {
+                    $this->lastDetailedReportSucceeded = true;
+                    break;
+                }
+                if ($this->client->getLastResponseStatus() !== 200
+                    || ! is_array($rows) || ! array_is_list($rows)
+                    || count(array_filter($rows, 'is_array')) !== count($rows)) {
+                    break;
+                }
+                if ($rows === []) {
+                    $this->lastDetailedReportSucceeded = true;
                     break;
                 }
 
                 $allRows = array_merge($allRows, $rows);
                 $last = end($rows);
                 $nextRrdId = (int) ($last['rrdId'] ?? 0);
-                if (count($rows) < $limit || $nextRrdId <= $rrdId) {
+                if (count($rows) < $limit) {
+                    $this->lastDetailedReportSucceeded = true;
+                    break;
+                }
+                if ($nextRrdId <= $rrdId) {
                     break;
                 }
                 $rrdId = $nextRrdId;
@@ -70,7 +87,7 @@ class RealizationReportApi
                 sleep(61);
             } while (true);
 
-            return $allRows;
+            return $this->lastDetailedReportSucceeded ? $allRows : [];
         } catch (\Throwable $e) {
             Log::error('WB Finance detailed sales reports error', [
                 'date_from' => $dateFrom,
@@ -163,7 +180,7 @@ class RealizationReportApi
             if ($responseStatus === 429) {
                 return $this->emptyCombinedResult('rate_limited', $retryAfter);
             }
-            if ($responseStatus !== null && ($responseStatus < 200 || $responseStatus >= 300)) {
+            if (! $this->lastDetailedReportSucceeded || ! in_array($responseStatus, [200, 204], true)) {
                 return $this->emptyCombinedResult('unavailable');
             }
 

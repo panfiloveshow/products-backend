@@ -15,6 +15,29 @@ class SupplyServiceOzonStatusTest extends TestCase
 {
     use LazilyRefreshDatabase;
 
+    public function test_empty_order_response_is_retryable_and_does_not_mark_supply_fresh(): void
+    {
+        $integration = Integration::factory()->ozon()->create(['id' => 919195, 'work_space_id' => 91]);
+        $supply = Supply::create([
+            'integration_id' => $integration->id,
+            'supply_type' => Supply::TYPE_FBO,
+            'supply_method' => Supply::METHOD_DIRECT,
+            'status' => Supply::STATUS_IN_TRANSIT,
+            'ozon_order_id' => '5678',
+        ]);
+        Http::preventStrayRequests();
+        Http::fake(['api-seller.ozon.ru/v3/supply-order/get' => Http::response(['orders' => []])]);
+
+        $this->expectException(\RuntimeException::class);
+        $this->expectExceptionMessage('did not return the requested supply order');
+        try {
+            app(SupplyService::class)->syncStatus($supply);
+        } finally {
+            $this->assertNull($supply->fresh()->external_last_synced_at);
+            Http::assertSentCount(1);
+        }
+    }
+
     public function test_existing_supply_order_uses_v3_details_instead_of_draft_status(): void
     {
         $integration = Integration::factory()->ozon()->create([

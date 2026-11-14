@@ -65,6 +65,7 @@ class UnitEconomicsCacheController extends Controller
     private UnitEconomicsOrchestrator $orchestrator;
 
     private IntegrationAccessService $integrationAccessService;
+    private ?int $publicationRevision = null;
 
     public function __construct(
         UnitEconomicsCacheService $cacheService,
@@ -84,6 +85,25 @@ class UnitEconomicsCacheController extends Controller
      * GET /api/v2/unit-economics/{marketplace}
      */
     public function index(Request $request, string $marketplace): JsonResponse
+    {
+        return DB::transaction(function () use ($request, $marketplace): JsonResponse {
+            if (DB::getDriverName() === 'pgsql' && DB::transactionLevel() === 1) {
+                DB::statement('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ');
+            }
+            $this->publicationRevision = Schema::hasTable('unit_economics_sync_states')
+                ? \App\Models\UnitEconomicsSyncState::whereKey((int) $request->input('integration_id'))->value('publication_revision') : null;
+            $response = $this->indexAtSnapshot($request, $marketplace);
+            if ($response->isSuccessful()) {
+                $body = $response->getData(true);
+                $body['publication_revision'] = $this->publicationRevision;
+                $response->setData($body);
+            }
+
+            return $response;
+        });
+    }
+
+    private function indexAtSnapshot(Request $request, string $marketplace): JsonResponse
     {
         $marketplace = $this->normalizeMarketplace($marketplace);
         $validated = Validator::make($request->all(), [
@@ -540,6 +560,28 @@ class UnitEconomicsCacheController extends Controller
             'settings' => $settings,
             'all_schemes' => $allSchemes,
         ]);
+    }
+
+    /** Internal guarded entry point; calculation stays with the existing owner. */
+    public function saveManagerFinancialSettings(\App\Services\Manager\ManagerIdentity $identity, Product $product, array $values, ?UnitEconomicsSettings $current): UnitEconomicsSettings
+    {
+        if (! $identity->personalConfirmed || ! $identity->permits('unit_economics.settings.edit') || ! Integration::whereKey($product->integration_id)->where('work_space_id', $identity->workspaceId)->exists()
+            || ($current && ((int) $current->integration_id !== (int) $product->integration_id || $current->sku !== $product->sku))) {
+            throw new \App\Services\Manager\ManagerDataException('Не подтверждён доступ к настройкам SKU.', 403);
+        }
+        $values = app(\App\Services\Manager\ManagerFinancialSettingsPatch::class)->normalize($values);
+        // A missing baseline is a create, not an upsert over a concurrently created row.
+        $current ??= new UnitEconomicsSettings(['integration_id' => $product->integration_id, 'sku' => $product->sku]);
+        $current->fill($values);
+        if (array_key_exists('cost_price', $values)) $current->forceFill(['explicit_cost_price' => $values['cost_price']]);
+        $current->save();
+
+        return $current->fresh();
+    }
+
+    public function refreshManagerFinancialSettings(int $integrationId, string $sku): void
+    {
+        $this->cacheService->onSettingsChanged($integrationId, $sku);
     }
 
     /**
@@ -2530,6 +2572,9 @@ class UnitEconomicsCacheController extends Controller
     private function getStats(int $integrationId, string $marketplace, string $fulfillmentType): array
     {
         $cacheKey = "ue_stats_{$integrationId}_{$marketplace}_".strtoupper($fulfillmentType).'_v2';
+        if ($this->publicationRevision !== null) {
+            $cacheKey .= '_r'.$this->publicationRevision;
+        }
 
         return Cache::remember($cacheKey, 60, function () use ($integrationId, $marketplace, $fulfillmentType) {
             $isWb = $marketplace === 'wildberries';
@@ -2752,6 +2797,11 @@ class UnitEconomicsCacheController extends Controller
 
         // Базовые данные из кэша
         $data = $cache->toArray();
+        $sourceData = $cache->marketplace === 'wildberries' ? ($product?->wb_data ?? []) : ($product?->ozon_data ?? []);
+        $data['price_sync_error_code'] = $sourceData['price_sync_error_code'] ?? ($cache->marketplace_data['price_sync_error_code'] ?? null);
+        $data['calculation_error_code'] = $cache->marketplace_data['calculation_error_code'] ?? null;
+        $data['price_is_stale'] = $data['price_sync_error_code'] !== null || $data['calculation_error_code'] !== null
+            || ! $cache->price_observed_at || (int) $cache->source_version < (int) ($sourceData['price_version'] ?? 0);
 
         // Убираем relation чтобы не дублировать
         unset($data['product']);
@@ -4564,6 +4614,11 @@ class UnitEconomicsCacheController extends Controller
                 'success' => false,
                 'message' => 'Интеграция не найдена',
             ], 404);
+        }
+
+        if (in_array($integration->marketplace, ['wildberries', 'ozon'], true)
+            && Schema::hasTable('unit_economics_sync_states')) {
+            return response()->json(['success' => true, 'data' => app(\App\Services\UnitEconomics\UnitEconomicsFreshness::class)->forIntegration($integration)]);
         }
 
         // Максимальный updated_at в кэше — момент когда данные реально обновились.

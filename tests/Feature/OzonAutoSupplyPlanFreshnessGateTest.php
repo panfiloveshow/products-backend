@@ -155,6 +155,104 @@ class OzonAutoSupplyPlanFreshnessGateTest extends TestCase
         $this->assertNotNull($plan->fresh()->approved_at);
     }
 
+    public function test_new_facts_cannot_be_validated_onto_quantities_calculated_from_an_older_version(): void
+    {
+        $plan = $this->makeReadyPlan();
+        $this->health = $this->readyHealth(str_repeat('c', 64));
+        $this->postJson("/api/auto-supply-plans/{$plan->id}/validate", [], $this->workspaceHeaders())
+            ->assertStatus(422)->assertJsonFragment(['code' => 'facts_changed_since_calculation']);
+        $this->assertNull($plan->fresh()->validation_fingerprint);
+    }
+
+    public function test_a_changed_fact_matrix_after_validation_cannot_reach_approval(): void
+    {
+        $plan = $this->makeReadyPlan();
+        $this->postJson("/api/auto-supply-plans/{$plan->id}/validate", [], $this->workspaceHeaders())->assertOk();
+        $snapshot = $plan->snapshot;
+        $stock = $snapshot->stock_facts_json;
+        $stock['lines'][0]['current_stock'] = 999;
+        $snapshot->update(['stock_facts_json' => $stock]);
+        $this->postJson("/api/auto-supply-plans/{$plan->id}/approve", [], $this->workspaceHeaders())
+            ->assertStatus(422)->assertJsonFragment(['code' => 'facts_snapshot_changed']);
+        $this->assertNull($plan->fresh()->approved_at);
+    }
+
+    public function test_a_legacy_snapshot_without_an_input_receipt_requires_recalculation(): void
+    {
+        $plan = $this->makeReadyPlan();
+        $plan->snapshot->update(['summary_json' => ['stage' => 'completed']]);
+        $this->postJson("/api/auto-supply-plans/{$plan->id}/validate", [], $this->workspaceHeaders())
+            ->assertStatus(422)->assertJsonFragment(['code' => 'facts_snapshot_evidence_missing']);
+    }
+
+    public function test_validation_without_its_exact_snapshot_digest_cannot_authorize_approval(): void
+    {
+        $plan = $this->makeReadyPlan();
+        $this->postJson("/api/auto-supply-plans/{$plan->id}/validate", [], $this->workspaceHeaders())->assertOk();
+        $validation = $plan->fresh()->validation_json;
+        unset($validation['snapshot_hash']);
+        $plan->update(['validation_json' => $validation]);
+        $this->postJson("/api/auto-supply-plans/{$plan->id}/approve", [], $this->workspaceHeaders())
+            ->assertStatus(422)->assertJsonFragment(['code' => 'facts_snapshot_changed_after_validation']);
+        $this->assertNull($plan->fresh()->approved_at);
+    }
+
+    public function test_a_snapshot_from_another_plan_cannot_explain_this_plan(): void
+    {
+        $plan = $this->makeReadyPlan();
+        $other = $plan->replicate();
+        $other->save();
+        $this->assertSame('facts_snapshot_scope_mismatch', \App\Services\AutoSupplyPlanning\PlanningSnapshotEvidence::errors($other)[0]['code']);
+        $this->postJson("/api/auto-supply-plans/{$other->id}/validate", [], $this->workspaceHeaders())
+            ->assertStatus(422)->assertJsonFragment(['code' => 'facts_snapshot_required']);
+    }
+
+    public function test_even_a_sealed_empty_matrix_cannot_explain_stored_positive_quantities(): void
+    {
+        $plan = $this->makeReadyPlan();
+        $snapshot = $plan->snapshot;
+        $snapshot->update(['stock_facts_json' => ['lines' => []]]);
+        $snapshot->refresh();
+        $snapshot->update(['summary_json' => \App\Services\AutoSupplyPlanning\PlanningSnapshotEvidence::seal($snapshot)]);
+        $this->postJson("/api/auto-supply-plans/{$plan->id}/validate", [], $this->workspaceHeaders())
+            ->assertStatus(422)->assertJsonFragment(['code' => 'facts_snapshot_lines_missing']);
+    }
+
+    public function test_materialized_supply_cannot_start_a_new_native_draft_after_inputs_change(): void
+    {
+        $plan = $this->makeReadyPlan();
+        $this->postJson("/api/auto-supply-plans/{$plan->id}/validate", [], $this->workspaceHeaders())->assertOk();
+        $materializer = app(\App\Services\AutoSupplyPlanning\OzonPlanMaterializationService::class);
+        $plan = $materializer->approve($plan->fresh());
+        $supply = $materializer->materialize($plan)['supplies']->first();
+        $this->health = $this->readyHealth(str_repeat('d', 64));
+        \Illuminate\Support\Facades\Http::preventStrayRequests();
+        try {
+            app(\App\Services\Supply\SupplyService::class)->createOzonDraft($supply);
+            $this->fail('A stale plan must not create a new Native draft');
+        } catch (\App\Exceptions\OzonPreconditionException $e) {
+            $this->assertStringContainsString('Исходные данные или утверждение автоплана', $e->getMessage());
+        }
+        \Illuminate\Support\Facades\Http::assertNothingSent();
+        $this->assertNull($supply->fresh()->ozon_draft_id);
+        // Reading a recorded result remains possible without a new command.
+        $supply->update(['ozon_draft_id' => '900001', 'ozon_response' => ['status' => 'success']]);
+        $this->assertSame('900001', app(\App\Services\Supply\SupplyService::class)->createOzonDraft($supply)['draft_id']);
+    }
+
+    public function test_input_changes_during_calculation_are_not_relabelled_as_a_stable_result(): void
+    {
+        $plan = $this->makeReadyPlan();
+        $capture = app(\App\Services\AutoSupplyPlanning\PlanningFactSnapshotService::class);
+        $capture->start($plan);
+        $facts = app(\App\Services\AutoSupplyPlanning\OzonPlanningFactsBuilder::class)->buildLineFacts($plan->lines()->get()->toArray());
+        $this->health = $this->readyHealth(str_repeat('c', 64));
+        $capture->complete($plan, ['demand_facts' => ['lines' => $facts['demand']], 'stock_facts' => ['lines' => $facts['stock']],
+            'supply_facts' => ['lines' => $facts['supply']], 'economics_facts' => ['lines' => $facts['economics']]]);
+        $this->postJson("/api/auto-supply-plans/{$plan->id}/validate", [], $this->workspaceHeaders())
+            ->assertStatus(422)->assertJsonFragment(['code' => 'facts_changed_during_calculation']);
+    }
+
     /**
      * @return array<string, mixed>
      */
@@ -218,17 +316,11 @@ class OzonAutoSupplyPlanFreshnessGateTest extends TestCase
         ]);
 
         if ($withSnapshot) {
-            $snapshot = PlanningFactSnapshot::create([
-                'auto_supply_plan_id' => $plan->id,
-                'integration_id' => $integration->id,
-                'marketplace' => 'ozon',
-                'status' => 'ready',
-                'captured_at' => now(),
-                'params_json' => ['effective' => $plan->params],
-                'facts_freshness_json' => ['status' => 'ready'],
-                'summary_json' => ['stage' => 'completed'],
-            ]);
-            $plan->update(['snapshot_id' => $snapshot->id]);
+            $capture = app(\App\Services\AutoSupplyPlanning\PlanningFactSnapshotService::class);
+            $capture->start($plan);
+            $facts = app(\App\Services\AutoSupplyPlanning\OzonPlanningFactsBuilder::class)->buildLineFacts($plan->lines()->get()->toArray());
+            $capture->complete($plan, ['demand_facts' => ['lines' => $facts['demand']], 'stock_facts' => ['lines' => $facts['stock']],
+                'supply_facts' => ['lines' => $facts['supply']], 'economics_facts' => ['lines' => $facts['economics']]]);
         }
 
         return $plan->fresh();

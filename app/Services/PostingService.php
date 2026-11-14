@@ -592,6 +592,11 @@ class PostingService
      */
     public function pack(Posting $posting, array $products): Posting
     {
+        return $this->guardManagerFbsMutation($posting, fn () => $this->packWithoutManagerGuard($posting, $products));
+    }
+
+    private function packWithoutManagerGuard(Posting $posting, array $products): Posting
+    {
         $integration = Integration::findOrFail($posting->integration_id);
 
         if (!$posting->canPack()) {
@@ -647,6 +652,11 @@ class PostingService
      */
     public function ship(Posting $posting): Posting
     {
+        return $this->guardManagerFbsMutation($posting, fn () => $this->shipWithoutManagerGuard($posting));
+    }
+
+    private function shipWithoutManagerGuard(Posting $posting): Posting
+    {
         $integration = Integration::findOrFail($posting->integration_id);
 
         if (!$posting->canShip()) {
@@ -666,6 +676,11 @@ class PostingService
      */
     public function cancel(Posting $posting, int $reasonId, ?string $message = null): Posting
     {
+        return $this->guardManagerFbsMutation($posting, fn () => $this->cancelWithoutManagerGuard($posting, $reasonId, $message));
+    }
+
+    private function cancelWithoutManagerGuard(Posting $posting, int $reasonId, ?string $message = null): Posting
+    {
         $integration = Integration::findOrFail($posting->integration_id);
 
         if (!$posting->canCancel()) {
@@ -682,9 +697,27 @@ class PostingService
         return $posting->fresh(['items']);
     }
 
-    /**
-     * Отменить отправление Ozon
-     */
+    /** Respect pending manager operations before another order mutation. */
+    private function guardManagerFbsMutation(Posting $posting, callable $callback): Posting
+    {
+        $integration = Integration::findOrFail($posting->integration_id);
+        $market = match ($integration->marketplace) {
+            'wb', 'wildberries' => 'wildberries', 'ozon' => 'ozon', default => null,
+        };
+
+        if ($market === null) return $callback();
+        $guarded = fn () => app(\App\Services\Manager\ManagerFbsPublicationGuard::class)->run($market, (string) $posting->posting_number, $callback);
+        $policy = app(\App\Services\Manager\ManagerFbsExecutionPolicy::class);
+        if (! $policy->active()) return $guarded();
+        $credentials = $integration->resolveCredentials();
+        $clientId = isset($credentials['client_id']) ? (string) $credentials['client_id'] : null;
+        // Match OzonClient's effective OAuth mode before even a local status mutation.
+        if ($market === 'ozon' && (string) ($credentials['oauth_access_token'] ?? $credentials['access_token'] ?? config('services.ozon.access_token') ?? '') !== '') $clientId = null;
+        return $policy->legacy($market,
+            (string) ($credentials['api_key'] ?? $credentials['token'] ?? ''), $clientId, $guarded);
+    }
+
+    /** Отменить отправление Ozon. */
     private function cancelOzonPosting(Integration $integration, Posting $posting, int $reasonId, ?string $message): void
     {
         $marketplace = OzonMarketplace::fromIntegration($integration);

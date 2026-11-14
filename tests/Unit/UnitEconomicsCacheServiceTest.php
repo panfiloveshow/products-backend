@@ -320,10 +320,11 @@ class UnitEconomicsCacheServiceTest extends TestCase
 
         $cacheData = $method->invoke(
             $service,
-            new Product(['id' => 'product-tax', 'name' => 'Tax Product']),
+            new Product(['id' => 'product-tax', 'name' => 'Tax Product', 'integration_id' => 1, 'sku' => 'sku-tax', 'marketplace' => 'yandex_market']),
             null,
             $result,
             [
+                'sku' => 'sku-tax', 'integration_id' => 1, 'marketplace' => 'yandex_market', 'fulfillment_type' => 'FBS', 'price' => 1000, 'cost_price' => 300,
                 '_extra' => [
                     'tax_percent' => 6,
                     'drr_percent' => 0,
@@ -778,10 +779,11 @@ class UnitEconomicsCacheServiceTest extends TestCase
 
         $cacheData = $method->invoke(
             $service,
-            new Product(['id' => 'wb-il-product', 'name' => 'WB IL']),
+            new Product(['id' => 'wb-il-product', 'name' => 'WB IL', 'integration_id' => 1, 'sku' => 'wb-il', 'marketplace' => 'wildberries']),
             null,
             $result,
             [
+                'sku' => 'wb-il', 'integration_id' => 1, 'marketplace' => 'wildberries', 'fulfillment_type' => 'FBO', 'price' => 1000, 'cost_price' => 0,
                 'localization_index' => 1.2,
                 '_extra' => [
                     'tax_percent' => 0,

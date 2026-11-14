@@ -21,6 +21,10 @@ use App\Models\Integration;
  */
 class ProductsApi implements ProductsApiInterface
 {
+    private bool $lastPriceSnapshotComplete = false;
+    private bool $strictPriceSnapshot = false;
+    private float $priceSnapshotDeadline = 0;
+
     public function __construct(
         private WildberriesClient $client
     ) {}
@@ -67,6 +71,7 @@ class ProductsApi implements ProductsApiInterface
             $card['_dimensions_observed_at'] = $dimensionsObservedAt;
         }
         unset($card);
+        $cursorTotal = $response['cursor']['total'] ?? null;
         
         // Не делаем дополнительный поиск по nmID по умолчанию: при полной пагинации
         // это превращает sync в O(pages^2) Content API calls. Включать только для
@@ -89,6 +94,8 @@ class ProductsApi implements ProductsApiInterface
         return [
             'cards' => $cards,
             'cursor' => $response['cursor'] ?? null,
+            'complete' => is_array($response['cards'] ?? null) && ! ($response['error'] ?? false)
+                && is_numeric($cursorTotal) && $cursorTotal >= 0,
         ];
     }
     
@@ -207,6 +214,23 @@ class ProductsApi implements ProductsApiInterface
         // Но лучше получить все и отфильтровать
         return $this->getAllPrices($nmIds);
     }
+
+    public function getPriceSnapshot(?Integration $integration = null, array $nmIds = []): array
+    {
+        $startedAt = now()->utc()->toIso8601String();
+        $this->strictPriceSnapshot = true;
+        $this->priceSnapshotDeadline = microtime(true) + 90;
+        try {
+            $prices = $this->getPrices($integration, $nmIds);
+        } finally {
+            $this->strictPriceSnapshot = false;
+        }
+
+        return ['prices' => $prices, 'complete' => $this->lastPriceSnapshotComplete,
+            'http_status' => $this->client->getLastResponseStatus(),
+            'retry_after' => $this->client->getLastRateLimitRetryAfter(),
+            'request_started_at' => $startedAt];
+    }
     
     /**
      * Получить все цены с пагинацией
@@ -237,6 +261,7 @@ class ProductsApi implements ProductsApiInterface
      */
     private function getAllPrices(array $filterNmIds = []): array
     {
+        $this->lastPriceSnapshotComplete = false;
         $prices = [];
         $offset = 0;
         $limit = 1000;
@@ -249,6 +274,13 @@ class ProductsApi implements ProductsApiInterface
         ]);
 
         do {
+            if ($this->strictPriceSnapshot && microtime(true) >= $this->priceSnapshotDeadline) {
+                $this->lastPriceSnapshotComplete = false;
+                break;
+            }
+            if ($this->strictPriceSnapshot && $iteration > 0) {
+                usleep(650000);
+            }
             $response = $this->client->pricesGet('/api/v2/list/goods/filter', [
                 'limit'  => $limit,
                 'offset' => $offset,
@@ -261,7 +293,7 @@ class ProductsApi implements ProductsApiInterface
                 break;
             }
 
-            if (!isset($response['data']['listGoods'])) {
+            if (!isset($response['data']['listGoods']) || !is_array($response['data']['listGoods'])) {
                 \Illuminate\Support\Facades\Log::warning('WB ProductsApi: Prices API response missing listGoods', [
                     'response_keys' => array_keys($response),
                     'error'         => $response['error'] ?? null,
@@ -271,6 +303,11 @@ class ProductsApi implements ProductsApiInterface
             }
 
             $items = $response['data']['listGoods'];
+            $observedAt = now()->utc()->toIso8601String();
+            // A short page ends this fixed-size offset listing. Base tokens can
+            // require 15 minutes between reads, so do not probe an unnecessary
+            // empty page after all returned goods have already been observed.
+            $this->lastPriceSnapshotComplete = count($items) < $limit;
 
             if ($iteration === 0) {
                 \Illuminate\Support\Facades\Log::info('WB ProductsApi: Prices API first response', [
@@ -301,6 +338,7 @@ class ProductsApi implements ProductsApiInterface
                     'club_price'         => $clubPrice,
                     'club_discount'      => (int) ($item['clubDiscount'] ?? 0),
                     'final_price'        => $discountedPrice > 0 ? $discountedPrice : $basePrice,
+                    'price_observed_at'  => $observedAt,
                     'currency'           => $item['currencyIsoCode4217'] ?? 'RUB',
                     'is_bad_turnover'    => $item['isBadTurnover'] ?? false,
                     'editable_size_price'=> $item['editableSizePrice'] ?? false,
@@ -440,7 +478,7 @@ class ProductsApi implements ProductsApiInterface
                     if ($ordersCount > 0) {
                         $buyoutsCount = (int) ($selected['buyoutCount'] ?? 0);
                         $buyoutsPercent = $selected['conversions']['buyoutPercent'] ?? null;
-                        $entry['redemption_rate'] = is_numeric($buyoutsPercent) && $buyoutsPercent > 0
+                        $entry['redemption_rate'] = is_numeric($buyoutsPercent) && $buyoutsPercent >= 0
                             ? round((float) $buyoutsPercent, 2)
                             : round(min(100, ($buyoutsCount / max(1, $ordersCount)) * 100), 2);
                         $entry['redemption_orders_count'] = $ordersCount;

@@ -195,8 +195,18 @@ class ProductService
         );
 
         return $lock->block(15, function () use ($marketplace, $credentials, $integrationId, $syncType) {
+            $coordinator = app(\App\Services\UnitEconomics\UnitEconomicsSyncCoordinator::class);
+            $integration = $integrationId ? \App\Models\Integration::find($integrationId) : null;
+            $requiredStages = $syncType === 'inventory'
+                ? ['inventory', 'prices', 'projection', 'enrichment', ...($marketplace === 'wildberries' ? ['finance'] : [])]
+                : null;
+            $run = $integration && in_array($marketplace, ['wildberries', 'ozon'], true) && $coordinator->enabled($integrationId)
+                ? $coordinator->start($integration, 'full', $requiredStages) : null;
             $existingSync = SyncStartGuard::findActiveDuplicate($syncType, $marketplace, $integrationId);
             if ($existingSync) {
+                if ($run) {
+                    $coordinator->attachLog($existingSync, $run->id);
+                }
                 return $existingSync;
             }
 
@@ -222,7 +232,12 @@ class ProductService
                 'sync_type' => $syncType,
                 'status' => SyncLog::STATUS_PENDING,
                 'credentials' => $credentials,
+                'metadata' => $run ? ['unit_economics_run_id' => $run->id, 'queue_available_at' => now()->utc()->toIso8601String()] : null,
             ]);
+
+            if ($run) {
+                $coordinator->logStage($syncLog);
+            }
 
             if ($syncType === 'inventory') {
                 SyncInventoryJob::dispatch($syncLog);

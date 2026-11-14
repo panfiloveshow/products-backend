@@ -99,6 +99,13 @@ return new class extends Migration
             
             DB::statement('PRAGMA foreign_keys=on');
         } else {
+            if (DB::getDriverName() === 'pgsql') {
+                // PostgreSQL keeps the old enum CHECK when changing the column to varchar.
+                $grammar = Schema::getConnection()->getSchemaGrammar();
+                $table = $grammar->wrapTable('unit_economics_cache');
+                $constraint = $grammar->wrap(DB::getTablePrefix().'unit_economics_cache_fulfillment_type_check');
+                DB::statement("ALTER TABLE {$table} DROP CONSTRAINT IF EXISTS {$constraint}");
+            }
             Schema::table('unit_economics_cache', function (Blueprint $table) {
                 $table->string('fulfillment_type', 20)->default('FBO')->change();
             });

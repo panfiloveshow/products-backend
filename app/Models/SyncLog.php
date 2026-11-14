@@ -68,10 +68,12 @@ class SyncLog extends Model
 
     public function start(): void
     {
+        $this->refresh();
         $this->update([
             'status' => self::STATUS_RUNNING,
             'started_at' => now(),
         ]);
+        app(\App\Services\UnitEconomics\UnitEconomicsSyncCoordinator::class)->logStage($this);
     }
 
     public function complete(int $synced = 0, int $failed = 0): void
@@ -82,6 +84,7 @@ class SyncLog extends Model
             'items_failed' => $failed,
             'completed_at' => now(),
         ]);
+        app(\App\Services\UnitEconomics\UnitEconomicsSyncCoordinator::class)->logStage($this);
     }
 
     public function fail(string $errorMessage): void
@@ -91,6 +94,7 @@ class SyncLog extends Model
             'error_message' => $errorMessage,
             'completed_at' => now(),
         ]);
+        app(\App\Services\UnitEconomics\UnitEconomicsSyncCoordinator::class)->logStage($this);
     }
 
     public function isRunning(): bool

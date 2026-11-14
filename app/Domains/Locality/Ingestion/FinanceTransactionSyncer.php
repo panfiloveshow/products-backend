@@ -5,6 +5,7 @@ namespace App\Domains\Locality\Ingestion;
 use App\Domains\Ozon\Api\OzonClient;
 use App\Models\Integration;
 use App\Models\OzonFinanceTransaction;
+use App\Services\Ozon\OzonActualRatesService;
 use Carbon\Carbon;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
@@ -39,10 +40,17 @@ class FinanceTransactionSyncer
     /** true, если realization/by-day ответил 403 «Premium plus required» в этом прогоне. */
     private bool $realizationBlocked = false;
 
+    /** Empty/not-yet-published reports must never erase saved sales. */
+    private bool $realizationDayAvailable = false;
+
+    private bool $realizationOutsideRetention = false;
+
     private const ENDPOINT_REALIZATION_BY_DAY = '/v1/finance/realization/by-day';
+
     private const ENDPOINT_ACCRUAL_BY_DAY = '/v1/finance/accrual/by-day';
 
     public const SALE_OPERATION_TYPE = 'OperationAgentDeliveredToCustomer';
+
     public const RETURN_OPERATION_TYPE = 'ClientReturnAgentOperation';
 
     /** Пауза между запросами к Ozon: новый API строго последовательный. */
@@ -101,6 +109,7 @@ class FinanceTransactionSyncer
 
     public function syncForIntegration(Integration $integration, Carbon $from, Carbon $to): SyncResult
     {
+        $this->realizationBlocked = false;
         $client = OzonClient::fromIntegration($integration);
         $integrationId = (int) $integration->id;
 
@@ -123,8 +132,10 @@ class FinanceTransactionSyncer
             $cursor->addDay();
 
             try {
+                $realizationRows = $this->fetchRealizationRows($client, $integrationId, $date);
+                $replaceRealization = $this->realizationDayAvailable;
                 $rows = [
-                    ...$this->fetchRealizationRows($client, $integrationId, $date),
+                    ...$realizationRows,
                     ...$this->fetchAccrualRows($client, $integrationId, $date),
                 ];
             } catch (\Throwable $e) {
@@ -137,45 +148,16 @@ class FinanceTransactionSyncer
                 continue;
             }
 
-            if ($rows === []) {
+            if ($rows === [] && ! $replaceRealization) {
                 // Пустой день не трогаем: возможен временный пустой ответ API,
                 // а удаление уже записанного дня по нему — потеря данных.
                 continue;
             }
 
-            DB::transaction(function () use ($rows, $integrationId, $date, &$inserted, &$updated, &$skipped) {
-                // Стираем строки этого дня из legacy-источника (их operation_id —
-                // числовой id без ':'), иначе новые строки суммируются со старыми.
-                OzonFinanceTransaction::query()
-                    ->where('integration_id', $integrationId)
-                    ->whereDate('operation_date', $date)
-                    ->where('operation_id', 'NOT LIKE', '%:%')
-                    ->delete();
-
-                foreach ($rows as $row) {
-                    $attrs = [
-                        'integration_id' => $integrationId,
-                        'operation_id' => $row['operation_id'],
-                    ];
-                    $values = $row;
-                    unset($values['operation_id']);
-                    $values['fetched_at'] = now();
-
-                    $existing = OzonFinanceTransaction::query()->where($attrs)->first();
-                    if ($existing === null) {
-                        OzonFinanceTransaction::query()->create(array_merge($attrs, $values));
-                        $inserted++;
-                    } else {
-                        $existing->fill($values);
-                        if ($existing->isDirty()) {
-                            $existing->save();
-                            $updated++;
-                        } else {
-                            $skipped++;
-                        }
-                    }
-                }
-            });
+            $result = $this->persistDay($integrationId, $date, $rows, $replaceRealization, true);
+            $inserted += $result->inserted;
+            $updated += $result->updated;
+            $skipped += $result->skipped;
         }
 
         Log::channel('locality')->info('FinanceTransactionSyncer completed', [
@@ -187,10 +169,6 @@ class FinanceTransactionSyncer
 
         $this->markPremiumPlusRequired($integration, $this->realizationBlocked);
         if ($this->realizationBlocked) {
-            // Продажные строки (units/revenue — знаменатель фактических ставок
-            // OzonActualRatesService) добираем из месячного отчёта о реализации:
-            // он доступен без Premium Plus. Legacy /v3/finance/transaction/list
-            // Ozon отключил 08.09.2026 («obsolete method cannot be used»).
             [$mi, $mu] = $this->syncMonthlyRealizationSales($client, $integrationId);
             $inserted += $mi;
             $updated += $mu;
@@ -200,6 +178,94 @@ class FinanceTransactionSyncer
         return new SyncResult($inserted, $updated, $skipped);
     }
 
+    private function persistDay(int $integrationId, string $date, array $rows, bool $replaceRealization, bool $replaceLegacy = false): SyncResult
+    {
+        $result = DB::transaction(function () use ($rows, $integrationId, $date, $replaceRealization, $replaceLegacy) {
+            $inserted = $updated = $skipped = 0;
+            if ($replaceLegacy) {
+                OzonFinanceTransaction::query()
+                    ->where('integration_id', $integrationId)
+                    ->whereDate('operation_date', $date)
+                    ->where('operation_id', 'NOT LIKE', '%:%')
+                    ->delete();
+            }
+
+            if ($replaceRealization) {
+                $ids = array_column(array_filter($rows, fn (array $row) => ($row['raw']['source'] ?? null) === 'realization_by_day'), 'operation_id');
+                OzonFinanceTransaction::query()
+                    ->where('integration_id', $integrationId)
+                    ->whereDate('operation_date', $date)
+                    ->where('raw->source', 'realization_by_day')
+                    ->whereNotIn('operation_id', $ids)
+                    ->delete();
+            }
+
+            foreach ($rows as $row) {
+                $attrs = [
+                    'integration_id' => $integrationId,
+                    'operation_id' => $row['operation_id'],
+                ];
+                $values = $row;
+                unset($values['operation_id']);
+                $values['fetched_at'] = now();
+
+                $existing = OzonFinanceTransaction::query()->where($attrs)->first();
+                if ($existing === null) {
+                    OzonFinanceTransaction::query()->create(array_merge($attrs, $values));
+                    $inserted++;
+                } else {
+                    $existing->fill($values);
+                    if ($existing->isDirty()) {
+                        $existing->save();
+                        $updated++;
+                    } else {
+                        $skipped++;
+                    }
+                }
+            }
+
+            return new SyncResult($inserted, $updated, $skipped);
+        });
+        OzonActualRatesService::forgetIntegration($integrationId);
+
+        return $result;
+    }
+
+    /** Repair only sales/returns. Existing fee transactions are preserved. */
+    public function restoreRealizationDay(Integration $integration, Carbon $date): array
+    {
+        $this->realizationBlocked = false;
+        $rows = $this->fetchRealizationRows(OzonClient::fromIntegration($integration), (int) $integration->id, $date->toDateString());
+        if ($this->realizationBlocked) {
+            $this->markPremiumPlusRequired($integration, true);
+
+            return ['status' => 'premium_required'];
+        }
+        if ($this->realizationOutsideRetention) {
+            return ['status' => 'outside_retention'];
+        }
+        if (! $this->realizationDayAvailable) {
+            return ['status' => 'unavailable'];
+        }
+
+        $before = OzonFinanceTransaction::query()
+            ->where('integration_id', $integration->id)
+            ->whereDate('operation_date', $date->toDateString())
+            ->where('operation_type', self::SALE_OPERATION_TYPE)
+            ->where('raw->source', 'realization_by_day')
+            ->get(['raw'])->sum(fn ($row) => (int) ($row->raw['quantity'] ?? 0));
+        $result = $this->persistDay((int) $integration->id, $date->toDateString(), $rows, true);
+        $this->markPremiumPlusRequired($integration, false);
+        $after = array_sum(array_map(fn (array $row) => $row['operation_type'] === self::SALE_OPERATION_TYPE ? (int) $row['raw']['quantity'] : 0, $rows));
+
+        return ['status' => 'restored', 'before_units' => $before, 'after_units' => $after] + $result->toArray();
+    }
+
+    public function restoreMonthlyRealization(Integration $integration, ?Carbon $month = null): array
+    {
+        return $this->syncMonthlyRealizationSales(OzonClient::fromIntegration($integration), (int) $integration->id, $month);
+    }
+
     /**
      * Продажи последнего закрытого месяца из /v2/finance/realization одной
      * строкой на SKU (operation_date = последний день месяца, raw.quantity —
@@ -207,18 +273,21 @@ class FinanceTransactionSyncer
      *
      * @return array{0:int,1:int} [inserted, updated]
      */
-    private function syncMonthlyRealizationSales(OzonClient $client, int $integrationId): array
+    private function syncMonthlyRealizationSales(OzonClient $client, int $integrationId, ?Carbon $month = null): array
     {
         $inserted = 0;
         $updated = 0;
 
-        foreach ([1, 2] as $monthsBack) {
-            $period = now()->subMonthsNoOverflow($monthsBack);
+        $months = $month ? [$month->copy()] : [now()->subMonthNoOverflow(), now()->subMonthsNoOverflow(2)];
+        foreach ($months as $period) {
             usleep(self::REQUEST_PAUSE_US);
             $response = $client->post('/v2/finance/realization', [
                 'month' => $period->month,
                 'year' => $period->year,
             ]);
+            if ($month !== null && (! is_array($response) || isset($response['_error']))) {
+                throw new \RuntimeException('Monthly realization HTTP '.($response['_http_status'] ?? 'no response'));
+            }
             $rows = is_array($response) ? data_get($response, 'result.rows', $response['rows'] ?? []) : [];
             if (! is_array($rows) || $rows === []) {
                 continue; // отчёт месяца ещё не готов — пробуем на месяц раньше
@@ -239,7 +308,7 @@ class FinanceTransactionSyncer
                     continue;
                 }
 
-                $operationId = "real:{$monthKey}:" . ($sku !== '' ? $sku : $offerId);
+                $operationId = "real:{$monthKey}:".($sku !== '' ? $sku : $offerId);
                 // Отчёт содержит несколько строк SKU с разными ценами: сохраняем
                 // их сумму, иначе последняя строка занижает знаменатель ставок.
                 if (isset($sales[$operationId])) {
@@ -288,6 +357,8 @@ class FinanceTransactionSyncer
             break; // хватило одного закрытого месяца
         }
 
+        OzonActualRatesService::forgetIntegration($integrationId);
+
         return [$inserted, $updated];
     }
 
@@ -305,8 +376,6 @@ class FinanceTransactionSyncer
         ]);
     }
 
-
-
     /**
      * Продажи/возвраты дня из /v1/finance/realization/by-day.
      * Одна строка = один SKU; количество единиц лежит в raw.quantity
@@ -316,6 +385,8 @@ class FinanceTransactionSyncer
      */
     private function fetchRealizationRows(OzonClient $client, int $integrationId, string $date): array
     {
+        $this->realizationDayAvailable = false;
+        $this->realizationOutsideRetention = false;
         $day = Carbon::parse($date);
         usleep(self::REQUEST_PAUSE_US);
         $response = $client->post(self::ENDPOINT_REALIZATION_BY_DAY, [
@@ -327,6 +398,14 @@ class FinanceTransactionSyncer
         if (! is_array($response) || isset($response['_error'])) {
             // 404/пусто для свежего дня — норма (отчёт ещё не сформирован).
             $status = is_array($response) ? ($response['_http_status'] ?? null) : null;
+            if ($status === 400 && str_contains((string) ($response['message'] ?? ''), '32 days')) {
+                $this->realizationOutsideRetention = true;
+
+                return [];
+            }
+            if ($status === 403 && str_contains(strtolower((string) ($response['message'] ?? '')), 'api-key has expired')) {
+                throw new \RuntimeException('Ozon API key expired for integration '.$integrationId);
+            }
             if ($status === 403) {
                 // Дневная реализация доступна только с Ozon Premium Plus. Не роняем
                 // день: accrual/by-day открыт всем — услуги (эквайринг, логистика)
@@ -346,6 +425,12 @@ class FinanceTransactionSyncer
         if (! is_array($rows)) {
             return [];
         }
+        foreach ($rows as $row) {
+            if (! is_array($row) || ! is_array($row['item'] ?? null) || ! is_numeric($row['seller_price_per_instance'] ?? null)) {
+                throw new \RuntimeException('Malformed realization report for '.$date);
+            }
+        }
+        $this->realizationDayAvailable = $rows !== [];
 
         $result = [];
         foreach ($rows as $index => $row) {
@@ -366,23 +451,34 @@ class FinanceTransactionSyncer
                     continue;
                 }
 
-                $quantity = max(1, (int) ($commission['quantity'] ?? 1));
+                $quantity = (int) ($commission['quantity'] ?? 0);
                 $gross = round(abs($sellerPrice) * $quantity, 2);
-                if ($gross <= 0) {
+                if ($quantity <= 0 || $gross <= 0) {
                     continue;
                 }
 
-                $result[] = [
-                    'operation_id' => "rlz:{$date}:{$operationType}:" . ($sku !== '' ? $sku : $index),
+                $operationId = "rlz:{$date}:{$operationType}:".($sku !== '' ? $sku : $index);
+                $fee = -1 * $sign * abs((float) ($commission['standard_fee'] ?? 0));
+                if (isset($result[$operationId])) {
+                    $result[$operationId]['amount'] = round($result[$operationId]['amount'] + $sign * $gross, 2);
+                    $result[$operationId]['accruals_for_sale'] = $result[$operationId]['amount'];
+                    $result[$operationId]['sale_commission'] = round($result[$operationId]['sale_commission'] + $fee, 2);
+                    $result[$operationId]['raw']['quantity'] += $quantity;
+                    $result[$operationId]['raw']['price_rows'][] = ['quantity' => $quantity, 'seller_price_per_instance' => $sellerPrice, 'commission' => $commission];
+
+                    continue;
+                }
+                $result[$operationId] = [
+                    'operation_id' => $operationId,
                     'operation_type' => $operationType,
                     'operation_type_name' => $sign > 0 ? 'Продажа (realization/by-day)' : 'Возврат (realization/by-day)',
-                    'operation_date' => $date . ' 00:00:00',
+                    'operation_date' => $date.' 00:00:00',
                     'posting_number' => null,
                     'sku' => $sku !== '' ? $sku : null,
                     'offer_id' => $item['offer_id'] ?? null,
                     'amount' => $sign * $gross,
                     'accruals_for_sale' => $sign * $gross,
-                    'sale_commission' => -1 * $sign * abs((float) ($commission['standard_fee'] ?? 0)),
+                    'sale_commission' => $fee,
                     'warehouse_id' => null,
                     'warehouse_name' => null,
                     'raw' => [
@@ -391,12 +487,13 @@ class FinanceTransactionSyncer
                         'seller_price_per_instance' => $sellerPrice,
                         'commission' => $commission,
                         'item' => $item,
+                        'price_rows' => [['quantity' => $quantity, 'seller_price_per_instance' => $sellerPrice, 'commission' => $commission]],
                     ],
                 ];
             }
         }
 
-        return $result;
+        return array_values($result);
     }
 
     /**
@@ -420,7 +517,7 @@ class FinanceTransactionSyncer
             $response = $client->post(self::ENDPOINT_ACCRUAL_BY_DAY, $payload);
             if (! is_array($response) || isset($response['_error'])) {
                 $status = is_array($response) ? ($response['_http_status'] ?? null) : null;
-                throw new \RuntimeException('accrual/by-day HTTP ' . ($status ?? 'null response'));
+                throw new \RuntimeException('accrual/by-day HTTP '.($status ?? 'null response'));
             }
 
             $accruals = $response['accruals'] ?? [];
@@ -454,7 +551,7 @@ class FinanceTransactionSyncer
      * type_id + accrued.amount — это начисление, sku наследуется от ближайшего
      * родителя, у которого он есть.
      *
-     * @param array<string,array<string,mixed>> $aggregated
+     * @param  array<string,array<string,mixed>>  $aggregated
      */
     private function aggregateAccrualFees(array &$aggregated, array $accrual, string $date): void
     {
@@ -480,7 +577,7 @@ class FinanceTransactionSyncer
 
             $typeId = $fee['type_id'];
             $sku = $fee['sku'];
-            $key = "{$accrualId}:{$typeId}:" . ($sku ?? '-');
+            $key = "{$accrualId}:{$typeId}:".($sku ?? '-');
 
             if (isset($aggregated[$key])) {
                 $aggregated[$key]['amount'] = round($aggregated[$key]['amount'] + $amount, 2);
@@ -492,7 +589,7 @@ class FinanceTransactionSyncer
                 'operation_id' => $key,
                 'operation_type' => self::ACCRUAL_TYPE_NAMES[$typeId] ?? "AccrualType_{$typeId}",
                 'operation_type_name' => null,
-                'operation_date' => $date . ' 00:00:00',
+                'operation_date' => $date.' 00:00:00',
                 'posting_number' => $unitNumber,
                 'sku' => $sku,
                 'offer_id' => null,
@@ -514,7 +611,7 @@ class FinanceTransactionSyncer
     }
 
     /**
-     * @param list<array{sku: ?string, type_id: int, amount: float}> $fees
+     * @param  list<array{sku: ?string, type_id: int, amount: float}>  $fees
      */
     private function collectFees(array $node, ?string $sku, array &$fees): void
     {

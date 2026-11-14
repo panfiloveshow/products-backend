@@ -197,20 +197,25 @@ class SalesApi
      *
      * @return array<string, array<string, array{sales_7_days:int,sales_14_days:int,sales_30_days:int,avg_daily_sales:float}>>
      */
-    public function getSalesByWarehouse(int $days = 30): array
+    public function getSalesByWarehouse(int $days = 30, ?int $prefetchDays = null): array
     {
         try {
             $days = max(1, $days);
             $dateFrom = now()->subDays($days)->format('Y-m-d');
+            $fetchFrom = now()->subDays(max($days, $prefetchDays ?? $days))->format('Y-m-d');
 
             $response = $this->client->statistics('/api/v1/supplier/sales', [
-                'dateFrom' => $dateFrom,
+                'dateFrom' => $fetchFrom,
             ]);
 
             /** @var array<string, array<string, array{sales_30_days:int,sales_14_days:int,sales_7_days:int}>> $byKeyWarehouse */
             $byKeyWarehouse = [];
 
             foreach ($response ?? [] as $sale) {
+                if ($fetchFrom < $dateFrom && is_string($sale['lastChangeDate'] ?? null)
+                    && substr($sale['lastChangeDate'], 0, 10) < $dateFrom) {
+                    continue;
+                }
                 if ($this->isReturnSale($sale)) {
                     continue;
                 }

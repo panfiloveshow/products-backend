@@ -129,12 +129,12 @@ class FbsPostingsApi
      */
     public function downloadAct(int $actId): array
     {
-        $response = $this->client->post('/v2/posting/fbs/act/get-pdf', [
+        $content = $this->client->download('/v2/posting/fbs/act/get-pdf', [
             'id' => $actId,
         ]);
 
         return [
-            'content' => $response['content'] ?? null,
+            'content' => $content,
             'content_type' => 'application/pdf',
         ];
     }

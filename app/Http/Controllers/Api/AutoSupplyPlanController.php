@@ -170,7 +170,20 @@ class AutoSupplyPlanController extends Controller
         return $this->createPlanFromRequest($request, $integration);
     }
 
-    private function createPlanFromRequest(Request $request, Integration $integration): JsonResponse
+    /** Internal factory: the manager owns approval/outbox; this owner owns the plan recipe. */
+    public function createPendingForManager(\App\Services\Manager\ManagerIdentity $identity, Integration $integration, array $parameters, string $operationId, string $planId): JsonResponse
+    {
+        if ((int) $integration->work_space_id !== $identity->workspaceId || ! $identity->permits('auto_supply.create')
+            || ! \Illuminate\Support\Str::isUuid($operationId) || ! \Illuminate\Support\Str::isUuid($planId)) {
+            return response()->json(['message' => 'Доступ к подготовке расчёта не подтверждён.'], 403);
+        }
+        $payload = app(\App\Services\Manager\ManagerSupplyPlanParameters::class)->ownerRequest((int) $integration->id, $integration->marketplace, $parameters);
+
+        return $this->createPlanFromRequest(Request::create('/internal/manager-supply-plan', 'POST', $payload), $integration,
+            ['operation_id' => $operationId, 'plan_id' => $planId]);
+    }
+
+    private function createPlanFromRequest(Request $request, Integration $integration, ?array $manager = null): JsonResponse
     {
         $limitResponse = $this->ensureAutoplanningLimitAvailable($integration);
         if ($limitResponse !== null) {
@@ -237,7 +250,11 @@ class AutoSupplyPlanController extends Controller
             'locality_recommendation_ids' => $request->input('locality_recommendation_ids'),
         ], static fn ($v) => $v !== null && $v !== []);
 
-        $plan = AutoSupplyPlan::create([
+        if ($manager !== null) {
+            $params['manager_calculation_id'] = $manager['operation_id'];
+            $params['manager_parameter_version'] = \App\Services\Manager\ManagerSupplyPlanParameters::VERSION;
+        }
+        $plan = new AutoSupplyPlan([
             'integration_id' => $integration->id,
             'mp_account_id' => $integration->id,
             'marketplace' => $integration->marketplace,
@@ -254,14 +271,16 @@ class AutoSupplyPlanController extends Controller
             'algorithm_version' => 'asp-1.0.0',
             'params' => $params,
         ]);
+        if ($manager !== null) $plan->id = $manager['plan_id'];
+        $plan->save();
 
-        if ((int) ($integration->work_space_id ?? 0) > 0) {
+        if ($manager === null && (int) ($integration->work_space_id ?? 0) > 0) {
             $this->limitsSync->syncWorkspaceAutoplanningLimit((int) $integration->work_space_id);
         }
 
         $constraintFile?->forceFill(['last_used_at' => now()])->save();
 
-        CalculateAutoSupplyPlanJob::dispatch($plan->id);
+        if ($manager === null) CalculateAutoSupplyPlanJob::dispatch($plan->id);
 
         return response()->json([
             'message' => 'План создан, расчёт запущен',
@@ -653,6 +672,11 @@ class AutoSupplyPlanController extends Controller
 
         $blocked = \DB::transaction(function () use ($plan): bool {
             $lockedPlan = AutoSupplyPlan::query()->lockForUpdate()->findOrFail($plan->id);
+            if (($lockedPlan->params['manager_parameter_version'] ?? null) === \App\Services\Manager\ManagerSupplyPlanParameters::VERSION
+                && \App\Models\ManagerSupplyCalculation::where('plan_id', $lockedPlan->id)
+                ->whereIn('status', ['verifying', 'unknown'])->whereNull('run_finished_at')->exists()) {
+                abort(409, 'Для этого плана уже согласован расчёт Сели. Сначала проверьте результат сохранённого запроса.');
+            }
             if ($lockedPlan->supplies()->exists()) {
                 return true;
             }

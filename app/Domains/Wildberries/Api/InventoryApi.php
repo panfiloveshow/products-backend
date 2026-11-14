@@ -33,6 +33,14 @@ use Illuminate\Support\Facades\Log;
  */
 class InventoryApi implements InventoryApiInterface
 {
+    private ?int $deferredRetryAfter = null;
+    private ?array $sizeMetadata = null;
+
+    public function getDeferredRetryAfter(): ?int
+    {
+        return $this->deferredRetryAfter;
+    }
+
     public function __construct(
         private WildberriesClient $client,
         private ?ProductsApi $productsApi = null
@@ -48,6 +56,7 @@ class InventoryApi implements InventoryApiInterface
      */
     public function getStocks(?Integration $integration = null, array $chrtIds = []): array
     {
+        $this->deferredRetryAfter = null;
         $stocksReport = $this->getWbWarehousesStocksReport($integration, $chrtIds);
 
         if (empty($stocksReport)) {
@@ -532,23 +541,16 @@ class InventoryApi implements InventoryApiInterface
     private function getWarehouseRemainsReport(): array
     {
         try {
-            // Создание таска жёстко лимитировано WB (наблюдали 429 и через минуту —
-            // окно ~5 минут): до 3 попыток с паузой 130с. Фолбэк гоняется из cron
-            // (раз в 3 часа) и только для магазинов без Джема — время есть.
-            $taskId = '';
-            for ($createAttempt = 1; $createAttempt <= 3; $createAttempt++) {
-                $create = $this->client->analyticsGet('/api/v1/warehouse_remains', [
-                    'groupByBarcode' => 'true',
-                    'groupBySa' => 'true',
-                ]);
-                $taskId = (string) ($create['data']['taskId'] ?? '');
-                if ($taskId !== '') {
-                    break;
-                }
-                if ($createAttempt < 3) {
-                    sleep(130);
-                }
+            // A long external cooldown belongs in the queue. Retrying here used
+            // to hold the default worker for 260 seconds on every failed report.
+            $create = $this->client->analyticsGet('/api/v1/warehouse_remains', [
+                'groupByBarcode' => 'true',
+                'groupBySa' => 'true',
+            ]);
+            if ($this->client->getLastResponseStatus() === 429) {
+                $this->deferredRetryAfter = $this->client->getLastRateLimitRetryAfter() ?? 60;
             }
+            $taskId = (string) ($create['data']['taskId'] ?? '');
             if ($taskId === '') {
                 Log::warning('WB InventoryApi: warehouse_remains task not created', ['response' => $create ?? null]);
 
@@ -629,6 +631,9 @@ class InventoryApi implements InventoryApiInterface
      */
     private function getSizeMetadata(?Integration $integration = null): array
     {
+        if ($this->sizeMetadata !== null) {
+            return $this->sizeMetadata;
+        }
         if (! $this->productsApi) {
             $this->productsApi = new ProductsApi($this->client);
         }
@@ -682,7 +687,8 @@ class InventoryApi implements InventoryApiInterface
             }
 
             $iteration++;
-            $hasMore = ! empty($cards) && $cursor && isset($cursor['nmID']);
+            $hasMore = ! empty($cards) && $cursor && isset($cursor['nmID'])
+                && ! (isset($cursor['total']) && (int) $cursor['total'] < 100);
         } while ($hasMore && $iteration < $maxIterations);
 
         Log::info('WB InventoryApi: Collected size metadata', [
@@ -690,7 +696,7 @@ class InventoryApi implements InventoryApiInterface
             'nm_chrt_count' => count($byNmChrt),
         ]);
 
-        return [
+        return $this->sizeMetadata = [
             'by_nm_chrt' => $byNmChrt,
             'by_nm' => $byNm,
             'chrt_to_nm' => $chrtToNm,
@@ -737,7 +743,8 @@ class InventoryApi implements InventoryApiInterface
             $iteration++;
 
             // Проверяем условие выхода: нет курсора или достигли лимита итераций
-            $hasMore = ! empty($cards) && $cursor && isset($cursor['nmID']);
+            $hasMore = ! empty($cards) && $cursor && isset($cursor['nmID'])
+                && ! (isset($cursor['total']) && (int) $cursor['total'] < 100);
 
         } while ($hasMore && $iteration < $maxIterations);
 

@@ -2,7 +2,7 @@
 
 namespace Tests\Unit;
 
-use App\Console\Commands\SyncUnitEconomicsCommand;
+use App\Services\UnitEconomicsSynchronizer;
 use App\Models\Product;
 use Illuminate\Foundation\Testing\LazilyRefreshDatabase;
 use ReflectionClass;
@@ -26,7 +26,7 @@ class OzonCurrentPricePersistenceTest extends TestCase
             ],
         ]);
 
-        $command = new SyncUnitEconomicsCommand;
+        $command = new UnitEconomicsSynchronizer;
         $method = (new ReflectionClass($command))->getMethod('persistOzonCurrentPrices');
 
         $persisted = $method->invoke($command, collect([$product]), [
@@ -65,7 +65,7 @@ class OzonCurrentPricePersistenceTest extends TestCase
             'ozon_data' => ['actual_price' => 990],
         ]);
 
-        $command = new SyncUnitEconomicsCommand;
+        $command = new UnitEconomicsSynchronizer;
         $method = (new ReflectionClass($command))->getMethod('persistOzonCurrentPrices');
 
         $persisted = $method->invoke($command, collect([$product]), [

@@ -51,8 +51,10 @@ class UnitEconomicsSanityCheck extends Command
 
         $drifts = [];
         $checked = 0;
+        $returnUnchecked = 0;
+        $inspector = app(\App\Services\UnitEconomics\UnitEconomicsConsistencyInspector::class);
 
-        $query->orderBy('id')->limit($limit)->chunk(500, function ($rows) use (&$drifts, &$checked, $tolerance) {
+        $query->orderBy('id')->limit($limit)->chunk(500, function ($rows) use (&$drifts, &$checked, &$returnUnchecked, $inspector, $tolerance) {
             foreach ($rows as $row) {
                 $checked++;
 
@@ -62,10 +64,12 @@ class UnitEconomicsSanityCheck extends Command
                 $actualEffective = (float) $row->effective_logistics;
                 $effectiveDrift = abs($actualEffective - $expectedEffective);
 
-                $redemption = (float) ($row->redemption_rate ?? 100);
-                $returnBase = (float) $row->return_logistics_cost + (float) $row->return_processing_cost;
-                $expectedReturnFromFormula = $redemption >= 100 ? 0.0 : $returnBase * (100 - $redemption) / 100;
-                $returnDrift = abs((float) $row->expected_return_cost - $expectedReturnFromFormula);
+                $inspection = $inspector->inspect($row, $tolerance);
+                $expectedReturnFromFormula = $inspection['return_expected'];
+                $returnDrift = $inspection['return_drift'] ?? 0;
+                if (! $inspection['return_checked']) {
+                    $returnUnchecked++;
+                }
 
                 if ($effectiveDrift > $tolerance || $returnDrift > $tolerance) {
                     $drifts[] = [
@@ -77,7 +81,7 @@ class UnitEconomicsSanityCheck extends Command
                         'effective_expected' => round($expectedEffective, 2),
                         'effective_drift' => round($effectiveDrift, 2),
                         'return_actual' => round((float) $row->expected_return_cost, 2),
-                        'return_expected' => round($expectedReturnFromFormula, 2),
+                        'return_expected' => $expectedReturnFromFormula === null ? null : round($expectedReturnFromFormula, 2),
                         'return_drift' => round($returnDrift, 2),
                         'calc_at' => optional($row->calculated_at)?->toDateTimeString(),
                     ];
@@ -87,6 +91,7 @@ class UnitEconomicsSanityCheck extends Command
 
         $this->newLine();
         $this->info("Проверено: {$checked}. Найдено рассинхронов: " . count($drifts));
+        $this->line("Возвраты без подтверждённых входных данных формулы: {$returnUnchecked}; проверка возвратов для них неизвестна.");
 
         // Проверка «синк не долил данные»: протухание источника + дефолтные комиссии/
         // пустой индекс у Ozon. Ловит именно тот класс проблем, из-за которого юнитка
@@ -129,7 +134,7 @@ class UnitEconomicsSanityCheck extends Command
         }
 
         if ($drifts === [] && $anomalies === []) {
-            $this->info('✅ Поля согласованы, синк свежий, дефолтов-массово нет.');
+            $this->info('Проверенные поля согласованы. Свежесть внешних цен проверяется отдельно через ue:sync-health/freshness.');
             return self::SUCCESS;
         }
 

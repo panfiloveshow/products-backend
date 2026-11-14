@@ -2,9 +2,9 @@
 
 namespace App\Jobs;
 
+use App\Models\Integration;
 use App\Models\InventoryAlert;
 use App\Models\InventoryWarehouse;
-use App\Models\Integration;
 use App\Services\Ozon\OzonCredentialHealthService;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
@@ -18,6 +18,7 @@ class GenerateAlertsJob implements ShouldQueue
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
 
     public int $tries = 1;
+
     public int $timeout = 600;
 
     public function handle(OzonCredentialHealthService $credentialHealth): void
@@ -139,11 +140,13 @@ class GenerateAlertsJob implements ShouldQueue
 
             if ($status === null) {
                 $alert->resolve();
+
                 continue;
             }
 
             if ($alert->type === 'critical' && $status !== 'critical') {
                 $alert->resolve();
+
                 continue;
             }
 
@@ -160,6 +163,13 @@ class GenerateAlertsJob implements ShouldQueue
      */
     private function generateOzonCredentialAlerts(OzonCredentialHealthService $healthService): int
     {
+        InventoryAlert::withoutGlobalScopes()
+            ->where('sku', '__OZON_CREDENTIAL__')
+            ->where('is_resolved', false)
+            ->whereIn('integration_id', Integration::withoutGlobalScopes()
+                ->where('marketplace', 'ozon')->where('is_active', false)->select('id'))
+            ->update(['is_resolved' => true, 'resolved_at' => now()]);
+
         $created = 0;
         $integrations = Integration::withoutGlobalScopes()
             ->where('marketplace', 'ozon')
@@ -181,6 +191,7 @@ class GenerateAlertsJob implements ShouldQueue
 
             if (! $needsAlert) {
                 $active?->resolve();
+
                 continue;
             }
 
@@ -193,9 +204,15 @@ class GenerateAlertsJob implements ShouldQueue
                 default => 6,
             };
             $type = $priority >= 9 ? 'critical' : 'warning';
+            $isApiKey = ($health['credential_type'] ?? $integration->credential_type) !== 'oauth';
+            $apiKeyExpired = $isApiKey && ($status === 'expired'
+                || str_contains(strtolower((string) $integration->last_validation_error), 'api-key has expired'));
             $message = match (true) {
+                $apiKeyExpired => 'API-ключ Ozon истёк. Обновите ключ в настройках интеграции. До обновления ключа синхронизация приостановлена, данные не обновляются.',
                 $status === 'expired' => 'Доступ Ozon истёк. Переподключите интеграцию, иначе синхронизация и автопланирование заблокированы.',
+                ! ($health['usable'] ?? false) && $isApiKey => 'Доступ Ozon недействителен. Обновите API-ключ в настройках интеграции, чтобы возобновить синхронизацию.',
                 ! ($health['usable'] ?? false) => 'Доступ Ozon недействителен. Переподключите интеграцию.',
+                $daysInt !== null && $isApiKey => "API-ключ Ozon истекает через {$daysInt} дн. Обновите ключ в настройках интеграции заранее.",
                 $daysInt !== null => "Доступ Ozon истекает через {$daysInt} дн. Переподключите интеграцию заранее.",
                 default => 'Проверьте доступ Ozon: срок действия credentials требует внимания.',
             };

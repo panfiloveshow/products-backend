@@ -4,6 +4,9 @@ namespace App\Domains\Ozon\Api;
 
 use App\Models\Integration;
 use Illuminate\Support\Facades\Http;
+use App\Services\Marketplace\PriceDispatchAuthorization;
+use App\Services\Marketplace\PriceDispatchDenied;
+use App\Services\Manager\ManagerFbsExecutionPolicy;
 use Illuminate\Support\Facades\Log;
 
 /**
@@ -17,6 +20,29 @@ class OzonClient
     private string $apiKey;
     private string $accessToken;
     private int $timeout = 30;
+    private ?int $lastResponseStatus = null;
+    private ?int $lastRateLimitRetryAfter = null;
+
+    public function getLastResponseStatus(): ?int
+    {
+        return $this->lastResponseStatus;
+    }
+
+    public function getLastRateLimitRetryAfter(): ?int
+    {
+        return $this->lastRateLimitRetryAfter;
+    }
+
+    private function rememberResponse(\Illuminate\Http\Client\Response $response): void
+    {
+        $this->lastResponseStatus = $response->status();
+        $this->lastRateLimitRetryAfter = null;
+        if ($response->status() === 429) {
+            $retry = $response->header('Retry-After');
+            $seconds = is_numeric($retry) ? (int) ceil((float) $retry) : (($retry && strtotime($retry)) ? strtotime($retry) - time() : 60);
+            $this->lastRateLimitRetryAfter = max(1, $seconds);
+        }
+    }
 
     public function __construct(
         ?string $clientId = null,
@@ -55,8 +81,15 @@ class OzonClient
      */
     public function post(string $endpoint, array $data = [], bool $forceObject = false, bool $retryRateLimit = true): ?array
     {
+        $this->lastResponseStatus = null;
+        $this->lastRateLimitRetryAfter = null;
         $requestId = uniqid('ozon_req_', true);
-        $maxAttempts = 3;
+        $priceMutation = PriceDispatchAuthorization::isOzonMutation($endpoint);
+        $fbsMutation = ManagerFbsExecutionPolicy::isMutation('ozon', 'POST', self::BASE_URL, $endpoint);
+        $fboMutation = \App\Services\Manager\ManagerFboPublicationGuard::isMutation($endpoint);
+        $maxAttempts = ($priceMutation || $fbsMutation || $fboMutation) ? 1 : 3;
+        $dispatchId = null;
+        $nativeRequestStarted = false;
         $body = (empty($data) && $forceObject) ? (object)[] : $data;
 
         Log::info('Ozon API Request', [
@@ -73,12 +106,28 @@ class OzonClient
 
         for ($attempt = 1; $attempt <= $maxAttempts; $attempt++) {
             try {
-                $response = Http::withHeaders($this->getHeaders())
-                    ->timeout($this->timeout)
-                    ->asJson()
-                    ->post(self::BASE_URL . $endpoint, $body);
+                $pending = Http::withHeaders($this->getHeaders())->timeout($this->timeout)->asJson();
+                if ($priceMutation) {
+                    $wire = PriceDispatchAuthorization::encode($body);
+                    $account = PriceDispatchAuthorization::ozonAccount($this->clientId, $this->apiKey, $this->accessToken);
+                    $grant = app(PriceDispatchAuthorization::class)->authorize('ozon', $account, $endpoint, $wire);
+                    $dispatchId = $grant['command_id'];
+                    $pending->beforeSending(function () use ($grant, &$nativeRequestStarted): void {
+                        PriceDispatchAuthorization::assertFresh($grant);
+                        $nativeRequestStarted = true;
+                    });
+                    $response = $pending->withOptions(['allow_redirects' => false])->withBody($wire, 'application/json')->post(self::BASE_URL . $endpoint);
+                } else {
+                    $response = $fboMutation
+                        ? app(\App\Services\Manager\ManagerFboPublicationGuard::class)->legacy($this->accessToken !== '' ? null : $this->clientId,
+                            fn () => $pending->withOptions(['allow_redirects' => false])->post(self::BASE_URL . $endpoint, $body), isset($data['draft_id']) ? (string) $data['draft_id'] : null)
+                        : ($fbsMutation
+                        ? app(ManagerFbsExecutionPolicy::class)->legacy('ozon', $this->apiKey, $this->accessToken !== '' ? null : $this->clientId, fn () => $pending->withOptions(['allow_redirects' => false])->post(self::BASE_URL . $endpoint, $body))
+                        : $pending->post(self::BASE_URL . $endpoint, $body));
+                }
 
                 $status = $response->status();
+                $this->rememberResponse($response);
                 $bodyContent = $response->body();
 
                 Log::info('Ozon API Response', [
@@ -92,7 +141,12 @@ class OzonClient
                 ]);
 
                 if ($response->successful()) {
-                    return $response->json();
+                    $decoded = $response->json();
+                    if ($priceMutation) {
+                        if (! is_array($decoded)) return ['_error' => true, '_http_status' => $status, '_sellico_price_dispatch' => ['command_id' => $dispatchId, 'status' => 'submit_unknown']];
+                        $decoded['_sellico_price_dispatch'] = ['command_id' => $dispatchId, 'status' => 'receipt_received'];
+                    }
+                    return $decoded;
                 }
 
                 if ($response->status() === 429 && $retryRateLimit && $attempt < $maxAttempts) {
@@ -108,12 +162,13 @@ class OzonClient
                 }
 
                 $decoded = $response->json();
-                if (empty($decoded)) {
+                if (! is_array($decoded) || empty($decoded)) {
                     $decoded = ['error' => ['message' => $response->body()]];
                 }
 
                 $decoded['_error']       = true;
                 $decoded['_http_status'] = $response->status();
+                if ($priceMutation) $decoded['_sellico_price_dispatch'] = ['command_id' => $dispatchId, 'status' => $status < 400 || $status >= 500 || $status === 408 || $status === 499 ? 'submit_unknown' : 'rejected'];
 
                 Log::warning('Ozon API error', [
                     'request_id' => $requestId,
@@ -133,7 +188,9 @@ class OzonClient
                     'error'     => $e->getMessage(),
                     'client_id' => $this->clientId ? substr($this->clientId, 0, 4) . '***' : 'empty',
                 ]);
-                return null;
+                $dispatch = ['command_id' => $dispatchId, 'status' => $nativeRequestStarted ? 'submit_unknown' : 'not_dispatched'];
+                if (! $nativeRequestStarted && $e instanceof PriceDispatchDenied) $dispatch['denial'] = $e->publicData();
+                return $priceMutation ? ['_error' => true, '_http_status' => 0, '_sellico_price_dispatch' => $dispatch] : null;
             }
         }
 
@@ -143,12 +200,16 @@ class OzonClient
     /**
      * Скачать файл (PDF) из Ozon API
      */
-    public function download(string $endpoint): ?string
+    public function download(string $endpoint, ?array $data = null): ?string
     {
+        $this->lastResponseStatus = null;
+        $this->lastRateLimitRetryAfter = null;
         try {
-            $response = Http::withHeaders($this->getHeaders())
-                ->timeout($this->timeout)
-                ->get(self::BASE_URL . $endpoint);
+            $request = Http::withHeaders($this->getHeaders())->timeout($this->timeout);
+            $response = $data === null
+                ? $request->get(self::BASE_URL . $endpoint)
+                : $request->asJson()->post(self::BASE_URL . $endpoint, $data);
+            $this->rememberResponse($response);
 
             if ($response->successful()) {
                 return $response->body();
@@ -175,6 +236,8 @@ class OzonClient
      */
     public function get(string $endpoint, array $params = []): ?array
     {
+        $this->lastResponseStatus = null;
+        $this->lastRateLimitRetryAfter = null;
         $requestId = uniqid('ozon_req_', true);
         
         Log::info('Ozon API Request', [
@@ -194,6 +257,7 @@ class OzonClient
                 ->get(self::BASE_URL . $endpoint, $params);
 
             $status = $response->status();
+            $this->rememberResponse($response);
             $body = $response->body();
 
             Log::info('Ozon API Response', [

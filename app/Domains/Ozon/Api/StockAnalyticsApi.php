@@ -33,8 +33,7 @@ class StockAnalyticsApi
      * - turnover_grade / turnover_grade_cluster
      * - valid_stock_count, warehouse_name, offer_id, sku
      *
-     * API отдаёт постраничный список. Запрошенные SKU фильтруем локально,
-     * чтобы не зависеть от спорной поддержки sku-фильтра в этом методе.
+     * Метод не использует пагинацию: один запрос на каждые 100 SKU.
      *
      * @param array $skus SKU (Ozon numeric SKU), макс 100
      * @param array $warehouseIds Фильтр по складам (опционально)
@@ -51,7 +50,6 @@ class StockAnalyticsApi
         $warehouseFilter = array_fill_keys(array_map('strval', $warehouseIds), true);
         $clusterFilter = array_fill_keys(array_map('strval', $clusterIds), true);
         $allItems = [];
-        $limit = 1000;
 
         // Ozon требует поле skus (1–100 артикулов за запрос), иначе 400
         // "AnalyticsStocksRequest.Skus: value must contain between 1 and 100 items".
@@ -59,52 +57,47 @@ class StockAnalyticsApi
         $skuBatches = array_chunk(array_values(array_unique(array_map('strval', $skus))), 100);
 
         foreach ($skuBatches as $batch) {
-            $offset = 0;
-            do {
-                $body = [
-                    'skus' => $batch,
-                    'limit' => $limit,
-                    'offset' => $offset,
-                    'warehouse_type' => 'ALL',
-                ];
+            $body = ['skus' => $batch];
+            if ($warehouseIds !== []) {
+                $body['warehouse_ids'] = array_values($warehouseIds);
+            }
+            if ($clusterIds !== []) {
+                $body['cluster_ids'] = array_values($clusterIds);
+            }
 
-                $response = $this->client->post('/v1/analytics/stocks', $body);
+            $response = $this->client->post('/v1/analytics/stocks', $body);
 
-                if (!$response || !empty($response['_error'])) {
-                    Log::warning('Ozon StockAnalytics: ошибка /v1/analytics/stocks', [
-                        'skus_in_batch' => count($batch),
-                        'offset' => $offset,
-                        'error' => $response['message'] ?? $response['error'] ?? 'unknown',
-                    ]);
-                    break;
+            if (!$response || !empty($response['_error'])) {
+                Log::warning('Ozon StockAnalytics: ошибка /v1/analytics/stocks', [
+                    'skus_in_batch' => count($batch),
+                    'error' => $response['message'] ?? $response['error'] ?? 'unknown',
+                ]);
+                continue;
+            }
+
+            $items = $response['items'] ?? $response['result']['items'] ?? [];
+            foreach ($items as $item) {
+                $sku = (string) ($item['sku'] ?? '');
+                if ($sku === '' || !isset($requestedSkus[$sku])) {
+                    continue;
                 }
 
-                $items = $response['items'] ?? $response['result']['items'] ?? [];
-                foreach ($items as $item) {
-                    $sku = (string) ($item['sku'] ?? '');
-                    if ($sku === '' || !isset($requestedSkus[$sku])) {
+                if ($warehouseFilter !== []) {
+                    $warehouseId = (string) ($item['warehouse_id'] ?? '');
+                    if ($warehouseId === '' || !isset($warehouseFilter[$warehouseId])) {
                         continue;
                     }
-
-                    if ($warehouseFilter !== []) {
-                        $warehouseId = (string) ($item['warehouse_id'] ?? '');
-                        if ($warehouseId === '' || !isset($warehouseFilter[$warehouseId])) {
-                            continue;
-                        }
-                    }
-
-                    if ($clusterFilter !== []) {
-                        $clusterId = (string) ($item['cluster_id'] ?? '');
-                        if ($clusterId === '' || !isset($clusterFilter[$clusterId])) {
-                            continue;
-                        }
-                    }
-
-                    $allItems[] = $item;
                 }
 
-                $offset += $limit;
-            } while (count($items) === $limit);
+                if ($clusterFilter !== []) {
+                    $clusterId = (string) ($item['cluster_id'] ?? '');
+                    if ($clusterId === '' || !isset($clusterFilter[$clusterId])) {
+                        continue;
+                    }
+                }
+
+                $allItems[] = $item;
+            }
         }
 
         Log::info('Ozon StockAnalytics: загружено записей', [

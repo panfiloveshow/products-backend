@@ -8,6 +8,7 @@ use App\Models\InventoryWarehouse;
 use App\Services\Wildberries\WildberriesAcquiringSnapshotStore;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
+use Illuminate\Contracts\Queue\ShouldBeUnique;
 use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
@@ -26,24 +27,51 @@ use Illuminate\Support\Facades\Log;
  * (v5 reportDetailByPeriod отключён WB 15.07.2026)
  * Поля: storage_fee_total, storage_fee_last_week, storage_fee_report_from, storage_fee_report_to
  */
-class SyncStorageFeesJob implements ShouldQueue
+class SyncStorageFeesJob implements ShouldQueue, ShouldBeUnique
 {
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
 
     public int $tries = 3;
+    public int $uniqueFor = 86400;
 
     public int $timeout = 600; // 10 минут — отчёт может быть большим
 
     public array $backoff = [30, 60, 120];
+    public ?string $unitEconomicsRunId = null;
+
+    public function uniqueId(): string
+    {
+        return $this->integrationId.':'.$this->weeks.':'.($this->unitEconomicsRunId ?? 'legacy');
+    }
 
     public function __construct(
         private int $integrationId,
         private array $credentials,
-        private int $weeks = 4
-    ) {}
+        private int $weeks = 4,
+        ?string $unitEconomicsRunId = null
+    ) {
+        $this->unitEconomicsRunId = $unitEconomicsRunId;
+        if ($unitEconomicsRunId) {
+            $this->tries = 0;
+            $this->onQueue(config('unit_economics_sync.enrichment_queue'));
+        }
+    }
+
+    public function retryUntil(): ?\DateTimeInterface
+    {
+        return $this->unitEconomicsRunId ? \App\Models\UnitEconomicsSyncRun::find($this->unitEconomicsRunId)?->deadline_at : null;
+    }
+
+    private function stage(string $status, array $details = []): void
+    {
+        if ($this->unitEconomicsRunId) {
+            app(\App\Services\UnitEconomics\UnitEconomicsSyncCoordinator::class)->updateStage($this->unitEconomicsRunId, 'finance', $status, $details);
+        }
+    }
 
     public function handle(WildberriesAcquiringSnapshotStore $acquiringStore): void
     {
+        $this->stage('running', ['next_retry_at' => null]);
         $startTime = microtime(true);
 
         Log::info('SyncStorageFeesJob: starting', [
@@ -54,7 +82,7 @@ class SyncStorageFeesJob implements ShouldQueue
 
         try {
             // Создаём клиент WB
-            $marketplace = new WildberriesMarketplace($this->credentials);
+            $marketplace = new WildberriesMarketplace($this->credentials, Integration::find($this->integrationId));
 
             // Один Finance-отчёт сразу для хранения и эквайринга. Два
             // последовательных запроса выбивали второй этап в 429.
@@ -66,6 +94,7 @@ class SyncStorageFeesJob implements ShouldQueue
                     'delay_seconds' => $delay,
                 ]);
                 $this->release($delay);
+                $this->stage('waiting_external', ['error_code' => 'rate_limited', 'next_retry_at' => now()->addSeconds($delay)->utc()->toIso8601String()]);
 
                 return;
             }
@@ -78,6 +107,7 @@ class SyncStorageFeesJob implements ShouldQueue
                 : ['by_sku' => [], 'avg' => 0.0, 'observed_at' => null];
 
             if (($financeSnapshot['status'] ?? null) !== 'success') {
+                $this->stage('failed', ['error_code' => 'finance_unavailable']);
                 Log::warning('SyncStorageFeesJob: WB Finance snapshot unavailable; preserving previous values', [
                     'integration_id' => $this->integrationId,
                 ]);
@@ -178,6 +208,7 @@ class SyncStorageFeesJob implements ShouldQueue
                 ]);
             }
 
+            $this->stage('completed', ['total' => $updated, 'succeeded' => $updated, 'observed_at' => $acquiringSnapshot['observed_at'] ?? null]);
             $this->dispatchUnitEconomicsSync();
 
         } catch (\Exception $e) {
@@ -193,6 +224,7 @@ class SyncStorageFeesJob implements ShouldQueue
 
     public function failed(\Throwable $exception): void
     {
+        $this->stage('failed', ['error_code' => 'finance_worker_failed']);
         Log::error('SyncStorageFeesJob: job failed permanently', [
             'integration_id' => $this->integrationId,
             'error' => $exception->getMessage(),
@@ -206,8 +238,7 @@ class SyncStorageFeesJob implements ShouldQueue
 
     private function dispatchUnitEconomicsSync(): void
     {
-        SyncUnitEconomicsJob::dispatch($this->integrationId)
-            ->onQueue('unit-economics');
+        SyncUnitEconomicsJob::dispatch($this->integrationId, unitEconomicsRunId: $this->unitEconomicsRunId);
 
         Log::info('UnitEconomics sync dispatched after WB storage fees sync', [
             'integration_id' => $this->integrationId,

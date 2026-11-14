@@ -81,6 +81,7 @@ return [
         'retry_after_seconds' => (int) env('AUTOPLAN_DRAFT_RETRY_AFTER', 90),
         'status_poll_minutes' => (int) env('AUTOPLAN_STATUS_POLL_MINUTES', 15),
         'status_poll_enabled' => (bool) env('AUTOPLAN_STATUS_POLL_ENABLED', true),
+        'status_queue' => env('AUTOPLAN_STATUS_QUEUE', 'supply-statuses'),
     ],
 
     'facts' => [

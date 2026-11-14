@@ -3,6 +3,7 @@
 namespace App\Jobs;
 
 use App\Domains\Marketplace\MarketplaceFactory;
+use App\Domains\Wildberries\Api\WildberriesRateLimitException;
 use App\Models\InventoryWarehouse;
 use App\Models\Product;
 use App\Models\SyncLog;
@@ -26,7 +27,17 @@ class SyncInventoryJob implements ShouldBeUnique, ShouldQueue
 
     public function __construct(
         public SyncLog $syncLog
-    ) {}
+    ) {
+        if ($syncLog->marketplace === 'wildberries' && !empty($syncLog->metadata['unit_economics_run_id'])) {
+            $this->tries = 0;
+        }
+    }
+
+    public function retryUntil(): ?\DateTimeInterface
+    {
+        $runId = $this->syncLog->metadata['unit_economics_run_id'] ?? null;
+        return $runId ? \App\Models\UnitEconomicsSyncRun::find($runId)?->deadline_at : null;
+    }
 
     /**
      * @return list<int>
@@ -127,7 +138,12 @@ class SyncInventoryJob implements ShouldBeUnique, ShouldQueue
             // Yandex: получаем продажи для расчета average_daily_sales
             $salesBySkuWarehouse = [];
             if ($this->syncLog->marketplace === 'wildberries' && method_exists($marketplaceService, 'getSalesByWarehouse')) {
-                $salesBySkuWarehouse = $marketplaceService->getSalesByWarehouse(30);
+                // The following localization stage needs 91 days. Fetch that
+                // window first, then keep only the requested 30-day stock-sales
+                // metrics. Its recent snapshot is shared by subsequent stages.
+                $prefetchDays = !empty($this->syncLog->metadata['unit_economics_run_id'])
+                    && !($integration->settings['wb_indices_manual'] ?? false) ? 91 : null;
+                $salesBySkuWarehouse = $marketplaceService->getSalesByWarehouse(30, $prefetchDays);
                 Log::info('WB sales by warehouse loaded', ['skus' => count($salesBySkuWarehouse)]);
             } elseif ($this->syncLog->marketplace === 'ozon' && method_exists($marketplaceService, 'getSalesBySkuAndWarehouse')) {
                 $salesBySkuWarehouse = $marketplaceService->getSalesBySkuAndWarehouse(30);
@@ -185,8 +201,8 @@ class SyncInventoryJob implements ShouldBeUnique, ShouldQueue
                 // склады не приходят никогда, и новый магазин оставался без кэша
                 // ЮЭ до ночного прогона («в товарах есть, в юните нет»).
                 if ($this->syncLog->integration_id) {
-                    SyncUnitEconomicsJob::dispatch((int) $this->syncLog->integration_id)
-                        ->onQueue('unit-economics');
+                    SyncUnitEconomicsJob::dispatch((int) $this->syncLog->integration_id,
+                        unitEconomicsRunId: $this->syncLog->metadata['unit_economics_run_id'] ?? null);
                 }
 
                 return;
@@ -403,14 +419,15 @@ class SyncInventoryJob implements ShouldBeUnique, ShouldQueue
                 $this->refreshProductFulfillmentTypesFromInventory((int) $this->syncLog->integration_id);
             }
 
-            // Сохраняем метаданные о синхронизации
+            // Preserve workflow identity when publishing the inventory result.
+            $this->syncLog->refresh();
             $this->syncLog->update([
-                'metadata' => [
+                'metadata' => array_merge($this->syncLog->metadata ?? [], [
                     'total_from_api' => count($inventory),
                     'created' => $created,
                     'updated' => $updated,
                     'unchanged' => $synced - $created - $updated,
-                ],
+                ]),
             ]);
 
             $this->syncLog->complete($synced, $failed);
@@ -426,22 +443,37 @@ class SyncInventoryJob implements ShouldBeUnique, ShouldQueue
             // Для WB: после синхронизации остатков запускаем джоб сбора начислений за хранение
             if ($this->syncLog->marketplace === 'wildberries') {
                 $credentials = $this->syncLog->credentials ?? [];
-                if (! empty($credentials)) {
-                    SyncStorageFeesJob::dispatch($this->syncLog->integration_id, $credentials, 4)
+                // WB resolves empty queued credentials through Integration.
+                // The finance hop is required for a complete unit-economics run.
+                if ($this->syncLog->integration_id) {
+                    SyncStorageFeesJob::dispatch($this->syncLog->integration_id, $credentials, 4,
+                        $this->syncLog->metadata['unit_economics_run_id'] ?? null)
                         ->delay(now()->addSeconds(10));
                     Log::info('SyncStorageFeesJob dispatched after inventory sync', [
                         'integration_id' => $this->syncLog->integration_id,
                     ]);
                 }
             } elseif ($this->syncLog->integration_id) {
-                SyncUnitEconomicsJob::dispatch((int) $this->syncLog->integration_id)
-                    ->onQueue('unit-economics');
+                SyncUnitEconomicsJob::dispatch((int) $this->syncLog->integration_id,
+                    unitEconomicsRunId: $this->syncLog->metadata['unit_economics_run_id'] ?? null);
 
                 Log::info('UnitEconomics sync dispatched after inventory sync', [
                     'integration_id' => $this->syncLog->integration_id,
                     'marketplace' => $this->syncLog->marketplace,
                 ]);
             }
+        } catch (WildberriesRateLimitException $e) {
+            $delay = max(1, $e->retryAfterSeconds) + 15;
+            $retryAt = now()->addSeconds($delay)->utc()->toIso8601String();
+            $this->syncLog->refresh();
+            $this->syncLog->update(['status' => SyncLog::STATUS_PENDING,
+                'metadata' => array_merge($this->syncLog->metadata ?? [], ['queue_available_at' => $retryAt])]);
+            if ($runId = $this->syncLog->metadata['unit_economics_run_id'] ?? null) {
+                app(\App\Services\UnitEconomics\UnitEconomicsSyncCoordinator::class)->updateStage($runId, 'inventory', 'waiting_external',
+                    ['error_code' => 'rate_limited', 'next_retry_at' => $retryAt]);
+            }
+            $this->release($delay);
+
         } catch (\Exception $e) {
             $this->syncLog->fail($e->getMessage());
 

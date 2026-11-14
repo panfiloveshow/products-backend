@@ -101,7 +101,7 @@ class OzonPlanValidationService
                 ];
                 $health = null;
             } else {
-                $health = $this->freshness->inspect($integration);
+                $health = $this->freshness->inspect($integration, (string) $locked->id);
                 foreach ($health['blocking_errors'] as $error) {
                     $errors[] = [
                         'code' => 'facts_' . $error['source'] . '_' . $error['status'],
@@ -115,6 +115,8 @@ class OzonPlanValidationService
                     ];
                 }
             }
+
+            if ($locked->snapshot?->status === 'ready') $errors = [...$errors, ...PlanningSnapshotEvidence::errors($locked, $health)];
 
             $planFingerprint = $check['fingerprint'];
             $snapshotHash = $this->snapshotHash($locked);
@@ -194,13 +196,6 @@ class OzonPlanValidationService
             return null;
         }
 
-        return hash('sha256', json_encode([
-            'id' => $plan->snapshot->id,
-            'captured_at' => $plan->snapshot->captured_at?->toIso8601String(),
-            'params' => $plan->snapshot->params_json,
-            'freshness' => $plan->snapshot->facts_freshness_json,
-            'sources' => $plan->snapshot->planning_sources_json,
-            'summary' => $plan->snapshot->summary_json,
-        ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR));
+        return PlanningSnapshotEvidence::hash($plan->snapshot);
     }
 }

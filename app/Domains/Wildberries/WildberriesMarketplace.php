@@ -30,6 +30,12 @@ use Illuminate\Support\Facades\Log;
 class WildberriesMarketplace implements LegacyMarketplaceInterface, MarketplaceInterface
 {
     private WildberriesClient $client;
+    private bool $catalogComplete = false;
+
+    public function isCatalogComplete(): bool
+    {
+        return $this->catalogComplete;
+    }
 
     private ProductsApi $products;
 
@@ -51,7 +57,11 @@ class WildberriesMarketplace implements LegacyMarketplaceInterface, MarketplaceI
 
     public function __construct(array $credentials = [], ?Integration $integration = null)
     {
-        $apiKey = $credentials['api_key'] ?? config('services.wildberries.api_key');
+        $apiKey = $credentials['api_key'] ?? null;
+        if (empty($apiKey) && $integration !== null) {
+            $apiKey = $integration->resolveCredentials()['api_key'] ?? null;
+        }
+        $apiKey = $apiKey ?: config('services.wildberries.api_key');
 
         $this->client = new WildberriesClient($apiKey);
         $this->products = new ProductsApi($this->client);
@@ -116,6 +126,8 @@ class WildberriesMarketplace implements LegacyMarketplaceInterface, MarketplaceI
 
     public function getProducts(): array
     {
+        $this->catalogComplete = false;
+        $validPages = true;
         $cards = [];
         $cursor = null;
         $pages = 0;
@@ -125,17 +137,30 @@ class WildberriesMarketplace implements LegacyMarketplaceInterface, MarketplaceI
                 'limit' => 100,
                 'cursor' => $cursor,
             ]);
-            $pageCards = $result['cards'] ?? $result;
+            $pageCards = $result['cards'] ?? (array_is_list($result) ? $result : []);
+            $validPages = $validPages && ($result['complete'] ?? false);
             $cursor = $result['cursor'] ?? null;
 
             if (empty($pageCards)) {
+                $this->catalogComplete = $validPages;
                 break;
             }
 
             $cards = array_merge($cards, $pageCards);
             $pages++;
 
-            $hasMore = $cursor && isset($cursor['nmID']) && (int) $cursor['nmID'] > 0;
+            // Content API documents cursor.total < limit as the final page.
+            // Avoid another request (and a possible external cooldown) after it.
+            if (isset($cursor['total']) && (int) $cursor['total'] < 100) {
+                $this->catalogComplete = $validPages;
+                break;
+            }
+
+            $hasMore = $cursor && ! empty($cursor['updatedAt'])
+                && isset($cursor['nmID']) && (int) $cursor['nmID'] > 0;
+            if (! $hasMore) {
+                $this->catalogComplete = false;
+            }
         } while ($hasMore && $pages < 500);
 
         if (empty($cards)) {
@@ -606,7 +631,12 @@ class WildberriesMarketplace implements LegacyMarketplaceInterface, MarketplaceI
 
     public function getInventory(): array
     {
-        return $this->inventory->getStocks($this->getIntegration());
+        $stocks = $this->inventory->getStocks($this->getIntegration());
+        if (($retryAfter = $this->inventory->getDeferredRetryAfter()) !== null) {
+            throw new \App\Domains\Wildberries\Api\WildberriesRateLimitException($retryAfter);
+        }
+
+        return $stocks;
     }
 
     /**
@@ -653,9 +683,9 @@ class WildberriesMarketplace implements LegacyMarketplaceInterface, MarketplaceI
     /**
      * Продажи по складам для {@see SyncInventoryJob} (остатки × sales_* / avg_daily_sales).
      */
-    public function getSalesByWarehouse(int $days = 30): array
+    public function getSalesByWarehouse(int $days = 30, ?int $prefetchDays = null): array
     {
-        return $this->sales->getSalesByWarehouse($days);
+        return $this->sales->getSalesByWarehouse($days, $prefetchDays);
     }
 
     /**

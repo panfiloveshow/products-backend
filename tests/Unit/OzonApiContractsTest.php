@@ -64,9 +64,7 @@ class OzonApiContractsTest extends TestCase
         Http::assertSent(function ($request) {
             return $request->method() === 'POST'
                 && $request->url() === 'https://api-seller.ozon.ru/v1/analytics/stocks'
-                && $request['limit'] === 1000
-                && $request['offset'] === 0
-                && $request['warehouse_type'] === 'ALL';
+                && $request->data() === ['skus' => ['123']];
         });
     }
 

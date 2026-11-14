@@ -4,10 +4,12 @@ namespace App\Services\AutoSupplyPlanning;
 
 use App\Models\AutoSupplyPlan;
 use App\Models\AutoSupplyPlanLine;
+use App\Models\ManagerSupplyCalculation;
 use App\Models\Product;
 use App\Models\Supply;
 use App\Models\SupplyEvent;
 use App\Models\SupplyItem;
+use App\Services\Manager\ManagerSupplyPlanParameters;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Validation\ValidationException;
@@ -52,17 +54,31 @@ class OzonPlanMaterializationService
         }
 
         $integration = $plan->integration()->withoutGlobalScopes()->first();
-        if ($integration !== null && isset($validation['facts_hash'])) {
-            $health = app(DataFreshnessRegistry::class)->inspect($integration);
+        $factsHash = $validation['facts_hash'] ?? null;
+        if (! is_string($factsHash) || ! preg_match('/^[a-f0-9]{64}$/D', $factsHash) || $integration === null) {
+            $check['errors'][] = [
+                'code' => 'facts_evidence_missing',
+                'message' => 'Не подтверждена версия исходных фактов. Проверьте план повторно.',
+            ];
+        } else {
+            $health = app(DataFreshnessRegistry::class)->inspect($integration, (string) $plan->id);
+            $currentHash = $health['hash'] ?? null;
             if (
-                ! hash_equals((string) $validation['facts_hash'], (string) ($health['hash'] ?? ''))
-                || ! ($health['can_approve'] ?? false)
+                ! is_string($currentHash) || ! preg_match('/^[a-f0-9]{64}$/D', $currentHash)
+                || ! hash_equals($factsHash, $currentHash)
+                || ($health['can_approve'] ?? null) !== true
             ) {
                 $check['errors'][] = [
                     'code' => 'facts_changed_after_validation',
                     'message' => 'Исходные данные обновились или устарели после проверки. Проверьте план повторно.',
                 ];
             }
+        }
+
+        $check['errors'] = [...$check['errors'], ...PlanningSnapshotEvidence::errors($plan, isset($health) ? $health : null)];
+        $snapshot = $plan->snapshot_id ? \App\Models\PlanningFactSnapshot::whereKey($plan->snapshot_id)->first() : null;
+        if (! $snapshot || ! PlanningSnapshotEvidence::digest($validation['snapshot_hash'] ?? null) || ! hash_equals($validation['snapshot_hash'], PlanningSnapshotEvidence::hash($snapshot))) {
+            $check['errors'][] = ['code' => 'facts_snapshot_changed_after_validation', 'message' => 'Не подтверждён снимок фактов, сохранённый при проверке. Выполните расчёт заново.'];
         }
 
         $check['allowed'] = $check['errors'] === [];
@@ -90,6 +106,21 @@ class OzonPlanMaterializationService
     {
         $errors = [];
         $warnings = [];
+
+        // The calculator can mark the plan ready before the manager wrapper verifies its receipt.
+        if (($plan->params['manager_parameter_version'] ?? null) === ManagerSupplyPlanParameters::VERSION
+            && ! ManagerSupplyCalculation::query()
+                ->whereKey((string) ($plan->params['manager_calculation_id'] ?? ''))
+                ->where('plan_id', (string) $plan->id)
+                ->where('integration_id', $plan->integration_id)
+                ->where('marketplace', $plan->marketplace)
+                ->where('status', 'succeeded')
+                ->exists()) {
+            $errors[] = [
+                'code' => 'manager_calculation_unconfirmed',
+                'message' => 'Расчёт Сели ещё не подтверждён. Проверьте сохранённый запрос перед утверждением плана.',
+            ];
+        }
 
         if ($plan->marketplace !== 'ozon') {
             $errors[] = [
@@ -227,6 +258,11 @@ class OzonPlanMaterializationService
         return DB::transaction(function () use ($plan, $userId): array {
             /** @var AutoSupplyPlan $lockedPlan */
             $lockedPlan = AutoSupplyPlan::query()->lockForUpdate()->findOrFail($plan->id);
+            if (\Illuminate\Support\Facades\Schema::hasTable('manager_fbo_resource_holds')
+                && \App\Models\ManagerOzonFboOperation::where('plan->plan_id', (string) $lockedPlan->id)
+                    ->whereIn('id', \Illuminate\Support\Facades\DB::table('manager_fbo_resource_holds')->select('operation_id'))->exists()) {
+                throw ValidationException::withMessages(['plan' => ['План уже имеет исполнение FBO в чате. Проверьте журнал, чтобы не создать дубль.']]);
+            }
             $check = $this->approvalCheck($lockedPlan);
 
             if (! $check['allowed']) {
@@ -428,12 +464,12 @@ class OzonPlanMaterializationService
         }
 
         $ozonData = is_array($product->ozon_data) ? $product->ozon_data : [];
-        $value = $ozonData['sku']
-            ?? $ozonData['product_id']
-            ?? $product->marketplace_id
-            ?? null;
-
-        if (! is_numeric($value) || (int) $value <= 0) {
+        // product_id, marketplace_id and a seller article are different identifiers.
+        // Only an explicit, exact Native SKU can be used in an FBO draft.
+        $value = $ozonData['sku'] ?? null;
+        if (! (is_int($value) || is_string($value))
+            || ! preg_match('/^[1-9][0-9]{0,18}$/D', (string) $value)
+            || filter_var($value, FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]) === false) {
             return null;
         }
 

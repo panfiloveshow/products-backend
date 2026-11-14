@@ -9,6 +9,12 @@ Artisan::command('inspire', function () {
 
 // Все синхронизации запускаются пользователем вручную через UI.
 // Scheduled jobs отключены — нет фоновой нагрузки на API маркетплейсов.
+// This outbox contains only individually approved calculations. It never
+// creates an additional plan when recovering a lost queue receipt.
+if (config('services.manager.supply_calculations_enabled', false)) {
+    \Illuminate\Support\Facades\Schedule::command('manager:supply-calculations:dispatch --limit=50')
+        ->everyMinute()->withoutOverlapping()->name('manager.supply-calculation-outbox');
+}
 //
 // Exception: Locality Engine — единственный источник правды для расчёта
 // non-local переплат и рекомендаций поставок. Включи через ENV LOCALITY_SCHEDULE=true,
@@ -222,20 +228,13 @@ Artisan::command('sync:ozon-storage {--days=30 : Окно периода в дн
 
 // Сверка локального зеркала интеграций с живым списком Sellico: удаляет осиротевшие
 // (удалённые в Sellico, но «зависшие» локально) интеграции + их товары/кэш/снапшоты.
-// Команда fail-closed: без достоверного непустого списка из Sellico ничего не удаляет.
-//
-// ВКЛЮЧАТЬ только когда сервисный аккаунт Sellico получит доступ к списку интеграций
-// (сейчас /get-integrations/{ws} отвечает «reserved for service accounts», а
-// /workspaces/{ws}/integrations — 401 для сервисного токена → команда безопасно
-// пропускает все workspace). До этого запускать вручную с пользовательским токеном:
-//   php artisan integrations:reconcile --workspace=3 --token=<bearer> --apply
-if (filter_var(env('INTEGRATIONS_RECONCILE_SCHEDULE', false), FILTER_VALIDATE_BOOLEAN)) {
-    \Illuminate\Support\Facades\Schedule::command('integrations:reconcile --apply')
-        ->dailyAt('06:30')
-        ->withoutOverlapping()
-        ->appendOutputTo(storage_path('logs/integrations-reconcile.log'))
-        ->name('integrations.reconcile');
-}
+// Сервисный аккаунт получает полный реестр, включая неактивные интеграции.
+// Ошибки авторизации, сети и формата ответа запрещают очистку.
+\Illuminate\Support\Facades\Schedule::command('integrations:reconcile --apply')
+    ->everyMinute()
+    ->withoutOverlapping()
+    ->appendOutputTo(storage_path('logs/integrations-reconcile.log'))
+    ->name('integrations.reconcile');
 
 // Санитар «зомби»-интеграций по ОТПЕЧАТКУ credentials (в отличие от reconcile выше —
 // сигнал чисто локальный, Sellico не требуется). Ловит один кабинет, подключённый
@@ -265,3 +264,6 @@ if (filter_var(env('INVENTORY_SYNC_SCHEDULE', false), FILTER_VALIDATE_BOOLEAN)) 
         ->appendOutputTo(storage_path('logs/inventory-sync.log'))
         ->name('inventory.sync-scheduled');
 }
+
+// Expires private execution contexts even while stopped; dispatch requires both new flags.
+Schedule::command('manager:dispatch-ozon-packing --limit=50')->everyMinute()->withoutOverlapping();

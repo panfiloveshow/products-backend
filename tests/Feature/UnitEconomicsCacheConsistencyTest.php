@@ -3,166 +3,50 @@
 namespace Tests\Feature;
 
 use App\Models\UnitEconomicsCache;
-use Illuminate\Foundation\Testing\LazilyRefreshDatabase;
+use App\Services\UnitEconomics\UnitEconomicsConsistencyInspector;
+use PHPUnit\Framework\Attributes\DataProvider;
 use Tests\TestCase;
 
-/**
- * Ловит класс багов «бэк записал в БД рассинхронизированные поля».
- *
- * Если кто-то добавит параллельный путь расчёта effective_logistics или
- * expected_return_cost с кривой формулой, все записанные через него строки
- * провалят этот тест.
- *
- * Проверки идут напрямую на таблицу unit_economics_cache — без мокирования
- * калькулятора, чтобы ловить проблемы в реальном pipeline (orchestrator →
- * calculator → cache).
- */
 class UnitEconomicsCacheConsistencyTest extends TestCase
 {
-    use LazilyRefreshDatabase;
-
-    private const TOLERANCE = 0.02; // копейки округлений
-
-    /**
-     * @dataProvider fixtureCases
-     */
-    public function test_effective_logistics_equals_delivery_plus_expected_return(
-        float $logistics,
-        float $lastMile,
-        float $processing,
-        float $returnLogistics,
-        float $returnProcessing,
-        float $redemption,
-    ): void {
-        $expectedReturn = $redemption >= 100
-            ? 0.0
-            : ($returnLogistics + $returnProcessing) * (100 - $redemption) / 100;
-        $expectedEffective = $logistics + $lastMile + $processing + $expectedReturn;
-
-        $cache = UnitEconomicsCache::create([
-            'integration_id' => 999999,
-            'product_id' => 1,
-            'sku' => 'TEST-' . uniqid(),
-            'product_name' => 'test',
-            'marketplace' => 'ozon',
-            'fulfillment_type' => 'FBO',
-            'price' => 1000,
-            'logistics_cost' => $logistics,
-            'last_mile_cost' => $lastMile,
-            'processing_cost' => $processing,
-            'return_logistics_cost' => $returnLogistics,
-            'return_processing_cost' => $returnProcessing,
-            'expected_return_cost' => $expectedReturn,
-            'effective_logistics' => $expectedEffective,
-            'redemption_rate' => $redemption,
-            'redemption_source' => 'test',
-            'calculated_at' => now(),
-        ]);
-
-        $row = UnitEconomicsCache::find($cache->id);
-
-        $actualDelivery = (float) $row->logistics_cost + (float) $row->last_mile_cost + (float) $row->processing_cost;
-        $actualEffective = (float) $row->effective_logistics;
-
-        $this->assertEqualsWithDelta(
-            $actualDelivery + (float) $row->expected_return_cost,
-            $actualEffective,
-            self::TOLERANCE,
-            sprintf(
-                'effective_logistics (%.2f) должен быть равен delivery (%.2f) + expected_return (%.2f) = %.2f',
-                $actualEffective,
-                $actualDelivery,
-                $row->expected_return_cost,
-                $actualDelivery + (float) $row->expected_return_cost,
-            ),
-        );
-
-        $expectedReturnFromRow = (float) $row->redemption_rate >= 100
-            ? 0.0
-            : ((float) $row->return_logistics_cost + (float) $row->return_processing_cost)
-                * (100 - (float) $row->redemption_rate) / 100;
-
-        $this->assertEqualsWithDelta(
-            $expectedReturnFromRow,
-            (float) $row->expected_return_cost,
-            self::TOLERANCE,
-            sprintf(
-                'expected_return_cost (%.2f) должен быть (return_log %.2f + return_proc %.2f) × (100 − выкуп %.2f) / 100 = %.2f',
-                (float) $row->expected_return_cost,
-                (float) $row->return_logistics_cost,
-                (float) $row->return_processing_cost,
-                (float) $row->redemption_rate,
-                $expectedReturnFromRow,
-            ),
-        );
+    #[DataProvider('returnCases')]
+    public function test_checks_independently_calculated_per_sold_unit_costs(string $marketplace, string $scheme, float $redemption, float $forward, float $backward, float $processing, ?int $orders, ?int $returns, float $expected): void
+    {
+        $row = new UnitEconomicsCache(['marketplace' => $marketplace, 'fulfillment_type' => $scheme,
+            'redemption_rate' => $redemption, 'logistics_cost' => $forward, 'return_logistics_cost' => $backward,
+            'return_processing_cost' => $processing, 'last_mile_cost' => 25, 'processing_cost' => 5,
+            'expected_return_cost' => $expected, 'effective_logistics' => $forward + 30 + $expected,
+            'marketplace_data' => ['return_audit' => ['model' => 'per_sold_unit_v1',
+                'orders_count' => $orders, 'returns_count' => $returns, 'cancelled_count' => 0]]]);
+        $inspector = new UnitEconomicsConsistencyInspector;
+        $good = $inspector->inspect($row);
+        $this->assertTrue($good['return_checked']);
+        $this->assertSame($expected, $good['return_expected']);
+        $this->assertFalse($good['has_drift']);
+        $row->expected_return_cost = $expected + 5;
+        $this->assertTrue($inspector->inspect($row)['has_drift']);
     }
 
-    public static function fixtureCases(): array
+    public static function returnCases(): array
     {
         return [
-            'Ozon FBO 100% выкуп — возвраты 0' => [
-                'logistics' => 1247.0, 'lastMile' => 25.0, 'processing' => 0.0,
-                'returnLogistics' => 0.0, 'returnProcessing' => 0.0,
-                'redemption' => 100.0,
-            ],
-            'Ozon FBO 66.67% выкуп — стандартный кейс' => [
-                'logistics' => 449.13, 'lastMile' => 25.0, 'processing' => 0.0,
-                'returnLogistics' => 176.75, 'returnProcessing' => 15.0,
-                'redemption' => 66.67,
-            ],
-            'Ozon FBS 50% выкуп — с processing' => [
-                'logistics' => 300.0, 'lastMile' => 25.0, 'processing' => 45.0,
-                'returnLogistics' => 300.0, 'returnProcessing' => 50.0,
-                'redemption' => 50.0,
-            ],
-            'Ozon FBO 0% выкуп — полные возвраты' => [
-                'logistics' => 200.0, 'lastMile' => 25.0, 'processing' => 0.0,
-                'returnLogistics' => 200.0, 'returnProcessing' => 15.0,
-                'redemption' => 0.0,
-            ],
+            // Fixed expectations from independent arithmetic: 150 * 30 / 70.
+            'WB both legs per sold item' => ['wildberries', 'FBO', 70, 100, 50, 0, 100, 0, 64.29],
+            // (100+100+15) * (0.2+0.1) / 0.7.
+            'Ozon cancellations and post-delivery returns' => ['ozon', 'FBO', 80, 130, 100, 15, 100, 10, 92.14],
+            'Ozon full buyout still has post-delivery returns' => ['ozon', 'FBS', 100, 300, 300, 50, 100, 10, 72.22],
+            'Ozon own delivery includes both legs' => ['ozon', 'RFBS', 50, 100, 70, 0, 100, 0, 170.0],
+            'zero buyout capped at three returns per sale' => ['ozon', 'FBO', 0, 200, 200, 15, 100, 0, 1245.0],
         ];
     }
 
-    /**
-     * Запускается на реальной БД: пробегает до 1000 записей и проверяет консистентность.
-     * Падает если хотя бы одна строка рассинхронизирована. Служит детектором
-     * проникнувших в прод кривых расчётов.
-     *
-     * @group integration
-     */
-    public function test_production_cache_rows_are_mathematically_consistent(): void
+    public function test_unknown_legacy_formula_inputs_are_reported_as_unchecked_instead_of_false_drift(): void
     {
-        if (UnitEconomicsCache::count() === 0) {
-            $this->markTestSkipped('unit_economics_cache пуст — нечего проверять (dev/CI без данных).');
-        }
-
-        $drifts = [];
-        UnitEconomicsCache::query()->orderBy('id')->limit(1000)->chunk(200, function ($rows) use (&$drifts) {
-            foreach ($rows as $row) {
-                $expectedEffective = (float) $row->logistics_cost
-                    + (float) $row->last_mile_cost
-                    + (float) $row->processing_cost
-                    + (float) $row->expected_return_cost;
-
-                if (abs((float) $row->effective_logistics - $expectedEffective) > self::TOLERANCE) {
-                    $drifts[] = sprintf(
-                        '[%s] %s %s: effective=%.2f, ожидалось=%.2f (Δ=%.2f)',
-                        $row->marketplace,
-                        $row->sku,
-                        $row->fulfillment_type,
-                        $row->effective_logistics,
-                        $expectedEffective,
-                        (float) $row->effective_logistics - $expectedEffective,
-                    );
-                }
-            }
-        });
-
-        $this->assertEmpty(
-            $drifts,
-            "Найдено " . count($drifts) . " рассинхронизированных строк в unit_economics_cache:\n"
-                . implode("\n", array_slice($drifts, 0, 20))
-                . (count($drifts) > 20 ? "\n... и ещё " . (count($drifts) - 20) : ''),
-        );
+        $row = new UnitEconomicsCache(['marketplace' => 'ozon', 'redemption_rate' => 70,
+            'logistics_cost' => 100, 'expected_return_cost' => 75, 'effective_logistics' => 175]);
+        $result = (new UnitEconomicsConsistencyInspector)->inspect($row);
+        $this->assertFalse($result['return_checked']);
+        $this->assertNull($result['return_expected']);
+        $this->assertFalse($result['has_drift']);
     }
 }

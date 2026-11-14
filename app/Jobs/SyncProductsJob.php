@@ -125,14 +125,20 @@ class SyncProductsJob implements ShouldBeUnique, ShouldQueue
             }
 
             $totalFromApi = count($products);
+            $catalogComplete = method_exists($marketplace, 'isCatalogComplete') && $marketplace->isCatalogComplete()
+                && $beforeFilter === $totalFromApi;
             $this->syncLog->update([
                 'metadata' => array_merge($this->syncLog->metadata ?? [], [
                     'total_from_api' => $totalFromApi,
+                    'catalog_complete' => $catalogComplete,
                     'phase' => 'products',
                 ]),
             ]);
 
             if (empty($products)) {
+                if (in_array($this->syncLog->marketplace, ['wildberries', 'ozon'], true) && ! $catalogComplete) {
+                    throw new \RuntimeException('Marketplace catalog completeness was not confirmed');
+                }
                 $previousCatalogSize = $this->lastCompletedProductsApiTotal();
                 if ($previousCatalogSize >= self::SUSPICIOUS_EMPTY_API_THRESHOLD) {
                     throw new \RuntimeException(
@@ -201,7 +207,7 @@ class SyncProductsJob implements ShouldBeUnique, ShouldQueue
                 }
             }
 
-            $pruned = $this->pruneMissingMarketplaceProducts($products);
+            $pruned = $catalogComplete && $failed === 0 ? $this->pruneMissingMarketplaceProducts($products) : 0;
 
             // Сохраняем метаданные о синхронизации
             $this->syncLog->update([
@@ -262,12 +268,16 @@ class SyncProductsJob implements ShouldBeUnique, ShouldQueue
 
             // Автоматически запускаем синхронизацию остатков после товаров (через сервис: lock + дедуп)
             $credentials = $this->syncLog->credentials ?? [];
-            if (! empty($credentials)) {
+            // WB can resolve its key from the linked integration even when the
+            // queued credentials array is empty. Continue the full workflow;
+            // otherwise catalog succeeds and all following stages stay pending.
+            if (! empty($credentials) || ($this->syncLog->marketplace === 'wildberries' && $integration !== null)) {
                 $inventorySyncLog = $inventoryService->startSync(
                     $this->syncLog->marketplace,
                     $credentials,
                     $this->syncLog->integration_id,
-                    5
+                    5,
+                    $this->syncLog->metadata['unit_economics_run_id'] ?? null
                 );
 
                 Log::info('Inventory sync dispatched after products sync', [
@@ -340,7 +350,10 @@ class SyncProductsJob implements ShouldBeUnique, ShouldQueue
 
     private function pruneMissingMarketplaceProducts(array $products): int
     {
-        if (($this->syncLog->marketplace ?? '') !== 'ozon') {
+        if (($this->syncLog->metadata['catalog_complete'] ?? false) !== true) {
+            return 0;
+        }
+        if (! in_array($this->syncLog->marketplace ?? '', ['ozon', 'wildberries'], true)) {
             return 0;
         }
 
@@ -385,55 +398,82 @@ class SyncProductsJob implements ShouldBeUnique, ShouldQueue
             return 0;
         }
 
-        $staleSkus = Product::query()
+        $staleQuery = Product::query()
             ->where('integration_id', $integrationId)
             ->where('marketplace', $this->syncLog->marketplace)
-            ->whereNotIn('sku', $currentSkus->all())
-            ->pluck('sku')
-            ->filter(fn ($sku) => trim((string) $sku) !== '')
-            ->unique()
-            ->values();
-
-        if ($staleSkus->isEmpty()) {
-            return 0;
+            ->whereNotIn('sku', $currentSkus->all());
+        $currentNmIds = collect();
+        if ($this->syncLog->marketplace === 'wildberries') {
+            // A legacy barcode can disappear while its card is still active.
+            // Only a known card missing from the complete catalog is removable.
+            $currentNmIds = collect($products)->pluck('wb_data.nmID')->filter()
+                ->map(fn ($id) => (string) $id)->unique()->values();
+            if ($currentNmIds->isEmpty()) {
+                return 0;
+            }
+            $staleQuery->whereNotNull('wb_data->nmID')->whereNotIn('wb_data->nmID', $currentNmIds->all());
         }
 
-        $staleSkuValues = $staleSkus->all();
+        return DB::transaction(function () use ($staleQuery, $integrationId, $currentCount, $existingCount, $currentNmIds): int {
+            // Keep the same state -> product lock order as price publication.
+            $state = \Illuminate\Support\Facades\Schema::hasTable('unit_economics_sync_states')
+                ? \App\Models\UnitEconomicsSyncState::whereKey($integrationId)->lockForUpdate()->first() : null;
+            if ($this->syncLog->marketplace === 'wildberries') {
+                $run = $state?->latest_run_id ? \App\Models\UnitEconomicsSyncRun::whereKey($state->latest_run_id)->lockForUpdate()->first() : null;
+                $priceStage = $run?->stages['prices'] ?? [];
+                $observed = strtotime($priceStage['response_received_at'] ?? '');
+                // Content can stop returning a card while Prices still serves it.
+                // Retire only a matching, recent, complete price snapshot's gap.
+                if (! $run || $run->requested_version !== $state->requested_version
+                    || ! in_array($priceStage['status'] ?? '', ['completed', 'partial'], true)
+                    || ($priceStage['complete'] ?? false) !== true || (int) ($priceStage['http_status'] ?? 0) !== 200
+                    || ! $observed || $observed < now()->subMinutes(config('unit_economics_sync.price_max_age_minutes', 30))->getTimestamp()) {
+                    return 0;
+                }
+                $staleQuery->where('wb_data->price_sync_error_code', 'price_not_returned')
+                    ->whereIn('wb_data->price_sync_requested_version', [(int) $state->requested_version, (string) $state->requested_version]);
+            }
+            $staleSkus = $staleQuery->lockForUpdate()->get(['id', 'sku', 'wb_data'])
+                ->filter(function (Product $product) use ($currentNmIds, $state): bool {
+                    if ($this->syncLog->marketplace !== 'wildberries') {
+                        return true;
+                    }
+                    // JSON numbers and canonical strings represent the same
+                    // version. Booleans/floats must not become integer 1 through
+                    // a database's JSON comparison rules during deletion.
+                    $version = $product->wb_data['price_sync_requested_version'] ?? null;
+                    if ($version !== (int) $state->requested_version && $version !== (string) $state->requested_version) return false;
+                    $nm = trim((string) ($product->wb_data['nmID'] ?? ''));
 
-        UnitEconomicsCache::query()
-            ->where('integration_id', $integrationId)
-            ->where('marketplace', $this->syncLog->marketplace)
-            ->whereIn('sku', $staleSkuValues)
-            ->delete();
+                    return ctype_digit($nm) && (int) $nm > 0 && ! $currentNmIds->contains((string) (int) $nm);
+                })->pluck('sku')
+                ->filter(fn ($sku) => trim((string) $sku) !== '')->unique()->values();
+            if ($staleSkus->isEmpty()) {
+                return 0;
+            }
+            $staleSkuValues = $staleSkus->all();
 
-        UnitEconomics::query()
-            ->where('integration_id', $integrationId)
-            ->where('marketplace', $this->syncLog->marketplace)
-            ->whereIn('sku', $staleSkuValues)
-            ->delete();
+            UnitEconomicsCache::query()->where('integration_id', $integrationId)
+                ->where('marketplace', $this->syncLog->marketplace)->whereIn('sku', $staleSkuValues)->delete();
+            UnitEconomics::query()->where('integration_id', $integrationId)
+                ->where('marketplace', $this->syncLog->marketplace)->whereIn('sku', $staleSkuValues)->delete();
+            InventoryWarehouse::query()->where('integration_id', $integrationId)
+                ->where('marketplace', $this->syncLog->marketplace)->whereIn('sku', $staleSkuValues)->delete();
+            $deletedProducts = Product::query()->where('integration_id', $integrationId)
+                ->where('marketplace', $this->syncLog->marketplace)->whereIn('sku', $staleSkuValues)->delete();
+            $state?->increment('publication_revision');
 
-        InventoryWarehouse::query()
-            ->where('integration_id', $integrationId)
-            ->where('marketplace', $this->syncLog->marketplace)
-            ->whereIn('sku', $staleSkuValues)
-            ->delete();
+            Log::info('Pruned stale marketplace products after full sync', [
+                'marketplace' => $this->syncLog->marketplace,
+                'integration_id' => $integrationId,
+                'stale_skus_count' => count($staleSkuValues),
+                'deleted_products' => $deletedProducts,
+                'api_response_count' => $currentCount,
+                'db_existing_count' => $existingCount,
+            ]);
 
-        $deletedProducts = Product::query()
-            ->where('integration_id', $integrationId)
-            ->where('marketplace', $this->syncLog->marketplace)
-            ->whereIn('sku', $staleSkuValues)
-            ->delete();
-
-        Log::info('Pruned stale marketplace products after full sync', [
-            'marketplace' => $this->syncLog->marketplace,
-            'integration_id' => $integrationId,
-            'stale_skus_count' => count($staleSkuValues),
-            'deleted_products' => $deletedProducts,
-            'api_response_count' => $currentCount,
-            'db_existing_count' => $existingCount,
-        ]);
-
-        return $deletedProducts;
+            return $deletedProducts;
+        });
     }
 
     /**
@@ -444,6 +484,11 @@ class SyncProductsJob implements ShouldBeUnique, ShouldQueue
      * @return string 'created'|'updated'|'unchanged'
      */
     private function syncProduct(array $productData): string
+    {
+        return \Illuminate\Support\Facades\DB::transaction(fn () => $this->syncProductLocked($productData));
+    }
+
+    private function syncProductLocked(array $productData): string
     {
         $marketplace = $this->syncLog->marketplace;
         $integrationId = $this->syncLog->integration_id ?? null;
@@ -460,6 +505,9 @@ class SyncProductsJob implements ShouldBeUnique, ShouldQueue
             return 'created';
         }
 
+        $existingProduct = Product::whereKey($existingProduct->id)->lockForUpdate()->firstOrFail();
+        $productData = app(\App\Services\UnitEconomics\MarketplacePriceObservation::class)
+            ->preserveConfirmedPrice($existingProduct, $productData);
         $integrationChanged = $integrationId && $existingProduct->integration_id !== $integrationId;
 
         // Проверяем есть ли изменения
@@ -763,6 +811,10 @@ class SyncProductsJob implements ShouldBeUnique, ShouldQueue
 
         RecalculateUnitEconomicsCacheJob::dispatch((int) $this->syncLog->integration_id)
             ->onQueue('unit-economics');
+
+        if (app(\App\Services\UnitEconomics\UnitEconomicsSyncCoordinator::class)->enabled((int) $this->syncLog->integration_id)) {
+            return;
+        }
 
         // WB can keep returning the previous discount for several minutes after
         // the seller changes it. Re-read the authoritative Prices API after the

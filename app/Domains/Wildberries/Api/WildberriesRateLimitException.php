@@ -8,6 +8,6 @@ class WildberriesRateLimitException extends RuntimeException
 {
     public function __construct(public readonly int $retryAfterSeconds)
     {
-        parent::__construct("WB Prices API rate limit; retry after {$retryAfterSeconds} seconds");
+        parent::__construct("WB API rate limit; retry after {$retryAfterSeconds} seconds");
     }
 }

@@ -53,6 +53,10 @@ class OzonMarketplace implements MarketplaceInterface
 
     public function __construct(array $credentials = [], ?Integration $integration = null)
     {
+        if ($integration !== null && empty($credentials['client_id']) && empty($credentials['api_key'])
+            && empty($credentials['oauth_access_token']) && empty($credentials['access_token'])) {
+            $credentials = array_merge($credentials, $integration->resolveCredentials());
+        }
         $clientId = $credentials['client_id'] ?? config('services.ozon.client_id');
         $apiKey = $credentials['api_key'] ?? config('services.ozon.api_key');
         $accessToken = $credentials['oauth_access_token']
@@ -93,7 +97,7 @@ class OzonMarketplace implements MarketplaceInterface
      */
     public static function fromIntegration(Integration $integration): self
     {
-        return new self($integration->getDecryptedCredentials(), $integration);
+        return new self($integration->resolveCredentials(), $integration);
     }
 
     // === MarketplaceInterface ===
@@ -111,8 +115,8 @@ class OzonMarketplace implements MarketplaceInterface
     public function testConnection(Integration $integration): bool
     {
         try {
-            $products = $this->products->getProducts(1);
-            return true;
+            $products = $this->products->getProducts($integration, ['limit' => 1]);
+            return ($products['complete'] ?? false) && $this->client->getLastResponseStatus() === 200;
         } catch (\Exception $e) {
             return false;
         }
@@ -131,6 +135,10 @@ class OzonMarketplace implements MarketplaceInterface
      */
     public function getProducts(): array
     {
+        $this->catalogComplete = false;
+        $validPages = true;
+        $seenCursors = [];
+        $page = 0;
         $allProducts = [];
         $allOfferIds = [];
         $lastId = '';
@@ -164,17 +172,25 @@ class OzonMarketplace implements MarketplaceInterface
             ]);
             
             $items = $result['items'] ?? [];
+            $previousLastId = $lastId;
             $lastId = $result['last_id'] ?? '';
+            if (! ($result['complete'] ?? false)) {
+                $validPages = false;
+            }
             
             \Log::debug('Ozon getProducts: batch loaded', ['items_count' => count($items), 'last_id' => $lastId]);
             
             if (empty($items)) {
+                $this->catalogComplete = $validPages && $lastId === '';
                 break;
             }
             
             // Получаем подробную информацию о товарах через v4 API
             $productIds = array_column($items, 'product_id');
             $detailedProducts = $this->products->getProductsByIds($productIds);
+            if (count($detailedProducts) !== count($productIds)) {
+                $validPages = false;
+            }
             
             \Log::debug('Ozon getProducts: detailed loaded', [
                 'product_ids_count' => count($productIds),
@@ -209,6 +225,14 @@ class OzonMarketplace implements MarketplaceInterface
                 
                 $allProducts[] = $mapped;
             }
+            $page++;
+            if ($lastId === '') {
+                $this->catalogComplete = $validPages;
+            } elseif ($lastId === $previousLastId || isset($seenCursors[$lastId]) || $page >= 500) {
+                $validPages = false;
+                break;
+            }
+            $seenCursors[$lastId] = true;
             
         } while (!empty($items) && !empty($lastId));
         
@@ -328,6 +352,13 @@ class OzonMarketplace implements MarketplaceInterface
         }
         
         return $allProducts;
+    }
+
+    private bool $catalogComplete = false;
+
+    public function isCatalogComplete(): bool
+    {
+        return $this->catalogComplete;
     }
     
     /**
@@ -943,6 +974,11 @@ class OzonMarketplace implements MarketplaceInterface
     public function getRedemptionRateFromAnalytics(?string $dateFrom = null, ?string $dateTo = null, array $productIdToSkuMap = []): array
     {
         return $this->analytics->getRedemptionRateFromAnalytics($dateFrom, $dateTo, $productIdToSkuMap);
+    }
+
+    public function getRedemptionAnalyticsStatus(): string
+    {
+        return $this->analytics->getRedemptionAnalyticsStatus();
     }
 
     public function getLocalizationIndex(): array

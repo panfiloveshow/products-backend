@@ -82,7 +82,7 @@ class FboPostingsApi
      */
     public function getCancelReasons(): array
     {
-        $response = $this->client->post('/v1/posting/fbo/cancel-reason/list', []);
+        $response = $this->client->post('/v1/posting/fbo/cancel-reason/list', [], true);
 
         return $response['result'] ?? $response ?? [];
     }

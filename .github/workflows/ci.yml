@@ -67,7 +67,87 @@ jobs:
           tests/Feature/UnitEconomicsCacheConsistencyTest.php
           tests/Feature/SecurityRemediationTest.php
           tests/Feature/HealthEndpointTest.php
+          tests/Unit/MarketplacePriceSnapshotCompletenessTest.php
+          tests/Unit/UnitEconomicsHealthAlertsTest.php
+          tests/Unit/OzonOrderDeliveryProfileServiceTest.php
+          tests/Unit/OzonAnalyticsDataLimitsTest.php
+          tests/Unit/WildberriesApiCompatibilityTest.php
+          tests/Unit/WildberriesApiContractTest.php
+          tests/Unit/WildberriesAnalyticsRetryTest.php
+          tests/Unit/WildberriesRealizationReportApiTest.php
+          tests/Feature/MarketplacePriceObservationTest.php
+          tests/Feature/MarketplacePricePipelineTest.php
+          tests/Feature/UnitEconomicsSyncCoordinatorTest.php
+          tests/Feature/UnitEconomicsFreshnessTest.php
+          tests/Feature/UnitEconomicsPriceRecoveryTest.php
+          tests/Feature/UnitEconomicsSyncEntryPointsTest.php
+          tests/Feature/UnitEconomicsCatalogRetentionTest.php
+          tests/Feature/UnitEconomicsPartialRecalculationTest.php
+          tests/Feature/UnitEconomicsSyncResultTest.php
+          tests/Feature/UnitEconomicsJobOutcomeTest.php
+          tests/Feature/SyncSupplyStatusesJobTest.php
+          tests/Feature/RecoverUnitEconomicsQueueTest.php
 
       - name: Report dependency vulnerabilities
         continue-on-error: true
         run: composer audit --locked --no-interaction
+
+  unit-economics-postgres:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: codex_ue
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: codex_ue_reliability_testing
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready --health-interval 5s
+          --health-timeout 5s --health-retries 10
+    env:
+      APP_ENV: testing
+      APP_KEY: base64:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+      APP_CONFIG_CACHE: /tmp/codex-ue-ci-no-config.php
+      CACHE_STORE: array
+      DB_CONNECTION: pgsql
+      DB_HOST: 127.0.0.1
+      DB_PORT: 5432
+      DB_DATABASE: codex_ue_reliability_testing
+      DB_USERNAME: codex_ue
+      DB_PASSWORD: test
+      PGPASSWORD: test
+      QUEUE_CONNECTION: sync
+      SESSION_DRIVER: array
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          extensions: mbstring, pdo_pgsql, pgsql, pcntl, intl, gd, zip
+          coverage: none
+          tools: composer:v2
+      - run: composer install --no-interaction --prefer-dist --no-progress
+      - name: Restore schema-only fixture and apply additive migration
+        run: |
+          psql -h 127.0.0.1 -U codex_ue -d codex_ue_reliability_testing -v ON_ERROR_STOP=1 -f tests/fixtures/unit-economics-pg16-schema.sql > /tmp/ue-schema-restore.log
+          php artisan migrate --path=database/migrations/2026_11_02_130000_create_unit_economics_sync_runs.php --force
+      - name: Verify real PostgreSQL transactions, prices and recovery
+        run: >-
+          php vendor/bin/phpunit --bootstrap tests/Support/pgsql-reliability-bootstrap.php --no-progress
+          tests/Feature/UnitEconomicsPostgresConcurrencyTest.php
+          tests/Feature/OzonOrderDeliveryProfileServiceTest.php
+          tests/Feature/WildberriesFullSyncCredentialsTest.php
+          tests/Feature/UnitEconomicsSynchronizerTest.php
+          tests/Feature/MarketplacePricePipelineTest.php
+          tests/Feature/MarketplacePriceObservationTest.php
+          tests/Feature/UnitEconomicsSyncCoordinatorTest.php
+          tests/Feature/UnitEconomicsFreshnessTest.php
+          tests/Feature/UnitEconomicsPriceRecoveryTest.php
+          tests/Feature/UnitEconomicsSyncEntryPointsTest.php
+          tests/Feature/UnitEconomicsCatalogRetentionTest.php
+          tests/Feature/UnitEconomicsPartialRecalculationTest.php
+          tests/Feature/UnitEconomicsJobOutcomeTest.php
+          tests/Feature/SyncSupplyStatusesJobTest.php
+          tests/Feature/RecoverUnitEconomicsQueueTest.php

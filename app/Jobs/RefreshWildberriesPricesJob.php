@@ -41,6 +41,14 @@ class RefreshWildberriesPricesJob implements ShouldBeUnique, ShouldQueue
 
     public function handle(WildberriesPriceRefreshService $service): void
     {
+        $coordinator = app(\App\Services\UnitEconomics\UnitEconomicsSyncCoordinator::class);
+        if ($coordinator->enabled($this->integrationId)) {
+            $integration = Integration::whereKey($this->integrationId)->where('is_active', true)->first();
+            if ($integration) {
+                $coordinator->start($integration);
+            }
+            return;
+        }
         $apiKey = $this->resolveApiKey();
 
         if ($apiKey === '') {

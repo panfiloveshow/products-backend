@@ -56,16 +56,16 @@ class MigrateCostPriceToSettings extends Command
         
         foreach ($records as $record) {
             try {
-                UnitEconomicsSettings::updateOrCreate(
-                    [
-                        'integration_id' => $record->integration_id,
-                        'sku' => $record->sku,
-                    ],
-                    [
-                        'cost_price' => $record->cost_price,
-                    ]
-                );
-                $migrated++;
+                $changed = DB::transaction(function () use ($record): bool {
+                    $scope = ['integration_id' => $record->integration_id, 'sku' => $record->sku];
+                    $settings = UnitEconomicsSettings::where($scope)->lockForUpdate()->first();
+                    if ($settings?->hasExplicitCostPrice()) return false;
+                    if ($settings) $settings->update(['cost_price' => $record->cost_price]);
+                    else UnitEconomicsSettings::create([...$scope, 'cost_price' => $record->cost_price]);
+
+                    return true;
+                });
+                if ($changed) $migrated++;
             } catch (\Exception $e) {
                 $errors++;
                 $this->error("Ошибка для SKU {$record->sku}: {$e->getMessage()}");

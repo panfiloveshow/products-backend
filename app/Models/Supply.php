@@ -218,6 +218,15 @@ class Supply extends Model
         ]);
     }
 
+    public function scopeTrackableOzon($query)
+    {
+        return $query->active()
+            ->whereHas('integration', fn ($integration) => $integration->where('is_active', true)->where('marketplace', 'ozon'))
+            ->where(fn ($supply) => $supply->whereNotNull('ozon_order_id')
+                ->orWhereNotNull('ozon_supply_id')
+                ->orWhereNotNull('ozon_draft_id'));
+    }
+
     public function scopePending($query)
     {
         return $query->whereIn('status', [

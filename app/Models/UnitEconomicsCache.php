@@ -17,6 +17,8 @@ use Illuminate\Database\Eloquent\Relations\BelongsTo;
  */
 class UnitEconomicsCache extends Model
 {
+    public const CURRENT_DATA_VERSION = 4;
+
     use HasFactory, Traits\BelongsToCurrentWorkspaceThroughIntegration;
 
     protected $table = 'unit_economics_cache';
@@ -29,6 +31,9 @@ class UnitEconomicsCache extends Model
         'marketplace',
         'fulfillment_type',
         'marketplace_data',
+        'source_version',
+        'price_observed_at',
+        'price_source',
         // Базовые данные
         'price',
         'old_price',

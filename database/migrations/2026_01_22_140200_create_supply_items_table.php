@@ -16,7 +16,7 @@ return new class extends Migration
         Schema::create('supply_items', function (Blueprint $table) {
             $table->id();
             $table->foreignId('supply_id')->constrained('supplies')->onDelete('cascade');
-            $table->foreignId('product_id')->nullable()->constrained()->onDelete('set null');
+            $table->foreignUuid('product_id')->nullable()->constrained()->onDelete('set null');
             
             // Идентификация товара
             $table->string('sku', 100)->index();
