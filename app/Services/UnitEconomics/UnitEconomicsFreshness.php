@@ -109,6 +109,15 @@ class UnitEconomicsFreshness
                 default => $data['total'] ?? 0,
             };
 
+            $projecting = $name === 'projection' && in_array($data['status'], ['queued', 'running'], true);
+            $progressTotal = match (true) {
+                // The projection counter only includes batches that have already finished.
+                $projecting => $run?->stages['prices']['succeeded'] ?? 0,
+                // Enrichment counts describe source collection until its cache is published.
+                $name === 'enrichment' && $data['status'] === 'running' => 0,
+                default => $data['total'] ?? 0,
+            };
+
             return array_merge($data, ['items_synced' => $data['succeeded'] ?? 0,
                 'completed_at' => $data['finished_at'] ?? null,
                 'progress_percent' => $progressTotal > 0
