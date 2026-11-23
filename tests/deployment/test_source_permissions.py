@@ -145,7 +145,16 @@ if sys.argv[1] == 'status':
                 PHP_TEST_LOG=str(php_log),
                 PHP_BIN=str(commands / "php8.4"),
                 PHP_FPM_SERVICE="php8.4-fpm",
+                PHP_BINARY="/usr/bin/php8.2",
             )
+            (root / "bootstrap" / "cache").mkdir(parents=True)
+            stale_routes = root / "bootstrap" / "cache" / "routes-v7.php"
+            stale_routes.write_text("<?php // stale L12 routes cache\n")
+            (commands / "php8.4").write_text(
+                '#!/bin/sh\n'
+                'printf "%s|PHP_BINARY=%s|ROUTES_EXISTS=%d\\n" "$*" "${PHP_BINARY:-}" "$(test -e bootstrap/cache/routes-v7.php && echo 1 || echo 0)" >> "$PHP_TEST_LOG"\n'
+            )
+            (commands / "php8.4").chmod(0o755)
             state.write_text(json.dumps(dict.fromkeys(names, 'RUNNING')))
             result = subprocess.run(['bash', str(ROOT / 'scripts/deploy-runtime.sh'), str(root)],
                                     env=env, capture_output=True, text=True)
@@ -153,7 +162,11 @@ if sys.argv[1] == 'status':
             self.assertEqual('reload php8.4-fpm\n', fpm_reload.read_text())
             calls = php_log.read_text().splitlines()
             composer_bin = str(commands / "composer")
-            self.assertIn(f"{composer_bin} install --no-dev --optimize-autoloader --no-interaction", calls)
+            expected_php = str(commands / "php8.4")
+            self.assertIn(
+                f"{composer_bin} install --no-dev --optimize-autoloader --no-interaction|PHP_BINARY={expected_php}|ROUTES_EXISTS=0",
+                calls,
+            )
             for artisan_cmd in (
                 "artisan migrate --force",
                 "artisan config:cache",
@@ -162,7 +175,26 @@ if sys.argv[1] == 'status':
                 "artisan --version",
                 "artisan queue:restart",
             ):
-                self.assertIn(artisan_cmd, calls)
+                self.assertIn(f"{artisan_cmd}|PHP_BINARY={expected_php}|ROUTES_EXISTS=0", calls)
+
+    def test_repo_cron_and_supervisor_templates_pin_php84(self):
+        template_paths = [
+            *sorted((ROOT / "scripts" / "cron.d").glob("*")),
+            *sorted((ROOT / "scripts" / "supervisor").glob("*.conf")),
+            ROOT / "scripts" / "unit-economics-sync.cron",
+        ]
+        for path in template_paths:
+            if path.name.startswith("._") or not path.is_file():
+                continue
+            for lineno, line in enumerate(path.read_text().splitlines(), 1):
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+                self.assertNotRegex(
+                    stripped,
+                    r'(?:^|[\s&;])(?:/usr/bin/)?php\s+artisan\b|command=php\s+',
+                    f"{path.relative_to(ROOT)}:{lineno} must pin /usr/bin/php8.4",
+                )
 
 
 if __name__ == "__main__":

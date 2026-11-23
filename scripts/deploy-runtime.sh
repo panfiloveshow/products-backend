@@ -11,8 +11,10 @@ PHP_BIN="${PHP_BIN:-/usr/bin/php8.4}"
 runuser -u www-data -- bash -euc '
   cd "$1"
   PHP_BIN="$2"
+  export PHP_BINARY="$PHP_BIN"
   COMPOSER_BIN="$(command -v composer)"
   umask 002
+  rm -f bootstrap/cache/routes-v7.php
   "$PHP_BIN" "$COMPOSER_BIN" install --no-dev --optimize-autoloader --no-interaction
   "$PHP_BIN" artisan migrate --force
   "$PHP_BIN" artisan config:cache
