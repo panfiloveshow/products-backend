@@ -5,21 +5,26 @@ REMOTE_PATH="${1:?Project directory required}"
 [[ "$REMOTE_PATH" =~ ^/[A-Za-z0-9_./-]+$ && "$REMOTE_PATH" != / ]] || exit 1
 [[ "$(id -u)" == 0 ]] || { echo 'Runtime preparation requires root' >&2; exit 1; }
 
+PHP_BIN="${PHP_BIN:-/usr/bin/php8.4}"
+[[ "$PHP_BIN" =~ ^/[A-Za-z0-9_./-]+$ ]] || exit 1
+
 runuser -u www-data -- bash -euc '
   cd "$1"
+  PHP_BIN="$2"
+  COMPOSER_BIN="$(command -v composer)"
   umask 002
-  composer install --no-dev --optimize-autoloader --no-interaction
-  php artisan migrate --force
-  php artisan config:cache
-  php artisan route:cache
-  php artisan view:cache
-  php artisan --version
-  php artisan queue:restart
-' _ "$REMOTE_PATH"
+  "$PHP_BIN" "$COMPOSER_BIN" install --no-dev --optimize-autoloader --no-interaction
+  "$PHP_BIN" artisan migrate --force
+  "$PHP_BIN" artisan config:cache
+  "$PHP_BIN" artisan route:cache
+  "$PHP_BIN" artisan view:cache
+  "$PHP_BIN" artisan --version
+  "$PHP_BIN" artisan queue:restart
+' _ "$REMOTE_PATH" "$PHP_BIN"
 
 # Production disables OPcache timestamp checks. A graceful FPM reload is
 # required for HTTP requests to use the uploaded code and refreshed config.
-PHP_FPM_SERVICE="${PHP_FPM_SERVICE:-php8.2-fpm}"
+PHP_FPM_SERVICE="${PHP_FPM_SERVICE:-php8.4-fpm}"
 [[ "$PHP_FPM_SERVICE" =~ ^[A-Za-z0-9_.@-]+$ ]] || exit 1
 systemctl reload "$PHP_FPM_SERVICE"
 

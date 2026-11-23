@@ -107,6 +107,63 @@ if sys.argv[1] == 'start':
                                     env=env, capture_output=True, text=True)
             self.assertNotEqual(0, result.returncode)
 
+    def test_runtime_uses_explicit_php_bin_for_composer_and_artisan(self):
+        with tempfile.TemporaryDirectory(prefix="products-phpbin-test-") as directory:
+            root = pathlib.Path(directory)
+            commands = root / "bin"
+            commands.mkdir()
+            state = root / "state.json"
+            fpm_reload = root / "fpm-reload.txt"
+            php_log = root / "php-calls.log"
+            names = [f"products-backend-{group}:worker_00" for group in
+                     ("worker", "ue-worker", "price-refresh-worker", "ue-enrichment-worker")]
+            for command, content in {
+                "id": "#!/bin/sh\necho 0\n",
+                "runuser": '#!/bin/sh\nwhile [ "$#" -gt 0 ] && [ "$1" != "--" ]; do shift; done\nshift\nexec "$@"\n',
+                "php": '#!/bin/sh\necho "UNEXPECTED_BARE_PHP $*" >> "$PHP_TEST_LOG"\nexit 99\n',
+                "php8.4": '#!/bin/sh\nprintf "%s\\n" "$*" >> "$PHP_TEST_LOG"\n',
+                "composer": '#!/bin/sh\necho "UNEXPECTED_BARE_COMPOSER $*" >> "$PHP_TEST_LOG"\nexit 98\n',
+                "systemctl": '#!/bin/sh\nprintf "%s\\n" "$*" > "$FPM_TEST_RELOAD"\n',
+                "supervisorctl": '''#!/usr/bin/env python3
+import json, os, pathlib, sys
+p = pathlib.Path(os.environ['WORKER_TEST_STATE'])
+workers = json.loads(p.read_text())
+if sys.argv[1] == 'status':
+    for name, status in workers.items(): print(name, status)
+    sys.exit(0)
+''',
+            }.items():
+                path = commands / command
+                path.write_text(content)
+                path.chmod(0o755)
+
+            env = os.environ.copy()
+            env.update(
+                PATH=str(commands) + os.pathsep + env['PATH'],
+                WORKER_TEST_STATE=str(state),
+                FPM_TEST_RELOAD=str(fpm_reload),
+                PHP_TEST_LOG=str(php_log),
+                PHP_BIN=str(commands / "php8.4"),
+                PHP_FPM_SERVICE="php8.4-fpm",
+            )
+            state.write_text(json.dumps(dict.fromkeys(names, 'RUNNING')))
+            result = subprocess.run(['bash', str(ROOT / 'scripts/deploy-runtime.sh'), str(root)],
+                                    env=env, capture_output=True, text=True)
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertEqual('reload php8.4-fpm\n', fpm_reload.read_text())
+            calls = php_log.read_text().splitlines()
+            composer_bin = str(commands / "composer")
+            self.assertIn(f"{composer_bin} install --no-dev --optimize-autoloader --no-interaction", calls)
+            for artisan_cmd in (
+                "artisan migrate --force",
+                "artisan config:cache",
+                "artisan route:cache",
+                "artisan view:cache",
+                "artisan --version",
+                "artisan queue:restart",
+            ):
+                self.assertIn(artisan_cmd, calls)
+
 
 if __name__ == "__main__":
     unittest.main()

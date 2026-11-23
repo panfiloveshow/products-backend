@@ -12,3 +12,4 @@ _backups/
 public/build/
 __pycache__/
 *.pyc
+.superpowers/

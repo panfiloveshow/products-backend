@@ -23,4 +23,4 @@ MAILTO=""
 
 # Ежедневно в 05:30 МСК — обновить КС всех активных WB-интеграций
 # (box-снапшоты + inventory_warehouses) и пересобрать кэш юнит-экономики.
-30 5 * * * www-data cd /var/www/products-backend && /usr/bin/php artisan wb:refresh-tariffs >> /var/www/products-backend/storage/logs/wb-tariff-refresh.log 2>&1
+30 5 * * * www-data cd /var/www/products-backend && /usr/bin/php8.4 artisan wb:refresh-tariffs >> /var/www/products-backend/storage/logs/wb-tariff-refresh.log 2>&1
