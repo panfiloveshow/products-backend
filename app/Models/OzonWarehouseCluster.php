@@ -61,11 +61,23 @@ class OzonWarehouseCluster extends Model
             return self::where('warehouse_name_normalized', $normalized)->first();
         }
         
-        return Cache::remember(
-            "ozon_warehouse_cluster:{$normalized}",
+        $cached = Cache::remember(
+            "ozon_warehouse_cluster:v2:{$normalized}",
             now()->addHours(24),
-            fn() => self::where('warehouse_name_normalized', $normalized)->first()
+            static function () use ($normalized): array {
+                $model = self::where('warehouse_name_normalized', $normalized)->first();
+
+                return $model === null
+                    ? ['found' => false]
+                    : ['found' => true, 'attributes' => $model->getAttributes()];
+            }
         );
+
+        if (! is_array($cached) || empty($cached['found']) || ! is_array($cached['attributes'] ?? null)) {
+            return null;
+        }
+
+        return (new static)->newFromBuilder($cached['attributes']);
     }
 
     /**
@@ -100,11 +112,16 @@ class OzonWarehouseCluster extends Model
      */
     public static function getWarehousesByCluster(int $clusterId)
     {
-        return Cache::remember(
-            "ozon_cluster_warehouses:{$clusterId}",
+        $rows = Cache::remember(
+            "ozon_cluster_warehouses:v2:{$clusterId}",
             now()->addHours(24),
-            fn() => self::where('cluster_id', $clusterId)->get()
+            static fn (): array => self::where('cluster_id', $clusterId)
+                ->get()
+                ->map(static fn (self $item): array => $item->getAttributes())
+                ->all()
         );
+
+        return static::hydrate(is_array($rows) ? $rows : []);
     }
 
     /**
