@@ -1,4 +1,4 @@
 # Feature-gated rotation; no external calls for disabled integrations.
-*/5 * * * * www-data cd /var/www/products-backend && /usr/bin/flock -n storage/framework/ue-price-rotation.lock /usr/bin/php artisan ue:refresh-prices --stale-only --limit=10 --apply >> storage/logs/ue-price-rotation.log 2>&1
-*/5 * * * * www-data cd /var/www/products-backend && /usr/bin/flock -n storage/framework/ue-price-recovery.lock /usr/bin/php artisan ue:refresh-prices --recover --limit=100 --apply >> storage/logs/ue-price-recovery.log 2>&1
-*/5 * * * * www-data cd /var/www/products-backend && /usr/bin/flock -n storage/framework/ue-sync-health.lock /usr/bin/php artisan ue:sync-health --fail-on-degraded --log >> storage/logs/ue-sync-health.log 2>&1
+*/5 * * * * www-data cd /var/www/products-backend && /usr/bin/flock -n storage/framework/ue-price-rotation.lock /usr/bin/php8.4 artisan ue:refresh-prices --stale-only --limit=10 --apply >> storage/logs/ue-price-rotation.log 2>&1
+*/5 * * * * www-data cd /var/www/products-backend && /usr/bin/flock -n storage/framework/ue-price-recovery.lock /usr/bin/php8.4 artisan ue:refresh-prices --recover --limit=100 --apply >> storage/logs/ue-price-recovery.log 2>&1
+*/5 * * * * www-data cd /var/www/products-backend && /usr/bin/flock -n storage/framework/ue-sync-health.lock /usr/bin/php8.4 artisan ue:sync-health --fail-on-degraded --log >> storage/logs/ue-sync-health.log 2>&1

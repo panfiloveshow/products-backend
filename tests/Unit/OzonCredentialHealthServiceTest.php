@@ -7,6 +7,7 @@ use App\Services\Ozon\OzonCredentialHealthService;
 use App\Services\SellicoApiService;
 use Illuminate\Foundation\Testing\LazilyRefreshDatabase;
 use Illuminate\Support\Facades\Http;
+use PHPUnit\Framework\Attributes\DataProvider;
 use Tests\TestCase;
 
 class OzonCredentialHealthServiceTest extends TestCase
@@ -62,9 +63,7 @@ class OzonCredentialHealthServiceTest extends TestCase
         Http::assertSent(fn ($request): bool => str_contains($request->url(), '/v3/product/list'));
     }
 
-    /**
-     * @dataProvider authRejectionStatuses
-     */
+    #[DataProvider('authRejectionStatuses')]
     public function test_only_auth_rejection_marks_credentials_invalid(int $httpStatus): void
     {
         Http::preventStrayRequests();

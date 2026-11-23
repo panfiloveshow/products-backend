@@ -99,10 +99,10 @@ class WildberriesApiCompatibilityTest extends TestCase
 
         $this->assertLessThan(10, microtime(true) - $started);
         $this->assertSame(3600, $inventory->getDeferredRetryAfter());
-        $this->assertCount(1, Http::recorded(fn (Request $r) => str_contains($r->url(), '/content/v2/get/cards/list')));
+        $this->assertCount(0, Http::recorded(fn (Request $r) => str_contains($r->url(), '/content/v2/get/cards/list')));
         $this->assertCount(1, Http::recorded(fn (Request $r) => str_ends_with($r->url(), '/api/v1/warehouse_remains?groupByBarcode=true&groupBySa=true')));
-        $this->assertSame(200, $client->getLastResponseStatus());
-        $this->assertNull($client->getLastRateLimitRetryAfter());
+        $this->assertSame(429, $client->getLastResponseStatus());
+        $this->assertSame(3600, $client->getLastRateLimitRetryAfter());
 
         $this->expectException(WildberriesRateLimitException::class);
         (new WildberriesMarketplace(['api_key' => 'inventory-defer-test']))->getInventory();

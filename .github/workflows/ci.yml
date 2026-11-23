@@ -34,7 +34,7 @@ jobs:
       - name: Set up PHP
         uses: shivammathur/setup-php@v2
         with:
-          php-version: '8.3'
+          php-version: '8.4'
           extensions: mbstring, pdo_sqlite, sqlite3, intl, gd, zip
           coverage: none
           tools: composer:v2
@@ -55,6 +55,11 @@ jobs:
       - name: Check PHP syntax
         run: find app routes config database/migrations tests -name '*.php' -print0 | xargs -0 -n1 php -l
 
+      - name: Verify deployment permissions and worker recovery
+        run: |
+          bash -n deploy-to-server.sh scripts/prepare-deploy-source.sh scripts/deploy-runtime.sh
+          python3 -m unittest discover -s tests/deployment -v
+
       - name: Run price and unit-economics regression tests
         run: >-
           php -d memory_limit=512M artisan test
@@ -74,6 +79,7 @@ jobs:
           tests/Unit/WildberriesApiCompatibilityTest.php
           tests/Unit/WildberriesApiContractTest.php
           tests/Unit/WildberriesAnalyticsRetryTest.php
+          tests/Unit/WildberriesWarehouseReportRetryTest.php
           tests/Unit/WildberriesRealizationReportApiTest.php
           tests/Feature/MarketplacePriceObservationTest.php
           tests/Feature/MarketplacePricePipelineTest.php
@@ -87,9 +93,12 @@ jobs:
           tests/Feature/UnitEconomicsJobOutcomeTest.php
           tests/Feature/SyncSupplyStatusesJobTest.php
           tests/Feature/RecoverUnitEconomicsQueueTest.php
+          tests/Feature/OzonWarehouseClusterCacheSerializationTest.php
+          tests/Feature/ArtisanCompatibilityCommandsTest.php
+          tests/Unit/SpreadsheetRoundtripTest.php
+          tests/Unit/OzonCredentialHealthServiceTest.php
 
       - name: Report dependency vulnerabilities
-        continue-on-error: true
         run: composer audit --locked --no-interaction
 
   unit-economics-postgres:
@@ -124,7 +133,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: shivammathur/setup-php@v2
         with:
-          php-version: '8.3'
+          php-version: '8.4'
           extensions: mbstring, pdo_pgsql, pgsql, pcntl, intl, gd, zip
           coverage: none
           tools: composer:v2
@@ -137,8 +146,10 @@ jobs:
         run: >-
           php vendor/bin/phpunit --bootstrap tests/Support/pgsql-reliability-bootstrap.php --no-progress
           tests/Feature/UnitEconomicsPostgresConcurrencyTest.php
+          tests/Feature/UnitEconomicsListingConcurrencyTest.php
           tests/Feature/OzonOrderDeliveryProfileServiceTest.php
           tests/Feature/WildberriesFullSyncCredentialsTest.php
+          tests/Feature/WildberriesCatalogRetryTest.php
           tests/Feature/UnitEconomicsSynchronizerTest.php
           tests/Feature/MarketplacePricePipelineTest.php
           tests/Feature/MarketplacePriceObservationTest.php

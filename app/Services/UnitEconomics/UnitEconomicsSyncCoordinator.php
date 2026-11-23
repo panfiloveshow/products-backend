@@ -41,6 +41,12 @@ class UnitEconomicsSyncCoordinator
                 ? ['catalog', 'inventory', 'prices', 'projection', 'enrichment', ...($integration->marketplace === 'wildberries' ? ['finance'] : [])]
                 : ['prices', 'projection']);
             $requestedStages = $required;
+            $deadlineHours = max(1, (int) config('unit_economics_sync.deadline_hours', 6));
+            if ($integration->marketplace === 'wildberries' && in_array('finance', $required, true)) {
+                // Finance с базовым токеном может законно ждать 12 часов.
+                // Общий короткий дедлайн иначе завершает очередь до её повтора.
+                $deadlineHours = max($deadlineHours, (int) config('unit_economics_sync.wildberries_finance_deadline_hours', 24));
+            }
 
             if (! $run || in_array($run->status, self::TERMINAL, true) || $run->deadline_at->isPast()) {
                 if ($run && ! in_array($run->status, self::TERMINAL, true)) {
@@ -50,13 +56,19 @@ class UnitEconomicsSyncCoordinator
                     'integration_id' => $integration->id, 'version' => $state->requested_version,
                     'requested_version' => $state->requested_version, 'purpose' => $purpose,
                     'status' => 'queued', 'required_stages' => $required, 'stages' => [],
-                    'deadline_at' => now()->addHours(max(1, (int) config('unit_economics_sync.deadline_hours', 6))),
+                    'deadline_at' => now()->addHours($deadlineHours),
                 ]);
             } else {
                 $required = array_values(array_unique([...$run->required_stages, ...$required]));
                 $run->fill(['requested_version' => $state->requested_version,
                     'purpose' => $run->purpose === 'full' || $purpose === 'full' ? 'full' : 'prices',
                     'required_stages' => $required, 'status' => 'queued', 'finished_at' => null]);
+                // При добавлении Finance к ценовому запросу расширяем исходный
+                // бюджет. Повторные нажатия не сдвигают его дальше от created_at.
+                $minimumDeadline = $run->created_at->copy()->addHours($deadlineHours);
+                if ($run->deadline_at->lt($minimumDeadline)) {
+                    $run->deadline_at = $minimumDeadline;
+                }
             }
             $stages = $run->stages;
             foreach ($required as $name) {
@@ -210,6 +222,62 @@ class UnitEconomicsSyncCoordinator
             $this->updateStage($run->id, 'enrichment', $status, ['total' => $stats['total'],
                 'succeeded' => $stats['success'], 'failed' => $stats['errors'],
                 'error_code' => ($stats['errors'] ?? 0) > 0 ? 'enrichment_projection_partial' : ($sourceStatus === 'partial' ? 'source_data_incomplete' : null)]);
+        });
+    }
+
+    /** Atomically complete WB finance and queue a fresh enrichment pass so the run never closes prematurely. */
+    public function completeFinanceAndRequeueEnrichment(string $runId, array $financeDetails = []): bool
+    {
+        return (bool) $this->mutate($runId, function ($state, $run) use ($financeDetails): bool {
+            if (in_array($run->status, self::TERMINAL, true)) {
+                return false;
+            }
+            $stages = $run->stages;
+            $finance = $stages['finance'] ?? $this->stage('pending', $run->requested_version);
+            if (in_array($finance['status'] ?? null, [...self::TERMINAL, 'skipped'], true)
+                && ($finance['status'] ?? null) !== 'completed') {
+                return false;
+            }
+            $now = now()->utc()->toIso8601String();
+            $stages['finance'] = array_merge($finance, $financeDetails, [
+                'status' => 'completed',
+                'error_code' => null,
+                'heartbeat_at' => $now,
+                'finished_at' => $now,
+                'next_retry_at' => null,
+            ]);
+            $stages['enrichment'] = $this->stage('queued', $run->requested_version);
+            $run->stages = $stages;
+            $run->heartbeat_at = now();
+            $this->deriveStatus($run);
+            $run->save();
+
+            return true;
+        });
+    }
+
+    public function queueEnrichmentIfPending(string $runId): bool
+    {
+        return (bool) $this->mutate($runId, function ($state, $run): bool {
+            if (in_array($run->status, self::TERMINAL, true)) {
+                return false;
+            }
+            $stages = $run->stages;
+            if (($stages['enrichment']['status'] ?? null) !== 'pending') {
+                return false;
+            }
+            $now = now()->utc()->toIso8601String();
+            $stages['enrichment'] = array_merge($stages['enrichment'], [
+                'status' => 'queued',
+                'available_at' => $now,
+                'heartbeat_at' => $now,
+            ]);
+            $run->stages = $stages;
+            $run->heartbeat_at = now();
+            $this->deriveStatus($run);
+            $run->save();
+
+            return true;
         });
     }
 

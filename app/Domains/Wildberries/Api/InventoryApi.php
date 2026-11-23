@@ -4,6 +4,7 @@ namespace App\Domains\Wildberries\Api;
 
 use App\Domains\Marketplace\Contracts\InventoryApiInterface;
 use App\Models\Integration;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
 
 /**
@@ -58,6 +59,10 @@ class InventoryApi implements InventoryApiInterface
     {
         $this->deferredRetryAfter = null;
         $stocksReport = $this->getWbWarehousesStocksReport($integration, $chrtIds);
+
+        if ($this->deferredRetryAfter !== null) {
+            return [];
+        }
 
         if (empty($stocksReport)) {
             Log::warning('WB InventoryApi: No stocks from WB warehouses APIs, trying FBS warehouses');
@@ -454,13 +459,16 @@ class InventoryApi implements InventoryApiInterface
         $offset = 0;
         $result = [];
         $pages = 0;
-        $sizeMeta = $this->getSizeMetadata($integration);
+        $sizeMeta = null;
 
         $body = [
             'limit' => $limit,
             'offset' => 0,
         ];
 
+        if (! empty($chrtIds)) {
+            $sizeMeta = $this->getSizeMetadata($integration);
+        }
         if (! empty($chrtIds) && ! empty($sizeMeta['chrt_to_nm'])) {
             $filteredChrtIds = array_values(array_unique(array_map('intval', $chrtIds)));
             $nmIds = [];
@@ -494,6 +502,7 @@ class InventoryApi implements InventoryApiInterface
                 break;
             }
 
+            $sizeMeta ??= $this->getSizeMetadata($integration);
             foreach ($items as $item) {
                 $nmId = (int) ($item['nmId'] ?? 0);
                 $chrtId = (int) ($item['chrtId'] ?? 0);
@@ -541,43 +550,10 @@ class InventoryApi implements InventoryApiInterface
     private function getWarehouseRemainsReport(): array
     {
         try {
-            // A long external cooldown belongs in the queue. Retrying here used
-            // to hold the default worker for 260 seconds on every failed report.
-            $create = $this->client->analyticsGet('/api/v1/warehouse_remains', [
-                'groupByBarcode' => 'true',
-                'groupBySa' => 'true',
-            ]);
-            if ($this->client->getLastResponseStatus() === 429) {
-                $this->deferredRetryAfter = $this->client->getLastRateLimitRetryAfter() ?? 60;
-            }
-            $taskId = (string) ($create['data']['taskId'] ?? '');
-            if ($taskId === '') {
-                Log::warning('WB InventoryApi: warehouse_remains task not created', ['response' => $create ?? null]);
-
+            $rows = $this->fetchWarehouseRemainsRows();
+            if ($rows === null) {
                 return [];
             }
-
-            $status = '';
-            for ($attempt = 0; $attempt < 12; $attempt++) {
-                sleep(5);
-                $statusResponse = $this->client->analyticsGet("/api/v1/warehouse_remains/tasks/{$taskId}/status");
-                $status = (string) ($statusResponse['data']['status'] ?? '');
-                if ($status === 'done') {
-                    break;
-                }
-                if (in_array($status, ['error', 'canceled'], true)) {
-                    Log::warning('WB InventoryApi: warehouse_remains task failed', ['status' => $status]);
-
-                    return [];
-                }
-            }
-            if ($status !== 'done') {
-                Log::warning('WB InventoryApi: warehouse_remains task not ready in time');
-
-                return [];
-            }
-
-            $rows = $this->client->analyticsGet("/api/v1/warehouse_remains/tasks/{$taskId}/download") ?? [];
 
             // Агрегаты и транзит WB — не физический сток склада.
             $skipWarehouses = ['всего находится на складах', 'в пути до получателей', 'в пути возвраты на склад wb'];
@@ -614,10 +590,87 @@ class InventoryApi implements InventoryApiInterface
 
             return $result;
         } catch (\Throwable $e) {
+            $this->deferredRetryAfter ??= 60;
             Log::warning('WB InventoryApi: warehouse_remains fallback failed', ['error' => $e->getMessage()]);
 
             return [];
         }
+    }
+
+    /** Persist the create/status/download checkpoint; queue delays never lose it. */
+    private function fetchWarehouseRemainsRows(): ?array
+    {
+        $key = 'wb:warehouse-remains:'.$this->client->cacheIdentity();
+        $lock = Cache::lock($key.':lock', 240);
+        if (! $lock->get()) {
+            $this->deferredRetryAfter = 15;
+            return null;
+        }
+        try {
+            $task = Cache::get($key, []);
+            $retryAt = (int) ($task['retry_at'] ?? 0);
+            if ($retryAt > now()->timestamp) {
+                $this->deferredRetryAfter = $retryAt - now()->timestamp;
+                return null;
+            }
+            $taskId = (string) ($task['task_id'] ?? '');
+            if ($taskId === '') {
+                $create = $this->client->analyticsGet('/api/v1/warehouse_remains', [
+                    'groupByBarcode' => 'true', 'groupBySa' => 'true',
+                ]);
+                $httpStatus = $this->client->getLastResponseStatus();
+                $taskId = (string) ($create['data']['taskId'] ?? '');
+                if ($taskId === '') {
+                    if ($httpStatus === 429 || $httpStatus === null || $httpStatus >= 500) {
+                        $this->deferWarehouseReport($key, [], $this->client->getLastRateLimitRetryAfter() ?? 60);
+                    }
+                    return null;
+                }
+                // Let WB generate the report without occupying a queue worker
+                // or spending its status-request quota on immediate polling.
+                $this->deferWarehouseReport($key, ['task_id' => $taskId, 'phase' => 'status'], 15);
+                return null;
+            }
+            if (($task['phase'] ?? 'status') !== 'download') {
+                $response = $this->client->analyticsGet("/api/v1/warehouse_remains/tasks/{$taskId}/status");
+                $httpStatus = $this->client->getLastResponseStatus();
+                $status = (string) ($response['data']['status'] ?? '');
+                if ($httpStatus === 404 || in_array($status, ['error', 'canceled'], true)) {
+                    $this->deferWarehouseReport($key, [], 60);
+                    return null;
+                }
+                if ($status !== 'done') {
+                    $delay = $httpStatus === 429 ? ($this->client->getLastRateLimitRetryAfter() ?? 60)
+                        : ($httpStatus === 200 ? 15 : 60);
+                    $this->deferWarehouseReport($key, $task, $delay);
+                    return null;
+                }
+                $task['phase'] = 'download';
+                Cache::put($key, $task, now()->addHours(12));
+            }
+            $rows = $this->client->analyticsGet("/api/v1/warehouse_remains/tasks/{$taskId}/download");
+            $httpStatus = $this->client->getLastResponseStatus();
+            if ($httpStatus === 204) {
+                Cache::forget($key);
+                return [];
+            }
+            if ($httpStatus !== 200 || $rows === null) {
+                $this->deferWarehouseReport($key, $httpStatus === 404 ? [] : $task,
+                    $this->client->getLastRateLimitRetryAfter() ?? 60);
+                return null;
+            }
+            Cache::forget($key);
+            return $rows;
+        } finally {
+            $lock->release();
+        }
+    }
+
+    private function deferWarehouseReport(string $key, array $task, int $seconds): void
+    {
+        $this->deferredRetryAfter = max(1, $seconds);
+        $task['retry_at'] = now()->addSeconds($this->deferredRetryAfter)->timestamp;
+        Cache::put($key, $task, now()->addSeconds(max(43200, $this->deferredRetryAfter + 300)));
     }
 
     /**

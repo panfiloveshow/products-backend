@@ -96,7 +96,10 @@ class RefreshUnitEconomicsPrices extends Command
                 if (CarbonImmutable::parse($heartbeat)->greaterThan(now()->subMinutes(10))) {
                     continue;
                 }
-                if ($name === 'projection' && empty($stage['observation_id'])) {
+                // A rejected/rate-limited response still has an observation ID,
+                // but cannot publish prices. Wait for at least one confirmed SKU.
+                if ($name === 'projection' && (empty($stage['observation_id'])
+                    || (int) ($run->stages['prices']['succeeded'] ?? 0) === 0)) {
                     continue;
                 }
                 $actions[] = ['run_id' => $run->id, 'integration_id' => $run->integration_id, 'action' => 'recover_'.$name];

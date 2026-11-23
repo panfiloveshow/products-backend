@@ -1,0 +1,15 @@
+.git/
+.DS_Store
+._*
+node_modules/
+vendor/
+.env*
+bootstrap/cache/
+.phpunit*
+/storage/
+_backups/
+*.bak
+public/build/
+__pycache__/
+*.pyc
+.superpowers/

@@ -100,7 +100,7 @@ class UnitEconomicsCacheController extends Controller
             }
 
             return $response;
-        });
+        }, 3); // Concurrent database-cache upserts can invalidate this snapshot (40001).
     }
 
     private function indexAtSnapshot(Request $request, string $marketplace): JsonResponse

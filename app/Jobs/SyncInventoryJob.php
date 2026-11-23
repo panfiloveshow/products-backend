@@ -346,10 +346,6 @@ class SyncInventoryJob implements ShouldBeUnique, ShouldQueue
                     ]);
             }
 
-            if ($this->syncLog->marketplace === 'wildberries') {
-                $this->refreshWildberriesWarehouseCoefficients($marketplaceService);
-            }
-
             // Удаляем устаревшие записи — те что были в БД, но не пришли из API.
             // Фикс: раньше использовался chunkById + row->delete() внутри итерации.
             // Это пропускает до ~половины записей из-за сдвига курсора по id,
@@ -446,12 +442,18 @@ class SyncInventoryJob implements ShouldBeUnique, ShouldQueue
                 // WB resolves empty queued credentials through Integration.
                 // The finance hop is required for a complete unit-economics run.
                 if ($this->syncLog->integration_id) {
-                    SyncStorageFeesJob::dispatch($this->syncLog->integration_id, $credentials, 4,
-                        $this->syncLog->metadata['unit_economics_run_id'] ?? null)
+                    $runId = $this->syncLog->metadata['unit_economics_run_id'] ?? null;
+                    SyncStorageFeesJob::dispatch($this->syncLog->integration_id, $credentials, 4, $runId)
                         ->delay(now()->addSeconds(10));
                     Log::info('SyncStorageFeesJob dispatched after inventory sync', [
                         'integration_id' => $this->syncLog->integration_id,
                     ]);
+
+                    if ($runId && (\App\Models\UnitEconomicsSyncRun::find($runId)?->stages['finance']['status'] ?? null) === 'waiting_external') {
+                        if (app(\App\Services\UnitEconomics\UnitEconomicsSyncCoordinator::class)->queueEnrichmentIfPending($runId)) {
+                            SyncUnitEconomicsJob::dispatch((int) $this->syncLog->integration_id, unitEconomicsRunId: $runId);
+                        }
+                    }
                 }
             } elseif ($this->syncLog->integration_id) {
                 SyncUnitEconomicsJob::dispatch((int) $this->syncLog->integration_id,
@@ -863,31 +865,6 @@ class SyncInventoryJob implements ShouldBeUnique, ShouldQueue
                     })
                     ->update(['fulfillment_type' => $scheme]);
             }
-        }
-    }
-
-    private function refreshWildberriesWarehouseCoefficients(object $marketplaceService): void
-    {
-        if (! method_exists($marketplaceService, 'getInventory')) {
-            return;
-        }
-
-        $inventory = $marketplaceService->getInventory();
-        foreach ($inventory as $item) {
-            $sku = $item['sku'] ?? null;
-            $warehouseId = $item['warehouse_id'] ?? null;
-            $warehouseCoefficient = $item['warehouse_coefficient'] ?? null;
-
-            if (! $sku || ! $warehouseId || $warehouseCoefficient === null) {
-                continue;
-            }
-
-            InventoryWarehouse::where('sku', $sku)
-                ->where('warehouse_id', $warehouseId)
-                ->where('integration_id', $this->syncLog->integration_id)
-                ->update([
-                    'warehouse_coefficient' => (float) $warehouseCoefficient,
-                ]);
         }
     }
 

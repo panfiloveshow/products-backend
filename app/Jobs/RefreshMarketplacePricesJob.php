@@ -110,7 +110,10 @@ class RefreshMarketplacePricesJob implements ShouldBeUniqueUntilProcessing, Shou
                 Cache::put($scope.':next', time() + $retry, now()->addSeconds($retry));
             }
             $result = $coordinator->observe($run->id, $version,
-                fn ($integration) => $writer->apply($integration, $snapshot['prices'], $version), $snapshot['complete'], $details);
+                fn ($integration) => ! $snapshot['complete'] && empty($snapshot['prices'])
+                    ? ['total' => Product::where('integration_id', $integration->id)->count(),
+                        'matched' => 0, 'missing' => 0, 'stale' => 0]
+                    : $writer->apply($integration, $snapshot['prices'], $version), $snapshot['complete'], $details);
             if (! $result['accepted']) {
                 self::dispatch($run->id, $this->integrationId);
 

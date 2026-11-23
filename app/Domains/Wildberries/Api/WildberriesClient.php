@@ -44,6 +44,8 @@ class WildberriesClient
 
     private string $userAgent;
 
+    private string $clientSecret;
+
     private ?int $lastResponseStatus = null;
 
     private ?int $lastRateLimitRetryAfter = null;
@@ -52,11 +54,18 @@ class WildberriesClient
     {
         $this->apiKey = $apiKey ?? config('services.wildberries.api_key') ?? '';
         $this->userAgent = (string) config('services.wildberries.user_agent', 'wbas_sellico.ru2823');
+        $this->clientSecret = trim((string) config('services.wildberries.client_secret', ''));
     }
 
     public function getLastResponseStatus(): ?int
     {
         return $this->lastResponseStatus;
+    }
+
+    /** Opaque identity for sharing read-only report tasks between workers. */
+    public function cacheIdentity(): string
+    {
+        return hash('sha256', $this->apiKey);
     }
 
     public function getLastRateLimitRetryAfter(): ?int
@@ -341,6 +350,10 @@ class WildberriesClient
                     'api' => $apiName,
                     'endpoint' => $endpoint,
                     'status' => $status,
+                    'rate_limit_retry_after' => $this->lastRateLimitRetryAfter,
+                    'rate_limit_limit' => $response->header('X-Ratelimit-Limit'),
+                    'rate_limit_remaining' => $response->header('X-Ratelimit-Remaining'),
+                    'rate_limit_reset' => $response->header('X-Ratelimit-Reset'),
                     'body' => substr($body, 0, 500),
                 ]);
 
@@ -484,7 +497,7 @@ class WildberriesClient
                     $this->lastRateLimitRetryAfter = $headerDelay ?? 60;
 
                     // Короткий лимит можно переждать в текущем воркере. Длинный
-                    // Finance cooldown (до нескольких часов) отдаём очереди,
+                    // Finance cooldown (12 часов для базового токена) отдаём очереди,
                     // чтобы не блокировать worker и не делать бесполезные 2/4с retry.
                     if (! $priceMutation && $attempt < $maxAttempts && ($headerDelay === null || $headerDelay <= 15)) {
                         $delay = max(1, $headerDelay ?? min(2 * pow(2, $attempt - 1), 15));
@@ -511,6 +524,10 @@ class WildberriesClient
                     'api' => $apiName,
                     'endpoint' => $endpoint,
                     'status' => $status,
+                    'rate_limit_retry_after' => $this->lastRateLimitRetryAfter,
+                    'rate_limit_limit' => $response->header('X-Ratelimit-Limit'),
+                    'rate_limit_remaining' => $response->header('X-Ratelimit-Remaining'),
+                    'rate_limit_reset' => $response->header('X-Ratelimit-Reset'),
                     'body' => substr($body, 0, 500),
                 ]);
 
@@ -732,6 +749,10 @@ class WildberriesClient
             Log::warning('WB Analytics API error', [
                 'endpoint' => $endpoint,
                 'status' => $response->status(),
+                'rate_limit_retry_after' => $this->lastRateLimitRetryAfter,
+                'rate_limit_limit' => $response->header('X-Ratelimit-Limit'),
+                'rate_limit_remaining' => $response->header('X-Ratelimit-Remaining'),
+                'rate_limit_reset' => $response->header('X-Ratelimit-Reset'),
                 'body' => $response->body(),
             ]);
 
@@ -807,9 +828,10 @@ class WildberriesClient
 
                 // 403 "base token is not allowed" — токен типа Basic не имеет доступа к этому пути.
                 // Чтобы не спамить лог и не долбить API, отключаем Analytics API для этого токена на сутки.
-                if ($status === 403 && str_contains($body, 'base token is not allowed')) {
+                if ($status === 403 && (str_contains($body, 'base token is not allowed')
+                    || str_contains($body, 'token does not satisfy additional requirements'))) {
                     Cache::put($disabledKey, true, now()->addDay());
-                    Log::warning('WB Analytics API disabled for token (base token forbidden)', [
+                    Log::warning('WB Analytics endpoint unavailable for token', [
                         'endpoint' => $endpoint,
                         'status' => $status,
                     ]);
@@ -908,7 +930,46 @@ class WildberriesClient
      */
     public function financePost(string $endpoint, array $data = []): ?array
     {
-        return $this->post($endpoint, $data, self::FINANCE_URL);
+        if ($endpoint !== '/api/finance/v1/sales-reports/detailed') {
+            return $this->post($endpoint, $data, self::FINANCE_URL);
+        }
+
+        // Лимит общий для продавца: другой worker не должен обходить уже
+        // полученный X-Ratelimit-Retry отдельным заданием или диапазоном дат.
+        $cooldownKey = 'wb:finance:cooldown:'.hash('sha256', $this->apiKey.'|'.$this->clientSecret.'|'.$endpoint);
+        $retryAt = (int) Cache::get($cooldownKey, 0);
+        if ($retryAt > now()->timestamp) {
+            $this->lastResponseStatus = 429;
+            $this->lastRateLimitRetryAfter = $retryAt - now()->timestamp;
+
+            return null;
+        }
+        $lock = Cache::lock($cooldownKey.':lock', 180);
+        if (! $lock->get()) {
+            $this->lastResponseStatus = 429;
+            $this->lastRateLimitRetryAfter = 30;
+
+            return null;
+        }
+
+        try {
+            $retryAt = (int) Cache::get($cooldownKey, 0);
+            if ($retryAt > now()->timestamp) {
+                $this->lastResponseStatus = 429;
+                $this->lastRateLimitRetryAfter = $retryAt - now()->timestamp;
+
+                return null;
+            }
+            $result = $this->post($endpoint, $data, self::FINANCE_URL);
+            if ($this->lastResponseStatus === 429) {
+                $delay = max(1, $this->lastRateLimitRetryAfter ?? 60);
+                Cache::put($cooldownKey, now()->addSeconds($delay)->timestamp, now()->addSeconds($delay + 5));
+            }
+
+            return $result;
+        } finally {
+            $lock->release();
+        }
     }
 
     /**
@@ -941,12 +1002,25 @@ class WildberriesClient
 
     private function getHeaders(): array
     {
-        return [
+        $headers = [
             'Authorization' => $this->apiKey,
             'User-Agent' => $this->userAgent,
             'Content-Type' => 'application/json',
             'Accept' => 'application/json',
         ];
+
+        // WB разрешает сервисный секрет с базовым и сервисным токеном.
+        // Персональный токен с этим заголовком получает 403. Читаем только
+        // тип JWT; проверку подлинности токенов по-прежнему выполняет WB.
+        $payload = explode('.', $this->apiKey)[1] ?? '';
+        $decoded = base64_decode(strtr($payload, '-_', '+/'), true);
+        $claims = $decoded === false ? null : json_decode($decoded, true);
+        if ($this->clientSecret !== '' && is_array($claims)
+            && in_array($claims['acc'] ?? null, [1, 4], true)) {
+            $headers['X-Client-Secret'] = $this->clientSecret;
+        }
+
+        return $headers;
     }
 
     /**
@@ -958,12 +1032,7 @@ class WildberriesClient
      */
     private function getBearerHeaders(): array
     {
-        return [
-            'Authorization' => 'Bearer '.$this->apiKey,
-            'User-Agent' => $this->userAgent,
-            'Content-Type' => 'application/json',
-            'Accept' => 'application/json',
-        ];
+        return array_replace($this->getHeaders(), ['Authorization' => 'Bearer '.$this->apiKey]);
     }
 
     /**
