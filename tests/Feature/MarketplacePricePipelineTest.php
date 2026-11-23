@@ -27,6 +27,41 @@ class MarketplacePricePipelineTest extends TestCase
         config(['unit_economics_sync.enabled' => true]);
     }
 
+    public function test_an_empty_rate_limited_response_preserves_the_published_snapshot_without_sku_errors(): void
+    {
+        Queue::fake();
+        $integration = Integration::factory()->wildberries()->create(['id' => 62041]);
+        $observedAt = now()->subMinutes(20)->utc()->toIso8601String();
+        $product = Product::factory()->wildberries()->create(['integration_id' => $integration->id,
+            'sku' => 'A', 'price' => 800, 'wb_data' => ['nmID' => 123, 'price_version' => 1, 'price_observed_at' => $observedAt]]);
+        $cache = UnitEconomicsCache::create(['integration_id' => $integration->id, 'product_id' => $product->id,
+            'sku' => 'A', 'product_name' => 'A', 'marketplace' => 'wildberries', 'fulfillment_type' => 'FBO',
+            'price' => 800, 'source_version' => 1, 'price_observed_at' => $observedAt]);
+        $coordinator = app(UnitEconomicsSyncCoordinator::class);
+        $run = $coordinator->request($integration, 'full');
+        $coordinator->withCurrentVersion($run->id, 1, function ($state, $current): void {
+            $state->update(['observed_version' => 1, 'published_version' => 1, 'publication_revision' => 5]);
+            $current->update(['published_version' => 1]);
+        });
+        $run = $coordinator->request($integration, 'full');
+        $fetcher = \Mockery::mock(MarketplacePriceSnapshotFetcher::class)->makePartial();
+        $fetcher->shouldReceive('fetch')->once()->andReturn([
+            'complete' => false, 'http_status' => 429, 'retry_after' => 900, 'prices' => [],
+        ]);
+
+        (new RefreshMarketplacePricesJob($run->id, $integration->id))->handle($coordinator, $fetcher, app(MarketplacePriceObservation::class));
+
+        $this->assertSame('waiting_external', $run->fresh()->stages['prices']['status']);
+        $this->assertSame(0, $run->fresh()->stages['prices']['failed'], 'A request-level rate limit is not a failure of every SKU.');
+        $this->assertNull($product->fresh()->wb_data['price_sync_error_code'] ?? null);
+        $this->assertNull($cache->fresh()->marketplace_data['price_sync_error_code'] ?? null);
+        $this->assertEquals(800, $cache->fresh()->price);
+        $this->assertSame($observedAt, $product->fresh()->wb_data['price_observed_at']);
+        $this->assertSame(1, UnitEconomicsSyncState::find($integration->id)->published_version);
+        $this->assertSame(5, UnitEconomicsSyncState::find($integration->id)->publication_revision);
+        Queue::assertNotPushed(ProjectMarketplacePricesJob::class);
+    }
+
     public function test_partial_snapshot_publishes_only_confirmed_skus_preserves_missing_cache_and_keeps_retry_state(): void
     {
         Queue::fake();

@@ -307,6 +307,29 @@ class SyncProductsJob implements ShouldBeUnique, ShouldQueue
                 }
             }
         } catch (\Exception $e) {
+            if ($this->job && $this->attempts() < $this->tries) {
+                // The unique job still exists during backoff. Keep its log active
+                // so another click cannot create a pending log with no queue job.
+                $backoff = $this->backoff();
+                $delay = $backoff[min($this->attempts() - 1, count($backoff) - 1)];
+                $this->syncLog->update([
+                    'status' => SyncLog::STATUS_PENDING,
+                    'error_message' => $e->getMessage(),
+                    'metadata' => array_merge($this->syncLog->metadata ?? [], [
+                        'queue_available_at' => now()->addSeconds($delay)->utc()->toIso8601String(),
+                    ]),
+                ]);
+                app(\App\Services\UnitEconomics\UnitEconomicsSyncCoordinator::class)->logStage($this->syncLog);
+                Log::warning('Products sync attempt will be retried', [
+                    'sync_log_id' => $this->syncLog->id,
+                    'integration_id' => $this->syncLog->integration_id,
+                    'attempt' => $this->attempts(),
+                    'delay_s' => $delay,
+                    'error_class' => $e::class,
+                ]);
+
+                throw $e;
+            }
             $this->syncLog->fail($e->getMessage());
 
             // Обновляем статус на интеграции

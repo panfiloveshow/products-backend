@@ -3,6 +3,7 @@
 namespace Tests\Feature;
 
 use App\Jobs\RefreshMarketplacePricesJob;
+use App\Jobs\ProjectMarketplacePricesJob;
 use App\Models\Integration;
 use App\Models\Product;
 use App\Models\UnitEconomicsSyncRun;
@@ -92,6 +93,44 @@ class UnitEconomicsPriceRecoveryTest extends TestCase
         $this->artisan('ue:refresh-prices', ['--recover' => true, '--apply' => true])->assertSuccessful();
         $this->assertSame('failed', $run->fresh()->status);
         $this->assertSame('deadline_exceeded', $run->fresh()->stages['prices']['error_code']);
+    }
+
+    public function test_recovery_does_not_start_projection_for_an_empty_rate_limited_price_observation(): void
+    {
+        Queue::fake();
+        config(['unit_economics_sync.integration_ids' => [62039]]);
+        $coordinator = app(UnitEconomicsSyncCoordinator::class);
+        $run = $coordinator->request(Integration::factory()->wildberries()->create(['id' => 62039]));
+        $coordinator->updateStage($run->id, 'prices', 'waiting_external', [
+            'next_retry_at' => now()->addMinutes(15)->utc()->toIso8601String(),
+            'succeeded' => 0, 'failed' => 1, 'http_status' => 429,
+        ], 1);
+        $coordinator->updateStage($run->id, 'projection', 'pending', ['observation_id' => 'empty-observation'], 1);
+        $this->travel(11)->minutes();
+
+        $this->artisan('ue:refresh-prices', ['--integration' => [62039], '--recover' => true, '--apply' => true])->assertSuccessful();
+
+        Queue::assertNothingPushed();
+        $this->assertSame('pending', $run->fresh()->stages['projection']['status']);
+    }
+
+    public function test_recovery_can_resume_projection_for_the_confirmed_part_of_a_rate_limited_snapshot(): void
+    {
+        Queue::fake();
+        config(['unit_economics_sync.integration_ids' => [62040]]);
+        $coordinator = app(UnitEconomicsSyncCoordinator::class);
+        $run = $coordinator->request(Integration::factory()->wildberries()->create(['id' => 62040]));
+        $coordinator->updateStage($run->id, 'prices', 'waiting_external', [
+            'next_retry_at' => now()->addMinutes(15)->utc()->toIso8601String(),
+            'succeeded' => 1, 'failed' => 1, 'http_status' => 429,
+        ], 1);
+        $coordinator->updateStage($run->id, 'projection', 'pending', ['observation_id' => 'partial-observation'], 1);
+        $this->travel(11)->minutes();
+
+        $this->artisan('ue:refresh-prices', ['--integration' => [62040], '--recover' => true, '--apply' => true])->assertSuccessful();
+
+        Queue::assertPushed(ProjectMarketplacePricesJob::class, 1);
+        Queue::assertNotPushed(RefreshMarketplacePricesJob::class);
     }
 
     public function test_completed_stages_without_a_confirmed_publication_are_not_stuck_running_after_deadline(): void

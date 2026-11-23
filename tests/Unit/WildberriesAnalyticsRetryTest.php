@@ -8,6 +8,25 @@ use Tests\TestCase;
 
 class WildberriesAnalyticsRetryTest extends TestCase
 {
+    public function test_an_unsupported_stock_endpoint_is_skipped_without_disabling_the_fallback(): void
+    {
+        Http::preventStrayRequests();
+        Http::fake([
+            'seller-analytics-api.wildberries.ru/api/analytics/v1/stocks-report/wb-warehouses' => Http::response([
+                'detail' => 'token does not satisfy additional requirements',
+            ], 403),
+            'seller-analytics-api.wildberries.ru/api/v1/warehouse_remains*' => Http::response(['data' => ['taskId' => 'available-report']]),
+        ]);
+        $endpoint = '/api/analytics/v1/stocks-report/wb-warehouses';
+        $first = new WildberriesClient('stock-endpoint-key');
+        $this->assertNull($first->analyticsPost($endpoint));
+        $retry = new WildberriesClient('stock-endpoint-key');
+        $this->assertNull($retry->analyticsPost($endpoint));
+        $this->assertSame(403, $retry->getLastResponseStatus());
+        $this->assertSame(['data' => ['taskId' => 'available-report']], $retry->analyticsGet('/api/v1/warehouse_remains'));
+        Http::assertSentCount(2);
+    }
+
     public function test_sales_funnel_retries_429_using_rate_limit_header(): void
     {
         Http::fake([

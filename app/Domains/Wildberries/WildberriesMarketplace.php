@@ -184,7 +184,12 @@ class WildberriesMarketplace implements LegacyMarketplaceInterface, MarketplaceI
         ]);
 
         // Получаем цены через Prices API (актуальный эндпоинт!)
-        $prices = ! empty($nmIds) ? $this->products->getPrices(null, $nmIds) : [];
+        // The versioned price queue owns the seller's Prices API slot. Catalog
+        // reads must not bypass its lock/cooldown with a second price request.
+        $integration = $this->getIntegration();
+        $separatePriceQueue = $integration !== null
+            && app(\App\Services\UnitEconomics\UnitEconomicsSyncCoordinator::class)->enabled((int) $integration->id);
+        $prices = ! empty($nmIds) && ! $separatePriceQueue ? $this->products->getPrices(null, $nmIds) : [];
 
         Log::info('WB Marketplace: Prices loaded', [
             'count' => count($prices),

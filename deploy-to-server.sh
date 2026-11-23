@@ -1,59 +1,43 @@
 #!/usr/bin/env bash
-# Деплой на сервер. Запуск: ./deploy-to-server.sh
-# Пароль SSH вводите вручную, когда появится запрос.
-# Другой каталог: REMOTE_PATH=/path ./deploy-to-server.sh
-#
-# Если видите "Connection closed by ... port 22" — на сервере часто запрещён root по паролю.
-# Проверка: ssh -vv root@194.87.104.42
-# На VPS: PermitRootLogin / вход только по ключу — см. панель хостинга или пользователя ubuntu/debian.
-
+# Deploy the working tree through a permission-normalized source artifact.
+# SSH keys are required for DEPLOY_USER and DEPLOY_ADMIN_USER.
 set -euo pipefail
 
-DEPLOY_USER="danya_user"
-DEPLOY_HOST="194.87.104.42"
-HOST="${DEPLOY_USER}@${DEPLOY_HOST}"
+DEPLOY_USER="${DEPLOY_USER:-danya_user}"
+DEPLOY_ADMIN_USER="${DEPLOY_ADMIN_USER:-root}"
+DEPLOY_HOST="${DEPLOY_HOST:-194.87.104.42}"
 REMOTE_PATH="${REMOTE_PATH:-/var/www/products-backend}"
+PHP_FPM_SERVICE="${PHP_FPM_SERVICE:-php8.2-fpm}"
+[[ "$DEPLOY_USER" =~ ^[A-Za-z0-9_-]+$ && "$DEPLOY_ADMIN_USER" =~ ^[A-Za-z0-9_-]+$ ]] || exit 1
+[[ "$DEPLOY_HOST" =~ ^[A-Za-z0-9.-]+$ ]] || exit 1
+[[ "$REMOTE_PATH" =~ ^/[A-Za-z0-9_./-]+$ && "$REMOTE_PATH" != / ]] || exit 1
+[[ "$PHP_FPM_SERVICE" =~ ^[A-Za-z0-9_.@-]+$ ]] || exit 1
+HOST="${DEPLOY_USER}@${DEPLOY_HOST}"
+ADMIN_HOST="${DEPLOY_ADMIN_USER}@${DEPLOY_HOST}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10)
 
-echo "Локально:  $SCRIPT_DIR"
-echo "Сервер:    $HOST:$REMOTE_PATH"
-echo ""
-echo "Изменения отправлены в репозиторий. Теперь pulling на сервере..."
-echo ""
+# Fail before uploading if the service-user smoke check and worker recovery
+# cannot be performed. A successful copy is not a successful deployment.
+ssh "${SSH_OPTS[@]}" "$ADMIN_HOST" \
+  'test "$(id -u)" = 0 && command -v runuser >/dev/null && command -v supervisorctl >/dev/null && command -v systemctl >/dev/null'
+ssh "${SSH_OPTS[@]}" "$ADMIN_HOST" \
+  "test -f '$REMOTE_PATH/artisan' && test -f '$REMOTE_PATH/composer.json'"
 
-# Сначала пытаемся сделать git pull на сервере
-ssh -o StrictHostKeyChecking=accept-new "$HOST" "cd ${REMOTE_PATH} && git config --global --add safe.directory ${REMOTE_PATH} && git pull origin main" || {
-  echo ""
-  echo "Git pull не удался. Пробуем rsync..."
-  echo ""
-  
-  # --omit-dir-times: каталоги принадлежат www-data, время на них выставить нельзя,
-  # и без этого флага rsync заваливает вывод «failed to set times».
-  export COPYFILE_DISABLE=1
-  rsync -avz --delete --omit-dir-times \
-    --exclude '.git/' \
-    --exclude '.DS_Store' \
-    --exclude '._*' \
-    --exclude 'node_modules/' \
-    --exclude 'vendor/' \
-    --exclude '.env*' \
-    `# bootstrap/cache локально содержит dev-пакеты (laravel/pail), которых нет в` \
-    `# серверном vendor --no-dev: залитый туда packages.php ломает artisan целиком.` \
-    --exclude 'bootstrap/cache/' \
-    --exclude '.phpunit*' \
-    --exclude '/storage/' \
-    --exclude '_backups/' \
-    --exclude '*.bak' \
-    --exclude 'public/build/' \
-    -e "ssh -o StrictHostKeyChecking=accept-new" \
-    "$SCRIPT_DIR/" "${HOST}:${REMOTE_PATH}/"
-  
-  echo ""
-  echo "Rsync готов. Обновление зависимостей и миграции на сервере..."
-}
+STAGING_DIR="$(mktemp -d "${TMPDIR:-/tmp}/products-deploy.XXXXXXXX")"
+trap 'rm -rf -- "$STAGING_DIR"' EXIT
+bash "$SCRIPT_DIR/scripts/prepare-deploy-source.sh" "$SCRIPT_DIR" "$STAGING_DIR"
 
-# Выполняем команды на сервере независимо от метода доставки
-ssh -o StrictHostKeyChecking=accept-new "$HOST" "cd ${REMOTE_PATH} && composer install --no-dev --optimize-autoloader && php artisan migrate --force && php artisan config:cache && php artisan route:cache && php artisan view:cache"
+echo "Загружаю подготовленный код в $HOST:$REMOTE_PATH"
+export COPYFILE_DISABLE=1
+# Existing server permissions stay intact. New files inherit safe permissions
+# from the staged artifact, including when the source disk reports mode 0700.
+rsync -avz --delete --no-owner --no-group --no-perms --omit-dir-times \
+  --rsync-path='umask 002; exec rsync' \
+  --exclude-from="$SCRIPT_DIR/scripts/deploy-excludes.txt" \
+  -e 'ssh -o BatchMode=yes -o ConnectTimeout=10' \
+  "$STAGING_DIR/" "${HOST}:${REMOTE_PATH}/"
 
-echo ""
-echo "Готово."
+ssh "${SSH_OPTS[@]}" "$ADMIN_HOST" \
+  "PHP_FPM_SERVICE='$PHP_FPM_SERVICE' bash '$REMOTE_PATH/scripts/deploy-runtime.sh' '$REMOTE_PATH'"
+echo 'Готово: приложение проверено от www-data, обработчики очередей работают.'

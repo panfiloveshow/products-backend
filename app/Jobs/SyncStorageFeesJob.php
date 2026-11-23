@@ -88,13 +88,16 @@ class SyncStorageFeesJob implements ShouldQueue, ShouldBeUnique
             // последовательных запроса выбивали второй этап в 429.
             $financeSnapshot = $marketplace->getStorageAndAcquiringBySku($this->weeks);
             if (($financeSnapshot['status'] ?? null) === 'rate_limited') {
-                $delay = max(60, min(21600, (int) ($financeSnapshot['retry_after'] ?? 60) + 15));
+                // Базовый токен без сервисного секрета допускает Finance-запрос
+                // раз в 12 часов. Не сокращаем X-Ratelimit-Retry лимитом в 6 часов.
+                $delay = max(60, (int) ($financeSnapshot['retry_after'] ?? 60) + 15);
                 Log::warning('SyncStorageFeesJob: WB Finance rate limited; deferring job', [
                     'integration_id' => $this->integrationId,
                     'delay_seconds' => $delay,
                 ]);
                 $this->release($delay);
                 $this->stage('waiting_external', ['error_code' => 'rate_limited', 'next_retry_at' => now()->addSeconds($delay)->utc()->toIso8601String()]);
+                $this->dispatchUnitEconomicsIfPending();
 
                 return;
             }
@@ -111,7 +114,7 @@ class SyncStorageFeesJob implements ShouldQueue, ShouldBeUnique
                 Log::warning('SyncStorageFeesJob: WB Finance snapshot unavailable; preserving previous values', [
                     'integration_id' => $this->integrationId,
                 ]);
-                $this->dispatchUnitEconomicsSync();
+                $this->dispatchUnitEconomicsIfPending();
 
                 return;
             }
@@ -208,8 +211,17 @@ class SyncStorageFeesJob implements ShouldQueue, ShouldBeUnique
                 ]);
             }
 
-            $this->stage('completed', ['total' => $updated, 'succeeded' => $updated, 'observed_at' => $acquiringSnapshot['observed_at'] ?? null]);
-            $this->dispatchUnitEconomicsSync();
+            $targetRunId = null;
+            if ($this->unitEconomicsRunId) {
+                $requeued = app(\App\Services\UnitEconomics\UnitEconomicsSyncCoordinator::class)
+                    ->completeFinanceAndRequeueEnrichment($this->unitEconomicsRunId, [
+                        'total' => $updated,
+                        'succeeded' => $updated,
+                        'observed_at' => $acquiringSnapshot['observed_at'] ?? null,
+                    ]);
+                $targetRunId = $requeued ? $this->unitEconomicsRunId : null;
+            }
+            $this->dispatchUnitEconomicsSync($targetRunId);
 
         } catch (\Exception $e) {
             Log::error('SyncStorageFeesJob: failed', [
@@ -229,6 +241,21 @@ class SyncStorageFeesJob implements ShouldQueue, ShouldBeUnique
             'integration_id' => $this->integrationId,
             'error' => $exception->getMessage(),
         ]);
+
+        $targetRunId = null;
+        if ($this->unitEconomicsRunId) {
+            $run = \App\Models\UnitEconomicsSyncRun::find($this->unitEconomicsRunId);
+            $enrichmentStatus = $run?->stages['enrichment']['status'] ?? null;
+            if (in_array($enrichmentStatus, ['completed', 'partial', 'running', 'queued'], true)) {
+                return;
+            }
+            $coordinator = app(\App\Services\UnitEconomics\UnitEconomicsSyncCoordinator::class);
+            if ($run && ! $run->deadline_at->isPast() && $coordinator->queueEnrichmentIfPending($run->id)) {
+                $targetRunId = $run->id;
+            }
+        }
+
+        $this->dispatchUnitEconomicsSync($targetRunId);
     }
 
     private function formatMemory(int $bytes): string
@@ -236,12 +263,26 @@ class SyncStorageFeesJob implements ShouldQueue, ShouldBeUnique
         return round($bytes / 1024 / 1024, 2).' MB';
     }
 
-    private function dispatchUnitEconomicsSync(): void
+    private function dispatchUnitEconomicsIfPending(): void
     {
-        SyncUnitEconomicsJob::dispatch($this->integrationId, unitEconomicsRunId: $this->unitEconomicsRunId);
+        if ($this->unitEconomicsRunId === null) {
+            $this->dispatchUnitEconomicsSync(null);
+
+            return;
+        }
+        $coordinator = app(\App\Services\UnitEconomics\UnitEconomicsSyncCoordinator::class);
+        if ($coordinator->queueEnrichmentIfPending($this->unitEconomicsRunId)) {
+            $this->dispatchUnitEconomicsSync($this->unitEconomicsRunId);
+        }
+    }
+
+    private function dispatchUnitEconomicsSync(?string $runId = null): void
+    {
+        SyncUnitEconomicsJob::dispatch($this->integrationId, unitEconomicsRunId: $runId);
 
         Log::info('UnitEconomics sync dispatched after WB storage fees sync', [
             'integration_id' => $this->integrationId,
+            'unit_economics_run_id' => $runId,
         ]);
     }
 }

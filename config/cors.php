@@ -18,6 +18,7 @@ return [
     ],
     'allowed_headers' => ['*'],
     'exposed_headers' => [
+        'X-Request-Id',
         'Content-Disposition',
         'X-Unit-Economics-Export-Version',
         'X-Unit-Economics-Export-Format',

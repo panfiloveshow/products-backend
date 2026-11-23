@@ -19,6 +19,90 @@ use Tests\TestCase;
  */
 class WildberriesApiContractTest extends TestCase
 {
+    public function test_finance_cooldown_is_shared_between_workers_and_date_ranges_but_not_sellers_or_prices(): void
+    {
+        $this->travelTo(now()->startOfSecond());
+        Http::preventStrayRequests();
+        Http::fake([
+            'finance-api.wildberries.ru/*' => Http::sequence()
+                ->push(['detail' => 'rate limited'], 429, ['X-Ratelimit-Retry' => '43200'])
+                ->push([])
+                ->push([]),
+            'discounts-prices-api.wildberries.ru/*' => Http::response(['data' => ['listGoods' => []]]),
+        ]);
+        $endpoint = '/api/finance/v1/sales-reports/detailed';
+        $firstWorker = new WildberriesClient('seller-one');
+        $this->assertNull($firstWorker->financePost($endpoint, ['dateFrom' => '2026-10-01']));
+        $this->travel(1)->hours();
+        $secondWorker = new WildberriesClient('seller-one');
+
+        $this->assertNull($secondWorker->financePost($endpoint, ['dateFrom' => '2026-11-01']));
+        $this->assertSame(429, $secondWorker->getLastResponseStatus());
+        $this->assertSame(39600, $secondWorker->getLastRateLimitRetryAfter());
+        Http::assertSentCount(1);
+
+        $this->assertSame([], (new WildberriesClient('seller-two'))->financePost($endpoint));
+        $this->assertNotNull($secondWorker->pricesGet('/api/v2/list/goods/filter'));
+        Http::assertSentCount(3);
+        $this->travel(11)->hours();
+        $this->assertSame([], $secondWorker->financePost($endpoint));
+        $this->assertSame(200, $secondWorker->getLastResponseStatus());
+        $this->assertNull($secondWorker->getLastRateLimitRetryAfter());
+        Http::assertSentCount(4);
+    }
+
+    public function test_service_secret_accompanies_basic_and_service_tokens_on_all_auth_formats(): void
+    {
+        config(['services.wildberries.client_secret' => 'service-secret']);
+        Http::preventStrayRequests();
+        Http::fake(['*' => Http::response([])]);
+
+        foreach ([1, 4] as $type) {
+            $token = 'header.'.rtrim(strtr(base64_encode(json_encode(['acc' => $type])), '+/', '-_'), '=').'.signature';
+            $client = new WildberriesClient($token);
+            $client->pricesGet('/api/v2/list/goods/filter', ['limit' => 1000, 'offset' => 0]);
+            $client->financePost('/api/finance/v1/sales-reports/detailed');
+            $client->getWithBearer('/api/v3/warehouses');
+
+            Http::assertSent(fn (Request $r) => str_contains($r->url(), 'discounts-prices-api.')
+                && $r->hasHeader('Authorization', $token) && $r->hasHeader('X-Client-Secret', 'service-secret'));
+            Http::assertSent(fn (Request $r) => str_contains($r->url(), 'finance-api.')
+                && $r->hasHeader('Authorization', $token) && $r->hasHeader('X-Client-Secret', 'service-secret'));
+            Http::assertSent(fn (Request $r) => $r->hasHeader('Authorization', 'Bearer '.$token)
+                && $r->hasHeader('X-Client-Secret', 'service-secret'));
+        }
+        Http::assertSentCount(6);
+    }
+
+    public function test_service_secret_is_omitted_for_personal_test_and_unrecognised_tokens(): void
+    {
+        config(['services.wildberries.client_secret' => 'service-secret']);
+        Http::preventStrayRequests();
+        Http::fake(['*' => Http::response([])]);
+
+        foreach ([2, 3, null] as $type) {
+            $token = 'header.'.rtrim(strtr(base64_encode(json_encode(['acc' => $type])), '+/', '-_'), '=').'.signature';
+            (new WildberriesClient($token))->getWithBearer('/api/v3/warehouses');
+        }
+        (new WildberriesClient('legacy-key'))->getWithBearer('/api/v3/warehouses');
+
+        Http::assertSentCount(4);
+        Http::assertNotSent(fn (Request $r) => $r->hasHeader('X-Client-Secret'));
+    }
+
+    public function test_unconfigured_service_secret_does_not_send_an_empty_header(): void
+    {
+        config(['services.wildberries.client_secret' => null]);
+        Http::preventStrayRequests();
+        Http::fake(['*' => Http::response([])]);
+        $token = 'header.'.rtrim(base64_encode('{"acc":1}'), '=').'.signature';
+
+        (new WildberriesClient($token))->getWithBearer('/api/v3/warehouses');
+
+        Http::assertSent(fn (Request $r) => $r->hasHeader('Authorization', 'Bearer '.$token)
+            && ! $r->hasHeader('X-Client-Secret'));
+    }
+
     public function test_fbw_supply_details_go_to_supplies_api_host_by_path(): void
     {
         Http::fake([
