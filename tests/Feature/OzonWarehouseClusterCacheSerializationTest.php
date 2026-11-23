@@ -14,11 +14,14 @@ class OzonWarehouseClusterCacheSerializationTest extends TestCase
 {
     private ?string $previousCacheDefault = null;
 
+    private mixed $previousSerializableClasses = null;
+
     protected function setUp(): void
     {
         parent::setUp();
 
         $this->previousCacheDefault = config('cache.default');
+        $this->previousSerializableClasses = config('cache.serializable_classes');
 
         if (! Schema::hasTable('cache')) {
             Schema::create('cache', function (Blueprint $table): void {
@@ -69,7 +72,11 @@ class OzonWarehouseClusterCacheSerializationTest extends TestCase
     protected function tearDown(): void
     {
         if ($this->previousCacheDefault !== null) {
-            config(['cache.default' => $this->previousCacheDefault]);
+            config([
+                'cache.default' => $this->previousCacheDefault,
+                'cache.serializable_classes' => $this->previousSerializableClasses,
+            ]);
+            Cache::forgetDriver('database');
         }
 
         parent::tearDown();

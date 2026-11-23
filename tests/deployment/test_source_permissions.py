@@ -53,8 +53,16 @@ class SourceArtifactPermissionsTest(unittest.TestCase):
             commands.mkdir()
             state = root / "state.json"
             fpm_reload = root / "fpm-reload.txt"
-            names = [f"products-backend-{group}:worker_00" for group in
-                     ("worker", "ue-worker", "price-refresh-worker", "ue-enrichment-worker")]
+            names = [f"products-backend-{group}:worker_00" for group in (
+                "worker",
+                "ue-worker",
+                "locality-worker",
+                "autoplanning-worker",
+                "price-refresh-worker",
+                "supply-status-worker",
+                "ue-enrichment-worker",
+                "ue-enrichment-worker-extra",
+            )]
             for command, content in {
                 "id": "#!/bin/sh\necho 0\n",
                 "runuser": "#!/bin/sh\nexit 0\n",
@@ -106,6 +114,12 @@ if sys.argv[1] == 'start':
             result = subprocess.run(['bash', str(ROOT / 'scripts/deploy-runtime.sh'), str(root)],
                                     env=env, capture_output=True, text=True)
             self.assertNotEqual(0, result.returncode)
+            env.pop('FPM_TEST_FAIL')
+            missing_locality = {k: 'RUNNING' for k in names if not k.startswith('products-backend-locality-worker:')}
+            state.write_text(json.dumps(missing_locality))
+            result = subprocess.run(['bash', str(ROOT / 'scripts/deploy-runtime.sh'), str(root)],
+                                    env=env, capture_output=True, text=True)
+            self.assertNotEqual(0, result.returncode)
 
     def test_runtime_uses_explicit_php_bin_for_composer_and_artisan(self):
         with tempfile.TemporaryDirectory(prefix="products-phpbin-test-") as directory:
@@ -115,8 +129,16 @@ if sys.argv[1] == 'start':
             state = root / "state.json"
             fpm_reload = root / "fpm-reload.txt"
             php_log = root / "php-calls.log"
-            names = [f"products-backend-{group}:worker_00" for group in
-                     ("worker", "ue-worker", "price-refresh-worker", "ue-enrichment-worker")]
+            names = [f"products-backend-{group}:worker_00" for group in (
+                "worker",
+                "ue-worker",
+                "locality-worker",
+                "autoplanning-worker",
+                "price-refresh-worker",
+                "supply-status-worker",
+                "ue-enrichment-worker",
+                "ue-enrichment-worker-extra",
+            )]
             for command, content in {
                 "id": "#!/bin/sh\necho 0\n",
                 "runuser": '#!/bin/sh\nwhile [ "$#" -gt 0 ] && [ "$1" != "--" ]; do shift; done\nshift\nexec "$@"\n',

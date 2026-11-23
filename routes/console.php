@@ -77,7 +77,7 @@ if (config('locality.schedule_enabled', false)) {
 
 // Платное хранение Ozon FBO — пишет в inventory_warehouses.storage_fee_prev_month.
 // Включи через ENV OZON_STORAGE_SCHEDULE=true. Источник: Ozon Placement-by-Products report.
-if (filter_var(env('OZON_STORAGE_SCHEDULE', false), FILTER_VALIDATE_BOOLEAN)) {
+if ((bool) config('schedules.ozon_storage', false)) {
     \Illuminate\Support\Facades\Schedule::job(new \App\Jobs\SyncStorageCostJob('ozon', 30))
         ->dailyAt('03:30')
         ->withoutOverlapping()
@@ -88,7 +88,7 @@ if (filter_var(env('OZON_STORAGE_SCHEDULE', false), FILTER_VALIDATE_BOOLEAN)) {
 // замораживается (например, Электросталь оставалась 160% после поднятия WB до 180%),
 // поэтому раз в сутки освежаем box-тарифы + inventory-коэффициенты и пересобираем кэш.
 // Нагрузка минимальна (~2 запроса на интеграцию). Отключается через WB_TARIFF_SCHEDULE=false.
-if (filter_var(env('WB_TARIFF_SCHEDULE', true), FILTER_VALIDATE_BOOLEAN)) {
+if ((bool) config('schedules.wb_tariff', true)) {
     \Illuminate\Support\Facades\Schedule::command('wb:refresh-tariffs')
         ->dailyAt('05:30')
         ->withoutOverlapping()
@@ -102,7 +102,7 @@ if (filter_var(env('WB_TARIFF_SCHEDULE', true), FILTER_VALIDATE_BOOLEAN)) {
 // По умолчанию ВЫКЛЮЧЕНО (новый синк, нагрузка на API МП): включить MP_CONSTRAINTS_SCHEDULE=true.
 // ВНИМАНИЕ: на проде schedule:run может быть не настроен (см. ниже про системный cron) —
 // тогда задачу нужно завести в /etc/cron.d.
-if (filter_var(env('MP_CONSTRAINTS_SCHEDULE', false), FILTER_VALIDATE_BOOLEAN)) {
+if ((bool) config('schedules.mp_constraints', false)) {
     // WB: коэффициенты приёмки датированы и быстро устаревают → ежечасно.
     \Illuminate\Support\Facades\Schedule::command('mp:sync-constraints --marketplace=wildberries')
         ->hourly()
@@ -242,7 +242,7 @@ Artisan::command('sync:ozon-storage {--days=30 : Окно периода в дн
 // is_active=false, данные не трогаются). Прод использует /etc/cron.d, а не schedule:run,
 // поэтому там задача заводится отдельной cron-строкой:
 //   */30 * * * * www-data cd /var/www/products-backend && php artisan integrations:dedup-credentials --apply >> storage/logs/integrations-dedup.log 2>&1
-if (filter_var(env('INTEGRATIONS_DEDUP_SCHEDULE', false), FILTER_VALIDATE_BOOLEAN)) {
+if ((bool) config('schedules.integrations_dedup', false)) {
     \Illuminate\Support\Facades\Schedule::command('integrations:dedup-credentials --apply')
         ->everyThirtyMinutes()
         ->withoutOverlapping()
@@ -257,7 +257,7 @@ if (filter_var(env('INTEGRATIONS_DEDUP_SCHEDULE', false), FILTER_VALIDATE_BOOLEA
 // По умолчанию ВЫКЛЮЧЕНО: включить INVENTORY_SYNC_SCHEDULE=true.
 // ВНИМАНИЕ: на проде schedule:run не настроен — задача заведена в /etc/cron.d/inventory-sync,
 // которая дёргает `php artisan inventory:sync-scheduled` напрямую (как ue-sanity-check выше).
-if (filter_var(env('INVENTORY_SYNC_SCHEDULE', false), FILTER_VALIDATE_BOOLEAN)) {
+if ((bool) config('schedules.inventory_sync', false)) {
     \Illuminate\Support\Facades\Schedule::command('inventory:sync-scheduled')
         ->cron('20 2,10,18 * * *')
         ->withoutOverlapping()

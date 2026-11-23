@@ -4,8 +4,10 @@ namespace App\Console\Commands;
 
 use Illuminate\Foundation\Console\RouteListCommand as BaseRouteListCommand;
 use Illuminate\Routing\Router;
+use Symfony\Component\Console\Attribute\AsCommand;
 use Symfony\Component\Console\Input\InputOption;
 
+#[AsCommand(name: 'route:list')]
 class RouteListCommand extends BaseRouteListCommand
 {
     public function __construct(Router $router)

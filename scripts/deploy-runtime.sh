@@ -46,8 +46,16 @@ def statuses():
 
 
 workers = statuses()
-for required in ('products-backend-worker:', 'products-backend-ue-worker:',
-                 'products-backend-price-refresh-worker:', 'products-backend-ue-enrichment-worker:'):
+for required in (
+    'products-backend-worker:',
+    'products-backend-ue-worker:',
+    'products-backend-locality-worker:',
+    'products-backend-autoplanning-worker:',
+    'products-backend-price-refresh-worker:',
+    'products-backend-supply-status-worker:',
+    'products-backend-ue-enrichment-worker:',
+    'products-backend-ue-enrichment-worker-extra:',
+):
     if not any(name.startswith(required) for name in workers):
         raise RuntimeError('Missing required Supervisor group: ' + required)
 for name, state in workers.items():

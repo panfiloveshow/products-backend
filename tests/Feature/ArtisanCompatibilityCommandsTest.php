@@ -41,4 +41,30 @@ class ArtisanCompatibilityCommandsTest extends TestCase
 
         $this->assertSame(0, $eventsDispatched, 'Test must not execute live scheduled jobs.');
     }
+
+    public function test_route_list_command_declares_as_command_attribute_for_lazy_loading(): void
+    {
+        $attrs = (new \ReflectionClass(\App\Console\Commands\RouteListCommand::class))
+            ->getAttributes(\Symfony\Component\Console\Attribute\AsCommand::class);
+
+        $this->assertCount(1, $attrs, 'RouteListCommand must declare #[AsCommand] so Artisan keeps lazy loading.');
+        $this->assertSame('route:list', $attrs[0]->newInstance()->name);
+    }
+
+    public function test_console_routes_read_schedule_flags_from_config_not_env(): void
+    {
+        $source = file_get_contents(base_path('routes/console.php'));
+        $this->assertIsString($source);
+        $codeOnly = preg_replace('#//[^\n]*|/\*[\s\S]*?\*/#', '', $source) ?? '';
+
+        $this->assertDoesNotMatchRegularExpression(
+            '/\benv\s*\(/',
+            $codeOnly,
+            'routes/console.php must use config(), never env(), so flags work under config:cache.'
+        );
+
+        foreach (['ozon_storage', 'wb_tariff', 'mp_constraints', 'integrations_dedup', 'inventory_sync'] as $key) {
+            $this->assertIsBool(config("schedules.{$key}"));
+        }
+    }
 }
