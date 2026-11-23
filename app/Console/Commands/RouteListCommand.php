@@ -3,18 +3,23 @@
 namespace App\Console\Commands;
 
 use Illuminate\Foundation\Console\RouteListCommand as BaseRouteListCommand;
+use Illuminate\Routing\Router;
 use Symfony\Component\Console\Input\InputOption;
 
 class RouteListCommand extends BaseRouteListCommand
 {
-    /**
-     * @return array<int, array{0: string, 1: string|null, 2: int, 3: string}>
-     */
-    protected function getOptions()
+    public function __construct(Router $router)
     {
-        return array_merge(parent::getOptions(), [
-            ['columns', null, InputOption::VALUE_OPTIONAL, 'Columns to include (comma-separated): domain, method, uri, name, action, middleware'],
-        ]);
+        parent::__construct($router);
+
+        if (! $this->getDefinition()->hasOption('columns')) {
+            $this->addOption(
+                'columns',
+                null,
+                InputOption::VALUE_OPTIONAL,
+                'Columns to include (comma-separated): domain, method, uri, name, action, middleware, path'
+            );
+        }
     }
 
     /**
@@ -46,7 +51,7 @@ class RouteListCommand extends BaseRouteListCommand
             return $rows;
         }
 
-        $pad = array_fill_keys(['domain', 'method', 'uri', 'name', 'action', 'middleware'], '');
+        $pad = array_fill_keys(['domain', 'method', 'uri', 'name', 'action', 'middleware', 'path'], '');
 
         return array_map(fn (array $row) => array_merge($pad, $row), $rows);
     }
